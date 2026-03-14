@@ -48,11 +48,15 @@ PostgresLite is built with several advanced database engineering techniques to e
 
 ## 📦 Installation
 
-# Using Bun
-bun add @pglite/core
-
 # Using NPM
+```command
 npm install @pglite/core
+```
+
+# Using Bun
+```command
+bun add @pglite/core
+```
 
 ## 🛠 Usage
 ```ts
