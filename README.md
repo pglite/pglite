@@ -52,12 +52,10 @@ PostgresLite is built with several advanced database engineering techniques to e
 bun add @pglite/core
 
 # Using NPM
-npm installsh
-bun add @pglite/core
-```
+npm install @pglite/core
 
 ## 🛠 Usage
-
+```ts
 import { PGLite } from "@pglite/core";
 
 // For Node.js/Bun:
