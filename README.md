@@ -1,6 +1,7 @@
-# PostgresLite 🚀
+# Postgres Lite 🚀
+[![PGlite](https://files.hcm04.vstorage.vngcloud.vn/libs/bg-pglite.webp)]()
 
-**The High-Performance Embedded PostgreSQL Engine for Bun & Node.js**
+**An Ultra-Lightweight Embedded PostgreSQL Engine that Runs Natively in Node.js and the Browser — No WASM, No Emulation, Just Pure Performance.**
 
 [![Bun](https://img.shields.io/badge/Bun-%23000000.svg?style=for-the-badge&logo=bun&logoColor=white)](https://bun.sh)
 [![Node.js](https://img.shields.io/badge/Node.js-6DA55F?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
