@@ -1,0 +1,1791 @@
+import { expect, test, describe, beforeAll, afterAll } from "bun:test";
+import { LitePostgres } from "../src/database";
+
+import { unlinkSync, existsSync } from "fs";
+import { NodeFSAdapter } from "../src/adapters/node";
+
+const DB_FILE = "test_engine.db";
+
+describe("LitePostgres Engine Comprehensive Test Suite", () => {
+  let db: LitePostgres;
+
+  beforeAll(() => {
+    if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
+    if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
+    db = new LitePostgres(DB_FILE, {
+      database: "testdb",
+      adapter: new NodeFSAdapter(),
+    });
+  });
+
+  describe("LEVEL 6: Procedural Features", () => {
+    test("6.1 Anonymous Blocks (DO statement with $$ strings)", async () => {
+      const sql = `
+        DO $$
+        BEGIN
+          -- Simulated procedural block
+          NULL;
+        END;
+        $$
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+      expect(res.executed_block).toContain("BEGIN");
+    });
+
+    test("6.2 DO statement with explicit LANGUAGE", async () => {
+      const sql = `DO LANGUAGE plpgsql $$ RAISE NOTICE 'Hello'; $$`;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+      expect(res.language).toBe("plpgsql");
+      expect(res.executed_block).toBe(" RAISE NOTICE 'Hello'; ");
+    });
+
+    test("6.3 Using $DO alias (PostgreSQL extension-like syntax)", async () => {
+      const sql = `$DO $$ RETURN 1; $$`;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+      expect(res.executed_block).toBe(" RETURN 1; ");
+    });
+  });
+
+  afterAll(() => {
+    if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
+    if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
+  });
+
+  describe("LEVEL 1: Basic Operations (Currently Supported)", () => {
+    test("1.1 Create Table", async () => {
+      const res = await db.exec(
+        `CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT, age NUMBER)`,
+      );
+      expect(res.success).toBe(true);
+    });
+
+    test("1.2 Insert Data", async () => {
+      await db.exec(`INSERT INTO users (name, age) VALUES ('Alice', 25)`);
+      await db.exec(`INSERT INTO users (name, age) VALUES ('Bob', 30)`);
+      const res = await db.exec(
+        `INSERT INTO users (name, age) VALUES ('Charlie', 35)`,
+      );
+      expect(res.success).toBe(true);
+    });
+
+    test("1.3 Simple Select", async () => {
+      const rows = await db.query(`SELECT * FROM users`);
+      expect(rows.length).toBe(3);
+      expect(rows[0].name).toBe("Alice");
+    });
+
+    test("1.4 Select with basic WHERE (Uses Index Pushdown)", async () => {
+      const rows = await db.query(`SELECT name FROM users WHERE id = 2`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe("Bob");
+      expect(rows[0].id).toBeUndefined();
+    });
+
+    test("1.5 Update with WHERE", async () => {
+      const res = await db.exec(
+        `UPDATE users SET age = 26 WHERE name = 'Alice'`,
+      );
+      expect(res.updated).toBe(1);
+      const rows = await db.query(`SELECT * FROM users WHERE id = 1`);
+      expect(rows[0].age).toBe(26);
+    });
+
+    test("1.6 Delete with WHERE", async () => {
+      const res = await db.exec(`DELETE FROM users WHERE name = 'Charlie'`);
+      expect(res.deleted).toBe(1);
+      const rows = await db.query(`SELECT * FROM users`);
+      expect(rows.length).toBe(2);
+    });
+
+    test("1.7 Parameterized Queries ($1, $2, ...)", async () => {
+      // Test INSERT with params
+      const resInsert = await db.exec(
+        `INSERT INTO users (name, age) VALUES ($1, $2)`,
+        ["Diana", 28],
+      );
+      expect(resInsert.success).toBe(true);
+
+      // Test SELECT with multiple params
+      const rows = await db.query(
+        `SELECT * FROM users WHERE name = $1 AND age = $2`,
+        ["Diana", 28],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe("Diana");
+      expect(rows[0].age).toBe(28);
+
+      // Test same param used multiple times
+      const rowsMulti = await db.query(
+        `SELECT * FROM users WHERE name = $1 OR name = $1`,
+        ["Diana"],
+      );
+      expect(rowsMulti.length).toBe(1);
+
+      // Test positional consistency
+      const rowsReordered = await db.query(
+        `SELECT name FROM users WHERE age = $2 AND name = $1`,
+        ["Diana", 28],
+      );
+      expect(rowsReordered.length).toBe(1);
+      expect(rowsReordered[0].name).toBe("Diana");
+
+      // Test UPDATE with params
+      const resUpdate = await db.exec(
+        `UPDATE users SET age = $1 WHERE name = $2`,
+        [29, "Diana"],
+      );
+      expect(resUpdate.updated).toBe(1);
+
+      // Verify UPDATE
+      const rowsVerify = await db.query(
+        `SELECT age FROM users WHERE name = $1`,
+        ["Diana"],
+      );
+      expect(rowsVerify[0].age).toBe(29);
+
+      // Test DELETE with params
+      const resDelete = await db.exec(`DELETE FROM users WHERE name = $1`, [
+        "Diana",
+      ]);
+      expect(resDelete.deleted).toBe(1);
+    });
+  });
+
+  describe("LEVEL 2: Intermediate Querying (Target Features)", () => {
+    test("2.1 Comparison Operators (>, <, >=, <=, !=)", async () => {
+      const rows = await db.query(`SELECT * FROM users WHERE age >= 30`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe("Bob");
+    });
+
+    test("2.2 Logical Operators (AND, OR, NOT)", async () => {
+      const rows = await db.query(
+        `SELECT * FROM users WHERE age > 20 AND name = 'Alice'`,
+      );
+      expect(rows.length).toBe(1);
+      const rows2 = await db.query(
+        `SELECT * FROM users WHERE age = 30 OR name = 'Alice'`,
+      );
+      expect(rows2.length).toBe(2);
+    });
+
+    test("2.3 IN and LIKE operators", async () => {
+      const rows = await db.query(`SELECT * FROM users WHERE name LIKE 'Al%'`);
+      expect(rows.length).toBe(1);
+      const rows2 = await db.query(`SELECT * FROM users WHERE age IN (26, 30)`);
+      expect(rows2.length).toBe(2);
+    });
+
+    test("2.4 ORDER BY and LIMIT / OFFSET", async () => {
+      await db.exec(`INSERT INTO users (name, age) VALUES ('David', 40)`);
+      const rows = await db.query(
+        `SELECT * FROM users ORDER BY age DESC LIMIT 2 OFFSET 1`,
+      );
+      // 40 (David), 30 (Bob), 26 (Alice)
+      // LIMIT 2 OFFSET 1 -> Bob, Alice
+      expect(rows.length).toBe(2);
+      expect(rows[0].name).toBe("Bob");
+      expect(rows[1].name).toBe("Alice");
+    });
+  });
+
+  describe("LEVEL 3: Advanced Relational Features", () => {
+    beforeAll(async () => {
+      await db.exec(
+        `CREATE TABLE posts (id SERIAL PRIMARY KEY, title TEXT, user_id NUMBER)`,
+      );
+      await db.exec(
+        `INSERT INTO posts (title, user_id) VALUES ('Hello World', 1)`,
+      );
+      await db.exec(
+        `INSERT INTO posts (title, user_id) VALUES ('Bun is fast', 1)`,
+      );
+      await db.exec(
+        `INSERT INTO posts (title, user_id) VALUES ('Postgres Lite', 2)`,
+      );
+    });
+
+    test("3.1 INNER JOIN", async () => {
+      const rows = await db.query(`
+        SELECT users.name, posts.title 
+        FROM users 
+        INNER JOIN posts ON users.id = posts.user_id 
+        WHERE users.name = 'Alice'
+      `);
+      expect(rows.length).toBe(2);
+      expect(rows[0].title).toBe("Hello World");
+    });
+
+    test("3.2 LEFT JOIN", async () => {
+      await db.exec(`INSERT INTO users (name, age) VALUES ('Eve', 22)`);
+      const rows = await db.query(`
+        SELECT users.name, posts.title 
+        FROM users 
+        LEFT JOIN posts ON users.id = posts.user_id 
+        WHERE users.name = 'Eve'
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].title).toBeUndefined();
+    });
+
+    test("3.3 Aggregation & GROUP BY", async () => {
+      const rows = await db.query(`
+        SELECT user_id, COUNT(id) as post_count 
+        FROM posts 
+        GROUP BY user_id
+        HAVING COUNT(id) > 1
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].user_id).toBe(1);
+      expect(rows[0].post_count).toBe(2);
+    });
+
+    test("3.4 Subqueries in WHERE and FROM", async () => {
+      const rows = await db.query(`
+        SELECT name FROM users 
+        WHERE id IN (SELECT user_id FROM posts WHERE title = 'Postgres Lite')
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe("Bob");
+
+      const rows2 = await db.query(`
+        SELECT avg_age FROM (SELECT AVG(age) as avg_age FROM users)
+      `);
+      expect(rows2.length).toBe(1);
+      expect(rows2[0].avg_age).toBeGreaterThan(0);
+    });
+
+    test("3.5 Computed Columns / Expressions", async () => {
+      const rows = await db.query(
+        `SELECT age * 2 as double_age FROM users WHERE name = 'Alice'`,
+      );
+      expect(rows[0].double_age).toBe(52);
+    });
+
+    test("3.6 ARRAY_AGG function", async () => {
+      const rows = await db.query(`
+        SELECT user_id, ARRAY_AGG(title) as titles 
+        FROM posts 
+        GROUP BY user_id
+        ORDER BY user_id ASC
+      `);
+      expect(rows.length).toBe(2);
+      expect(rows[0].user_id).toBe(1);
+      expect(rows[0].titles).toEqual(["Hello World", "Bun is fast"]);
+      expect(rows[1].user_id).toBe(2);
+      expect(rows[1].titles).toEqual(["Postgres Lite"]);
+    });
+  });
+
+  describe("LEVEL 4: Data Integrity, Schema & Transactions", () => {
+    test("4.1 Constraints (UNIQUE, NOT NULL)", async () => {
+      expect(async () => {
+        await db.exec(
+          `CREATE TABLE tags (id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL)`,
+        );
+        await db.exec(`INSERT INTO tags (name) VALUES (NULL)`);
+      }).toThrow();
+
+      expect(async () => {
+        await db.exec(`INSERT INTO tags (name) VALUES ('database')`);
+        await db.exec(`INSERT INTO tags (name) VALUES ('database')`);
+      }).toThrow();
+    });
+
+    test("4.2 Foreign Keys", async () => {
+      expect(async () => {
+        await db.exec(
+          `CREATE TABLE comments (id SERIAL PRIMARY KEY, post_id NUMBER REFERENCES posts(id))`,
+        );
+        await db.exec(`INSERT INTO comments (post_id) VALUES (9999)`); // Does not exist
+      }).toThrow();
+    });
+
+    test("4.3 ALTER TABLE - ADD COLUMN", async () => {
+      await db.exec(`ALTER TABLE users ADD COLUMN active NUMBER DEFAULT 1`);
+      const rows = await db.query(
+        `SELECT active FROM users WHERE name = 'Alice'`,
+      );
+      expect(rows[0].active).toBe(1);
+    });
+
+    test("4.3.1 ALTER TABLE - ADD COLUMN IF NOT EXISTS", async () => {
+      await db.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`);
+      const rows = await db.query(`SELECT * FROM users WHERE name = 'Alice'`);
+      expect(rows[0].phone).toBeDefined();
+
+      // Should not throw when adding existing column
+      await db.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS active NUMBER`);
+    });
+
+    test("4.3.2 ALTER TABLE - RENAME COLUMN", async () => {
+      await db.exec(`CREATE TABLE rename_col_test (old_name TEXT, val NUMBER)`);
+      await db.exec(
+        `INSERT INTO rename_col_test (old_name, val) VALUES ('test_val', 123)`,
+      );
+      await db.exec(
+        `ALTER TABLE rename_col_test RENAME COLUMN old_name TO new_name`,
+      );
+      const rows = await db.query(`SELECT new_name, val FROM rename_col_test`);
+      expect(rows[0].new_name).toBe("test_val");
+      expect(rows[0].old_name).toBeUndefined();
+    });
+
+    test("4.3.3 ALTER TABLE - DROP COLUMN", async () => {
+      await db.exec(`ALTER TABLE rename_col_test DROP COLUMN val`);
+      const rows = await db.query(`SELECT * FROM rename_col_test`);
+      expect(rows[0].val).toBeUndefined();
+      expect(rows[0].new_name).toBe("test_val");
+    });
+
+    test("4.3.4 ALTER TABLE - DROP COLUMN IF EXISTS", async () => {
+      await db.exec(
+        `ALTER TABLE rename_col_test DROP COLUMN IF EXISTS new_name`,
+      );
+      await db.exec(
+        `ALTER TABLE rename_col_test DROP COLUMN IF EXISTS non_existent`,
+      );
+      // Table should still exist and allow schema modification
+      await db.exec(`ALTER TABLE rename_col_test ADD COLUMN check_col TEXT`);
+      const res = await db.exec(
+        `INSERT INTO rename_col_test (check_col) VALUES ('ok')`,
+      );
+      expect(res.success).toBe(true);
+    });
+
+    test("4.3.5 ALTER TABLE - RENAME TABLE", async () => {
+      await db.exec(
+        `CREATE TABLE table_to_rename (id SERIAL PRIMARY KEY, data TEXT)`,
+      );
+      await db.exec(`INSERT INTO table_to_rename (data) VALUES ('find_me')`);
+      await db.exec(`ALTER TABLE table_to_rename RENAME TO table_renamed`);
+      const rows = await db.query(`SELECT * FROM table_renamed`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].data).toBe("find_me");
+
+      expect(async () => {
+        await db.query(`SELECT * FROM table_to_rename`);
+      }).toThrow();
+    });
+
+    test("4.3.6 ALTER TABLE - SET/DROP DEFAULT", async () => {
+      await db.exec(
+        `CREATE TABLE alter_default (id SERIAL PRIMARY KEY, val NUMBER)`,
+      );
+      await db.exec(
+        `ALTER TABLE alter_default ALTER COLUMN val SET DEFAULT 100`,
+      );
+      await db.exec(`INSERT INTO alter_default (id) VALUES (1)`);
+      let rows = await db.query(`SELECT val FROM alter_default WHERE id = 1`);
+      expect(rows[0].val).toBe(100);
+
+      await db.exec(`ALTER TABLE alter_default ALTER COLUMN val DROP DEFAULT`);
+      await db.exec(`INSERT INTO alter_default (id) VALUES (2)`);
+      rows = await db.query(`SELECT val FROM alter_default WHERE id = 2`);
+      expect(rows[0].val).toBeNull();
+    });
+
+    test("4.3.7 ALTER TABLE - SET/DROP NOT NULL", async () => {
+      await db.exec(
+        `CREATE TABLE alter_not_null (id SERIAL PRIMARY KEY, name TEXT)`,
+      );
+      await db.exec(
+        `ALTER TABLE alter_not_null ALTER COLUMN name SET NOT NULL`,
+      );
+
+      expect(async () => {
+        await db.exec(`INSERT INTO alter_not_null (name) VALUES (NULL)`);
+      }).toThrow();
+
+      await db.exec(
+        `ALTER TABLE alter_not_null ALTER COLUMN name DROP NOT NULL`,
+      );
+      await db.exec(`INSERT INTO alter_not_null (name) VALUES (NULL)`);
+      const rows = await db.query(
+        `SELECT * FROM alter_not_null WHERE name IS NULL`,
+      );
+      expect(rows.length).toBe(1);
+    });
+
+    test("4.3.8 ALTER TABLE - ADD COLUMN with UNIQUE", async () => {
+      await db.exec(`CREATE TABLE alter_unique_test (id SERIAL PRIMARY KEY)`);
+      await db.exec(
+        `ALTER TABLE alter_unique_test ADD COLUMN slug TEXT UNIQUE`,
+      );
+      await db.exec(`INSERT INTO alter_unique_test (slug) VALUES ('first')`);
+
+      expect(async () => {
+        await db.exec(`INSERT INTO alter_unique_test (slug) VALUES ('first')`);
+      }).toThrow();
+    });
+
+    test("4.3.9 ALTER TABLE - ADD COLUMN with NOT NULL", async () => {
+      await db.exec(`CREATE TABLE alter_not_null_test (id SERIAL PRIMARY KEY)`);
+      await db.exec(
+        `ALTER TABLE alter_not_null_test ADD COLUMN description TEXT NOT NULL DEFAULT 'none'`,
+      );
+
+      // Should allow inserting with default
+      await db.exec(`INSERT INTO alter_not_null_test (id) VALUES (1)`);
+
+      expect(async () => {
+        // Attempt to insert null explicitly
+        await db.exec(
+          `INSERT INTO alter_not_null_test (id, description) VALUES (2, NULL)`,
+        );
+      }).toThrow();
+    });
+
+    test("4.3.10 ALTER TABLE - ADD COLUMN with REFERENCES", async () => {
+      await db.exec(`CREATE TABLE parent_ref (id NUMBER PRIMARY KEY)`);
+      await db.exec(`INSERT INTO parent_ref (id) VALUES (1)`);
+
+      await db.exec(`CREATE TABLE child_ref (id SERIAL PRIMARY KEY)`);
+      await db.exec(
+        `ALTER TABLE child_ref ADD COLUMN parent_id NUMBER REFERENCES parent_ref(id)`,
+      );
+
+      // Valid reference
+      await db.exec(`INSERT INTO child_ref (parent_id) VALUES (1)`);
+
+      // Invalid reference
+      expect(async () => {
+        await db.exec(`INSERT INTO child_ref (parent_id) VALUES (999)`);
+      }).toThrow();
+    });
+
+    test("4.4 Transactions (ACID)", async () => {
+      await db.exec(`BEGIN`);
+      await db.exec(`INSERT INTO users (name, age) VALUES ('Ghost', 99)`);
+      await db.exec(`ROLLBACK`);
+      const rows = await db.query(`SELECT * FROM users WHERE name = 'Ghost'`);
+      expect(rows.length).toBe(0);
+
+      await db.exec(`BEGIN`);
+      await db.exec(`INSERT INTO users (name, age) VALUES ('Phantom', 88)`);
+      await db.exec(`COMMIT`);
+      const rows2 = await db.query(
+        `SELECT * FROM users WHERE name = 'Phantom'`,
+      );
+      expect(rows2.length).toBe(1);
+    });
+
+    test("4.4.1 Transactions - START TRANSACTION and END", async () => {
+      await db.exec(`START TRANSACTION`);
+      await db.exec(`INSERT INTO users (name, age) VALUES ('StartEnd', 10)`);
+      await db.exec(`END`);
+      const rows = await db.query(
+        `SELECT * FROM users WHERE name = 'StartEnd'`,
+      );
+      expect(rows.length).toBe(1);
+    });
+
+    test("4.4.2 Transactions - Schema Rollback", async () => {
+      await db.exec(`BEGIN`);
+      await db.exec(`CREATE TABLE rollback_schema (id NUMBER)`);
+      await db.exec(`ROLLBACK`);
+
+      // Table should not exist
+      expect(async () => {
+        await db.query(`SELECT * FROM rollback_schema`);
+      }).toThrow();
+    });
+
+    test("4.4.3 Transactions - Alter Table Rollback", async () => {
+      await db.exec(`CREATE TABLE alter_rollback (id NUMBER)`);
+      await db.exec(`BEGIN`);
+      await db.exec(`ALTER TABLE alter_rollback ADD COLUMN secret TEXT`);
+      await db.exec(`ROLLBACK`);
+
+      const rows = await db.query(`SELECT * FROM alter_rollback`);
+      expect(rows.length).toBe(0);
+      // Column 'secret' should not exist in record
+      await db.exec(`INSERT INTO alter_rollback (id) VALUES (1)`);
+      const rows2 = await db.query(`SELECT * FROM alter_rollback`);
+      expect(rows2[0].secret).toBeUndefined();
+    });
+
+    test("4.4.4 Transactions - Index Consistency after Rollback", async () => {
+      await db.exec(
+        `CREATE TABLE index_rollback (id NUMBER PRIMARY KEY, val TEXT)`,
+      );
+      await db.exec(
+        `INSERT INTO index_rollback (id, val) VALUES (1, 'initial')`,
+      );
+
+      await db.exec(`BEGIN`);
+      await db.exec(`UPDATE index_rollback SET val = 'changed' WHERE id = 1`);
+      await db.exec(
+        `INSERT INTO index_rollback (id, val) VALUES (2, 'temporary')`,
+      );
+      await db.exec(`ROLLBACK`);
+
+      // Verify row 1 reverted
+      const row1 = await db.query(
+        `SELECT val FROM index_rollback WHERE id = 1`,
+      );
+      expect(row1[0].val).toBe("initial");
+
+      // Verify row 2 is gone from index lookup
+      const row2 = await db.query(`SELECT * FROM index_rollback WHERE id = 2`);
+      expect(row2.length).toBe(0);
+    });
+
+    test("4.4.5 Transactions - Abort alias", async () => {
+      await db.exec(`BEGIN`);
+      await db.exec(`INSERT INTO users (name, age) VALUES ('Aborted', 0)`);
+      await db.exec(`ABORT`);
+      const rows = await db.query(`SELECT * FROM users WHERE name = 'Aborted'`);
+      expect(rows.length).toBe(0);
+    });
+  });
+
+  describe("LEVEL 5: Extremely Complex Queries", () => {
+    test("5.1 Multi-join with aggregations, subqueries, and grouping", async () => {
+      const sql = `
+        SELECT 
+          u.name,
+          COUNT(p.id) as total_posts,
+          (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) as total_comments
+        FROM users u
+        LEFT JOIN posts p ON u.id = p.user_id
+        WHERE u.age >= 20 AND u.active = 1
+        GROUP BY u.id, u.name
+        HAVING COUNT(p.id) > 0
+        ORDER BY total_posts DESC, u.name ASC
+        LIMIT 10
+      `;
+      // Ensure parser and executor can handle the complexity without throwing
+      expect(async () => await db.query(sql)).not.toThrow();
+    });
+
+    test("5.2 CTE (Common Table Expressions)", async () => {
+      const sql = `
+        WITH user_stats AS (
+          SELECT user_id, COUNT(*) as post_count
+          FROM posts
+          GROUP BY user_id
+        )
+        SELECT u.name, s.post_count
+        FROM users u
+        JOIN user_stats s ON u.id = s.user_id
+        WHERE s.post_count >= 1
+      `;
+      expect(async () => await db.query(sql)).not.toThrow();
+    });
+
+    test("5.3 UNION and INTERSECT", async () => {
+      const sql = `
+        SELECT name FROM users WHERE age < 30
+        UNION
+        SELECT name FROM users WHERE age > 40
+      `;
+      expect(async () => await db.query(sql)).not.toThrow();
+    });
+
+    test("5.4 Complex catalog query with NOT IN and obj_description", async () => {
+      await db.exec(`COMMENT ON TABLE users IS 'User record table'`);
+      const sql = `
+        SELECT 
+          table_name,
+          obj_description((QUOTE_IDENT(table_schema) || '.' || QUOTE_IDENT(table_name))::regclass) AS comment
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('information_schema', 'pg_catalog') 
+          AND table_schema = 'public'
+          AND table_name = 'users'
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].table_name).toBe("users");
+      expect(rows[0].comment).toBe("User record table");
+    });
+
+    test("5.5 Unary NOT and NOT LIKE", async () => {
+      const rows = await db.query(
+        `SELECT name FROM users WHERE NOT (age < 25) AND name NOT LIKE 'Eve%'`,
+      );
+      // Alice (26), Bob (30), Diana (28), David (40)
+      expect(rows.length).toBe(4);
+    });
+
+    test("5.6 Complex catalog query with NOT IN and obj_description", async () => {
+      const sql = `
+        SELECT 
+          table_schema AS schema_name,
+          table_name,
+          table_type,
+          obj_description((QUOTE_IDENT(table_schema) || '.' || QUOTE_IDENT(table_name))::regclass) AS comment,
+          CASE WHEN table_type = 'TEMPORARY' THEN true ELSE false END AS is_temporary
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('information_schema', 'pg_catalog') AND table_schema = 'public'
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThanOrEqual(1); // Should at least find our testing tables in 'public'
+      expect(rows[0].table_type).toBe("BASE TABLE");
+    });
+
+    test("5.7 Query information_schema.schemata", async () => {
+      const sql = `
+        SELECT schema_name 
+        FROM information_schema.schemata
+        WHERE schema_name NOT IN ('information_schema', 'pg_catalog')
+          AND schema_name NOT LIKE 'pg_toast%'
+          AND schema_name NOT LIKE 'pg_temp%';
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      expect(rows.map((r: any) => r.schema_name)).toContain("public");
+    });
+
+    test("5.8 Query pg_namespace", async () => {
+      const sql = `
+        SELECT nspname AS schema_name
+        FROM pg_namespace;
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThanOrEqual(3);
+      const schemas = rows.map((r: any) => r.schema_name);
+      expect(schemas).toContain("public");
+      expect(schemas).toContain("pg_catalog");
+      expect(schemas).toContain("information_schema");
+    });
+
+    test("5.9 Query pg_constraint", async () => {
+      const sql = `
+        SELECT conname, contype 
+        FROM pg_constraint 
+        WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'users')
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      const types = rows.map((r: any) => r.contype);
+      expect(types).toContain("p");
+    });
+
+    test("5.10 Query pg_constraint for foreign keys and unique", async () => {
+      await db.exec(`CREATE TABLE ref_target (id SERIAL PRIMARY KEY)`);
+      await db.exec(
+        `CREATE TABLE ref_source (id SERIAL PRIMARY KEY, target_id INTEGER REFERENCES ref_target(id), uniq_col TEXT UNIQUE)`,
+      );
+
+      const sql = `
+        SELECT conname, contype 
+        FROM pg_constraint 
+        WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'ref_source')
+        ORDER BY contype
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(3);
+
+      const types = rows.map((r: any) => r.contype);
+      expect(types).toContain("p");
+      expect(types).toContain("f");
+      expect(types).toContain("u");
+    });
+
+    test("5.11 Query pg_attribute for table columns", async () => {
+      const sql = `
+        SELECT attname, attnum, attnotnull
+        FROM pg_attribute 
+        WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'users')
+        ORDER BY attnum;
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+
+      const names = rows.map((r: any) => r.attname);
+      expect(names).toContain("id");
+      expect(names).toContain("name");
+      expect(names).toContain("age");
+
+      const attnums = rows.map((r: any) => r.attnum);
+      expect(attnums).toContain(1);
+      expect(attnums).toContain(2);
+      expect(attnums).toContain(3);
+
+      const idCol = rows.find((r: any) => r.attname === "id");
+      expect(idCol.attnotnull).toBe(true);
+    });
+
+    test("5.12 col_description function", async () => {
+      await db.exec(
+        `CREATE TABLE comment_test (id SERIAL PRIMARY KEY, note TEXT)`,
+      );
+      await db.exec(
+        `COMMENT ON COLUMN comment_test.note IS 'This is a note column'`,
+      );
+
+      const sql = `
+        SELECT 
+          col_description((QUOTE_IDENT(table_schema) || '.' || QUOTE_IDENT(table_name))::regclass, ordinal_position) as comment
+        FROM information_schema.columns
+        WHERE table_name = 'comment_test' AND column_name = 'note'
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].comment).toBe("This is a note column");
+    });
+
+    test("5.14 Regression: Introspection query with quoted regclass cast", async () => {
+      await db.exec(`CREATE TABLE public.introspection_test (id SERIAL PRIMARY KEY)`);
+      await db.exec(`COMMENT ON TABLE public.introspection_test IS 'Introspection comment'`);
+
+      const sql = `
+        SELECT 
+          table_schema AS schema_name,
+          table_name,
+          table_type,
+          obj_description(('"' || table_schema || '"."' || table_name || '"')::regclass) AS comment,
+          CASE WHEN table_type = 'TEMPORARY' THEN true ELSE false END AS is_temporary
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'introspection_test'
+      `;
+      
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].schema_name).toBe("public");
+      expect(rows[0].comment).toBe("Introspection comment");
+    });
+
+    test("5.13 Advanced col_description with JSON comments and complex casting", async () => {
+      // 1. Setup table
+      await db.exec(`CREATE TABLE users2 (
+        id SERIAL PRIMARY KEY,
+        username TEXT,
+        password TEXT,
+        email TEXT,
+        created_at TIMESTAMP,
+        zalo_id TEXT,
+        phone_number TEXT,
+        updated_at TIMESTAMP,
+        deleted_at TIMESTAMP
+      )`);
+
+      // 2. Apply the specific comments provided by the user
+      const comments = [
+        `COMMENT ON TABLE users IS '{"label": "Người dùng", "description": "Bảng lưu trữ thông tin người dùng"}';`,
+        `COMMENT ON COLUMN users2.username IS '{"label": "Tên người dùng", "type": "short_text", "required": true, "description": "Tên người dùng duy nhất", "visible": true}';`,
+        `COMMENT ON COLUMN users2.password IS '{"label": "Mật khẩu", "type": "password", "required": true, "description": "Mật khẩu của người dùng", "visible": false}';`,
+        `COMMENT ON COLUMN users2.email IS '{"label": "Email", "type": "email", "required": true, "description": "Địa chỉ email của người dùng", "visible": true}';`,
+        `COMMENT ON COLUMN users2.created_at IS '{"label": "Thời gian tạo", "type": "datetime", "required": true, "description": "Thời điểm người dùng được tạo", "visible": false}';`,
+        `COMMENT ON COLUMN users2.zalo_id IS '{"label": "Zalo ID", "type": "short_text", "required": false, "description": "ID Zalo của người dùng", "visible": true}';`,
+        `COMMENT ON COLUMN users2.phone_number IS '{"label": "Số điện thoại", "type": "short_text", "required": false, "description": "Số điện thoại của người dùng", "visible": true}';`,
+        `COMMENT ON COLUMN users2.updated_at IS '{"label": "Thời gian cập nhật", "type": "datetime", "required": true, "description": "Thời điểm người dùng được cập nhật lần cuối", "visible": false}';`,
+        `COMMENT ON COLUMN users2.deleted_at IS '{"label": "Thời gian xóa", "type": "datetime", "required": false, "description": "Thời điểm người dùng bị xóa", "visible": false}';`,
+      ];
+
+      await db.exec(comments.join("\n"));
+
+      // 3. Execute the exact query provided by the user
+      const sql = `
+        SELECT 
+          cols.table_schema AS schema_name,
+          cols.table_name,
+          cols.column_name,
+          cols.data_type,
+          cols.is_nullable,
+          cols.column_default,
+          NULL AS constraint_type,
+          col_description(
+            (quote_ident(cols.table_schema) || '.' || quote_ident(cols.table_name))::regclass::oid,
+            cols.ordinal_position
+          ) AS comment
+        FROM information_schema.columns cols
+        WHERE cols.table_schema = $1
+          AND cols.table_schema NOT IN ('information_schema', 'pg_catalog')
+          AND cols.table_name = $2
+        ORDER BY cols.table_name, cols.ordinal_position
+      `;
+
+      const rows = await db.query(sql, ["public", "users2"]);
+
+      const allColumns = await db.query(
+        `SELECT 
+        *,
+        col_description(
+            (quote_ident(cols.table_schema) || '.' || quote_ident(cols.table_name))::regclass::oid,
+            cols.ordinal_position
+          ) AS comment 
+           FROM information_schema.columns cols 
+           WHERE cols.table_schema = 'public' AND cols.table_name = 'users2'
+           `,
+      );
+      console.log("USERS", allColumns);
+
+      // 4. Verify results
+      const usernameCol = rows.find((r) => r.column_name === "username");
+      expect(usernameCol).toBeDefined();
+      expect(usernameCol.comment).toContain('"label": "Tên người dùng"');
+      expect(usernameCol.is_nullable).toBe("YES"); // SERIAL/PK handling might make id 'NO' but others 'YES'
+
+      const emailCol = rows.find((r) => r.column_name === "email");
+      expect(emailCol.comment).toContain("Địa chỉ email");
+    });
+  });
+
+  describe("LEVEL 7: Schema Operations", () => {
+    test("7.1 CREATE SCHEMA", async () => {
+      const res = await db.exec(`CREATE SCHEMA analytics`);
+      expect(res.success).toBe(true);
+
+      const res2 = await db.exec(`CREATE SCHEMA IF NOT EXISTS analytics`);
+      expect(res2.success).toBe(true); // Should not throw because of IF NOT EXISTS
+    });
+
+    test("7.2 CREATE TABLE inside specific schema", async () => {
+      const res = await db.exec(
+        `CREATE TABLE analytics.metrics (id SERIAL PRIMARY KEY, name TEXT, value NUMBER)`,
+      );
+      expect(res.success).toBe(true);
+    });
+
+    test("7.3 INSERT and SELECT across schemas", async () => {
+      await db.exec(
+        `INSERT INTO analytics.metrics (name, value) VALUES ('visitors', 1500)`,
+      );
+      await db.exec(
+        `INSERT INTO analytics.metrics (name, value) VALUES ('bounces', 300)`,
+      );
+
+      const rows = await db.query(
+        `SELECT * FROM analytics.metrics WHERE value > 500`,
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe("visitors");
+    });
+
+    test("7.4 DROP SCHEMA RESTRICT (should fail if tables exist)", async () => {
+      expect(async () => {
+        await db.exec(`DROP SCHEMA analytics RESTRICT`);
+      }).toThrow();
+    });
+
+    test("7.5 DROP TABLE and DROP SCHEMA", async () => {
+      const dropTableRes = await db.exec(
+        `DROP TABLE IF EXISTS analytics.metrics`,
+      );
+      expect(dropTableRes.success).toBe(true);
+
+      const dropSchemaRes = await db.exec(`DROP SCHEMA analytics`);
+      expect(dropSchemaRes.success).toBe(true);
+
+      expect(async () => {
+        await db.query(`SELECT * FROM analytics.metrics`);
+      }).toThrow();
+    });
+
+    test("7.6 Default schema is public", async () => {
+      await db.exec(`CREATE TABLE public.test_public (id SERIAL PRIMARY KEY)`);
+      await db.exec(`INSERT INTO test_public (id) VALUES (1)`); // Defaults to public.test_public
+
+      const rows = await db.query(`SELECT * FROM public.test_public`);
+      expect(rows.length).toBe(1);
+    });
+  });
+
+  describe("LEVEL 21: Regex, JSON, Array Operators & Interval", () => {
+    test("21.1 Regex Operators (~, ~*, !~)", async () => {
+      const rows = await db.query(`
+        SELECT 
+          'apple' ~ 'a.p' as res1,
+          'APPLE' ~* 'apple' as res2,
+          'banana' !~ 'apple' as res3
+      `);
+      expect(rows[0].res1).toBe(true);
+      expect(rows[0].res2).toBe(true);
+      expect(rows[0].res3).toBe(true);
+    });
+
+    test("21.2 JSON Operators (->, ->>, #>, @>, ?)", async () => {
+      const rows = await db.query(`
+        SELECT 
+          '{"a": 1, "b": {"c": 2}}'::json -> 'b' as res1,
+          '{"a": 1, "b": 2}'::json ->> 'a' as res2,
+          '{"a": [1, 2, 3]}'::json #> ARRAY['a', 1] as res3,
+          '{"a": 1, "b": 2}'::json @> '{"a": 1}'::json as res4,
+          '{"a": 1, "b": 2}'::json ? 'a' as res5
+      `);
+      expect(rows[0].res1).toEqual({ c: 2 });
+      expect(rows[0].res2).toBe("1");
+      expect(rows[0].res3).toBe(2);
+      expect(rows[0].res4).toBe(true);
+      expect(rows[0].res5).toBe(true);
+    });
+
+    test("21.3 Array Operators (&&, @>)", async () => {
+      const rows = await db.query(`
+        SELECT 
+          ARRAY[1, 2] && ARRAY[2, 3] as res1,
+          ARRAY[1, 2, 3] @> ARRAY[1, 2] as res2,
+          ARRAY[1, 2] && ARRAY[3, 4] as res3
+      `);
+      expect(rows[0].res1).toBe(true);
+      expect(rows[0].res2).toBe(true);
+      expect(rows[0].res3).toBe(false);
+    });
+
+    test("21.4 INTERVAL Syntax & Arithmetic", async () => {
+      const rows = await db.query(`
+        SELECT 
+          '2024-01-01'::timestamp + INTERVAL '1 day' as res1,
+          '2024-01-02'::timestamp - INTERVAL '2 days' as res2,
+          '2024-01-01'::timestamp + INTERVAL '1 month' as res3
+      `);
+      expect(rows[0].res1).toContain("2024-01-02");
+      expect(rows[0].res2).toContain("2023-12-31");
+      expect(rows[0].res3).toContain("2024-02-01");
+    });
+  });
+
+  describe("LEVEL 13: Type Casting", () => {
+    test("13.1 Cast string to integer with :: syntax", async () => {
+      const rows = await db.query("SELECT '100'::int + 5 as result");
+      expect(rows[0].result).toBe(105);
+    });
+
+    test("13.2 Cast boolean to string", async () => {
+      const rows = await db.query("SELECT true::text as result");
+      expect(rows[0].result).toBe("true");
+    });
+
+    test("13.3 Cast string to boolean", async () => {
+      const rows = await db.query(
+        "SELECT 'true'::boolean as result1, '0'::boolean as result2",
+      );
+      expect(rows[0].result1).toBe(true);
+      expect(rows[0].result2).toBe(false);
+    });
+
+    test("13.4 Cast using CAST(expr AS type) syntax", async () => {
+      const rows = await db.query("SELECT CAST('200' AS INT) * 2 as result");
+      expect(rows[0].result).toBe(400);
+    });
+
+    test("13.5 Multiple cascaded casts", async () => {
+      const rows = await db.query("SELECT '300'::int::text as result");
+      expect(rows[0].result).toBe("300");
+    });
+
+    test("13.6 Cast string to regnamespace", async () => {
+      const rows = await db.query("SELECT 'public'::regnamespace as oid");
+      expect(rows[0].oid).toBe(2200);
+      
+      const rows2 = await db.query("SELECT 'pg_catalog'::regnamespace as oid");
+      expect(rows2[0].oid).toBe(11);
+    });
+  });
+
+  describe("LEVEL 12: Built-in Functions", () => {
+    test("12.1 NOW()", async () => {
+      const rows = await db.query("SELECT NOW() as current_time");
+      expect(rows[0].current_time).toBeDefined();
+      expect(
+        new Date(rows[0].current_time).getFullYear(),
+      ).toBeGreaterThanOrEqual(2024);
+    });
+
+    test("12.2 UPPER()", async () => {
+      const rows = await db.query("SELECT UPPER('hello') as val");
+      expect(rows[0].val).toBe("HELLO");
+    });
+
+    test("12.3 COALESCE()", async () => {
+      const rows = await db.query(
+        "SELECT COALESCE(NULL, NULL, 'first_non_null', 'second') as val",
+      );
+      expect(rows[0].val).toBe("first_non_null");
+    });
+
+    test("12.4 JSON_EXTRACT()", async () => {
+      const rows = await db.query(
+        "SELECT JSON_EXTRACT('{\"a\": {\"b\": 123}}', 'a', 'b') as val",
+      );
+      expect(rows[0].val).toBe(123);
+    });
+
+    test("12.5 DATE_TRUNC()", async () => {
+      const rows = await db.query(
+        "SELECT DATE_TRUNC('year', '2024-05-15 10:20:30') as val",
+      );
+      expect(rows[0].val).toContain("2024-01-01T00:00:00");
+    });
+
+    test("12.6 QUOTE_IDENT()", async () => {
+      const rows = await db.query(`
+        SELECT 
+          QUOTE_IDENT('my table') as res1, 
+          QUOTE_IDENT('my "table"') as res2, 
+          QUOTE_IDENT(NULL) as res3,
+          QUOTE_IDENT('schema') || '.' || QUOTE_IDENT('table') as res4
+      `);
+      expect(rows[0].res1).toBe('"my table"');
+      expect(rows[0].res2).toBe('"my ""table"""');
+      expect(rows[0].res3).toBeNull();
+      expect(rows[0].res4).toBe('"schema"."table"');
+    });
+  });
+
+  describe("LEVEL 8: Comments & Unicode Support", () => {
+    test("8.1 Skip single-line comments with Vietnamese characters", async () => {
+      const sql = `
+        -- Đây là bình luận tiếng Việt với ký tự đ
+        SELECT 1 as value;
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].value).toBe(1);
+    });
+
+    test("8.2 Skip multi-line comments", async () => {
+      const sql = `
+        /* 
+           Multi-line comment 
+           with đ character
+        */
+        SELECT 2 as value;
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].value).toBe(2);
+    });
+
+    test("8.3 Non-ASCII characters in strings and quoted identifiers", async () => {
+      // Create table with Unicode name and columns
+      await db.exec(`CREATE TABLE "Dữ Liệu" ("Mô Tả" TEXT)`);
+      await db.exec(`INSERT INTO "Dữ Liệu" ("Mô Tả") VALUES ('Điểm danh')`);
+      const rows = await db.query(`SELECT "Mô Tả" FROM "Dữ Liệu"`);
+      expect(rows.length).toBe(1);
+      expect(rows[0]["Mô Tả"]).toBe("Điểm danh");
+    });
+  });
+
+  describe("LEVEL 9: RETURNING Clause", () => {
+    test("9.1 INSERT ... RETURNING *", async () => {
+      await db.exec(
+        `CREATE TABLE returning_test (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
+      const res = await db.query(
+        `INSERT INTO returning_test (val) VALUES ('test1') RETURNING *`,
+      );
+      expect(res.length).toBe(1);
+      expect(res[0].id).toBe(1);
+      expect(res[0].val).toBe("test1");
+    });
+
+    test("9.2 INSERT ... RETURNING specific columns", async () => {
+      const res = await db.query(
+        `INSERT INTO returning_test (val) VALUES ('test2') RETURNING val, id AS my_id`,
+      );
+      expect(res.length).toBe(1);
+      expect(res[0].val).toBe("test2");
+      expect(res[0].my_id).toBe(2);
+    });
+
+    test("9.3 UPDATE ... RETURNING", async () => {
+      const res = await db.query(
+        `UPDATE returning_test SET val = 'updated' WHERE id = 1 RETURNING id, val`,
+      );
+      expect(res.length).toBe(1);
+      expect(res[0].id).toBe(1);
+      expect(res[0].val).toBe("updated");
+    });
+
+    test("9.4 DELETE ... RETURNING", async () => {
+      const res = await db.query(
+        `DELETE FROM returning_test WHERE id = 2 RETURNING *`,
+      );
+      expect(res.length).toBe(1);
+      expect(res[0].id).toBe(2);
+      expect(res[0].val).toBe("test2");
+
+      const count = await db.query(`SELECT COUNT(*) as c FROM returning_test`);
+      expect(count[0].c).toBe(1);
+    });
+
+    test("9.5 UPDATE multiple rows with RETURNING", async () => {
+      await db.exec(`INSERT INTO returning_test (val) VALUES ('a')`);
+      await db.exec(`INSERT INTO returning_test (val) VALUES ('b')`);
+      const res = await db.query(
+        `UPDATE returning_test SET val = 'x' RETURNING val`,
+      );
+      // We had 1 row ('updated') + 2 new rows = 3 rows total.
+      expect(res.length).toBe(3);
+      expect(res.every((r) => r.val === "x")).toBe(true);
+    });
+  });
+
+  describe("LEVEL 11: Window Functions", () => {
+    beforeAll(async () => {
+      await db.exec(
+        `CREATE TABLE employees (id SERIAL PRIMARY KEY, name TEXT, department TEXT, salary NUMBER)`,
+      );
+      await db.exec(
+        `INSERT INTO employees (name, department, salary) VALUES ('Alice', 'IT', 5000)`,
+      );
+      await db.exec(
+        `INSERT INTO employees (name, department, salary) VALUES ('Bob', 'IT', 6000)`,
+      );
+      await db.exec(
+        `INSERT INTO employees (name, department, salary) VALUES ('Charlie', 'HR', 4500)`,
+      );
+      await db.exec(
+        `INSERT INTO employees (name, department, salary) VALUES ('David', 'IT', 5000)`,
+      );
+      await db.exec(
+        `INSERT INTO employees (name, department, salary) VALUES ('Eve', 'HR', 4500)`,
+      );
+    });
+
+    test("11.1 ROW_NUMBER() OVER (ORDER BY ...)", async () => {
+      const rows = await db.query(`
+        SELECT name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC, name ASC) as rn 
+        FROM employees
+      `);
+      expect(rows[0].rn).toBe(1);
+      expect(rows[0].name).toBe("Bob");
+      expect(rows[1].rn).toBe(2);
+      expect(rows[1].salary).toBe(5000);
+    });
+
+    test("11.2 RANK() OVER (PARTITION BY ... ORDER BY ...)", async () => {
+      const rows = await db.query(`
+        SELECT name, department, salary, RANK() OVER (PARTITION BY department ORDER BY salary DESC) as rnk
+        FROM employees
+        ORDER BY department, rnk
+      `);
+
+      const itRows = rows.filter((r) => r.department === "IT");
+      expect(itRows[0].name).toBe("Bob");
+      expect(itRows[0].rnk).toBe(1);
+      expect(itRows[1].salary).toBe(5000);
+      expect(itRows[1].rnk).toBe(2);
+      expect(itRows[2].rnk).toBe(2); // Tie
+
+      const hrRows = rows.filter((r) => r.department === "HR");
+      expect(hrRows[0].rnk).toBe(1);
+      expect(hrRows[1].rnk).toBe(1); // Tie
+    });
+  });
+
+  describe("LEVEL 14: Multiple Row Inserts and Advanced Schema Definitions", () => {
+    test("14.1 Create table with complex constraints and references", async () => {
+      await db.exec(`CREATE TABLE parent_users (id SERIAL PRIMARY KEY)`);
+      const sql = `
+        CREATE TABLE IF NOT EXISTS news_articles (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            thumbnail_url TEXT,
+            author_id INTEGER REFERENCES parent_users(id) ON UPDATE CASCADE ON DELETE SET NULL,
+            category VARCHAR(100),
+            published_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+    });
+
+    test("14.2 Insert multiple rows in a single statement", async () => {
+      const sql = `
+        INSERT INTO news_articles (title, content, category) VALUES 
+        ('Khám phá AI', 'Nội dung 1', 'Công nghệ'),
+        ('Thiết kế 2024', 'Nội dung 2', 'Thiết kế'),
+        ('Bảo mật', 'Nội dung 3', 'Hệ thống');
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+      expect(res.inserted).toBeDefined();
+
+      const rows = await db.query(`SELECT * FROM news_articles`);
+      expect(rows.length).toBe(3);
+      expect(rows[0].title).toBe("Khám phá AI");
+      expect(rows[2].category).toBe("Hệ thống");
+    });
+
+    test("14.3 Add Comments to table and columns", async () => {
+      await db.exec(
+        `COMMENT ON TABLE news_articles IS '{ "label": "Tin tức" }'`,
+      );
+      await db.exec(
+        `COMMENT ON COLUMN news_articles.title IS '{ "label": "Tiêu đề" }'`,
+      );
+
+      const rows = await db.query(`
+        SELECT table_name, column_name, column_comment 
+        FROM information_schema.columns 
+        WHERE table_name = 'news_articles' AND column_name = 'title'
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].column_comment).toContain("Tiêu đề");
+    });
+  });
+
+  describe("LEVEL 16: Aggregate FILTER", () => {
+    beforeAll(async () => {
+      await db.exec(
+        `CREATE TABLE sales (id SERIAL PRIMARY KEY, category TEXT, amount NUMBER)`,
+      );
+      await db.exec(`INSERT INTO sales (category, amount) VALUES ('A', 100)`);
+      await db.exec(`INSERT INTO sales (category, amount) VALUES ('A', 200)`);
+      await db.exec(`INSERT INTO sales (category, amount) VALUES ('B', 300)`);
+      await db.exec(`INSERT INTO sales (category, amount) VALUES ('B', 400)`);
+      await db.exec(`INSERT INTO sales (category, amount) VALUES ('A', 500)`);
+    });
+
+    test("16.1 COUNT with FILTER", async () => {
+      const sql = `
+        SELECT 
+          COUNT(*) AS total_count,
+          COUNT(*) FILTER (WHERE category = 'A') AS count_a,
+          COUNT(*) FILTER (WHERE amount >= 300) AS count_high
+        FROM sales
+      `;
+      const rows = await db.query(sql);
+      expect(rows[0].total_count).toBe(5);
+      expect(rows[0].count_a).toBe(3);
+      expect(rows[0].count_high).toBe(3); // 300, 400, 500
+    });
+
+    test("16.2 AVG and ARRAY_AGG with FILTER", async () => {
+      const sql = `
+        SELECT 
+          AVG(amount) FILTER (WHERE category = 'A') AS avg_a,
+          ARRAY_AGG(amount) FILTER (WHERE category = 'B') AS arr_b
+        FROM sales
+      `;
+      const rows = await db.query(sql);
+      expect(rows[0].avg_a).toBe((100 + 200 + 500) / 3);
+      expect(rows[0].arr_b).toEqual([300, 400]);
+    });
+  });
+
+  describe("LEVEL 18: Complex Introspection", () => {
+    test("18.3 Advanced Table Introspection Query (DBeaver/TablePlus style)", async () => {
+      await db.exec(`CREATE TABLE public.intro_target (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'abc')`);
+      await db.exec(`COMMENT ON COLUMN public.intro_target.val IS 'Test comment'`);
+      
+      const sql = `
+        SELECT 
+          n.nspname AS schema_name,
+          c.relname AS table_name,
+          a.attname AS column_name,
+          format_type(a.atttypid, a.atttypmod) AS data_type,
+          CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+          pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+          d.description AS comment
+        FROM pg_attribute a
+        JOIN pg_class c ON a.attrelid = c.oid
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = a.attnum
+        LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+        WHERE n.nspname = $1
+          AND c.relkind = 'r' -- Chỉ lấy table (không lấy view/index)
+          AND a.attnum > 0 
+          AND NOT a.attisdropped
+        ORDER BY c.relname, a.attnum;
+      `;
+      
+      const rows = await db.query(sql, ["public"]);
+      expect(rows.length).toBeGreaterThan(0);
+      
+      const col = rows.find(r => r.table_name === 'intro_target' && r.column_name === 'val');
+      expect(col).toBeDefined();
+      expect(col.column_default).toContain('abc');
+      expect(col.comment).toBe('Test comment');
+    });
+
+    test("18.1 Advanced pg_constraint join with LATERAL and FILTER", async () => {
+      // Create some tables with constraints mapped to non-public schema
+      await db.exec(`CREATE SCHEMA IF NOT EXISTS introspection_schema`);
+      await db.exec(
+        `CREATE TABLE introspection_schema.users (id SERIAL PRIMARY KEY, name TEXT)`,
+      );
+      await db.exec(
+        `CREATE TABLE introspection_schema.posts (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES introspection_schema.users(id), title TEXT UNIQUE)`,
+      );
+
+      const sql = `
+        SELECT
+          nsp.nspname AS schema_name,
+          rel.relname AS table_name,
+          con.conname AS constraint_name,
+          CASE con.contype
+            WHEN 'f' THEN 'FOREIGN KEY'
+            WHEN 'p' THEN 'PRIMARY KEY'
+            WHEN 'u' THEN 'UNIQUE'
+            WHEN 'c' THEN 'CHECK'
+            ELSE con.contype::text
+          END AS constraint_type,
+          rnsp.nspname AS referenced_table_schema,
+          rrel.relname AS referenced_table_name,
+          ARRAY_AGG(att2.attname ORDER BY ucols.ordinality) FILTER (WHERE att2.attname IS NOT NULL) AS column_names,
+          ARRAY_AGG(att1.attname ORDER BY rcols.ordinality) FILTER (WHERE att1.attname IS NOT NULL) AS referenced_columns
+        FROM pg_constraint con
+          INNER JOIN pg_class rel ON rel.oid = con.conrelid
+          INNER JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+          LEFT JOIN pg_class rrel ON rrel.oid = con.confrelid
+          LEFT JOIN pg_namespace rnsp ON rnsp.oid = rrel.relnamespace
+          LEFT JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS ucols(attnum, ordinality) ON TRUE
+          LEFT JOIN pg_attribute att2 ON att2.attnum = ucols.attnum AND att2.attrelid = con.conrelid
+          LEFT JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS rcols(attnum, ordinality) ON TRUE
+          LEFT JOIN pg_attribute att1 ON att1.attnum = rcols.attnum AND att1.attrelid = con.confrelid
+        WHERE nsp.nspname = $1
+          AND con.contype IN ('f', 'p', 'u')
+        GROUP BY nsp.nspname, rel.relname, con.conname, con.contype, rnsp.nspname, rrel.relname
+        ORDER BY rel.relname, constraint_type;
+      `;
+
+      const rows = await db.query(sql, ["introspection_schema"]);
+      expect(rows.length).toBeGreaterThanOrEqual(3); // We have FK, PK, and Unique defined
+
+      // Verify FOREIGN KEY behavior and resolution completeness
+      const fk = rows.find(
+        (r) => r.constraint_type === "FOREIGN KEY" && r.table_name === "posts",
+      );
+      expect(fk).toBeDefined();
+      expect(fk.referenced_table_name).toBe("users");
+      expect(fk.column_names).toEqual(["user_id"]);
+      expect(fk.referenced_columns).toEqual(["id"]);
+
+      // Verify UNIQUE isolation
+      const uniq = rows.find(
+        (r) => r.constraint_type === "UNIQUE" && r.table_name === "posts",
+      );
+      expect(uniq).toBeDefined();
+      expect(uniq.column_names).toEqual(["title"]);
+
+      // Verify PRIMARY KEY
+      const pk = rows.find(
+        (r) => r.constraint_type === "PRIMARY KEY" && r.table_name === "posts",
+      );
+      expect(pk).toBeDefined();
+      expect(pk.column_names).toEqual(["id"]);
+    });
+
+    test("18.2 Query pg_attrdef system catalog", async () => {
+      await db.exec(`CREATE TABLE attr_test (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'hello')`);
+      
+      const sql = `
+        SELECT adnum, adbin 
+        FROM pg_attrdef 
+        WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 'attr_test')
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].adnum).toBe(2); // 'val' is second column
+      expect(rows[0].adbin).toContain("hello");
+    });
+
+    test("18.4 Composite Primary Key introspection via pg_constraint", async () => {
+      // In this engine, marking multiple columns as PRIMARY KEY results in a composite PK
+      await db.exec(`CREATE TABLE composite_test (a INT PRIMARY KEY, b INT PRIMARY KEY)`);
+      
+      const sql = `
+        SELECT conname, conkey 
+        FROM pg_constraint 
+        WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'composite_test')
+          AND contype = 'p'
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].conkey).toEqual([1, 2]); // 'a' is attnum 1, 'b' is attnum 2
+    });
+  });
+
+  describe("LEVEL 17: LATERAL Joins", () => {
+    beforeAll(async () => {
+      await db.exec(
+        `CREATE TABLE departments (id SERIAL PRIMARY KEY, name TEXT)`,
+      );
+      await db.exec(
+        `CREATE TABLE emp (id SERIAL PRIMARY KEY, dept_id NUMBER, name TEXT)`,
+      );
+
+      await db.exec(
+        `INSERT INTO departments (name) VALUES ('Sales'), ('Marketing')`,
+      );
+      await db.exec(
+        `INSERT INTO emp (dept_id, name) VALUES (1, 'Alice'), (1, 'Bob'), (2, 'Charlie')`,
+      );
+    });
+
+    test("17.1 LEFT JOIN LATERAL function", async () => {
+      const sql = `
+        SELECT d.name as dname, e.val
+        FROM departments d
+        LEFT JOIN LATERAL unnest(ARRAY[d.name, d.name]) AS e(val) ON true
+        WHERE d.id = 1
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].val).toBe("Sales");
+      expect(rows[1].val).toBe("Sales");
+    });
+
+    test("17.2 INNER JOIN LATERAL subquery", async () => {
+      const sql = `
+        SELECT d.name as dname, top_emp.name as ename
+        FROM departments d
+        JOIN LATERAL (
+          SELECT name FROM emp WHERE dept_id = d.id ORDER BY id DESC LIMIT 1
+        ) AS top_emp ON true
+        ORDER BY d.id
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].dname).toBe("Sales");
+      expect(rows[0].ename).toBe("Bob"); // Bob is inserted after Alice so has a higher ID, DESC gets Bob first
+      expect(rows[1].dname).toBe("Marketing");
+      expect(rows[1].ename).toBe("Charlie");
+    });
+
+    test("17.3 LATERAL without ON clause defaults to TRUE", async () => {
+      const sql = `
+        SELECT d.name, t.v
+        FROM departments d
+        JOIN LATERAL unnest(ARRAY[1, 2]) AS t(v)
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(4); // 2 departments * 2 values
+    });
+  });
+
+  describe("LEVEL 15: Unnest and Ordinality", () => {
+    test("15.1 basic unnest with array literal", async () => {
+      const sql = `SELECT * FROM unnest(ARRAY['a', 'b', 'c']) AS t(val)`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(3);
+      expect(rows[0].val).toBe("a");
+      expect(rows[2].val).toBe("c");
+    });
+
+    test("15.2 unnest WITH ORDINALITY", async () => {
+      const sql = `SELECT val, ord FROM unnest(ARRAY['x', 'y']) WITH ORDINALITY AS t(val, ord)`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].val).toBe("x");
+      expect(rows[0].ord).toBe(1);
+      expect(rows[1].val).toBe("y");
+      expect(rows[1].ord).toBe(2);
+    });
+
+    test("15.3 unnest with numeric array and arithmetic", async () => {
+      const sql = `SELECT item * 10 as calculation FROM unnest(ARRAY[1, 2, 3]) AS t(item)`;
+      const rows = await db.query(sql);
+      expect(rows[0].calculation).toBe(10);
+      expect(rows[2].calculation).toBe(30);
+    });
+  });
+
+  describe("LEVEL 10: ON CONFLICT", () => {
+    beforeAll(async () => {
+      await db.exec(
+        `CREATE TABLE conflict_test (id SERIAL PRIMARY KEY, email TEXT UNIQUE, name TEXT)`,
+      );
+    });
+
+    test("10.1 ON CONFLICT DO NOTHING", async () => {
+      await db.exec(
+        `INSERT INTO conflict_test (email, name) VALUES ('test@example.com', 'Original')`,
+      );
+
+      // Attempting to insert same email should not throw
+      const res = await db.exec(`
+        INSERT INTO conflict_test (email, name) 
+        VALUES ('test@example.com', 'Conflict') 
+        ON CONFLICT (email) DO NOTHING
+      `);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(
+        `SELECT name FROM conflict_test WHERE email = 'test@example.com'`,
+      );
+      expect(rows[0].name).toBe("Original");
+    });
+
+    test("10.2 ON CONFLICT DO UPDATE SET", async () => {
+      const res = await db.exec(`
+        INSERT INTO conflict_test (email, name) 
+        VALUES ('test@example.com', 'Updated') 
+        ON CONFLICT (email) DO UPDATE SET name = 'Updated'
+      `);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(
+        `SELECT name FROM conflict_test WHERE email = 'test@example.com'`,
+      );
+      expect(rows[0].name).toBe("Updated");
+    });
+
+    test("10.3 ON CONFLICT DO UPDATE with EXCLUDED table", async () => {
+      await db.exec(`
+        INSERT INTO conflict_test (email, name) 
+        VALUES ('test@example.com', 'FromExcluded') 
+        ON CONFLICT (email) DO UPDATE SET name = excluded.name
+      `);
+
+      const rows = await db.query(
+        `SELECT name FROM conflict_test WHERE email = 'test@example.com'`,
+      );
+      expect(rows[0].name).toBe("FromExcluded");
+    });
+
+    test("10.4 ON CONFLICT with RETURNING", async () => {
+      const res = await db.query(`
+        INSERT INTO conflict_test (email, name) 
+        VALUES ('test@example.com', 'ReturningVal') 
+        ON CONFLICT (email) DO UPDATE SET name = excluded.name
+        RETURNING name
+      `);
+      expect(res.length).toBe(1);
+      expect(res[0].name).toBe("ReturningVal");
+    });
+  });
+
+  describe("LEVEL 19: Extended Catalog Columns", () => {
+    test("19.1 Check pg_class.relkind", async () => {
+      const rows = await db.query(`
+        SELECT relname, relkind 
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'users' AND n.nspname = 'public'
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].relkind).toBe('r');
+    });
+
+    test("19.2 Check pg_attribute.atttypmod and attisdropped", async () => {
+      const rows = await db.query(`
+        SELECT attname, atttypmod, attisdropped 
+        FROM pg_attribute 
+        WHERE attrelid = (
+          SELECT c.oid 
+          FROM pg_class c 
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relname = 'users' AND n.nspname = 'public'
+        )
+        AND attname = 'id'
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].atttypmod).toBe(-1);
+      expect(rows[0].attisdropped).toBe(false);
+    });
+
+    test("19.3 Introspection query using relkind", async () => {
+      const sql = `
+        SELECT relname 
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'r' AND c.relname = 'posts' AND n.nspname = 'public'
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].relname).toBe('posts');
+    });
+  });
+
+  describe("LEVEL 20: System Functions (format_type, pg_get_expr)", () => {
+    test("20.1 format_type returns type name", async () => {
+      const sql = `
+        SELECT format_type(atttypid, atttypmod) as type_name
+        FROM pg_attribute
+        WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'users')
+          AND attname = 'name'
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].type_name).toBe("TEXT");
+    });
+
+    test("20.2 pg_get_expr decodes default value expressions", async () => {
+      await db.exec(`CREATE TABLE expr_test (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'my_default_val')`);
+      const sql = `
+        SELECT pg_get_expr(adbin, adrelid) as default_val
+        FROM pg_attrdef
+        WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 'expr_test')
+          AND adnum = 2
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].default_val).toBe("my_default_val");
+    });
+
+    test("20.3 pg_index introspection", async () => {
+      await db.exec(`CREATE TABLE idx_info_test (id SERIAL PRIMARY KEY, email TEXT UNIQUE)`);
+      
+      const sql = `
+        SELECT 
+          idx.indisprimary, 
+          idx.indisunique, 
+          idx.indkey
+        FROM pg_index idx
+        JOIN pg_class cls ON idx.indrelid = cls.oid
+        WHERE cls.relname = 'idx_info_test'
+        ORDER BY idx.indisprimary DESC
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      
+      const pk = rows.find(r => r.indisprimary);
+      expect(pk).toBeDefined();
+      expect(pk.indisunique).toBe(true);
+      expect(pk.indkey).toEqual([1]);
+
+      const uniq = rows.find(r => !r.indisprimary && r.indisunique);
+      expect(uniq).toBeDefined();
+      expect(uniq.indkey).toEqual([2]);
+    });
+  });
+
+  describe("LEVEL 22: Foreign Key Metadata Persistence", () => {
+    test("22.1 Create table with FK actions and verify metadata in pg_attribute", async () => {
+      await db.exec(`CREATE TABLE departments_fk (id SERIAL PRIMARY KEY)`);
+      await db.exec(`
+        CREATE TABLE employees_fk (
+          id SERIAL PRIMARY KEY,
+          dept_id INTEGER REFERENCES departments_fk(id) ON DELETE CASCADE ON UPDATE RESTRICT
+        )
+      `);
+
+      const rows = await db.query(`
+        SELECT 
+          attref_table, 
+          attref_col, 
+          attref_on_delete, 
+          attref_on_update 
+        FROM pg_attribute 
+        WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'employees_fk')
+          AND attname = 'dept_id'
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].attref_table).toBe("departments_fk");
+      expect(rows[0].attref_on_delete).toBe("CASCADE");
+      expect(rows[0].attref_on_update).toBe("RESTRICT");
+    });
+
+    test("22.2 Foreign Key Update Validation", async () => {
+      await db.exec(`CREATE TABLE parent_update (id NUMBER PRIMARY KEY)`);
+      await db.exec(`INSERT INTO parent_update (id) VALUES (1), (2)`);
+      await db.exec(`CREATE TABLE child_update (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_update(id))`);
+      await db.exec(`INSERT INTO child_update (p_id) VALUES (1)`);
+
+      // Valid update
+      await db.exec(`UPDATE child_update SET p_id = 2 WHERE p_id = 1`);
+      let rows = await db.query(`SELECT p_id FROM child_update`);
+      expect(rows[0].p_id).toBe(2);
+
+      // Invalid update - should throw to prevent orphaned data
+      expect(async () => {
+        await db.exec(`UPDATE child_update SET p_id = 999 WHERE id = 1`);
+      }).toThrow();
+    });
+
+    test("22.3 ON DELETE CASCADE", async () => {
+      await db.exec(`CREATE TABLE parent_cascade (id NUMBER PRIMARY KEY)`);
+      await db.exec(`CREATE TABLE child_cascade (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_cascade(id) ON DELETE CASCADE)`);
+      
+      await db.exec(`INSERT INTO parent_cascade (id) VALUES (10)`);
+      await db.exec(`INSERT INTO child_cascade (p_id) VALUES (10), (10)`);
+      
+      await db.exec(`DELETE FROM parent_cascade WHERE id = 10`);
+      
+      const rows = await db.query(`SELECT * FROM child_cascade`);
+      expect(rows.length).toBe(0);
+    });
+
+    test("22.4 ON DELETE SET NULL", async () => {
+      await db.exec(`CREATE TABLE parent_setnull (id NUMBER PRIMARY KEY)`);
+      await db.exec(`CREATE TABLE child_setnull (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_setnull(id) ON DELETE SET NULL)`);
+      
+      await db.exec(`INSERT INTO parent_setnull (id) VALUES (20)`);
+      await db.exec(`INSERT INTO child_setnull (p_id) VALUES (20)`);
+      
+      await db.exec(`DELETE FROM parent_setnull WHERE id = 20`);
+      
+      const rows = await db.query(`SELECT p_id FROM child_setnull`);
+      expect(rows[0].p_id).toBeNull();
+    });
+
+    test("22.5 ON UPDATE CASCADE", async () => {
+      await db.exec(`CREATE TABLE parent_upd_cascade (id NUMBER PRIMARY KEY)`);
+      await db.exec(`CREATE TABLE child_upd_cascade (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_upd_cascade(id) ON UPDATE CASCADE)`);
+      
+      await db.exec(`INSERT INTO parent_upd_cascade (id) VALUES (30)`);
+      await db.exec(`INSERT INTO child_upd_cascade (p_id) VALUES (30)`);
+      
+      await db.exec(`UPDATE parent_upd_cascade SET id = 31 WHERE id = 30`);
+      
+      const rows = await db.query(`SELECT p_id FROM child_upd_cascade`);
+      expect(rows[0].p_id).toBe(31);
+    });
+
+    test("22.6 ON DELETE RESTRICT (Default)", async () => {
+      await db.exec(`CREATE TABLE parent_restrict (id NUMBER PRIMARY KEY)`);
+      await db.exec(`CREATE TABLE child_restrict (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_restrict(id))`);
+      
+      await db.exec(`INSERT INTO parent_restrict (id) VALUES (40)`);
+      await db.exec(`INSERT INTO child_restrict (p_id) VALUES (40)`);
+      
+      // Should throw error because child record exists
+      expect(async () => {
+        await db.exec(`DELETE FROM parent_restrict WHERE id = 40`);
+      }).toThrow();
+    });
+  });
+
+  describe("LEVEL 23: Foreign Key Performance (Indexing)", () => {
+    test("23.1 Validate index usage for FK checks", async () => {
+      // Create a large table to simulate where scanning would be slow
+      await db.exec(`CREATE TABLE big_parent (id NUMBER PRIMARY KEY, info TEXT)`);
+      await db.exec(`CREATE TABLE big_child (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES big_parent(id))`);
+
+      // Populate parent
+      await db.exec(`INSERT INTO big_parent (id, info) VALUES (1, 'p1'), (2, 'p2'), (3, 'p3')`);
+
+      // 1. Outgoing FK check (Insert into child) - Should pass using index
+      const res = await db.exec(`INSERT INTO big_child (p_id) VALUES (2)`);
+      expect(res.success).toBe(true);
+
+      // 2. Parent-side check (Delete from parent) - Should be blocked using index
+      expect(async () => {
+        await db.exec(`DELETE FROM big_parent WHERE id = 2`);
+      }).toThrow();
+
+      // 3. Outgoing FK check (Invalid value) - Should fail quickly using index
+      expect(async () => {
+        await db.exec(`INSERT INTO big_child (p_id) VALUES (999)`);
+      }).toThrow();
+    });
+  });
+
+  describe("LEVEL 24: information_schema.referential_constraints", () => {
+    test("24.1 Query referential_constraints for FK rules", async () => {
+      await db.exec(`CREATE TABLE parent_rules (id SERIAL PRIMARY KEY)`);
+      await db.exec(`
+        CREATE TABLE child_rules (
+          id SERIAL PRIMARY KEY, 
+          p_id INTEGER REFERENCES parent_rules(id) ON DELETE CASCADE ON UPDATE SET NULL
+        )
+      `);
+
+      const rows = await db.query(`
+        SELECT 
+          constraint_name, 
+          update_rule, 
+          delete_rule 
+        FROM information_schema.referential_constraints 
+        WHERE constraint_schema = 'public' AND constraint_name = 'child_rules_p_id_fkey'
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].constraint_name).toBe("child_rules_p_id_fkey");
+      expect(rows[0].update_rule).toBe("SET NULL");
+      expect(rows[0].delete_rule).toBe("CASCADE");
+    });
+  });
+});

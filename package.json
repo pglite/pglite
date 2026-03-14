@@ -1,0 +1,51 @@
+{
+  "name": "@pglite/core",
+  "version": "0.0.0",
+  "description": "High-performance, in-process, zero-dependency embedded PostgreSQL database engine for Bun & Node.js. A lightweight, serverless SQLite alternative with full Postgres syntax support.",
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "pglite",
+    "embedded-database",
+    "sqlite-alternative",
+    "sql",
+    "bun",
+    "nodejs",
+    "typescript",
+    "in-process",
+    "serverless-database",
+    "acid-compliant",
+    "local-storage",
+    "database-engine",
+    "wal"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./node-fs": "./dist/adapters/node.js",
+    "./browser": "./dist/adapters/browser.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts src/adapters/node.ts src/adapters/browser.ts --outdir dist --target node && tsc",
+    "prepublishOnly": "bun run build",
+    "prompt": "bun run scripts/prompt_maker.ts",
+    "test": "bun test",
+    "benchmark": "bun run scripts/benchmark.ts",
+    "benchmark-sqlite": "bun run scripts/bun-sqlite-benchmark.ts",
+    "publish": "bun publish --access public"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "mitata": "^1.0.34"
+  }
+}
