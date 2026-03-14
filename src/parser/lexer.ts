@@ -90,7 +90,7 @@ export class Lexer {
         continue;
       }
 
-      if (/[0-9]/.test(char)) {
+      if (/[0-9]/.test(char) || (char === '.' && /[0-9]/.test(this.input[this.pos + 1] || ""))) {
         tokens.push(this.readNumber());
         continue;
       }
@@ -143,8 +143,25 @@ export class Lexer {
 
   private readNumber(): Token {
     let start = this.pos;
-    while (this.pos < this.input.length && /[0-9]/.test(this.input?.[this.pos] || "")) {
-      this.pos++;
+    let hasDot = false;
+    let hasE = false;
+    while (this.pos < this.input.length) {
+      const char = this.input[this.pos] || "";
+      if (/[0-9]/.test(char)) {
+        this.pos++;
+      } else if (char === '.' && !hasDot && !hasE) {
+        hasDot = true;
+        this.pos++;
+      } else if ((char === 'e' || char === 'E') && !hasE) {
+        hasE = true;
+        this.pos++;
+        const nextChar = this.input[this.pos] || "";
+        if (nextChar === '+' || nextChar === '-') {
+          this.pos++;
+        }
+      } else {
+        break;
+      }
     }
     return { type: "NUMBER", value: this.input.slice(start, this.pos) };
   }

@@ -1788,4 +1788,67 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].delete_rule).toBe("CASCADE");
     });
   });
+
+  describe("LEVEL 25: Quoted Identifiers & Decimal Numbers", () => {
+    test("25.1 Create table with quoted identifiers and insert decimal numbers", async () => {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS "user_25" (
+            "id" TEXT PRIMARY KEY,
+            "email" TEXT,
+            "fullName" TEXT,
+            "role" TEXT
+          )
+      `);
+
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS "product_25" (
+            "id" TEXT PRIMARY KEY,
+            "title" TEXT,
+            "price" NUMERIC,
+            "inStock" BOOLEAN
+          )
+      `);
+
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS "order_25" (
+            "id" TEXT PRIMARY KEY,
+            "productId" TEXT,
+            "userId" TEXT,
+            "status" TEXT
+          )
+      `);
+
+      await db.exec(`
+        INSERT INTO "user_25" (id, email, fullName, role) VALUES
+        ('1', 'alice@example.com', 'Alice', 'admin'),
+        ('2', 'bob@example.com', 'Bob', 'user')
+      `);
+
+      await db.exec(`
+        INSERT INTO "product_25" (id, title, price, inStock) VALUES
+        ('1', 'Product 1', 9.99, true),
+        ('2', 'Product 2', 19.99, false),
+        ('3', 'Product 3', .50, true),
+        ('4', 'Product 4', 1.2e-2, true)
+      `);
+
+      await db.exec(`
+        INSERT INTO "order_25" (id, productId, userId, status) VALUES
+        ('1', '1', '1', 'shipped'),
+        ('2', '2', '2', 'pending')
+      `);
+
+      const allUsers = await db.query(`SELECT * FROM "user_25"`);
+      expect(allUsers.length).toBe(2);
+
+      const allProducts = await db.query(`SELECT * FROM "product_25"`);
+      expect(allProducts.length).toBe(4);
+      expect(allProducts[0].price).toBe(9.99);
+      expect(allProducts[2].price).toBe(0.5);
+      expect(allProducts[3].price).toBe(0.012);
+
+      const allOrders = await db.query(`SELECT * FROM "order_25"`);
+      expect(allOrders.length).toBe(2);
+    });
+  });
 });
