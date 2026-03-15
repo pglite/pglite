@@ -1789,6 +1789,42 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 26: Overflow Pages (Data > 4KB)", () => {
+    test("26.1 Insert and Read a row larger than 4KB", async () => {
+      await db.exec(`CREATE TABLE overflow_test (id SERIAL PRIMARY KEY, large_text TEXT)`);
+      
+      // Generate a string larger than 4KB (e.g., 10KB)
+      let largeStr = "";
+      for (let i = 0; i < 10000; i++) {
+        largeStr += "A";
+      }
+
+      const res = await db.exec(`INSERT INTO overflow_test (large_text) VALUES ($1)`, [largeStr]);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT id, large_text FROM overflow_test`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBe(1);
+      expect(rows[0].large_text.length).toBe(10000);
+      expect(rows[0].large_text).toBe(largeStr);
+
+      // Update the row to an even larger string
+      let largerStr = largeStr + "B".repeat(5000); // 15KB
+      await db.exec(`UPDATE overflow_test SET large_text = $1 WHERE id = 1`, [largerStr]);
+
+      const updatedRows = await db.query(`SELECT large_text FROM overflow_test WHERE id = 1`);
+      expect(updatedRows[0].large_text.length).toBe(15000);
+      expect(updatedRows[0].large_text).toBe(largerStr);
+
+      // Delete the row
+      const delRes = await db.exec(`DELETE FROM overflow_test WHERE id = 1`);
+      expect(delRes.deleted).toBe(1);
+
+      const emptyRows = await db.query(`SELECT * FROM overflow_test`);
+      expect(emptyRows.length).toBe(0);
+    });
+  });
+
   describe("LEVEL 25: Quoted Identifiers & Decimal Numbers", () => {
     test("25.1 Create table with quoted identifiers and insert decimal numbers", async () => {
       await db.exec(`

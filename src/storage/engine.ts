@@ -550,7 +550,9 @@ class BTree {
     let offset = 7;
     let actualNumKeys = node.keys.length;
     for (let i = 0; i < node.keys.length; i++) {
-      const keyStr = String(node.keys[i]);
+      const isNum = typeof node.keys[i] === 'number';
+      const typeInd = isNum ? 'N' : 'S';
+      const keyStr = typeInd + String(node.keys[i]);
       const kLen = Buffer.byteLength(keyStr);
       if (offset + 2 + kLen + (node.isLeaf ? 6 : 4) > PAGE_SIZE) {
         actualNumKeys = i;
@@ -591,7 +593,14 @@ class BTree {
       const kLen = buf.readUInt16LE(offset);
       const kStr = buf.toString("utf-8", offset + 2, offset + 2 + kLen);
       offset += 2 + kLen;
-      keys.push(isNaN(Number(kStr)) ? kStr : Number(kStr));
+      const typeInd = kStr[0];
+      const valStr = kStr.substring(1);
+      // Legacy fallback if type indicator is missing (for older files if any)
+      if (typeInd !== 'N' && typeInd !== 'S') {
+        keys.push(isNaN(Number(kStr)) ? kStr : Number(kStr));
+      } else {
+        keys.push(typeInd === 'N' ? Number(valStr) : valStr);
+      }
       if (isLeaf) {
         vals.push({ pageId: buf.readUInt32LE(offset), slotIdx: buf.readUInt16LE(offset + 4) });
         offset += 6;
@@ -619,16 +628,24 @@ class BTree {
       for (let i = 0; i < numKeys; i++) {
         const kLen = buf.readUInt16LE(offset);
         const kStr = buf.toString("utf8", offset + 2, offset + 2 + kLen);
-        const nodeKey = isNaN(Number(kStr)) ? kStr : Number(kStr);
+        const typeInd = kStr[0];
+        const valStr = kStr.substring(1);
+        let nodeKey;
+        if (typeInd !== 'N' && typeInd !== 'S') {
+          nodeKey = isNaN(Number(kStr)) ? kStr : Number(kStr);
+        } else {
+          nodeKey = typeInd === 'N' ? Number(valStr) : valStr;
+        }
 
-        if (target <= nodeKey) {
-          if (isLeaf) {
-            if (target === nodeKey) {
-              const valOffset = offset + 2 + kLen;
-              return { pageId: buf.readUInt32LE(valOffset), slotIdx: buf.readUInt16LE(valOffset + 4) };
-            }
+        if (isLeaf) {
+          if (target === nodeKey) {
+            const valOffset = offset + 2 + kLen;
+            return { pageId: buf.readUInt32LE(valOffset), slotIdx: buf.readUInt16LE(valOffset + 4) };
+          } else if (target < nodeKey) {
             return null;
-          } else {
+          }
+        } else {
+          if (target < nodeKey) {
             currId = buf.readUInt32LE(offset + 2 + kLen);
             foundChild = true;
             break;
@@ -920,9 +937,10 @@ export class StorageEngine {
         const page = new SlottedPage(buf);
         for (const t of page.getTuples()) {
           if (t.slotIdx === loc.slotIdx) {
+            const resolved = await this.resolveOverflow(t.data);
             meta = this.deserializeRow(
               StorageEngine.CLUSTER_CATALOG_COLS,
-              t.data,
+              resolved,
             );
             break;
           }
@@ -1100,11 +1118,12 @@ export class StorageEngine {
     };
   }
 
-  private async insertRowIntoCatalog(table: TableData, row: any) {
+  private async insertRowIntoCatalog(table: TableData, row: any): Promise<{ pageId: number, slotIdx: number }> {
     let pageId = table.lastPage;
     let buf = await this.pager.readPage(pageId);
     let page = new SlottedPage(buf);
-    const rowData = this.serializeRow(table.columns, row);
+    const rawRowData = this.serializeRow(table.columns, row);
+    const rowData = await this.handleOverflow(rawRowData);
     let slotIdx = page.insertTuple(rowData);
 
     if (slotIdx === -1) {
@@ -1185,7 +1204,7 @@ export class StorageEngine {
             },
           );
         }
-      } else if (table.firstPage === this.dbMeta.cls_f) {
+      } else if (this.dbMeta && table.firstPage === this.dbMeta.cls_f) {
         const btree = new BTree(this.pager, this.dbMeta.clsIdx);
         const key = `${row.relnamespace}:${row.relname}`;
         const newRoot = await btree.insert(key, { pageId, slotIdx });
@@ -1202,6 +1221,7 @@ export class StorageEngine {
         }
       }
     }
+    return { pageId, slotIdx };
   }
 
   public getFullTableName(name: string): string {
@@ -1383,7 +1403,8 @@ export class StorageEngine {
       let relRow = null;
       for (const t of page.getTuples()) {
         if (t.slotIdx === loc.slotIdx) {
-          relRow = this.deserializeRow(StorageEngine.PG_CLASS_COLS, t.data);
+          const resolved = await this.resolveOverflow(t.data);
+          relRow = this.deserializeRow(StorageEngine.PG_CLASS_COLS, resolved);
           break;
         }
       }
@@ -1601,7 +1622,8 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
-        yield this.deserializeRow(def.columns, tuple.data);
+        const resolved = await this.resolveOverflow(tuple.data);
+        yield this.deserializeRow(def.columns, resolved);
       }
       pageId = page.nextPageId;
     }
@@ -1617,7 +1639,8 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let mod = false;
       for (const tuple of page.getTuples()) {
-        if (await filter(this.deserializeRow(def.columns, tuple.data))) {
+        const resolved = await this.resolveOverflow(tuple.data);
+        if (await filter(this.deserializeRow(def.columns, resolved))) {
           page.deleteTuple(tuple.slotIdx);
           mod = true;
         }
@@ -1641,10 +1664,19 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let mod = false;
       for (const tuple of page.getTuples()) {
-        const row = this.deserializeRow(def.columns, tuple.data);
+        const resolved = await this.resolveOverflow(tuple.data);
+        const row = this.deserializeRow(def.columns, resolved);
         if (await filter(row)) {
-          await update(row, { pageId, slotIdx: tuple.slotIdx });
-          page.updateTuple(tuple.slotIdx, this.serializeRow(def.columns, row));
+          const locObj = { pageId, slotIdx: tuple.slotIdx };
+          await update(row, locObj);
+          const rawRowData = this.serializeRow(def.columns, row);
+          const rowData = await this.handleOverflow(rawRowData);
+          if (!page.updateTuple(tuple.slotIdx, rowData)) {
+            page.deleteTuple(tuple.slotIdx);
+            const newLoc = await this.insertRowIntoCatalog(def, row);
+            locObj.pageId = newLoc.pageId;
+            locObj.slotIdx = newLoc.slotIdx;
+          }
           mod = true;
         }
       }
@@ -1706,6 +1738,63 @@ export class StorageEngine {
     1024 * 1024,
   );
 
+  private async handleOverflow(data: Buffer): Promise<Buffer> {
+    if (data.length <= 4000) return data;
+    
+    let currDataOffset = 0;
+    let firstPageId = -1;
+    let prevPageId = -1;
+
+    while (currDataOffset < data.length) {
+      const pageId = await this.pager.allocatePage();
+      if (firstPageId === -1) firstPageId = pageId;
+
+      if (prevPageId !== -1) {
+        const prevBuf = await this.pager.readPage(prevPageId);
+        prevBuf.writeUInt32LE(pageId, 0);
+        await this.pager.writePage(prevPageId, prevBuf);
+      }
+
+      const chunkLen = Math.min(data.length - currDataOffset, PAGE_SIZE - 4);
+      const buf = Buffer.alloc(PAGE_SIZE);
+      buf.writeUInt32LE(0xffffffff, 0);
+      data.copy(buf, 4, currDataOffset, currDataOffset + chunkLen);
+      await this.pager.writePage(pageId, buf);
+
+      currDataOffset += chunkLen;
+      prevPageId = pageId;
+    }
+
+    const ptrBuf = Buffer.alloc(10);
+    ptrBuf.writeUInt16LE((data.readUInt16LE(0) | 0x8000), 0);
+    ptrBuf.writeUInt32LE(firstPageId, 2);
+    ptrBuf.writeUInt32LE(data.length, 6);
+    return ptrBuf;
+  }
+
+  private async resolveOverflow(data: Buffer): Promise<Buffer> {
+    if (data.length === 10) {
+      const colLen = data.readUInt16LE(0);
+      if ((colLen & 0x8000) !== 0) {
+        const firstPageId = data.readUInt32LE(2);
+        const totalLen = data.readUInt32LE(6);
+        const fullData = Buffer.allocUnsafe(totalLen);
+        let currPageId = firstPageId;
+        let offset = 0;
+        while (currPageId !== 0xffffffff && currPageId !== 0) {
+          const buf = await this.pager.readPage(currPageId);
+          const nextId = buf.readUInt32LE(0);
+          const chunkLen = Math.min(totalLen - offset, PAGE_SIZE - 4);
+          buf.copy(fullData, offset, 4, 4 + chunkLen);
+          offset += chunkLen;
+          currPageId = nextId;
+        }
+        return fullData;
+      }
+    }
+    return data;
+  }
+
   private serializeRow(columns: ColumnDef[], row: any): Buffer {
     const colLen = columns.length;
     const nullBitmapLen = (colLen + 7) >> 3;
@@ -1735,13 +1824,11 @@ export class StorageEngine {
     }
 
     const totalSize = 2 + nullBitmapLen + payloadSize;
-    const target = StorageEngine.SERIALIZATION_SCRATCH;
+    let target = StorageEngine.SERIALIZATION_SCRATCH;
 
     // Safety check for massive rows
     if (totalSize > target.length) {
-      throw new Error(
-        `Storage Error: Row size ${totalSize} exceeds serialization limit.`,
-      );
+      target = Buffer.allocUnsafe(totalSize);
     }
 
     // Pass 2: Write data directly into scratch buffer
@@ -1922,7 +2009,8 @@ export class StorageEngine {
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
         for (const tuple of page.getTuples()) {
-          const row = this.deserializeRow(table.columns, tuple.data);
+          const resolved = await this.resolveOverflow(tuple.data);
+          const row = this.deserializeRow(table.columns, resolved);
           const rootId = await btree.insert(row[pkCol.name], {
             pageId,
             slotIdx: tuple.slotIdx,
@@ -1961,8 +2049,10 @@ export class StorageEngine {
     const buf = await this.pager.readPage(loc.pageId);
     const page = new SlottedPage(buf);
     for (const tuple of page.getTuples()) {
-      if (tuple.slotIdx === loc.slotIdx)
-        return this.deserializeRow(table.columns, tuple.data);
+      if (tuple.slotIdx === loc.slotIdx) {
+        const resolved = await this.resolveOverflow(tuple.data);
+        return this.deserializeRow(table.columns, resolved);
+      }
     }
     return null;
   }
@@ -2181,7 +2271,8 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
-        yield this.deserializeRow(table.columns, tuple.data);
+        const resolved = await this.resolveOverflow(tuple.data);
+        yield this.deserializeRow(table.columns, resolved);
       }
       pageId = page.nextPageId;
     }
@@ -2195,7 +2286,8 @@ export class StorageEngine {
     let pageId = table.lastPage!;
     let buf = await this.pager.readPage(pageId);
     let page = new SlottedPage(buf);
-    const rowData = this.serializeRow(table.columns, row);
+    const rawRowData = this.serializeRow(table.columns, row);
+    const rowData = await this.handleOverflow(rawRowData);
     let slotIdx = page.insertTuple(rowData);
 
     if (slotIdx === -1) {
@@ -2243,11 +2335,13 @@ export class StorageEngine {
       let pageModified = false;
 
       for (const tuple of page.getTuples()) {
-        const row = this.deserializeRow(table.columns, tuple.data);
+        const resolved = await this.resolveOverflow(tuple.data);
+        const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
           const oldRow = { ...row };
           await updateFn(row);
-          const newData = this.serializeRow(table.columns, row);
+          const rawData = this.serializeRow(table.columns, row);
+          const newData = await this.handleOverflow(rawData);
 
           if (!page.updateTuple(tuple.slotIdx, newData)) {
             page.deleteTuple(tuple.slotIdx);
@@ -2299,7 +2393,8 @@ export class StorageEngine {
       let pageModified = false;
 
       for (const tuple of page.getTuples()) {
-        const row = this.deserializeRow(table.columns, tuple.data);
+        const resolved = await this.resolveOverflow(tuple.data);
+        const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
           page.deleteTuple(tuple.slotIdx);
           if (pkCol && this.pkIndexes.has(fullName))
