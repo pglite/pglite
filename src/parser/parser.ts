@@ -449,7 +449,7 @@ export class Parser {
     // Handle sequences of identifiers/keywords for complex types
     // e.g., TIMESTAMP WITH TIME ZONE, integer[], USER-DEFINED
     const stopKeywords = new Set([
-      'PRIMARY', 'UNIQUE', 'NOT', 'NULL', 'REFERENCES', 'DEFAULT', 'CONSTRAINT',
+      'PRIMARY', 'UNIQUE', 'NOT', 'NULL', 'REFERENCES', 'DEFAULT', 'CONSTRAINT', 'CHECK', 'GENERATED',
       'AS', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT',
       'HAVING', 'RETURNING', 'ON', 'INNER', 'LEFT', 'JOIN', 'VALUES', 'SET', 'CONFLICT', 'DO',
       'END', 'THEN', 'ELSE', 'WHEN', 'FILTER', 'OVER', 'PARTITION', 'AND', 'OR', 'IS', 'IN',
@@ -457,7 +457,7 @@ export class Parser {
     ]);
     while (this.match('KEYWORD') || this.match('IDENTIFIER') || this.match('SYMBOL', '[') || this.match('SYMBOL', ']')) {
       const next = this.current()!;
-      if (next.type === 'KEYWORD' && stopKeywords.has(next.value.toUpperCase())) break;
+      if ((next.type === 'KEYWORD' || next.type === 'IDENTIFIER') && stopKeywords.has(next.value.toUpperCase())) break;
       if (next.type === 'SYMBOL' && !['[', ']'].includes(next.value)) break;
       
       if (next.value === '[' || next.value === ']') {
@@ -495,10 +495,18 @@ export class Parser {
     
     const columns: ColumnDef[] =[];
     while (!this.match('SYMBOL', ')')) {
+      let isConstraint = false;
       if (this.match('KEYWORD', 'CONSTRAINT')) {
         this.consume(); // CONSTRAINT
         if (this.matchIdentifier()) this.consume(); // constraint name
-        
+        isConstraint = true;
+      }
+      
+      if (this.match('KEYWORD', 'PRIMARY') || this.match('KEYWORD', 'FOREIGN') || this.match('KEYWORD', 'UNIQUE') || (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK')) {
+        isConstraint = true;
+      }
+
+      if (isConstraint) {
         if (this.match('KEYWORD', 'PRIMARY')) {
           this.consume(); this.consume('KEYWORD', 'KEY');
           if (this.match('SYMBOL', '(')) {
@@ -511,12 +519,14 @@ export class Parser {
           this.consume('SYMBOL', '(');
           while (!this.match('SYMBOL', ')')) this.consume();
           this.consume('SYMBOL', ')');
-          this.consume('KEYWORD', 'REFERENCES');
-          this.parseTableName();
-          if (this.match('SYMBOL', '(')) {
+          if (this.match('KEYWORD', 'REFERENCES')) {
             this.consume();
-            while (!this.match('SYMBOL', ')')) this.consume();
-            this.consume('SYMBOL', ')');
+            this.parseTableName();
+            if (this.match('SYMBOL', '(')) {
+              this.consume();
+              while (!this.match('SYMBOL', ')')) this.consume();
+              this.consume('SYMBOL', ')');
+            }
           }
         } else if (this.match('KEYWORD', 'UNIQUE')) {
           this.consume();
@@ -525,12 +535,22 @@ export class Parser {
             while (!this.match('SYMBOL', ')')) this.consume();
             this.consume('SYMBOL', ')');
           }
-          // Handle 'UNIQUE null' pattern seen in some dumps
           if (this.match('KEYWORD', 'NULL') || this.match('IDENTIFIER', 'null')) this.consume();
+        } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
+          this.consume(); // CHECK
+          if (this.match('SYMBOL', '(')) {
+            this.consume();
+            let depth = 1;
+            while (depth > 0 && this.current() && this.current()?.type !== 'EOF') {
+              const token = this.consume();
+              if (token.value === '(') depth++;
+              else if (token.value === ')') depth--;
+            }
+          }
         }
       } else {
         const name = this.consumeIdentifier();
-        const dataType = this.parseDataType();
+        let dataType = this.parseDataType();
         let isPrimaryKey = false, isUnique = false, isNotNull = false;
         let references: any, defaultVal;
 
@@ -543,19 +563,24 @@ export class Parser {
             this.consume(); isUnique = true;
           } else if (this.match('KEYWORD', 'NOT')) {
             this.consume(); this.consume('KEYWORD', 'NULL'); isNotNull = true;
+          } else if (this.match('KEYWORD', 'NULL')) {
+            this.consume();
           } else if (this.match('KEYWORD', 'REFERENCES')) {
             this.consume(); 
             const refTable = this.parseTableName();
-            this.consume('SYMBOL', '(');
-            const refCol = this.consumeIdentifier();
-            this.consume('SYMBOL', ')');
+            let refCol = "id";
+            if (this.match('SYMBOL', '(')) {
+              this.consume();
+              refCol = this.consumeIdentifier();
+              this.consume('SYMBOL', ')');
+            }
             references = { table: refTable, column: refCol };
 
             while (this.match('KEYWORD', 'ON')) {
               this.consume(); // ON
               const isDelete = this.match('KEYWORD', 'DELETE');
               const isUpdate = this.match('KEYWORD', 'UPDATE');
-              this.consume(); // DELETE or UPDATE
+              if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
 
               let action: any;
               if (this.match('KEYWORD', 'SET')) {
@@ -580,6 +605,27 @@ export class Parser {
             }
           } else if (this.match('KEYWORD', 'DEFAULT')) {
             this.consume(); defaultVal = this.parseExpr();
+          } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'GENERATED') {
+            this.consume(); // GENERATED
+            if (this.matchIdentifier() && ['ALWAYS', 'BY'].includes(this.current()?.value.toUpperCase() || '')) {
+              this.consume();
+              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DEFAULT') this.consume();
+            }
+            if (this.match('KEYWORD', 'AS')) this.consume();
+            if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') this.consume();
+            isNotNull = true;
+            dataType = 'SERIAL';
+          } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
+            this.consume(); // CHECK
+            if (this.match('SYMBOL', '(')) {
+              this.consume();
+              let depth = 1;
+              while (depth > 0 && this.current() && this.current()?.type !== 'EOF') {
+                const token = this.consume();
+                if (token.value === '(') depth++;
+                else if (token.value === ')') depth--;
+              }
+            }
           } else {
             break;
           }
@@ -635,7 +681,7 @@ export class Parser {
         ifNotExists = true;
       }
       const name = this.consumeIdentifier();
-      const dataType = this.parseDataType();
+      let dataType = this.parseDataType();
       let isPrimaryKey = false, isUnique = false, isNotNull = false;
       let references: any, defaultVal;
 
@@ -648,19 +694,24 @@ export class Parser {
           this.consume(); isUnique = true;
         } else if (this.match('KEYWORD', 'NOT')) {
           this.consume(); this.consume('KEYWORD', 'NULL'); isNotNull = true;
+        } else if (this.match('KEYWORD', 'NULL')) {
+          this.consume();
         } else if (this.match('KEYWORD', 'REFERENCES')) {
           this.consume(); 
           const refTable = this.parseTableName();
-          this.consume('SYMBOL', '(');
-          const refCol = this.consumeIdentifier();
-          this.consume('SYMBOL', ')');
+          let refCol = "id";
+          if (this.match('SYMBOL', '(')) {
+            this.consume();
+            refCol = this.consumeIdentifier();
+            this.consume('SYMBOL', ')');
+          }
           references = { table: refTable, column: refCol };
 
           while (this.match('KEYWORD', 'ON')) {
             this.consume(); // ON
             const isDelete = this.match('KEYWORD', 'DELETE');
             const isUpdate = this.match('KEYWORD', 'UPDATE');
-            this.consume(); // DELETE or UPDATE
+            if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
 
             let action: any;
             if (this.match('KEYWORD', 'SET')) {
@@ -685,6 +736,27 @@ export class Parser {
           }
         } else if (this.match('KEYWORD', 'DEFAULT')) {
           this.consume(); defaultVal = this.parseExpr();
+        } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'GENERATED') {
+          this.consume(); // GENERATED
+          if (this.matchIdentifier() && ['ALWAYS', 'BY'].includes(this.current()?.value.toUpperCase() || '')) {
+            this.consume();
+            if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DEFAULT') this.consume();
+          }
+          if (this.match('KEYWORD', 'AS')) this.consume();
+          if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') this.consume();
+          isNotNull = true;
+          dataType = 'SERIAL';
+        } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
+          this.consume(); // CHECK
+          if (this.match('SYMBOL', '(')) {
+            this.consume();
+            let depth = 1;
+            while (depth > 0 && this.current() && this.current()?.type !== 'EOF') {
+              const token = this.consume();
+              if (token.value === '(') depth++;
+              else if (token.value === ')') depth--;
+            }
+          }
         } else {
           break;
         }

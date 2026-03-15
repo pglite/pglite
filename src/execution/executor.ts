@@ -251,7 +251,7 @@ export class Executor {
           // 5. Normal Insert Path (Constraint checks and actual IO)
           startBenchmarks();
           for (const col of table.columns) {
-            if (col.isNotNull && record[col.name] === null)
+            if (col.isNotNull && (record[col.name] === null || record[col.name] === undefined))
               throw new Error(`Constraint Error: ${col.name} cannot be null`);
 
             if (col.references && record[col.name] !== undefined && record[col.name] !== null) {
