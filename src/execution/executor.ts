@@ -1266,6 +1266,12 @@ export class Executor {
         if (results.length > 0) return Object.values(results[0])[0];
         return null;
       }
+      case "Exists": {
+        for await (const _ of this.executeSelect(storage, expr.stmt, params, row)) {
+          return true;
+        }
+        return false;
+      }
       case "Interval":
         return expr.value;
       case "Alias":

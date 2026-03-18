@@ -284,6 +284,13 @@ export class Parser {
       const val = this.consume('STRING').value;
       return { type: 'Interval', value: val };
     }
+    if (this.match('KEYWORD', 'EXISTS') && this.tokens[this.pos + 1]?.value === '(') {
+      this.consume(); // EXISTS
+      this.consume('SYMBOL', '(');
+      const stmt = this.parseSelect();
+      this.consume('SYMBOL', ')');
+      return { type: 'Exists', stmt };
+    }
     if (this.match('KEYWORD', 'CASE')) {
       this.consume();
       let caseExpr: Expr | undefined;
@@ -864,9 +871,11 @@ export class Parser {
       return expr;
     };
 
-    columns.push(parseColumn());
-    while (this.match('SYMBOL', ',')) {
-      this.consume(); columns.push(parseColumn());
+    if (!this.match('KEYWORD', 'FROM') && !this.match('EOF') && !this.match('SYMBOL', ';')) {
+      columns.push(parseColumn());
+      while (this.match('SYMBOL', ',')) {
+        this.consume(); columns.push(parseColumn());
+      }
     }
     
     let from: any = undefined;

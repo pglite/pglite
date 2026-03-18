@@ -21,7 +21,8 @@ export type Expr =
   | { type: 'Cast'; expr: Expr; dataType: string }
   | { type: 'Case'; cases: { when: Expr; then: Expr }[]; elseExpr?: Expr }
   | { type: 'Array'; elements: Expr[] }
-  | { type: 'Interval'; value: string };
+  | { type: 'Interval'; value: string }
+  | { type: 'Exists'; stmt: Statement };
 
 export interface OnConflict {
   targetColumns?: string[];

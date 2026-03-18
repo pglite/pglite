@@ -1987,4 +1987,25 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(allOrders.length).toBe(2);
     });
   });
+
+  describe("LEVEL 29: EXISTS Subqueries", () => {
+    test("29.1 SELECT EXISTS", async () => {
+      await db.exec(`CREATE TABLE migrations (id SERIAL PRIMARY KEY)`);
+      const rows = await db.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' AND table_name = 'migrations'
+        ) as exists;
+      `);
+      expect(rows[0].exists).toBe(true);
+
+      const rows2 = await db.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' AND table_name = 'non_existent_table'
+        ) as exists;
+      `);
+      expect(rows2[0].exists).toBe(false);
+    });
+  });
 });
