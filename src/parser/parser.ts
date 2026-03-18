@@ -160,11 +160,18 @@ export class Parser {
   private parseCondition(): Expr {
     let left = this.parseAdditive();
     const ops = ['=', '>', '<', '>=', '<=', '!=', '->', '->>', '#>', '@>', '?', '&&', '~', '~*', '!~'];
-    if (ops.includes(this.current()?.value || "") || this.match('KEYWORD', 'LIKE')) {
+    if (ops.includes(this.current()?.value || "") || this.match('KEYWORD', 'LIKE') || this.match('KEYWORD', 'ILIKE')) {
       const opToken = this.consume();
       const op = opToken.value.toUpperCase();
       const right = this.parseAdditive();
-      if (op === 'LIKE') return { type: 'Like', left, right };
+      if (op === 'LIKE' || op === 'ILIKE') {
+        let escapeStr: string | undefined;
+        if (this.match('KEYWORD', 'ESCAPE')) {
+          this.consume();
+          escapeStr = this.consume('STRING').value;
+        }
+        return { type: 'Like', left, right, escapeStr, ilike: op === 'ILIKE' };
+      }
       return { type: 'Binary', left, operator: op, right };
     }
 
@@ -174,10 +181,16 @@ export class Parser {
       not = true;
     }
 
-    if (this.match('KEYWORD', 'LIKE')) {
-      this.consume();
+    if (this.match('KEYWORD', 'LIKE') || this.match('KEYWORD', 'ILIKE')) {
+      const opToken = this.consume();
+      const op = opToken.value.toUpperCase();
       const right = this.parseAdditive();
-      return { type: 'Like', left, right, not };
+      let escapeStr: string | undefined;
+      if (this.match('KEYWORD', 'ESCAPE')) {
+        this.consume();
+        escapeStr = this.consume('STRING').value;
+      }
+      return { type: 'Like', left, right, not, escapeStr, ilike: op === 'ILIKE' };
     }
 
     if (this.match('KEYWORD', 'IN')) {

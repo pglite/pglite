@@ -1218,13 +1218,14 @@ export class Executor {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
         const right = await this.evaluateExpr(storage, expr.right, row, params);
         if (typeof left !== "string" || typeof right !== "string") return false;
-        // Build regex with proper escape handling: \_ and \% are literal, unescaped _ and % are wildcards
+        // Build regex with proper escape handling
+        const escapeChar = (expr as any).escapeStr !== undefined ? (expr as any).escapeStr : '\\';
         let pattern = "";
         for (let i = 0; i < right.length; i++) {
           const ch = right[i];
-          if (ch === '\\' && i + 1 < right.length) {
+          if (ch === escapeChar && i + 1 < right.length && escapeChar !== '') {
             const next = right[i + 1];
-            if (next === '_' || next === '%' || next === '\\') {
+            if (next === '_' || next === '%' || next === escapeChar) {
               // Escaped special char → literal (escape for regex)
               pattern += next!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
               i++;
@@ -1239,7 +1240,7 @@ export class Executor {
             pattern += ch!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           }
         }
-        const regex = new RegExp("^" + pattern + "$");
+        const regex = new RegExp("^" + pattern + "$", (expr as any).ilike ? "i" : "");
         const res = regex.test(left);
         return (expr as any).not ? !res : res;
       }

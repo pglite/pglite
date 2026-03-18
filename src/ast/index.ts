@@ -14,7 +14,7 @@ export type Expr =
   | { type: 'Not'; expr: Expr }
   | { type: 'Call'; fnName: string; args: Expr[]; argsOrderBy?: OrderBy[]; over?: { partitionBy?: Expr[]; orderBy?: OrderBy[] }; filter?: Expr }
   | { type: 'In'; left: Expr; right: Expr[] | Statement; not?: boolean }
-  | { type: 'Like'; left: Expr; right: Expr; not?: boolean }
+  | { type: 'Like'; left: Expr; right: Expr; not?: boolean; escapeStr?: string; ilike?: boolean }
   | { type: 'Alias'; expr: Expr; alias: string }
   | { type: 'Subquery'; stmt: Statement }
   | { type: 'IsNull'; expr: Expr; not: boolean }

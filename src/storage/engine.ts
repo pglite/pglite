@@ -666,6 +666,7 @@ class BTree {
       const buf = await this.pager.readPage(this.rootPageId);
       const node = { isLeaf: true, keys: [key], vals: [val], children: [], nextLeaf: 0xffffffff };
       this.serializeNode(node, buf);
+      await this.pager.writePage(this.rootPageId, buf);
       BTree.nodeCache.set(buf, node);
       return this.rootPageId;
     }
@@ -709,8 +710,12 @@ class BTree {
       
       let promoteKey = currNode.isLeaf ? rightNode.keys[0] : rightNode.keys.shift();
       
-      this.serializeNode(currNode, await this.pager.readPage(currNode.pageId));
+      const currBuf = await this.pager.readPage(currNode.pageId);
+      this.serializeNode(currNode, currBuf);
+      await this.pager.writePage(currNode.pageId, currBuf);
+
       this.serializeNode(rightNode, rightBuf);
+      await this.pager.writePage(rightPageId, rightBuf);
 
       path.pop();
       if (path.length === 0) {
@@ -721,6 +726,7 @@ class BTree {
           children: [currNode.pageId, rightNode.pageId], nextLeaf: 0xffffffff
         };
         this.serializeNode(rootNode, rootBuf);
+        await this.pager.writePage(this.rootPageId, rootBuf);
         BTree.nodeCache.set(rootBuf, rootNode);
         break;
       } else {
@@ -734,7 +740,9 @@ class BTree {
     }
 
     if (currNode.keys.length <= 32) {
-      this.serializeNode(currNode, await this.pager.readPage(currNode.pageId));
+      const buf = await this.pager.readPage(currNode.pageId);
+      this.serializeNode(currNode, buf);
+      await this.pager.writePage(currNode.pageId, buf);
     }
 
     return this.rootPageId;
