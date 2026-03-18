@@ -84,6 +84,7 @@ export type Statement =
   | { 
       type: 'Select'; 
       columns: Expr[]; 
+      distinct?: boolean;
       from?: { 
         tableName?: string; 
         alias?: string; 

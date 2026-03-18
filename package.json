@@ -1,6 +1,6 @@
 {
   "name": "@pglite/core",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "High-performance, in-process, zero-dependency embedded PostgreSQL database engine for Bun & Node.js. A lightweight, serverless SQLite alternative with full Postgres syntax support.",
   "keywords": [
     "postgres",

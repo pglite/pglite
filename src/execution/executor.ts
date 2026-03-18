@@ -657,6 +657,10 @@ export class Executor {
          return { ...r, ...proj, ___lpg_projected___: proj };
       });
 
+      if (stmt.distinct) {
+         sourceStream = this.distinctStream(sourceStream);
+      }
+
       if (stmt.union) {
          const rightStream = this.executeSelect(storage, stmt.union, params, outerRow);
          sourceStream = this.concatStreams(sourceStream, rightStream);
@@ -787,6 +791,18 @@ export class Executor {
         }
       }
       if (!matched && join.type === "LEFT") yield { ...row };
+    }
+  }
+
+  private async *distinctStream(source: AsyncIterableIterator<any>) {
+    const seen = new Set<string>();
+    for await (const row of source) {
+      const proj = row.___lpg_projected___ ? row.___lpg_projected___ : row;
+      const key = JSON.stringify(proj);
+      if (!seen.has(key)) {
+        seen.add(key);
+        yield row;
+      }
     }
   }
 

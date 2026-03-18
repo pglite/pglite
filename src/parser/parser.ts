@@ -857,6 +857,13 @@ export class Parser {
 
   private parseSelect(): Statement {
     this.consume('KEYWORD', 'SELECT');
+    
+    let distinct = false;
+    if (this.match('KEYWORD', 'DISTINCT')) {
+      this.consume();
+      distinct = true;
+    }
+
     const columns: Expr[] =[];
 
     const parseColumn = () => {
@@ -1036,7 +1043,7 @@ export class Parser {
       this.consume(); offset = this.parseExpr();
     }
 
-    let stmt: Statement = { type: 'Select', columns, from, joins, where, groupBy, having, orderBy, limit, offset };
+    let stmt: Statement = { type: 'Select', columns, distinct, from, joins, where, groupBy, having, orderBy, limit, offset };
 
     if (this.match('KEYWORD', 'UNION')) {
       this.consume(); const right = this.parseSelect();

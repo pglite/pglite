@@ -2008,4 +2008,26 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows2[0].exists).toBe(false);
     });
   });
+
+  describe("LEVEL 30: DISTINCT and AS alias", () => {
+    test("30.1 SELECT DISTINCT with multiple AS aliases", async () => {
+      await db.exec(`CREATE TABLE products (id SERIAL PRIMARY KEY, category TEXT)`);
+      await db.exec(`INSERT INTO products (category) VALUES ('Electronics'), ('Clothing'), ('Electronics'), ('Home')`);
+
+      const rows = await db.query(
+        "SELECT DISTINCT category AS value, category AS label FROM products WHERE category ILIKE '%' || $1 || '%' LIMIT 1000",
+        ['e']
+      );
+
+      // 'Electronics', 'Home' contain 'e'
+      // 'Clothing' does not
+      expect(rows.length).toBe(2);
+      
+      const values = rows.map(r => r.value).sort();
+      expect(values).toEqual(['Electronics', 'Home']);
+      
+      const labels = rows.map(r => r.label).sort();
+      expect(labels).toEqual(['Electronics', 'Home']);
+    });
+  });
 });
