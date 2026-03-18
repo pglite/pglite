@@ -23,14 +23,14 @@ export class LitePostgres {
   /**
    * Used for statements that do not return rows (CREATE, INSERT, UPDATE, DELETE)
    */
-  public async exec(sql: string, params: any[] = [], dbName?: string): Promise<any> {
+  public async exec<T = any>(sql: string, params: any[] = [], dbName?: string): Promise<T> {
     return this.run(sql, params, dbName || this.defaultDb);
   }
 
   /**
    * Used for statements that return rows (SELECT)
    */
-  public async query(sql: string, params: any[] = [], dbName?: string): Promise<any[]> {
+  public async query<T = any>(sql: string, params: any[] = [], dbName?: string): Promise<T[]> {
     const result = await this.run(sql, params, dbName || this.defaultDb);
     return Array.isArray(result) ? result : [];
   }

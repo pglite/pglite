@@ -42,6 +42,7 @@ export interface ColumnDef {
     onUpdate?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION';
   };
   defaultVal?: Expr;
+  generatedExpr?: Expr;
   comment?: string;
 }
 

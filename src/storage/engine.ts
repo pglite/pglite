@@ -1441,7 +1441,8 @@ export class StorageEngine {
                 onUpdate: attr.attref_on_update || undefined,
               }
             : undefined,
-          defaultVal: attr.attdef ? JSON.parse(attr.attdef) : undefined,
+          defaultVal: attr.attdef ? (() => { try { const p = JSON.parse(attr.attdef); return p?.__generated__ ? undefined : p; } catch { return undefined; } })() : undefined,
+          generatedExpr: attr.attdef ? (() => { try { const p = JSON.parse(attr.attdef); return p?.__generated__ ? p.expr : undefined; } catch { return undefined; } })() : undefined,
         };
       });
 
@@ -1527,15 +1528,15 @@ export class StorageEngine {
         attref_col: col.references?.column || null,
         attref_on_delete: col.references?.onDelete || null,
         attref_on_update: col.references?.onUpdate || null,
-        attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : null,
+        attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : (col.generatedExpr ? JSON.stringify({ __generated__: true, expr: col.generatedExpr }) : null),
         atttypmod: -1,
         attisdropped: false,
       });
-      if (col.defaultVal) {
+      if (col.defaultVal || col.generatedExpr) {
         await this.insertRowIntoCatalog(this.pgAttrdefDef, {
           adrelid: firstPage,
           adnum: i + 1,
-          adbin: JSON.stringify(col.defaultVal),
+          adbin: col.generatedExpr ? JSON.stringify({ __generated__: true, expr: col.generatedExpr }) : JSON.stringify(col.defaultVal),
         });
       }
     }

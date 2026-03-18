@@ -553,6 +553,7 @@ export class Parser {
         let dataType = this.parseDataType();
         let isPrimaryKey = false, isUnique = false, isNotNull = false;
         let references: any, defaultVal;
+        let generatedExpr: Expr | undefined;
 
         if (dataType.toUpperCase().includes('SERIAL')) isNotNull = true;
 
@@ -611,10 +612,29 @@ export class Parser {
               this.consume();
               if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DEFAULT') this.consume();
             }
-            if (this.match('KEYWORD', 'AS')) this.consume();
-            if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') this.consume();
-            isNotNull = true;
-            dataType = 'SERIAL';
+            if (this.match('KEYWORD', 'AS')) {
+              this.consume();
+              if (this.match('SYMBOL', '(')) {
+                // GENERATED ALWAYS AS (expr) STORED
+                this.consume();
+                generatedExpr = this.parseExpr();
+                this.consume('SYMBOL', ')');
+                if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'STORED') {
+                  this.consume();
+                }
+              } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
+                this.consume();
+                isNotNull = true;
+                dataType = 'SERIAL';
+              }
+            } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
+              this.consume();
+              isNotNull = true;
+              dataType = 'SERIAL';
+            } else {
+              isNotNull = true;
+              dataType = 'SERIAL';
+            }
           } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
             this.consume(); // CHECK
             if (this.match('SYMBOL', '(')) {
@@ -630,7 +650,7 @@ export class Parser {
             break;
           }
         }
-        columns.push({ name, dataType, isPrimaryKey, isUnique, isNotNull, references, defaultVal });
+        columns.push({ name, dataType, isPrimaryKey, isUnique, isNotNull, references, defaultVal, generatedExpr });
       }
       
       if (this.match('SYMBOL', ',')) this.consume();
@@ -684,6 +704,7 @@ export class Parser {
       let dataType = this.parseDataType();
       let isPrimaryKey = false, isUnique = false, isNotNull = false;
       let references: any, defaultVal;
+      let generatedExpr: Expr | undefined;
 
       if (dataType.toUpperCase().includes('SERIAL')) isNotNull = true;
       
@@ -742,10 +763,28 @@ export class Parser {
             this.consume();
             if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DEFAULT') this.consume();
           }
-          if (this.match('KEYWORD', 'AS')) this.consume();
-          if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') this.consume();
-          isNotNull = true;
-          dataType = 'SERIAL';
+          if (this.match('KEYWORD', 'AS')) {
+            this.consume();
+            if (this.match('SYMBOL', '(')) {
+              this.consume();
+              generatedExpr = this.parseExpr();
+              this.consume('SYMBOL', ')');
+              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'STORED') {
+                this.consume();
+              }
+            } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
+              this.consume();
+              isNotNull = true;
+              dataType = 'SERIAL';
+            }
+          } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
+            this.consume();
+            isNotNull = true;
+            dataType = 'SERIAL';
+          } else {
+            isNotNull = true;
+            dataType = 'SERIAL';
+          }
         } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
           this.consume(); // CHECK
           if (this.match('SYMBOL', '(')) {
@@ -761,7 +800,7 @@ export class Parser {
           break;
         }
       }
-      return { type: 'AlterTable', tableName, action: { type: 'AddColumn', column: { name, dataType, isPrimaryKey, isUnique, isNotNull, references, defaultVal }, ifNotExists } };
+      return { type: 'AlterTable', tableName, action: { type: 'AddColumn', column: { name, dataType, isPrimaryKey, isUnique, isNotNull, references, defaultVal, generatedExpr }, ifNotExists } };
     } else if (this.match('KEYWORD', 'ALTER')) {
       this.consume();
       if (this.match('KEYWORD', 'COLUMN')) this.consume();

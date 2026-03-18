@@ -886,6 +886,54 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 28: LIKE Escape and NOT LIKE with underscore", () => {
+    test("28.1 NOT LIKE with escaped underscore filters correctly", async () => {
+      await db.exec(`CREATE TABLE _hidden_table (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`CREATE TABLE visible_table (id SERIAL PRIMARY KEY, val TEXT)`);
+
+      // Using escaped underscore to match literal underscore prefix
+      const rows = await db.query(`
+        SELECT table_name 
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name NOT LIKE '\\_%%'
+        ORDER BY table_name
+      `);
+      // _hidden_table should be excluded, visible_table should be included
+      const names = rows.map((r: any) => r.table_name);
+      expect(names).not.toContain("_hidden_table");
+      expect(names).toContain("visible_table");
+    });
+
+    test("28.2 LIKE with underscore wildcard", async () => {
+      const rows = await db.query(`SELECT 'abc' LIKE '_bc' as res`);
+      expect(rows[0].res).toBe(true);
+    });
+
+    test("28.3 LIKE with escaped underscore literal", async () => {
+      const rows = await db.query(`SELECT '_bc' LIKE '\\_bc' as res`);
+      expect(rows[0].res).toBe(true);
+
+      const rows2 = await db.query(`SELECT 'abc' LIKE '\\_bc' as res`);
+      expect(rows2[0].res).toBe(false);
+    });
+
+    test("28.4 information_schema.columns query with NOT LIKE escaped underscore", async () => {
+      const rows = await db.query(`
+        SELECT table_name, column_name, data_type, is_nullable, column_default, ordinal_position
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name NOT LIKE '\\_%%'
+        ORDER BY table_name, ordinal_position
+      `);
+      expect(rows.length).toBeGreaterThan(0);
+      // No table starting with underscore should appear
+      for (const r of rows) {
+        expect(r.table_name.startsWith('_')).toBe(false);
+      }
+    });
+  });
+
   describe("LEVEL 21: Regex, JSON, Array Operators & Interval", () => {
     test("21.1 Regex Operators (~, ~*, !~)", async () => {
       const rows = await db.query(`
@@ -1786,6 +1834,58 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].constraint_name).toBe("child_rules_p_id_fkey");
       expect(rows[0].update_rule).toBe("SET NULL");
       expect(rows[0].delete_rule).toBe("CASCADE");
+    });
+  });
+
+  describe("LEVEL 27: Generated Columns (GENERATED ALWAYS AS ... STORED)", () => {
+    test("27.1 Create table with generated column and insert data", async () => {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS revenue_monthly (
+          id SERIAL PRIMARY KEY,
+          month DATE NOT NULL,
+          revenue NUMERIC(12,2) NOT NULL,
+          expenses NUMERIC(12,2) DEFAULT 0,
+          profit NUMERIC(12,2) GENERATED ALWAYS AS (revenue - expenses) STORED
+        )
+      `);
+
+      await db.exec(`INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-01-01', 10000, 3000)`);
+      await db.exec(`INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-02-01', 15000, 5000)`);
+      await db.exec(`INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-03-01', 20000, 8000)`);
+
+      const rows = await db.query(`SELECT * FROM revenue_monthly ORDER BY id`);
+      expect(rows.length).toBe(3);
+      expect(rows[0].profit).toBe(7000);
+      expect(rows[1].profit).toBe(10000);
+      expect(rows[2].profit).toBe(12000);
+    });
+
+    test("27.2 Generated column recalculates on UPDATE", async () => {
+      await db.exec(`UPDATE revenue_monthly SET expenses = 1000 WHERE id = 1`);
+      const rows = await db.query(`SELECT profit FROM revenue_monthly WHERE id = 1`);
+      expect(rows[0].profit).toBe(9000);
+    });
+
+    test("27.3 Generated column with default expenses", async () => {
+      await db.exec(`INSERT INTO revenue_monthly (month, revenue) VALUES ('2024-04-01', 25000)`);
+      const rows = await db.query(`SELECT profit FROM revenue_monthly WHERE id = 4`);
+      expect(rows[0].profit).toBe(25000); // revenue - 0 (default)
+    });
+
+    test("27.4 Query generated column with WHERE filter", async () => {
+      const rows = await db.query(`SELECT month, profit FROM revenue_monthly WHERE profit > 10000 ORDER BY profit DESC`);
+      expect(rows.length).toBe(2);
+      expect(rows[0].profit).toBe(25000);
+      expect(rows[1].profit).toBe(12000);
+    });
+
+    test("27.5 Generated column with RETURNING", async () => {
+      const rows = await db.query(`
+        INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-05-01', 30000, 10000)
+        RETURNING id, profit
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].profit).toBe(20000);
     });
   });
 

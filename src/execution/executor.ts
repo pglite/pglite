@@ -191,6 +191,12 @@ export class Executor {
               record[col.name] = await this.evaluateExpr(storage, col.defaultVal, {}, params);
             }
           }
+          // 2b. Evaluate generated columns
+          for (const col of table.columns) {
+            if ((col as any).generatedExpr) {
+              record[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, record, params);
+            }
+          }
           endBenchmarks("serial_default_assignment");
 
           // 3. Unique/Conflict Checking
@@ -369,6 +375,13 @@ export class Executor {
 
               row[colName] = newVal;
             }
+            // Re-evaluate generated columns after update
+            for (const col of table.columns) {
+              if ((col as any).generatedExpr) {
+                row[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, row, params);
+              }
+            }
+
             if (stmt.returning) {
               updatedRows.push(await this.projectRow(storage, row, stmt.returning, params));
             }
@@ -1205,9 +1218,28 @@ export class Executor {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
         const right = await this.evaluateExpr(storage, expr.right, row, params);
         if (typeof left !== "string" || typeof right !== "string") return false;
-        const regex = new RegExp(
-          "^" + right.replace(/%/g, ".*").replace(/_/g, ".") + "$",
-        );
+        // Build regex with proper escape handling: \_ and \% are literal, unescaped _ and % are wildcards
+        let pattern = "";
+        for (let i = 0; i < right.length; i++) {
+          const ch = right[i];
+          if (ch === '\\' && i + 1 < right.length) {
+            const next = right[i + 1];
+            if (next === '_' || next === '%' || next === '\\') {
+              // Escaped special char → literal (escape for regex)
+              pattern += next!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              i++;
+              continue;
+            }
+          }
+          if (ch === '%') {
+            pattern += ".*";
+          } else if (ch === '_') {
+            pattern += ".";
+          } else {
+            pattern += ch!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          }
+        }
+        const regex = new RegExp("^" + pattern + "$");
         const res = regex.test(left);
         return (expr as any).not ? !res : res;
       }
