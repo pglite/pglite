@@ -2030,4 +2030,48 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(labels).toEqual(['Electronics', 'Home']);
     });
   });
+
+  describe("LEVEL 31: Complex DDL with ADD CONSTRAINT", () => {
+    test("31.1 Parse and execute ALTER TABLE ADD CONSTRAINT FOREIGN KEY", async () => {
+      const sql = `
+        -- 1. Tạo Giai đoạn Phễu
+        CREATE TABLE IF NOT EXISTS sales_stages_31 (id BIGSERIAL PRIMARY KEY);
+        ALTER TABLE sales_stages_31 ADD COLUMN IF NOT EXISTS name VARCHAR(255);
+        
+        -- 2. Tạo Khách hàng tiềm năng (Leads)
+        CREATE TABLE IF NOT EXISTS leads_31 (id BIGSERIAL PRIMARY KEY);
+        ALTER TABLE leads_31 ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+
+        -- 3. Tạo Cơ hội kinh doanh (Deals)
+        CREATE TABLE IF NOT EXISTS deals_31 (id BIGSERIAL PRIMARY KEY);
+        ALTER TABLE deals_31 ADD COLUMN IF NOT EXISTS lead_id BIGINT;
+        ALTER TABLE deals_31 ADD COLUMN IF NOT EXISTS stage_id BIGINT;
+
+        ALTER TABLE deals_31 ADD CONSTRAINT fk_deal_lead_31 FOREIGN KEY (lead_id) REFERENCES leads_31(id) ON UPDATE CASCADE ON DELETE SET NULL;
+        ALTER TABLE deals_31 ADD CONSTRAINT fk_deal_stage_31 FOREIGN KEY (stage_id) REFERENCES sales_stages_31(id) ON UPDATE CASCADE ON DELETE SET NULL;
+
+        -- Seed Data Giai đoạn
+        INSERT INTO sales_stages_31 (name) VALUES 
+        ('Mới'), ('Liên hệ')
+        ON CONFLICT DO NOTHING;
+      `;
+      const res = await db.exec(sql);
+      expect(res).toBeDefined();
+
+      const rows = await db.query("SELECT * FROM sales_stages_31");
+      expect(rows.length).toBe(2);
+
+      // Verify foreign key metadata using information_schema
+      const fkRows = await db.query(`
+        SELECT constraint_name, update_rule, delete_rule
+        FROM information_schema.referential_constraints
+        WHERE constraint_name IN ('deals_31_lead_id_fkey', 'deals_31_stage_id_fkey')
+      `);
+      expect(fkRows.length).toBe(2);
+      for (const fk of fkRows) {
+        expect(fk.update_rule).toBe("CASCADE");
+        expect(fk.delete_rule).toBe("SET NULL");
+      }
+    });
+  });
 });

@@ -64,6 +64,31 @@ export class Executor {
           table.columns.push(action.column);
           await storage.updateTableSchema(stmt.tableName, table);
 
+          await storage.insertRow('pg_catalog.pg_attribute', {
+            attrelid: table.firstPage,
+            attname: action.column.name,
+            atttypid: action.column.dataType,
+            attnum: table.columns.length,
+            attnotnull: !!action.column.isNotNull,
+            attprimary: !!action.column.isPrimaryKey,
+            attunique: !!action.column.isUnique,
+            attref_table: action.column.references?.table || null,
+            attref_col: action.column.references?.column || null,
+            attref_on_delete: action.column.references?.onDelete || null,
+            attref_on_update: action.column.references?.onUpdate || null,
+            attdef: action.column.defaultVal ? JSON.stringify(action.column.defaultVal) : (action.column.generatedExpr ? JSON.stringify({ __generated__: true, expr: action.column.generatedExpr }) : null),
+            atttypmod: -1,
+            attisdropped: false,
+          });
+
+          if (action.column.defaultVal || action.column.generatedExpr) {
+            await storage.insertRow('pg_catalog.pg_attrdef', {
+              adrelid: table.firstPage,
+              adnum: table.columns.length,
+              adbin: action.column.generatedExpr ? JSON.stringify({ __generated__: true, expr: action.column.generatedExpr }) : JSON.stringify(action.column.defaultVal),
+            });
+          }
+
           if (action.column.defaultVal) {
             await storage.updateRows(
               stmt.tableName,
@@ -84,9 +109,13 @@ export class Executor {
             if (action.ifExists) return { success: true };
             throw new Error(`Column ${action.columnName} does not exist`);
           }
+          const colNum = colIndex + 1;
           table.columns.splice(colIndex, 1);
           await storage.updateTableSchema(stmt.tableName, table);
           
+          await storage.deleteRows('pg_catalog.pg_attribute', async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName);
+          await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === colNum);
+
           await storage.updateRows(
             stmt.tableName,
             async () => true,
@@ -100,6 +129,11 @@ export class Executor {
           col.name = action.newColumnName;
           await storage.updateTableSchema(stmt.tableName, table);
           
+          await storage.updateRows('pg_catalog.pg_attribute', 
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.oldColumnName,
+            async (r: any) => { r.attname = action.newColumnName; }
+          );
+
           await storage.updateRows(
             stmt.tableName,
             async () => true,
@@ -117,26 +151,82 @@ export class Executor {
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
           col.dataType = action.dataType;
           await storage.updateTableSchema(stmt.tableName, table);
+          await storage.updateRows('pg_catalog.pg_attribute', 
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+            async (r: any) => { r.atttypid = action.dataType; }
+          );
         } else if (action.type === 'AlterColumnSetDefault') {
-          const col = table.columns.find((c: any) => c.name === action.columnName);
+          const colIndex = table.columns.findIndex((c: any) => c.name === action.columnName);
+          const col = table.columns[colIndex];
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
           col.defaultVal = action.defaultVal;
           await storage.updateTableSchema(stmt.tableName, table);
+          
+          const strDef = JSON.stringify(action.defaultVal);
+          await storage.updateRows('pg_catalog.pg_attribute', 
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+            async (r: any) => { r.attdef = strDef; }
+          );
+          
+          let updatedAd = false;
+          await storage.updateRows('pg_catalog.pg_attrdef',
+            async (r: any) => r.adrelid === table.firstPage && r.adnum === colIndex + 1,
+            async (r: any) => { r.adbin = strDef; updatedAd = true; }
+          );
+          if (!updatedAd) {
+            await storage.insertRow('pg_catalog.pg_attrdef', {
+              adrelid: table.firstPage,
+              adnum: colIndex + 1,
+              adbin: strDef
+            });
+          }
         } else if (action.type === 'AlterColumnDropDefault') {
-          const col = table.columns.find((c: any) => c.name === action.columnName);
+          const colIndex = table.columns.findIndex((c: any) => c.name === action.columnName);
+          const col = table.columns[colIndex];
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
           delete col.defaultVal;
           await storage.updateTableSchema(stmt.tableName, table);
+
+          await storage.updateRows('pg_catalog.pg_attribute', 
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+            async (r: any) => { r.attdef = null; }
+          );
+          await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === colIndex + 1);
         } else if (action.type === 'AlterColumnSetNotNull') {
           const col = table.columns.find((c: any) => c.name === action.columnName);
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
           col.isNotNull = true;
           await storage.updateTableSchema(stmt.tableName, table);
+          await storage.updateRows('pg_catalog.pg_attribute', 
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+            async (r: any) => { r.attnotnull = true; }
+          );
         } else if (action.type === 'AlterColumnDropNotNull') {
           const col = table.columns.find((c: any) => c.name === action.columnName);
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
           col.isNotNull = false;
           await storage.updateTableSchema(stmt.tableName, table);
+          await storage.updateRows('pg_catalog.pg_attribute', 
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+            async (r: any) => { r.attnotnull = false; }
+          );
+        } else if (action.type === 'AddForeignKey') {
+          const col = table.columns.find((c: any) => c.name === action.columnName);
+          if (!col) throw new Error(`Column ${action.columnName} does not exist`);
+          col.references = action.references;
+          storage.invalidateTableCache(action.references.table);
+          await storage.updateTableSchema(stmt.tableName, table);
+          
+          await storage.updateRows(
+            'pg_catalog.pg_attribute',
+            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+            async (r: any) => {
+              r.attref_table = action.references.table;
+              r.attref_col = action.references.column;
+              r.attref_on_delete = action.references.onDelete || null;
+              r.attref_on_update = action.references.onUpdate || null;
+            }
+          );
         }
 
         return { success: true };

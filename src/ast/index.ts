@@ -73,7 +73,8 @@ export type AlterTableAction =
   | { type: 'AlterColumnSetDefault'; columnName: string; defaultVal: Expr }
   | { type: 'AlterColumnDropDefault'; columnName: string }
   | { type: 'AlterColumnSetNotNull'; columnName: string }
-  | { type: 'AlterColumnDropNotNull'; columnName: string };
+  | { type: 'AlterColumnDropNotNull'; columnName: string }
+  | { type: 'AddForeignKey'; columnName: string; references: { table: string; column: string; onDelete?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION'; onUpdate?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION' } };
 
 export type Statement =
   | { type: 'CreateSchema'; schemaName: string; ifNotExists?: boolean }

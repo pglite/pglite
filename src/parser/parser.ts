@@ -714,6 +714,61 @@ export class Parser {
       return { type: 'AlterTable', tableName, action: { type: 'DropColumn', columnName, ifExists } };
     } else if (this.match('KEYWORD', 'ADD')) {
       this.consume();
+      
+      if (this.match('KEYWORD', 'CONSTRAINT')) {
+        this.consume(); // CONSTRAINT
+        const constraintName = this.consumeIdentifier();
+        if (this.match('KEYWORD', 'FOREIGN')) {
+          this.consume(); // FOREIGN
+          this.consume('KEYWORD', 'KEY'); // KEY
+          this.consume('SYMBOL', '(');
+          const columnName = this.consumeIdentifier();
+          this.consume('SYMBOL', ')');
+          
+          this.consume('KEYWORD', 'REFERENCES');
+          const refTable = this.parseTableName();
+          let refCol = "id";
+          if (this.match('SYMBOL', '(')) {
+            this.consume();
+            refCol = this.consumeIdentifier();
+            this.consume('SYMBOL', ')');
+          }
+          const references: any = { table: refTable, column: refCol };
+          
+          while (this.match('KEYWORD', 'ON')) {
+            this.consume(); // ON
+            const isDelete = this.match('KEYWORD', 'DELETE');
+            const isUpdate = this.match('KEYWORD', 'UPDATE');
+            if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
+
+            let action: any;
+            if (this.match('KEYWORD', 'SET')) {
+              this.consume();
+              if (this.match('KEYWORD', 'NULL')) {
+                this.consume(); action = 'SET NULL';
+              } else if (this.match('KEYWORD', 'DEFAULT')) {
+                this.consume(); action = 'SET DEFAULT';
+              }
+            } else if (this.match('KEYWORD', 'CASCADE')) {
+              this.consume(); action = 'CASCADE';
+            } else if (this.match('KEYWORD', 'RESTRICT')) {
+              this.consume(); action = 'RESTRICT';
+            } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'NO') {
+              this.consume();
+              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ACTION') {
+                this.consume(); action = 'NO ACTION';
+              }
+            }
+            if (isDelete) references.onDelete = action;
+            if (isUpdate) references.onUpdate = action;
+          }
+          
+          return { type: 'AlterTable', tableName, action: { type: 'AddForeignKey', columnName, references } };
+        } else {
+           throw new Error("Parse Error: Only FOREIGN KEY constraints are supported in ALTER TABLE ADD CONSTRAINT currently");
+        }
+      }
+
       if (this.match('KEYWORD', 'COLUMN')) this.consume();
       let ifNotExists = false;
       if (this.match('KEYWORD', 'IF')) {

@@ -2292,6 +2292,18 @@ export class StorageEngine {
     const table = await this.getTableAsync(fullName);
     if (!table) throw new Error(`Table ${fullName} not found`);
 
+    if (this.dbMeta && (
+      table.firstPage === this.dbMeta.nsp_f ||
+      table.firstPage === this.dbMeta.cls_f ||
+      table.firstPage === this.dbMeta.att_f ||
+      table.firstPage === this.dbMeta.dsc_f ||
+      table.firstPage === this.dbMeta.ad_f ||
+      table.firstPage === this.dbMeta.idx_f
+    )) {
+      await this.insertRowIntoCatalog(table, row);
+      return;
+    }
+
     let pageId = table.lastPage!;
     let buf = await this.pager.readPage(pageId);
     let page = new SlottedPage(buf);
