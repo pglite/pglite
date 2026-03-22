@@ -2031,6 +2031,34 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 32: Auto-Destroy on Close", () => {
+    test("32.1 Database destroys its files when destroyOnClose is true", async () => {
+      const DESTROY_DB_FILE = "test_destroy.db";
+      if (existsSync(DESTROY_DB_FILE)) unlinkSync(DESTROY_DB_FILE);
+      if (existsSync(DESTROY_DB_FILE + ".wal")) unlinkSync(DESTROY_DB_FILE + ".wal");
+
+      const dbDestroy = new LitePostgres(DESTROY_DB_FILE, {
+        database: "testdb",
+        adapter: new NodeFSAdapter(),
+        destroyOnClose: true,
+      });
+
+      // Insert some data
+      await dbDestroy.exec(`CREATE TABLE test_destroy (id SERIAL PRIMARY KEY)`);
+      await dbDestroy.exec(`INSERT INTO test_destroy (id) VALUES (1)`);
+      
+      // Ensure file exists
+      expect(existsSync(DESTROY_DB_FILE)).toBe(true);
+
+      // Trigger disconnect / close
+      await dbDestroy.close();
+
+      // Database files should be deleted automatically
+      expect(existsSync(DESTROY_DB_FILE)).toBe(false);
+      expect(existsSync(DESTROY_DB_FILE + ".wal")).toBe(false);
+    });
+  });
+
   describe("LEVEL 31: Complex DDL with ADD CONSTRAINT", () => {
     test("31.1 Parse and execute ALTER TABLE ADD CONSTRAINT FOREIGN KEY", async () => {
       const sql = `

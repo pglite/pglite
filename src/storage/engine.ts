@@ -434,6 +434,17 @@ class Pager {
     }
     await this.wal.close();
   }
+
+  public async destroy() {
+    await this.close();
+    Pager.pagers.delete(this.filepath);
+    if (await this.vfs.exists(this.filepath)) {
+      await this.vfs.unlink(this.filepath);
+    }
+    if (await this.vfs.exists(this.filepath + ".wal")) {
+      await this.vfs.unlink(this.filepath + ".wal");
+    }
+  }
 }
 
 class SlottedPage {
@@ -2460,5 +2471,9 @@ export class StorageEngine {
 
   public async close(): Promise<void> {
     await this.pager.close();
+  }
+
+  public async destroy(): Promise<void> {
+    await this.pager.destroy();
   }
 }

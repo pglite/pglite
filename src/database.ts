@@ -11,9 +11,11 @@ export class LitePostgres {
 
   private defaultDb: string;
   private currentDb?: string;
+  private destroyOnClose: boolean;
 
-  constructor(filepath: string, options: { database?: string, adapter: VFS }) {
+  constructor(filepath: string, options: { database?: string, adapter: VFS, destroyOnClose?: boolean }) {
     this.defaultDb = options.database || 'postgres';
+    this.destroyOnClose = !!options.destroyOnClose;
     if (!options.adapter) {
       throw new Error("A VFS adapter must be provided. For Node.js, use NodeFSAdapter from '@pglite/core/node-fs'.");
     }
@@ -39,7 +41,18 @@ export class LitePostgres {
    * Explicitly release resources. Crucial for handling 1M+ database instances.
    */
   public async close(): Promise<void> {
-    await this.storage.close();
+    if (this.destroyOnClose) {
+      await this.storage.destroy();
+    } else {
+      await this.storage.close();
+    }
+  }
+
+  /**
+   * Explicitly destroy the database files.
+   */
+  public async destroy(): Promise<void> {
+    await this.storage.destroy();
   }
 
   private async run(sql: string, params: any[] = [], dbName: string): Promise<any> {
