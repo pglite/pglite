@@ -193,6 +193,19 @@ export class Parser {
       return { type: 'Like', left, right, not, escapeStr, ilike: op === 'ILIKE' };
     }
 
+    if (this.match('KEYWORD', 'BETWEEN')) {
+      this.consume();
+      const lower = this.parseAdditive();
+      this.consume('KEYWORD', 'AND');
+      const upper = this.parseAdditive();
+      
+      const leftExpr: Expr = { type: 'Binary', left, operator: '>=', right: lower };
+      const rightExpr: Expr = { type: 'Binary', left, operator: '<=', right: upper };
+      const betweenExpr: Expr = { type: 'Logical', left: leftExpr, operator: 'AND', right: rightExpr };
+      
+      return not ? { type: 'Not', expr: betweenExpr } : betweenExpr;
+    }
+
     if (this.match('KEYWORD', 'IN')) {
       this.consume();
       this.consume('SYMBOL', '(');

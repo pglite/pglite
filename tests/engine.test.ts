@@ -2059,6 +2059,24 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 33: BETWEEN operator", () => {
+    test("33.1 Basic BETWEEN and NOT BETWEEN", async () => {
+      await db.exec(`CREATE TABLE between_test (id SERIAL PRIMARY KEY, val NUMBER)`);
+      await db.exec(`INSERT INTO between_test (val) VALUES (10), (20), (30), (40), (50)`);
+
+      const rows1 = await db.query(`SELECT val FROM between_test WHERE val BETWEEN 20 AND 40 ORDER BY val`);
+      expect(rows1.length).toBe(3);
+      expect(rows1[0].val).toBe(20);
+      expect(rows1[1].val).toBe(30);
+      expect(rows1[2].val).toBe(40);
+
+      const rows2 = await db.query(`SELECT val FROM between_test WHERE val NOT BETWEEN 20 AND 40 ORDER BY val`);
+      expect(rows2.length).toBe(2);
+      expect(rows2[0].val).toBe(10);
+      expect(rows2[1].val).toBe(50);
+    });
+  });
+
   describe("LEVEL 31: Complex DDL with ADD CONSTRAINT", () => {
     test("31.1 Parse and execute ALTER TABLE ADD CONSTRAINT FOREIGN KEY", async () => {
       const sql = `
