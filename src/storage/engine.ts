@@ -4,7 +4,8 @@ const PAGE_SIZE = 4096;
 
 // Vite/Browser compatibility: Tránh import trực tiếp module 'buffer' của Node.js.
 // Chúng ta sử dụng global Buffer nếu có (Node.js hoặc polyfill) hoặc dùng Uint8Array fallback.
-const _Buffer = typeof globalThis !== "undefined" ? (globalThis as any).Buffer : undefined;
+const _Buffer =
+  typeof globalThis !== "undefined" ? (globalThis as any).Buffer : undefined;
 
 /**
  * Shim cho Buffer để hoạt động trên cả Node.js và trình duyệt.
@@ -19,13 +20,17 @@ const Buffer = {
     return extendUint8Array(buf);
   },
   from: (data: any, enc?: string) => {
-    const buf = _Buffer ? _Buffer.from(data, enc) : (typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data));
+    const buf = _Buffer
+      ? _Buffer.from(data, enc)
+      : typeof data === "string"
+        ? new TextEncoder().encode(data)
+        : new Uint8Array(data);
     return extendUint8Array(buf);
   },
   byteLength: (str: string) => {
     if (_Buffer) return _Buffer.byteLength(str);
     return new TextEncoder().encode(str).length;
-  }
+  },
 };
 
 /**
@@ -35,39 +40,81 @@ function extendUint8Array(buf: Uint8Array): any {
   if ((buf as any).readUInt32LE) return buf;
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   Object.defineProperties(buf, {
-    readUInt32LE: { value: (offset: number) => dv.getUint32(offset, true), configurable: true },
-    writeUInt32LE: { value: (val: number, offset: number) => dv.setUint32(offset, val, true), configurable: true },
-    readUInt16LE: { value: (offset: number) => dv.getUint16(offset, true), configurable: true },
-    writeUInt16LE: { value: (val: number, offset: number) => dv.setUint16(offset, val, true), configurable: true },
-    readUInt8: { value: (offset: number) => dv.getUint8(offset), configurable: true },
-    writeUInt8: { value: (val: number, offset: number) => dv.setUint8(offset, val), configurable: true },
-    readDoubleLE: { value: (offset: number) => dv.getFloat64(offset, true), configurable: true },
-    writeDoubleLE: { value: (val: number, offset: number) => dv.setFloat64(offset, val, true), configurable: true },
+    readUInt32LE: {
+      value: (offset: number) => dv.getUint32(offset, true),
+      configurable: true,
+    },
+    writeUInt32LE: {
+      value: (val: number, offset: number) => dv.setUint32(offset, val, true),
+      configurable: true,
+    },
+    readUInt16LE: {
+      value: (offset: number) => dv.getUint16(offset, true),
+      configurable: true,
+    },
+    writeUInt16LE: {
+      value: (val: number, offset: number) => dv.setUint16(offset, val, true),
+      configurable: true,
+    },
+    readUInt8: {
+      value: (offset: number) => dv.getUint8(offset),
+      configurable: true,
+    },
+    writeUInt8: {
+      value: (val: number, offset: number) => dv.setUint8(offset, val),
+      configurable: true,
+    },
+    readDoubleLE: {
+      value: (offset: number) => dv.getFloat64(offset, true),
+      configurable: true,
+    },
+    writeDoubleLE: {
+      value: (val: number, offset: number) => dv.setFloat64(offset, val, true),
+      configurable: true,
+    },
     copy: {
-      value: (target: Uint8Array, targetStart: number, srcStart: number, srcEnd: number) => {
-        target.set(buf.subarray(srcStart || 0, srcEnd || buf.length), targetStart || 0);
+      value: (
+        target: Uint8Array,
+        targetStart: number,
+        srcStart: number,
+        srcEnd: number,
+      ) => {
+        target.set(
+          buf.subarray(srcStart || 0, srcEnd || buf.length),
+          targetStart || 0,
+        );
       },
-      configurable: true
+      configurable: true,
     },
     toString: {
       value: (enc?: string, start?: number, end?: number) => {
-        return new TextDecoder().decode(buf.subarray(start || 0, end || buf.length));
+        return new TextDecoder().decode(
+          buf.subarray(start || 0, end || buf.length),
+        );
       },
-      configurable: true
+      configurable: true,
     },
     write: {
       value: (str: string, offset?: number, length?: number) => {
-        const result = new TextEncoder().encodeInto(str, buf.subarray(offset || 0, (offset || 0) + (length || buf.length - (offset || 0))));
+        const result = new TextEncoder().encodeInto(
+          str,
+          buf.subarray(
+            offset || 0,
+            (offset || 0) + (length || buf.length - (offset || 0)),
+          ),
+        );
         return result.written;
       },
-      configurable: true
+      configurable: true,
     },
     subarray: {
       value: (begin?: number, end?: number) => {
-        return extendUint8Array(Uint8Array.prototype.subarray.call(buf, begin, end));
+        return extendUint8Array(
+          Uint8Array.prototype.subarray.call(buf, begin, end),
+        );
       },
-      configurable: true
-    }
+      configurable: true,
+    },
   });
   return buf;
 }
@@ -76,8 +123,18 @@ function extendUint8Array(buf: Uint8Array): any {
 type Buffer = any;
 
 export interface VFSHandle {
-  read(buffer: Uint8Array, offset: number, length: number, position: number): Promise<number>;
-  write(buffer: Uint8Array, offset: number, length: number, position: number): Promise<number>;
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<number>;
+  write(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<number>;
   stat(): Promise<{ size: number }>;
   truncate(length: number): Promise<void>;
   close(): Promise<void>;
@@ -99,7 +156,11 @@ class FileHandlePool {
   private static opening = new Map<string, Promise<VFSHandle>>();
   private static MAX_FDS = 4096;
 
-  static async getHandle(vfs: VFS, path: string, flags: string): Promise<VFSHandle> {
+  static async getHandle(
+    vfs: VFS,
+    path: string,
+    flags: string,
+  ): Promise<VFSHandle> {
     const existing = this.pool.get(path);
     if (existing) {
       this.pool.delete(path);
@@ -192,7 +253,10 @@ class WAL {
   private flushTimer: any = null;
   private static readonly MAX_WAL_BUFFER = 65536;
 
-  constructor(private vfs: VFS, private filepath: string) {
+  constructor(
+    private vfs: VFS,
+    private filepath: string,
+  ) {
     this.buffer = Buffer.allocUnsafe(WAL.MAX_WAL_BUFFER);
   }
 
@@ -285,6 +349,7 @@ class WAL {
 
 class Pager {
   private static pagers = new Map<string, Pager>();
+  private refCount = 0;
 
   public static get(vfs: VFS, filepath: string): Pager {
     let pager = this.pagers.get(filepath);
@@ -292,6 +357,7 @@ class Pager {
       pager = new Pager(vfs, filepath);
       this.pagers.set(filepath, pager);
     }
+    pager.refCount++;
     return pager;
   }
 
@@ -302,7 +368,10 @@ class Pager {
   private handle?: VFSHandle;
   private initialized = false;
 
-  private constructor(private vfs: VFS, private filepath: string) {
+  private constructor(
+    private vfs: VFS,
+    private filepath: string,
+  ) {
     this.wal = new WAL(vfs, filepath + ".wal");
   }
 
@@ -427,29 +496,50 @@ class Pager {
   }
 
   public async close() {
-    if (this.handle) {
-      FileHandlePool.releaseHandle(this.filepath);
-      await FileHandlePool.close(this.filepath);
-      this.handle = undefined;
+    this.refCount--;
+    if (this.refCount <= 0) {
+      if (this.handle) {
+        FileHandlePool.releaseHandle(this.filepath);
+        await FileHandlePool.close(this.filepath);
+        this.handle = undefined;
+      }
+      await this.wal.close();
+      Pager.pagers.delete(this.filepath);
+      this.initialized = false;
     }
-    await this.wal.close();
   }
 
   public async destroy() {
-    await this.close();
-    Pager.pagers.delete(this.filepath);
-    if (await this.vfs.exists(this.filepath)) {
-      await this.vfs.unlink(this.filepath);
-    }
-    if (await this.vfs.exists(this.filepath + ".wal")) {
-      await this.vfs.unlink(this.filepath + ".wal");
+    this.refCount--;
+    if (this.refCount <= 0) {
+      if (this.handle) {
+        FileHandlePool.releaseHandle(this.filepath);
+        await FileHandlePool.close(this.filepath);
+        this.handle = undefined;
+      }
+      await this.wal.close();
+      Pager.pagers.delete(this.filepath);
+      this.initialized = false;
+      if (await this.vfs.exists(this.filepath)) {
+        await this.vfs.unlink(this.filepath);
+      }
+      if (await this.vfs.exists(this.filepath + ".wal")) {
+        await this.vfs.unlink(this.filepath + ".wal");
+      }
     }
   }
 }
 
 class SlottedPage {
-  constructor(public buf: Buffer) {
-    if (this.buf.readUInt16LE(6) === 0) {
+  constructor(
+    public buf: Buffer,
+    isNew: boolean = false,
+  ) {
+    // Only initialize if explicitly new or if it's a completely empty buffer
+    // Checking byte 6 (freeSpacePointer) is unreliable for B-Tree nodes
+    const isEmpty =
+      this.buf.readUInt32LE(0) === 0 && this.buf.readUInt32LE(4) === 0;
+    if (isNew || isEmpty) {
       this.buf.writeUInt32LE(0xffffffff, 0);
       this.buf.writeUInt16LE(0, 4);
       this.buf.writeUInt16LE(PAGE_SIZE, 6);
@@ -505,7 +595,7 @@ class SlottedPage {
       const slotOffset = 8 + i * 4;
       const dataOffset = buffer.readUInt16LE(slotOffset);
       if (dataOffset === 0) continue;
-      
+
       const dataLen = buffer.readUInt16LE(slotOffset + 2);
       yield {
         offset: dataOffset,
@@ -561,8 +651,8 @@ class BTree {
     let offset = 7;
     let actualNumKeys = node.keys.length;
     for (let i = 0; i < node.keys.length; i++) {
-      const isNum = typeof node.keys[i] === 'number';
-      const typeInd = isNum ? 'N' : 'S';
+      const isNum = typeof node.keys[i] === "number";
+      const typeInd = isNum ? "N" : "S";
       const keyStr = typeInd + String(node.keys[i]);
       const kLen = Buffer.byteLength(keyStr);
       if (offset + 2 + kLen + (node.isLeaf ? 6 : 4) > PAGE_SIZE) {
@@ -591,8 +681,15 @@ class BTree {
 
   private deserializeNode(pageId: number, buf: Buffer) {
     if (!buf || buf.length < 7)
-      return { pageId, isLeaf: true, keys: [], vals: [], children: [], nextLeaf: 0xffffffff };
-    
+      return {
+        pageId,
+        isLeaf: true,
+        keys: [],
+        vals: [],
+        children: [],
+        nextLeaf: 0xffffffff,
+      };
+
     const isLeaf = buf.readUInt8(0) === 1;
     const numKeys = buf.readUInt16LE(1);
     const nextLeaf = buf.readUInt32LE(3);
@@ -607,13 +704,16 @@ class BTree {
       const typeInd = kStr[0];
       const valStr = kStr.substring(1);
       // Legacy fallback if type indicator is missing (for older files if any)
-      if (typeInd !== 'N' && typeInd !== 'S') {
+      if (typeInd !== "N" && typeInd !== "S") {
         keys.push(isNaN(Number(kStr)) ? kStr : Number(kStr));
       } else {
-        keys.push(typeInd === 'N' ? Number(valStr) : valStr);
+        keys.push(typeInd === "N" ? Number(valStr) : valStr);
       }
       if (isLeaf) {
-        vals.push({ pageId: buf.readUInt32LE(offset), slotIdx: buf.readUInt16LE(offset + 4) });
+        vals.push({
+          pageId: buf.readUInt32LE(offset),
+          slotIdx: buf.readUInt16LE(offset + 4),
+        });
         offset += 6;
       } else {
         children.push(buf.readUInt32LE(offset));
@@ -642,16 +742,19 @@ class BTree {
         const typeInd = kStr[0];
         const valStr = kStr.substring(1);
         let nodeKey;
-        if (typeInd !== 'N' && typeInd !== 'S') {
+        if (typeInd !== "N" && typeInd !== "S") {
           nodeKey = isNaN(Number(kStr)) ? kStr : Number(kStr);
         } else {
-          nodeKey = typeInd === 'N' ? Number(valStr) : valStr;
+          nodeKey = typeInd === "N" ? Number(valStr) : valStr;
         }
 
         if (isLeaf) {
           if (target === nodeKey) {
             const valOffset = offset + 2 + kLen;
-            return { pageId: buf.readUInt32LE(valOffset), slotIdx: buf.readUInt16LE(valOffset + 4) };
+            return {
+              pageId: buf.readUInt32LE(valOffset),
+              slotIdx: buf.readUInt16LE(valOffset + 4),
+            };
           } else if (target < nodeKey) {
             return null;
           }
@@ -671,11 +774,20 @@ class BTree {
     return null;
   }
 
-  async insert(key: any, val: { pageId: number; slotIdx: number }): Promise<number> {
+  async insert(
+    key: any,
+    val: { pageId: number; slotIdx: number },
+  ): Promise<number> {
     if (this.rootPageId === 0 || this.rootPageId === 0xffffffff) {
       this.rootPageId = await this.pager.allocatePage();
       const buf = await this.pager.readPage(this.rootPageId);
-      const node = { isLeaf: true, keys: [key], vals: [val], children: [], nextLeaf: 0xffffffff };
+      const node = {
+        isLeaf: true,
+        keys: [key],
+        vals: [val],
+        children: [],
+        nextLeaf: 0xffffffff,
+      };
       this.serializeNode(node, buf);
       await this.pager.writePage(this.rootPageId, buf);
       BTree.nodeCache.set(buf, node);
@@ -698,7 +810,10 @@ class BTree {
     let i = 0;
     while (i < leaf.keys.length && key > leaf.keys[i]) i++;
     if (i < leaf.keys.length && leaf.keys[i] === key) leaf.vals[i] = val;
-    else { leaf.keys.splice(i, 0, key); leaf.vals.splice(i, 0, val); }
+    else {
+      leaf.keys.splice(i, 0, key);
+      leaf.vals.splice(i, 0, val);
+    }
 
     let currNode = leaf;
     while (currNode.keys.length > 32) {
@@ -718,9 +833,11 @@ class BTree {
         currNode.nextLeaf = rightPageId;
       }
       BTree.nodeCache.set(rightBuf, rightNode);
-      
-      let promoteKey = currNode.isLeaf ? rightNode.keys[0] : rightNode.keys.shift();
-      
+
+      let promoteKey = currNode.isLeaf
+        ? rightNode.keys[0]
+        : rightNode.keys.shift();
+
       const currBuf = await this.pager.readPage(currNode.pageId);
       this.serializeNode(currNode, currBuf);
       await this.pager.writePage(currNode.pageId, currBuf);
@@ -733,8 +850,12 @@ class BTree {
         this.rootPageId = await this.pager.allocatePage();
         const rootBuf = await this.pager.readPage(this.rootPageId);
         const rootNode = {
-          pageId: this.rootPageId, isLeaf: false, keys: [promoteKey], vals: [],
-          children: [currNode.pageId, rightNode.pageId], nextLeaf: 0xffffffff
+          pageId: this.rootPageId,
+          isLeaf: false,
+          keys: [promoteKey],
+          vals: [],
+          children: [currNode.pageId, rightNode.pageId],
+          nextLeaf: 0xffffffff,
         };
         this.serializeNode(rootNode, rootBuf);
         await this.pager.writePage(this.rootPageId, rootBuf);
@@ -743,7 +864,8 @@ class BTree {
       } else {
         const parent = path[path.length - 1];
         let pIdx = 0;
-        while (pIdx < parent.keys.length && promoteKey > parent.keys[pIdx]) pIdx++;
+        while (pIdx < parent.keys.length && promoteKey > parent.keys[pIdx])
+          pIdx++;
         parent.keys.splice(pIdx, 0, promoteKey);
         parent.children.splice(pIdx + 1, 0, rightNode.pageId);
         currNode = parent;
@@ -759,7 +881,9 @@ class BTree {
     return this.rootPageId;
   }
 
-  async delete(key: any) { /* simplified tombstone */ }
+  async delete(key: any) {
+    /* simplified tombstone */
+  }
 }
 
 export interface TableData {
@@ -889,7 +1013,10 @@ export class StorageEngine {
     { name: "indisunique", dataType: "BOOLEAN", isPrimaryKey: false },
   ];
 
-  constructor(vfs: VFS, private filepath: string) {
+  constructor(
+    vfs: VFS,
+    public filepath: string,
+  ) {
     this.vfs = vfs;
     this.pager = Pager.get(vfs, filepath);
   }
@@ -948,7 +1075,10 @@ export class StorageEngine {
     let meta = StorageEngine.dbMetaCache.get(cacheKey) || null;
 
     if (!meta) {
-      const btree = new BTree(this.pager, this.clusterCatalogDef.indexRootPage!);
+      const btree = new BTree(
+        this.pager,
+        this.clusterCatalogDef.indexRootPage!,
+      );
       const loc = await btree.get(dbName);
 
       if (loc) {
@@ -961,6 +1091,8 @@ export class StorageEngine {
               StorageEngine.CLUSTER_CATALOG_COLS,
               resolved,
             );
+            // Persist found meta to cache
+            if (meta) StorageEngine.dbMetaCache.set(cacheKey, meta);
             break;
           }
         }
@@ -1137,7 +1269,10 @@ export class StorageEngine {
     };
   }
 
-  private async insertRowIntoCatalog(table: TableData, row: any): Promise<{ pageId: number, slotIdx: number }> {
+  private async insertRowIntoCatalog(
+    table: TableData,
+    row: any,
+  ): Promise<{ pageId: number; slotIdx: number }> {
     let pageId = table.lastPage;
     let buf = await this.pager.readPage(pageId);
     let page = new SlottedPage(buf);
@@ -1200,7 +1335,10 @@ export class StorageEngine {
       this.clusterCatalogDef &&
       table.firstPage === this.clusterCatalogDef.firstPage
     ) {
-      const btree = new BTree(this.pager, this.clusterCatalogDef.indexRootPage!);
+      const btree = new BTree(
+        this.pager,
+        this.clusterCatalogDef.indexRootPage!,
+      );
       const newRoot = await btree.insert(row.name, { pageId, slotIdx });
       if (newRoot !== this.clusterCatalogDef.indexRootPage) {
         this.clusterCatalogDef.indexRootPage = newRoot;
@@ -1460,8 +1598,26 @@ export class StorageEngine {
                 onUpdate: attr.attref_on_update || undefined,
               }
             : undefined,
-          defaultVal: attr.attdef ? (() => { try { const p = JSON.parse(attr.attdef); return p?.__generated__ ? undefined : p; } catch { return undefined; } })() : undefined,
-          generatedExpr: attr.attdef ? (() => { try { const p = JSON.parse(attr.attdef); return p?.__generated__ ? p.expr : undefined; } catch { return undefined; } })() : undefined,
+          defaultVal: attr.attdef
+            ? (() => {
+                try {
+                  const p = JSON.parse(attr.attdef);
+                  return p?.__generated__ ? undefined : p;
+                } catch {
+                  return undefined;
+                }
+              })()
+            : undefined,
+          generatedExpr: attr.attdef
+            ? (() => {
+                try {
+                  const p = JSON.parse(attr.attdef);
+                  return p?.__generated__ ? p.expr : undefined;
+                } catch {
+                  return undefined;
+                }
+              })()
+            : undefined,
         };
       });
 
@@ -1547,7 +1703,11 @@ export class StorageEngine {
         attref_col: col.references?.column || null,
         attref_on_delete: col.references?.onDelete || null,
         attref_on_update: col.references?.onUpdate || null,
-        attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : (col.generatedExpr ? JSON.stringify({ __generated__: true, expr: col.generatedExpr }) : null),
+        attdef: col.defaultVal
+          ? JSON.stringify(col.defaultVal)
+          : col.generatedExpr
+            ? JSON.stringify({ __generated__: true, expr: col.generatedExpr })
+            : null,
         atttypmod: -1,
         attisdropped: false,
       });
@@ -1555,7 +1715,9 @@ export class StorageEngine {
         await this.insertRowIntoCatalog(this.pgAttrdefDef, {
           adrelid: firstPage,
           adnum: i + 1,
-          adbin: col.generatedExpr ? JSON.stringify({ __generated__: true, expr: col.generatedExpr }) : JSON.stringify(col.defaultVal),
+          adbin: col.generatedExpr
+            ? JSON.stringify({ __generated__: true, expr: col.generatedExpr })
+            : JSON.stringify(col.defaultVal),
         });
       }
     }
@@ -1753,14 +1915,14 @@ export class StorageEngine {
     return result;
   }
 
-  // Pre-allocated buffer for row serialization to minimize GC pressure (1MB)
-  private static readonly SERIALIZATION_SCRATCH = Buffer.allocUnsafe(
-    1024 * 1024,
-  );
-
   private async handleOverflow(data: Buffer): Promise<Buffer> {
-    if (data.length <= 4000) return data;
-    
+    if (data.length <= 4000) {
+      // Return a copy to prevent corruption if the source buffer is reused
+      const copy = Buffer.allocUnsafe(data.length);
+      data.copy(copy);
+      return copy;
+    }
+
     let currDataOffset = 0;
     let firstPageId = -1;
     let prevPageId = -1;
@@ -1786,7 +1948,7 @@ export class StorageEngine {
     }
 
     const ptrBuf = Buffer.alloc(10);
-    ptrBuf.writeUInt16LE((data.readUInt16LE(0) | 0x8000), 0);
+    ptrBuf.writeUInt16LE(data.readUInt16LE(0) | 0x8000, 0);
     ptrBuf.writeUInt32LE(firstPageId, 2);
     ptrBuf.writeUInt32LE(data.length, 6);
     return ptrBuf;
@@ -1819,7 +1981,6 @@ export class StorageEngine {
     const colLen = columns.length;
     const nullBitmapLen = (colLen + 7) >> 3;
 
-    // Pass 1: Calculate Payload Size and Pre-cache strings to avoid redundant stringification
     let payloadSize = 0;
     const cache = new Array(colLen);
 
@@ -1831,27 +1992,22 @@ export class StorageEngine {
       const dt = col!.dataType.toUpperCase();
       if (this.isNumericType(dt)) {
         payloadSize += 8;
-        cache[i] = 1; // numeric
+        cache[i] = 1;
       } else if (dt.startsWith("BOOL")) {
         payloadSize += 1;
-        cache[i] = 2; // bool
+        cache[i] = 2;
       } else {
         const str = typeof val === "object" ? JSON.stringify(val) : String(val);
         const byteLen = Buffer.byteLength(str);
         payloadSize += 4 + byteLen;
-        cache[i] = str; // string/json
+        cache[i] = str;
       }
     }
 
     const totalSize = 2 + nullBitmapLen + payloadSize;
-    let target = StorageEngine.SERIALIZATION_SCRATCH;
+    // Do not use a static scratch buffer to avoid concurrency corruption
+    const target = Buffer.allocUnsafe(totalSize);
 
-    // Safety check for massive rows
-    if (totalSize > target.length) {
-      target = Buffer.allocUnsafe(totalSize);
-    }
-
-    // Pass 2: Write data directly into scratch buffer
     target.writeUInt16LE(colLen, 0);
     const nullBitmapOffset = 2;
     target.fill(0, nullBitmapOffset, nullBitmapOffset + nullBitmapLen);
@@ -2303,14 +2459,15 @@ export class StorageEngine {
     const table = await this.getTableAsync(fullName);
     if (!table) throw new Error(`Table ${fullName} not found`);
 
-    if (this.dbMeta && (
-      table.firstPage === this.dbMeta.nsp_f ||
-      table.firstPage === this.dbMeta.cls_f ||
-      table.firstPage === this.dbMeta.att_f ||
-      table.firstPage === this.dbMeta.dsc_f ||
-      table.firstPage === this.dbMeta.ad_f ||
-      table.firstPage === this.dbMeta.idx_f
-    )) {
+    if (
+      this.dbMeta &&
+      (table.firstPage === this.dbMeta.nsp_f ||
+        table.firstPage === this.dbMeta.cls_f ||
+        table.firstPage === this.dbMeta.att_f ||
+        table.firstPage === this.dbMeta.dsc_f ||
+        table.firstPage === this.dbMeta.ad_f ||
+        table.firstPage === this.dbMeta.idx_f)
+    ) {
       await this.insertRowIntoCatalog(table, row);
       return;
     }
