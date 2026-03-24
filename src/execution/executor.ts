@@ -1126,7 +1126,7 @@ export class Executor {
       }
       
       if (!groups.has(key)) {
-        groups.set(key, { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, baseRow: row });
+        groups.set(key, { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, __DISTINCTS__: {}, baseRow: row });
       }
       const state = groups.get(key);
       state.__COUNT__++;
@@ -1141,7 +1141,46 @@ export class Executor {
           }
 
           if (target.fnName === "COUNT") {
-            state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
+            if (target.distinct && target.args && target.args[0]) {
+               const val = await this.evaluateExpr(storage, target.args[0], row, params);
+               if (val !== null && val !== undefined) {
+                 if (!state.__DISTINCTS__[colName]) state.__DISTINCTS__[colName] = new Set();
+                 const valKey = typeof val === 'object' ? JSON.stringify(val) : val;
+                 state.__DISTINCTS__[colName].add(valKey);
+               }
+            } else {
+               let isNotNull = true;
+               if (target.args && target.args[0] && !(target.args[0].type === "Identifier" && target.args[0].name === "*")) {
+                  const val = await this.evaluateExpr(storage, target.args[0], row, params);
+                  if (val === null || val === undefined) isNotNull = false;
+               }
+               if (isNotNull) state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
+            }
+          } else if (target.fnName === "SUM") {
+            if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = null;
+            if (target.args && target.args[0]) {
+               const val = await this.evaluateExpr(storage, target.args[0], row, params);
+               if (val !== null && val !== undefined) {
+                 if (state.__SUMS__[colName] === null) state.__SUMS__[colName] = 0;
+                 state.__SUMS__[colName] += val;
+               }
+            }
+          } else if (target.fnName === "MIN") {
+            if (target.args && target.args[0]) {
+               const val = await this.evaluateExpr(storage, target.args[0], row, params);
+               if (val !== null && val !== undefined) {
+                 if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = val;
+                 else if (val < state.__SUMS__[colName]) state.__SUMS__[colName] = val;
+               }
+            }
+          } else if (target.fnName === "MAX") {
+            if (target.args && target.args[0]) {
+               const val = await this.evaluateExpr(storage, target.args[0], row, params);
+               if (val !== null && val !== undefined) {
+                 if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = val;
+                 else if (val > state.__SUMS__[colName]) state.__SUMS__[colName] = val;
+               }
+            }
           } else if (target.fnName === "AVG") {
             if (!state.__SUMS__[colName]) state.__SUMS__[colName] = 0;
             if (target.args && target.args[0]) {
@@ -1166,7 +1205,7 @@ export class Executor {
     }
     
     if (groups.size === 0 && !stmt.groupBy) {
-       groups.set("all", { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, baseRow: {} });
+       groups.set("all", { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, __DISTINCTS__: {}, baseRow: {} });
     }
 
     for (const state of groups.values()) {
@@ -1179,9 +1218,13 @@ export class Executor {
           if (target.type === "Call") {
              const colName = this.getExprKey(target);
              if (target.fnName === "COUNT") {
-                const count = state.__COUNTS__[colName] || 0;
+                const count = target.distinct ? (state.__DISTINCTS__[colName]?.size || 0) : (state.__COUNTS__[colName] || 0);
                 outRow[alias || "count"] = count;
                 outRow[colName] = count;
+             } else if (target.fnName === "SUM" || target.fnName === "MIN" || target.fnName === "MAX") {
+                const val = state.__SUMS__[colName] === undefined ? null : state.__SUMS__[colName];
+                outRow[alias || target.fnName.toLowerCase()] = val;
+                outRow[colName] = val;
              } else if (target.fnName === "AVG") {
                 const sum = state.__SUMS__[colName] || 0;
                 const count = state.__COUNTS__[colName] || 0;
@@ -1457,6 +1500,7 @@ export class Executor {
         const fnName = expr.fnName.toUpperCase();
         if (fnName === "COUNT") return row.__COUNT__ || 0;
         if (fnName === "AVG") return row.__AVG__ || 0;
+        if (fnName === "SUM" || fnName === "MIN" || fnName === "MAX") return null;
         if (fnName === "ARRAY_AGG") return [];
 
         const args = [];

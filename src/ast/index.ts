@@ -12,7 +12,7 @@ export type Expr =
   | { type: 'Binary'; left: Expr; operator: string; right: Expr }
   | { type: 'Logical'; left: Expr; operator: string; right: Expr }
   | { type: 'Not'; expr: Expr }
-  | { type: 'Call'; fnName: string; args: Expr[]; argsOrderBy?: OrderBy[]; over?: { partitionBy?: Expr[]; orderBy?: OrderBy[] }; filter?: Expr }
+  | { type: 'Call'; fnName: string; args: Expr[]; distinct?: boolean; argsOrderBy?: OrderBy[]; over?: { partitionBy?: Expr[]; orderBy?: OrderBy[] }; filter?: Expr }
   | { type: 'In'; left: Expr; right: Expr[] | Statement; not?: boolean }
   | { type: 'Like'; left: Expr; right: Expr; not?: boolean; escapeStr?: string; ilike?: boolean }
   | { type: 'Alias'; expr: Expr; alias: string }

@@ -1272,6 +1272,56 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 34: Aggregate SUM, MIN, MAX and COUNT(DISTINCT)", () => {
+    test("34.1 Advanced aggregations", async () => {
+      await db.exec(`CREATE TABLE orders_34 (id SERIAL PRIMARY KEY, user_id INTEGER, total_amount NUMBER, status TEXT)`);
+      await db.exec(`INSERT INTO orders_34 (user_id, total_amount, status) VALUES 
+        (1, 100, 'completed'),
+        (1, 150, 'completed'),
+        (2, 200, 'completed'),
+        (2, 50, 'pending'),
+        (3, 300, 'completed'),
+        (3, 300, 'completed')
+      `);
+
+      const rows = await db.query(`
+        SELECT 
+          COUNT(*) AS total_orders, 
+          SUM(total_amount) AS total_revenue, 
+          MIN(total_amount) AS min_amount,
+          MAX(total_amount) AS max_amount,
+          COUNT(DISTINCT user_id) AS customers_with_orders 
+        FROM orders_34 
+        WHERE status = 'completed' 
+        LIMIT 1000
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].total_orders).toBe(5); // 1, 1, 2, 3, 3 are completed
+      expect(rows[0].total_revenue).toBe(1050); // 100 + 150 + 200 + 300 + 300
+      expect(rows[0].min_amount).toBe(100);
+      expect(rows[0].max_amount).toBe(300);
+      expect(rows[0].customers_with_orders).toBe(3); // users 1, 2, 3
+    });
+
+    test("34.2 COUNT with nulls", async () => {
+      await db.exec(`CREATE TABLE null_counts (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`INSERT INTO null_counts (val) VALUES ('a'), (NULL), ('b'), ('a')`);
+      
+      const rows = await db.query(`
+        SELECT 
+          COUNT(*) AS total,
+          COUNT(val) AS count_val,
+          COUNT(DISTINCT val) AS distinct_val
+        FROM null_counts
+      `);
+
+      expect(rows[0].total).toBe(4);
+      expect(rows[0].count_val).toBe(3); // 'a', 'b', 'a'
+      expect(rows[0].distinct_val).toBe(2); // 'a', 'b'
+    });
+  });
+
   describe("LEVEL 16: Aggregate FILTER", () => {
     beforeAll(async () => {
       await db.exec(

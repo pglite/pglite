@@ -380,6 +380,11 @@ export class Parser {
       if (this.match('SYMBOL', '(')) {
         this.consume();
         const args: Expr[] =[];
+        let distinct = false;
+        if (this.match('KEYWORD', 'DISTINCT')) {
+          this.consume();
+          distinct = true;
+        }
         let argsOrderBy: OrderBy[] | undefined;
         if (this.match('SYMBOL', '*')) {
           this.consume();
@@ -441,7 +446,7 @@ export class Parser {
           over = { partitionBy, orderBy };
         }
 
-        return { type: 'Call', fnName: name.toUpperCase(), args, argsOrderBy, over, filter };
+        return { type: 'Call', fnName: name.toUpperCase(), args, distinct, argsOrderBy, over, filter };
       }
       return { type: 'Identifier', name };
     }
