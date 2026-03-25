@@ -2170,4 +2170,124 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       }
     });
   });
+
+
+  describe("LEVEL 36: CREATE TABLE IF NOT EXISTS in Transaction", () => {
+    test("36.1 Create table if not exists in a transaction", async () => {
+      // Create first table successfully
+      await db.transaction(async (tx) => {
+        await tx.query(`CREATE TABLE IF NOT EXISTS tx_test_a (id SERIAL PRIMARY KEY, val TEXT)`);
+        await tx.query(`INSERT INTO tx_test_a (val) VALUES ('A')`);
+      });
+
+      // Failed transaction
+      try {
+        await db.transaction(async (tx) => {
+          await tx.query(`CREATE TABLE IF NOT EXISTS tx_test_fail (id SERIAL PRIMARY KEY, val TEXT)`);
+          await tx.query(`INSERT INTO tx_test_fail (val) VALUES ('B')`);
+          throw new Error("Simulate error");
+        });
+      } catch (e) {}
+
+      // Try creating table again in new transaction
+      await db.transaction(async (tx) => {
+        await tx.exec(`CREATE TABLE IF NOT EXISTS tx_test_b (id SERIAL PRIMARY KEY, val TEXT)`);
+        await tx.exec(`CREATE TABLE IF NOT EXISTS tx_test_b (id SERIAL PRIMARY KEY, val TEXT)`);
+        await tx.exec(`INSERT INTO tx_test_b (val) VALUES ('C')`);
+      });
+
+      const rowsA = await db.query(`SELECT * FROM tx_test_a`);
+      expect(rowsA.length).toBe(1);
+
+      expect(async () => {
+        await db.query(`SELECT * FROM tx_test_fail`);
+      }).toThrow();
+
+      const rowsB = await db.query(`SELECT * FROM tx_test_b`);
+      expect(rowsB.length).toBe(1);
+      expect(rowsB[0].val).toBe('C');
+    });
+  });
+
+  describe("LEVEL 35: Transaction Callback", () => {
+    test("35.1 Successful transaction", async () => {
+      await db.exec(`CREATE TABLE tx_cb_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      const res = await db.transaction(async (tx) => {
+        await tx.exec(`INSERT INTO tx_cb_test (val) VALUES ('A')`);
+        await tx.exec(`INSERT INTO tx_cb_test (val) VALUES ('B')`);
+        return 'success';
+      });
+      expect(res).toBe('success');
+      const rows = await db.query(`SELECT * FROM tx_cb_test`);
+      expect(rows.length).toBe(2);
+    });
+
+    test("35.2 Failed transaction (JS Error)", async () => {
+      try {
+        await db.transaction(async (tx) => {
+          await tx.exec(`INSERT INTO tx_cb_test (val) VALUES ('C')`);
+          throw new Error("Abort");
+        });
+      } catch (e) {}
+      const rows = await db.query(`SELECT * FROM tx_cb_test WHERE val = 'C'`);
+      expect(rows.length).toBe(0);
+    });
+
+    test("35.3 Failed transaction (SQL Error)", async () => {
+      try {
+        await db.transaction(async (tx) => {
+          await tx.exec(`INSERT INTO tx_cb_test (val) VALUES ('D')`);
+          await tx.exec(`INVALID SQL`);
+        });
+      } catch (e) {}
+      const rows = await db.query(`SELECT * FROM tx_cb_test WHERE val = 'D'`);
+      expect(rows.length).toBe(0);
+    });
+  });
+
+  describe("LEVEL 37: Multi-database Context via exec/query Overloads", () => {
+    test("37.1 Overloaded exec/query passing dbName as the second argument", async () => {
+      const customDbFile = "test_multidb.db";
+      if (existsSync(customDbFile)) unlinkSync(customDbFile);
+      if (existsSync(customDbFile + ".wal")) unlinkSync(customDbFile + ".wal");
+
+      const pg = new LitePostgres(customDbFile, { adapter: new NodeFSAdapter() });
+
+      // Create a table in database "db1" by omitting params array
+      await pg.exec(`CREATE TABLE custom_test (id SERIAL PRIMARY KEY, val TEXT)`, "db1");
+      
+      // Insert using the omitted params overload
+      await pg.exec(`INSERT INTO custom_test (val) VALUES ('Hello')`, "db1");
+
+      // Select using omitted params
+      const rows = await pg.query(`SELECT * FROM custom_test`, "db1");
+      expect(rows.length).toBe(1);
+      expect(rows[0].val).toBe('Hello');
+
+      // Attempt to read from default database ('postgres'), should fail because table isn't there
+      expect(async () => {
+        await pg.query(`SELECT * FROM custom_test`);
+      }).toThrow();
+
+      // Test transaction targeting specific db
+      await pg.transaction(async (tx) => {
+        await tx.exec(`INSERT INTO custom_test (val) VALUES ('World')`);
+      }, "db1");
+
+      const txRows = await pg.query(`SELECT * FROM custom_test`,[], "db1");
+      expect(txRows.length).toBe(2);
+      expect(txRows[1].val).toBe('World');
+
+      // Test transaction cross-database failure
+      expect(async () => {
+        await pg.transaction(async (tx) => {
+          await tx.exec(`INSERT INTO custom_test (val) VALUES ('Fail')`, "db2");
+        }, "db1");
+      }).toThrow();
+
+      await pg.close();
+      if (existsSync(customDbFile)) unlinkSync(customDbFile);
+      if (existsSync(customDbFile + ".wal")) unlinkSync(customDbFile + ".wal");
+    });
+  });
 });

@@ -926,7 +926,8 @@ export class StorageEngine {
   private pkIndexes = new LRUCache<string, BTree>(500);
   private tempTables = new Map<string, any[]>();
   private inTransaction = false;
-  private txBackup: string | null = null;
+  private txDbMetaBackup: string | null = null;
+  private txClusterMetaBackup: string | null = null;
 
   private currentDbName?: string;
   private clusterInitialized = false;
@@ -2602,10 +2603,17 @@ export class StorageEngine {
   public begin(): void {
     if (this.inTransaction) return;
     this.inTransaction = true;
-    // Transactional backup for catalogs is complex, for now we just track state
+    if (this.dbMeta) {
+      this.txDbMetaBackup = JSON.stringify(this.dbMeta);
+    }
+    if (this.clusterCatalogDef) {
+      this.txClusterMetaBackup = JSON.stringify(this.clusterCatalogDef);
+    }
   }
   public async commit(): Promise<void> {
     this.inTransaction = false;
+    this.txDbMetaBackup = null;
+    this.txClusterMetaBackup = null;
     await this.flush();
   }
   public isInTransaction(): boolean {
@@ -2619,6 +2627,16 @@ export class StorageEngine {
       this.schemaCache = [];
       this.pkIndexes.clear();
       this.inTransaction = false;
+
+      if (this.txDbMetaBackup) {
+        this.dbMeta = JSON.parse(this.txDbMetaBackup);
+        this.refreshCatalogDefs();
+        this.txDbMetaBackup = null;
+      }
+      if (this.txClusterMetaBackup) {
+        this.clusterCatalogDef = JSON.parse(this.txClusterMetaBackup);
+        this.txClusterMetaBackup = null;
+      }
     }
   }
 

@@ -32,6 +32,7 @@ export class LitePostgres {
   private currentDb?: string;
   private destroyOnClose: boolean;
   private txRelease?: () => void;
+  private queue = Promise.resolve();
 
   constructor(filepath: string, options: { database?: string, adapter: VFS, destroyOnClose?: boolean }) {
     this.defaultDb = options.database || 'postgres';
@@ -45,34 +46,134 @@ export class LitePostgres {
   /**
    * Used for statements that do not return rows (CREATE, INSERT, UPDATE, DELETE)
    */
-  public async exec<T = any>(sql: string, params: any[] = [], dbName?: string): Promise<T> {
-    return this.run(sql, params, dbName || this.defaultDb);
+  public async exec<T = any>(sql: string, params?: any[] | string, dbName?: string): Promise<T> {
+    let actualParams: any[] =[];
+    let actualDbName = dbName;
+    if (typeof params === 'string') {
+      actualDbName = params;
+    } else if (Array.isArray(params)) {
+      actualParams = params;
+    }
+
+    return new Promise((resolve, reject) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          resolve(await this.run(sql, actualParams, actualDbName || this.defaultDb));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
   }
 
   /**
    * Used for statements that return rows (SELECT)
    */
-  public async query<T = any>(sql: string, params: any[] = [], dbName?: string): Promise<T[]> {
-    const result = await this.run(sql, params, dbName || this.defaultDb);
-    return Array.isArray(result) ? result : [];
+  public async query<T = any>(sql: string, params?: any[] | string, dbName?: string): Promise<T[]> {
+    let actualParams: any[] =[];
+    let actualDbName = dbName;
+    if (typeof params === 'string') {
+      actualDbName = params;
+    } else if (Array.isArray(params)) {
+      actualParams = params;
+    }
+
+    return new Promise((resolve, reject) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
+          resolve(Array.isArray(result) ? result :[]);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  /**
+   * Execute a callback function within a database transaction.
+   * If the callback resolves, the transaction is committed.
+   * If the callback throws an error, the transaction is rolled back.
+   */
+  public async transaction<T>(callback: (tx: LitePostgres) => Promise<T>, dbName?: string): Promise<T> {
+    const txDb = dbName || this.defaultDb;
+    return new Promise((resolve, reject) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          await this.run('BEGIN',[], txDb);
+          
+          const txObj = new Proxy(this, {
+            get: (target, prop) => {
+              if (prop === 'exec') return (sql: string, p?: any[] | string, db?: string) => {
+                let actualP: any[] =[];
+                let actualDb = db;
+                if (typeof p === 'string') { actualDb = p; } else if (Array.isArray(p)) { actualP = p; }
+                return target.run(sql, actualP, actualDb || txDb);
+              };
+              if (prop === 'query') return async (sql: string, p?: any[] | string, db?: string) => {
+                let actualP: any[] =[];
+                let actualDb = db;
+                if (typeof p === 'string') { actualDb = p; } else if (Array.isArray(p)) { actualP = p; }
+                const res = await target.run(sql, actualP, actualDb || txDb);
+                return Array.isArray(res) ? res :[];
+              };
+              if (prop === 'transaction') return async () => { throw new Error("Nested transactions not supported"); };
+              return (target as any)[prop];
+            }
+          });
+
+          const result = await callback(txObj as unknown as LitePostgres);
+          
+          if (this.storage.isInTransaction()) {
+            await this.run('COMMIT',[], txDb);
+          }
+          resolve(result);
+        } catch (error) {
+          if (this.storage.isInTransaction()) {
+            try {
+              await this.run('ROLLBACK',[], txDb);
+            } catch (rollbackError) {}
+          }
+          reject(error);
+        }
+      });
+    });
   }
 
   /**
    * Explicitly release resources. Crucial for handling 1M+ database instances.
    */
   public async close(): Promise<void> {
-    if (this.destroyOnClose) {
-      await this.storage.destroy();
-    } else {
-      await this.storage.close();
-    }
+    return new Promise((resolve, reject) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          if (this.destroyOnClose) {
+            await this.storage.destroy();
+          } else {
+            await this.storage.close();
+          }
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
   }
 
   /**
    * Explicitly destroy the database files.
    */
   public async destroy(): Promise<void> {
-    await this.storage.destroy();
+    return new Promise((resolve, reject) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          await this.storage.destroy();
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
   }
 
   private async run(sql: string, params: any[] = [], dbName: string): Promise<any> {
@@ -85,6 +186,9 @@ export class LitePostgres {
     try {
       sql = sql.trim();
       if (this.currentDb !== dbName) {
+        if (this.storage.isInTransaction()) {
+          throw new Error("Cannot switch database within a transaction");
+        }
         await this.storage.init(dbName);
         this.currentDb = dbName;
       }
