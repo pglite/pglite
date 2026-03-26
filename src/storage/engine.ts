@@ -619,8 +619,13 @@ class SlottedPage {
       this.buf.writeUInt16LE(data.length, slotOffset + 2);
       return true;
     } else {
-      this.deleteTuple(slotIdx);
-      return this.insertTuple(data) !== -1;
+      // Allocate new space but retain the same slot index to prevent index corruption
+      if (data.length > this.getFreeSpace()) return false;
+      this.freeSpacePointer -= data.length;
+      data.copy(this.buf, this.freeSpacePointer);
+      this.buf.writeUInt16LE(this.freeSpacePointer, slotOffset);
+      this.buf.writeUInt16LE(data.length, slotOffset + 2);
+      return true;
     }
   }
 }
@@ -1301,18 +1306,25 @@ export class StorageEngine {
         p0.writeUInt32LE(table.lastPage, 8);
         await this.pager.writePage(0, p0);
       } else if (this.dbMeta) {
-        if (table.firstPage === this.dbMeta.nsp_f)
+        if (table.firstPage === this.dbMeta.nsp_f) {
           this.dbMeta.nsp_l = newPageId;
-        else if (table.firstPage === this.dbMeta.cls_f)
+          this.pgNamespaceDef.lastPage = newPageId;
+        } else if (table.firstPage === this.dbMeta.cls_f) {
           this.dbMeta.cls_l = newPageId;
-        else if (table.firstPage === this.dbMeta.att_f)
+          this.pgClassDef.lastPage = newPageId;
+        } else if (table.firstPage === this.dbMeta.att_f) {
           this.dbMeta.att_l = newPageId;
-        else if (table.firstPage === this.dbMeta.dsc_f)
+          this.pgAttributeDef.lastPage = newPageId;
+        } else if (table.firstPage === this.dbMeta.dsc_f) {
           this.dbMeta.dsc_l = newPageId;
-        else if (table.firstPage === this.dbMeta.ad_f)
+          this.pgDescriptionDef.lastPage = newPageId;
+        } else if (table.firstPage === this.dbMeta.ad_f) {
           this.dbMeta.ad_l = newPageId;
-        else if (table.firstPage === this.dbMeta.idx_f)
+          this.pgAttrdefDef.lastPage = newPageId;
+        } else if (table.firstPage === this.dbMeta.idx_f) {
           this.dbMeta.idx_l = newPageId;
+          this.pgIndexDef.lastPage = newPageId;
+        }
 
         await this.updateRowsInCatalog(
           this.clusterCatalogDef,
@@ -1419,8 +1431,15 @@ export class StorageEngine {
 
     const attNums = [];
     for (const col of columns) {
-      const attrIdx = table.columns.findIndex((c) => c.name === col);
-      if (attrIdx === -1) throw new Error(`Column ${col} does not exist in table ${fullName}`);
+      let attrIdx = table.columns.findIndex((c) => c.name === col);
+      if (attrIdx === -1) {
+        const cleanCol = col.replace(/^"|"$/g, '').trim().toLowerCase();
+        attrIdx = table.columns.findIndex((c) => c.name.replace(/^"|"$/g, '').trim().toLowerCase() === cleanCol);
+      }
+      if (attrIdx === -1) {
+        const available = table.columns.map(c => c.name).join(', ');
+        throw new Error(`Column '${col}' does not exist in table ${fullName}. Available columns: [${available}]`);
+      }
       attNums.push(attrIdx + 1);
     }
 
@@ -1702,6 +1721,28 @@ export class StorageEngine {
         uniqueColumns,
         referencingColumns,
       };
+
+      if (this.dbMeta) {
+        if (relRow.oid === this.dbMeta.nsp_f) {
+          data.lastPage = this.dbMeta.nsp_l;
+          data.indexRootPage = this.dbMeta.nspIdx;
+        } else if (relRow.oid === this.dbMeta.cls_f) {
+          data.lastPage = this.dbMeta.cls_l;
+          data.indexRootPage = this.dbMeta.clsIdx;
+        } else if (relRow.oid === this.dbMeta.att_f) {
+          data.lastPage = this.dbMeta.att_l;
+        } else if (relRow.oid === this.dbMeta.dsc_f) {
+          data.lastPage = this.dbMeta.dsc_l;
+        } else if (relRow.oid === this.dbMeta.ad_f) {
+          data.lastPage = this.dbMeta.ad_l;
+        } else if (relRow.oid === this.dbMeta.idx_f) {
+          data.lastPage = this.dbMeta.idx_l;
+        }
+      } else if (this.clusterCatalogDef && relRow.oid === this.clusterCatalogDef.firstPage) {
+        data.lastPage = this.clusterCatalogDef.lastPage;
+        data.indexRootPage = this.clusterCatalogDef.indexRootPage;
+      }
+
       this.tableCache.set(fullName, data);
       return data;
     };
@@ -2697,6 +2738,7 @@ export class StorageEngine {
         this.dbMeta = JSON.parse(this.txDbMetaBackup);
         this.refreshCatalogDefs();
         this.txDbMetaBackup = null;
+        StorageEngine.dbMetaCache.set(`${this.filepath}:${this.dbMeta.name}`, this.dbMeta);
       }
       if (this.txClusterMetaBackup) {
         this.clusterCatalogDef = JSON.parse(this.txClusterMetaBackup);

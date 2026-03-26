@@ -2312,6 +2312,77 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const rows = await db.query(`SELECT index FROM index_col_test`);
       expect(rows[0].index).toBe(42);
     });
+
+    test("39.4 Create index on table with foreign keys (password_reset_tokens)", async () => {
+      await db.exec(`CREATE TABLE users_39 (id SERIAL PRIMARY KEY)`);
+      await db.exec(`
+        CREATE TABLE password_reset_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users_39(id) ON DELETE CASCADE,
+            token TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      const res = await db.exec(`CREATE INDEX idx_password_reset_tokens_token ON password_reset_tokens(token)`);
+      expect(res.success).toBe(true);
+    });
+
+    test("39.5 Create index on notifications with quotes and constraints", async () => {
+      await db.exec(`
+        CREATE TABLE "notifications_39" (
+            "id" SERIAL PRIMARY KEY,
+            "user_id" INTEGER NOT NULL REFERENCES "users_39"("id") ON DELETE CASCADE,
+            "title" TEXT NOT NULL,
+            "content" TEXT NOT NULL,
+            "type" TEXT NOT NULL CHECK ("type" IN ('order', 'promotion', 'system', 'appointment')),
+            "is_read" BOOLEAN DEFAULT FALSE,
+            "metadata" JSONB,
+            "created_at" TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            "updated_at" TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            "deleted_at" TIMESTAMP WITHOUT TIME ZONE
+        );
+      `);
+      const res1 = await db.exec(`CREATE INDEX "idx_notifications_user_id" ON "notifications_39"("user_id");`);
+      expect(res1.success).toBe(true);
+      const res2 = await db.exec(`CREATE INDEX "idx_notifications_type" ON "notifications_39"("type");`);
+      expect(res2.success).toBe(true);
+    });
+  });
+
+  describe("LEVEL 40: Corrupted dbMetaCache on Rollback", () => {
+    test("40.1 Table columns are not lost after a failed transaction causes rollback", async () => {
+      try {
+        await db.transaction(async (tx) => {
+          // Force an overflow in pgAttributeDef by creating a table with many columns
+          let cols = [];
+          for (let i = 0; i < 100; i++) cols.push(`col_${i} TEXT`);
+          await tx.exec(`CREATE TABLE wide_table_fail (${cols.join(", ")})`);
+          
+          // Throw to trigger rollback
+          throw new Error("Force rollback");
+        });
+      } catch (e) {}
+
+      // Now create a normal table in a new transaction
+      // Without the fix, this would fail during CREATE INDEX because 'token' would be written to an orphaned page
+      await db.transaction(async (tx) => {
+        await tx.exec(`CREATE TABLE safe_table (id SERIAL PRIMARY KEY, token TEXT)`);
+        await tx.exec(`CREATE INDEX idx_safe_table_token ON safe_table(token)`);
+      });
+
+      const rows = await db.query(`SELECT * FROM safe_table`);
+      expect(rows.length).toBe(0);
+
+      // Verify the columns exist in the catalog
+      const tableInfo = await db.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'safe_table'
+      `);
+      expect(tableInfo.length).toBe(2);
+      expect(tableInfo.map((r: any) => r.column_name)).toContain('token');
+    });
   });
 
   describe("LEVEL 37: Multi-database Context via exec/query Overloads", () => {
