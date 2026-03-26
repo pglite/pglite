@@ -2276,6 +2276,44 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 39: CREATE INDEX", () => {
+    test("39.1 Create basic index", async () => {
+      await db.exec(`CREATE TABLE users_idx_test (id SERIAL PRIMARY KEY, email TEXT)`);
+      const res = await db.exec(`CREATE INDEX idx_users_email ON users_idx_test(email)`);
+      expect(res.success).toBe(true);
+      expect(res.message).toContain("idx_users_email");
+
+      const res2 = await db.exec(`CREATE INDEX IF NOT EXISTS idx_users_email ON users_idx_test(email)`);
+      expect(res2.success).toBe(true);
+
+      const rows = await db.query(`
+        SELECT relname FROM pg_class WHERE relname = 'idx_users_email'
+      `);
+      expect(rows.length).toBe(1);
+    });
+
+    test("39.2 Create unique index with USING btree and ASC/DESC", async () => {
+      const res = await db.exec(`CREATE UNIQUE INDEX idx_users_email_uniq ON users_idx_test USING btree (email DESC NULLS LAST)`);
+      expect(res.success).toBe(true);
+      
+      const rows = await db.query(`
+        SELECT indisunique FROM pg_index 
+        WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_users_email_uniq')
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].indisunique).toBe(true);
+    });
+
+    test("39.3 Column named index still works", async () => {
+      const res = await db.exec(`CREATE TABLE index_col_test (id SERIAL, index INT)`);
+      expect(res.success).toBe(true);
+      
+      await db.exec(`INSERT INTO index_col_test (index) VALUES (42)`);
+      const rows = await db.query(`SELECT index FROM index_col_test`);
+      expect(rows[0].index).toBe(42);
+    });
+  });
+
   describe("LEVEL 37: Multi-database Context via exec/query Overloads", () => {
     test("37.1 Overloaded exec/query passing dbName as the second argument", async () => {
       const customDbFile = "test_multidb.db";

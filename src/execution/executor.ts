@@ -38,6 +38,11 @@ export class Executor {
         await storage.createSchema(stmt.schemaName, stmt.ifNotExists);
         return { success: true, message: `Schema ${stmt.schemaName} created.` };
       }
+
+      case "CreateIndex": {
+        await storage.createIndex(stmt.indexName, stmt.tableName, stmt.columns, !!stmt.unique, !!stmt.ifNotExists);
+        return { success: true, message: `Index ${stmt.indexName} created.` };
+      }
       
       case "DropSchema": {
         await storage.dropSchema(stmt.schemaName, stmt.ifExists, stmt.cascade);

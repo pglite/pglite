@@ -66,7 +66,7 @@ export class Parser {
     let stmt: Statement;
     if (token.type === 'KEYWORD') {
       switch (token.value.toUpperCase()) {
-        case 'CREATE': stmt = this.parseCreateTable(); break;
+        case 'CREATE': stmt = this.parseCreate(); break;
         case 'INSERT': stmt = this.parseInsert(); break;
         case 'SELECT': stmt = this.parseSelect(); break;
         case 'UPDATE': stmt = this.parseUpdate(); break;
@@ -508,8 +508,61 @@ export class Parser {
     return dataType;
   }
 
-  private parseCreateTable(): Statement {
+  private parseCreate(): Statement {
     this.consume('KEYWORD', 'CREATE');
+
+    let isUnique = false;
+    if (this.match('KEYWORD', 'UNIQUE')) {
+      this.consume();
+      isUnique = true;
+    }
+
+    if (this.match('KEYWORD', 'INDEX')) {
+      this.consume();
+      if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'CONCURRENTLY') {
+        this.consume();
+      }
+      let ifNotExists = false;
+      if (this.match('KEYWORD', 'IF')) {
+        this.consume(); this.consume('KEYWORD', 'NOT'); this.consume('KEYWORD', 'EXISTS');
+        ifNotExists = true;
+      }
+      const indexName = this.consumeIdentifier();
+      this.consume('KEYWORD', 'ON');
+      const tableName = this.parseTableName();
+      
+      if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'USING') {
+        this.consume();
+        this.consumeIdentifier();
+      }
+
+      this.consume('SYMBOL', '(');
+      const columns: string[] = [];
+      const parseIndexCol = () => {
+        const col = this.consumeIdentifier();
+        if (this.match('KEYWORD', 'ASC') || this.match('KEYWORD', 'DESC')) {
+           this.consume();
+        }
+        if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'NULLS') {
+           this.consume();
+           if ((this.match('KEYWORD') || this.matchIdentifier()) && (this.current()?.value.toUpperCase() === 'FIRST' || this.current()?.value.toUpperCase() === 'LAST')) {
+             this.consume();
+           }
+        }
+        return col;
+      };
+
+      columns.push(parseIndexCol());
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        columns.push(parseIndexCol());
+      }
+      this.consume('SYMBOL', ')');
+      
+      return { type: 'CreateIndex', indexName, tableName, columns, unique: isUnique, ifNotExists };
+    } else if (isUnique) {
+      throw new Error("Parse Error: UNIQUE can only be used with INDEX");
+    }
 
     if (this.match('KEYWORD', 'SCHEMA')) {
       this.consume();

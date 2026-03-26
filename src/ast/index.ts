@@ -78,6 +78,7 @@ export type AlterTableAction =
 
 export type Statement =
   | { type: 'CreateSchema'; schemaName: string; ifNotExists?: boolean }
+  | { type: 'CreateIndex'; indexName: string; tableName: string; columns: string[]; unique?: boolean; ifNotExists?: boolean }
   | { type: 'DropSchema'; schemaName: string; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropTable'; tableName: string; ifExists?: boolean }
   | { type: 'CreateTable'; tableName: string; columns: ColumnDef[]; ifNotExists?: boolean }

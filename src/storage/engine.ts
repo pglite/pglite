@@ -1386,6 +1386,71 @@ export class StorageEngine {
     return name.includes(".") ? name : `public.${name}`;
   }
 
+  public async createIndex(
+    indexName: string,
+    tableName: string,
+    columns: string[],
+    unique: boolean,
+    ifNotExists: boolean
+  ): Promise<void> {
+    const fullName = this.getFullTableName(tableName);
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} does not exist`);
+
+    const idxFullName = this.getFullTableName(indexName);
+    const parts = idxFullName.split(".");
+    const schema = parts[0]!;
+    const relname = parts[1]!;
+
+    const nspOid = await this.getSchemaOid(schema);
+    if (!nspOid) throw new Error(`Schema ${schema} does not exist`);
+
+    let existing = false;
+    for await (const row of this.scanCatalog(this.pgClassDef)) {
+      if (row.relnamespace === nspOid && row.relname === relname) {
+        existing = true; break;
+      }
+    }
+
+    if (existing) {
+      if (ifNotExists) return;
+      throw new Error(`Relation ${idxFullName} already exists`);
+    }
+
+    const attNums = [];
+    for (const col of columns) {
+      const attrIdx = table.columns.findIndex((c) => c.name === col);
+      if (attrIdx === -1) throw new Error(`Column ${col} does not exist in table ${fullName}`);
+      attNums.push(attrIdx + 1);
+    }
+
+    const rootPage = await this.pager.allocatePage();
+    const rootBuf = Buffer.alloc(PAGE_SIZE);
+    rootBuf.writeUInt8(1, 0);
+    rootBuf.writeUInt16LE(0, 1);
+    rootBuf.writeUInt32LE(0xffffffff, 3);
+    await this.pager.writePage(rootPage, rootBuf);
+
+    await this.insertRowIntoCatalog(this.pgClassDef, {
+      oid: rootPage,
+      relname: relname,
+      relnamespace: nspOid,
+      relfirstpage: rootPage,
+      rellastpage: rootPage,
+      relindexroot: rootPage,
+      relsequence: 0,
+      relkind: "i",
+    });
+
+    await this.insertRowIntoCatalog(this.pgIndexDef, {
+      indexrelid: rootPage,
+      indrelid: table.firstPage,
+      indkey: attNums,
+      indisprimary: false,
+      indisunique: unique,
+    });
+  }
+
   public async createSchema(
     name: string,
     ifNotExists: boolean = false,
