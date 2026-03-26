@@ -1135,27 +1135,39 @@ export class Parser {
     this.consume('KEYWORD', 'INTO');
     const tableName = this.parseTableName();
     
-    this.consume('SYMBOL', '(');
     const columns: string[] =[];
-    columns.push(this.consumeIdentifier());
-    while (this.match('SYMBOL', ',')) {
-      this.consume(); columns.push(this.consumeIdentifier());
-    }
-    this.consume('SYMBOL', ')');
-    
-    this.consume('KEYWORD', 'VALUES');
-    
-    const valuesList: Expr[][] = [];
-    do {
+    if (this.match('SYMBOL', '(')) {
       this.consume('SYMBOL', '(');
-      const values: Expr[] =[];
-      values.push(this.parseExpr());
+      columns.push(this.consumeIdentifier());
       while (this.match('SYMBOL', ',')) {
-        this.consume(); values.push(this.parseExpr());
+        this.consume(); columns.push(this.consumeIdentifier());
       }
       this.consume('SYMBOL', ')');
-      valuesList.push(values);
-    } while (this.match('SYMBOL', ',') && this.consume());
+    }
+    
+    let valuesList: Expr[][] | undefined;
+    let selectStmt: Statement | undefined;
+
+    if (this.match('KEYWORD', 'VALUES')) {
+      this.consume('KEYWORD', 'VALUES');
+      valuesList = [];
+      do {
+        this.consume('SYMBOL', '(');
+        const values: Expr[] =[];
+        if (!this.match('SYMBOL', ')')) {
+          values.push(this.parseExpr());
+          while (this.match('SYMBOL', ',')) {
+            this.consume(); values.push(this.parseExpr());
+          }
+        }
+        this.consume('SYMBOL', ')');
+        valuesList.push(values);
+      } while (this.match('SYMBOL', ',') && this.consume());
+    } else if (this.match('KEYWORD', 'SELECT')) {
+      selectStmt = this.parseSelect();
+    } else {
+      throw new Error(`Parse Error: Expected VALUES or SELECT in INSERT statement, got ${this.current()?.value}`);
+    }
 
     let onConflict: any;
     if (this.match('KEYWORD', 'ON')) {
@@ -1196,7 +1208,7 @@ export class Parser {
       returning = this.parseReturning();
     }
     
-    return { type: 'Insert', tableName, columns, values: valuesList, returning, onConflict };
+    return { type: 'Insert', tableName, columns, values: valuesList, select: selectStmt, returning, onConflict };
   }
 
   private parseUpdate(): Statement {

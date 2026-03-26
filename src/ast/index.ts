@@ -81,7 +81,7 @@ export type Statement =
   | { type: 'DropSchema'; schemaName: string; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropTable'; tableName: string; ifExists?: boolean }
   | { type: 'CreateTable'; tableName: string; columns: ColumnDef[]; ifNotExists?: boolean }
-  | { type: 'Insert'; tableName: string; columns: string[]; values: Expr[][] | Expr[]; returning?: Expr[]; onConflict?: OnConflict }
+  | { type: 'Insert'; tableName: string; columns: string[]; values?: Expr[][] | Expr[]; select?: Statement; returning?: Expr[]; onConflict?: OnConflict }
   | { 
       type: 'Select'; 
       columns: Expr[]; 

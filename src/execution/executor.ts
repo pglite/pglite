@@ -240,28 +240,61 @@ export class Executor {
         const table = await (storage as any).getTableAsync(stmt.tableName);
         if (!table) throw new Error(`Table ${stmt.tableName} not found`);
 
-        const valuesList: Expr[][] = (stmt.values.length > 0 && Array.isArray(stmt.values[0])) 
-          ? (stmt.values as Expr[][]) 
-          : [stmt.values as Expr[]];
-
         const insertedRecords = [];
         const returningRecords = [];
         let schemaUpdated = false;
 
-        for (const rowVals of valuesList) {
+        let insertRows: any[] = [];
+        
+        if (stmt.select) {
+          const selectStream = this.executeSelect(storage, stmt.select, params);
+          for await (const row of selectStream) {
+            insertRows.push(row);
+          }
+        } else if (stmt.values) {
+          const valuesList: Expr[][] = (stmt.values.length > 0 && Array.isArray(stmt.values[0])) 
+            ? (stmt.values as Expr[][]) 
+            : [stmt.values as Expr[]];
+            
+          for (const rowVals of valuesList) {
+            const record: any = {};
+            for (let idx = 0; idx < stmt.columns.length; idx++) {
+              if (!rowVals[idx]) record[stmt.columns[idx]!] = undefined;
+              else
+                record[stmt.columns[idx]!] = await this.evaluateExpr(
+                  storage,
+                  rowVals[idx]!,
+                  {},
+                  params
+                );
+            }
+            insertRows.push(record);
+          }
+        }
+
+        for (const recordData of insertRows) {
           const record: any = {};
 
           // 1. Map values and identifiers
           startBenchmarks();
-          for (let idx = 0; idx < stmt.columns.length; idx++) {
-            if (!rowVals[idx]) record[stmt.columns[idx]!] = undefined;
-            else
-              record[stmt.columns[idx]!] = await this.evaluateExpr(
-                storage,
-                rowVals[idx]!,
-                {},
-                params
-              );
+          if (stmt.select) {
+             const selectKeys = Object.keys(recordData).filter(k => !k.startsWith('__'));
+             let idx = 0;
+             for (const k of selectKeys) {
+               if (stmt.columns && stmt.columns.length > 0) {
+                 if (idx < stmt.columns.length) {
+                   record[stmt.columns[idx]!] = recordData[k];
+                 }
+               } else if (idx < table.columns.length) {
+                 const targetCol = table.columns[idx]?.name;
+                 if (targetCol) {
+                   record[targetCol] = recordData[k];
+                 }
+               }
+               idx++;
+             }
+          } else {
+             Object.assign(record, recordData);
           }
           endBenchmarks("expr_evaluation");
 

@@ -2245,6 +2245,37 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 38: INSERT INTO ... SELECT", () => {
+    test("38.1 Insert using SELECT without column names specified", async () => {
+      await db.exec(`CREATE TABLE src_table (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`INSERT INTO src_table (val) VALUES ('A'), ('B'), ('C')`);
+      
+      await db.exec(`CREATE TABLE dest_table (id SERIAL PRIMARY KEY, val TEXT)`);
+      // Insert all rows from src_table into dest_table
+      await db.exec(`INSERT INTO dest_table SELECT * FROM src_table`);
+      
+      const rows = await db.query(`SELECT * FROM dest_table ORDER BY id`);
+      expect(rows.length).toBe(3);
+      expect(rows[0].val).toBe('A');
+      expect(rows[2].val).toBe('C');
+    });
+
+    test("38.2 Insert using SELECT with column names specified", async () => {
+      await db.exec(`CREATE TABLE dest_table2 (id SERIAL PRIMARY KEY, title TEXT, score NUMBER)`);
+      
+      await db.exec(`
+        INSERT INTO dest_table2 (title, score)
+        SELECT val, id * 10 FROM src_table
+      `);
+      
+      const rows = await db.query(`SELECT * FROM dest_table2 ORDER BY id`);
+      expect(rows.length).toBe(3);
+      expect(rows[0].title).toBe('A');
+      expect(rows[0].score).toBe(10);
+      expect(rows[2].score).toBe(30);
+    });
+  });
+
   describe("LEVEL 37: Multi-database Context via exec/query Overloads", () => {
     test("37.1 Overloaded exec/query passing dbName as the second argument", async () => {
       const customDbFile = "test_multidb.db";
