@@ -2036,6 +2036,19 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const allOrders = await db.query(`SELECT * FROM "order_25"`);
       expect(allOrders.length).toBe(2);
     });
+
+    test("25.2 Update with quoted identifiers and string values", async () => {
+      await db.exec(`CREATE TABLE "users_update_test" ("id" TEXT PRIMARY KEY, "username" TEXT)`);
+      await db.exec(`INSERT INTO "users_update_test" ("id", "username") VALUES ('1', 'admin')`);
+
+      const res = await db.exec(`UPDATE "users_update_test" SET "username" = 'admin123' WHERE "id" = '1'`);
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(1);
+
+      const rows = await db.query(`SELECT "username" FROM "users_update_test" WHERE "id" = '1'`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].username).toBe('admin123');
+    });
   });
 
   describe("LEVEL 29: EXISTS Subqueries", () => {
