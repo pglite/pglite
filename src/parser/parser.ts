@@ -489,7 +489,7 @@ export class Parser {
     const stopKeywords = new Set([
       'PRIMARY', 'UNIQUE', 'NOT', 'NULL', 'REFERENCES', 'DEFAULT', 'CONSTRAINT', 'CHECK', 'GENERATED',
       'AS', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT',
-      'HAVING', 'RETURNING', 'ON', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'JOIN', 'VALUES', 'SET', 'CONFLICT', 'DO',
+      'HAVING', 'RETURNING', 'ON', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'VALUES', 'SET', 'CONFLICT', 'DO',
       'END', 'THEN', 'ELSE', 'WHEN', 'FILTER', 'OVER', 'PARTITION', 'AND', 'OR', 'IS', 'IN',
       'ASC', 'DESC', 'TRUE', 'FALSE', 'LIKE'
     ]);
@@ -1062,14 +1062,14 @@ export class Parser {
           this.consume('SYMBOL', ')');
           from.columnAliases = columnAliases;
         }
-      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
         from.alias = this.consumeIdentifier();
       }
     }
 
     const joins: JoinClause[] =[];
-    while (this.match('KEYWORD', 'INNER') || this.match('KEYWORD', 'LEFT') || this.match('KEYWORD', 'RIGHT') || this.match('KEYWORD', 'FULL') || this.match('KEYWORD', 'JOIN')) {
-      let type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL' = 'INNER';
+    while (this.match('KEYWORD', 'INNER') || this.match('KEYWORD', 'LEFT') || this.match('KEYWORD', 'RIGHT') || this.match('KEYWORD', 'FULL') || this.match('KEYWORD', 'CROSS') || this.match('KEYWORD', 'JOIN')) {
+      let type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL' | 'CROSS' = 'INNER';
       if (this.match('KEYWORD', 'LEFT')) {
         this.consume(); 
         if (this.match('KEYWORD', 'OUTER')) this.consume();
@@ -1082,6 +1082,9 @@ export class Parser {
         this.consume(); 
         if (this.match('KEYWORD', 'OUTER')) this.consume();
         type = 'FULL'; this.consume('KEYWORD', 'JOIN');
+      } else if (this.match('KEYWORD', 'CROSS')) {
+        this.consume(); this.consume('KEYWORD', 'JOIN');
+        type = 'CROSS';
       } else if (this.match('KEYWORD', 'INNER')) {
         this.consume(); this.consume('KEYWORD', 'JOIN');
       } else {
@@ -1134,7 +1137,7 @@ export class Parser {
           this.consume('SYMBOL', ')');
           columnAliases = aliases;
         }
-      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
         alias = this.consumeIdentifier();
       }
       

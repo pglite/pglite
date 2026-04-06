@@ -318,6 +318,30 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[2].val_b).toBe('B3');
     });
 
+    test("3.2.3 CROSS JOIN", async () => {
+      await db.exec(`CREATE TABLE cross_a (id NUMBER, val_a TEXT)`);
+      await db.exec(`CREATE TABLE cross_b (id NUMBER, val_b TEXT)`);
+      await db.exec(`INSERT INTO cross_a VALUES (1, 'A1'), (2, 'A2')`);
+      await db.exec(`INSERT INTO cross_b VALUES (1, 'B1'), (2, 'B2')`);
+
+      const rows = await db.query(`
+        SELECT cross_a.val_a, cross_b.val_b
+        FROM cross_a
+        CROSS JOIN cross_b
+        ORDER BY cross_a.val_a, cross_b.val_b
+      `);
+
+      expect(rows.length).toBe(4);
+      expect(rows[0].val_a).toBe('A1');
+      expect(rows[0].val_b).toBe('B1');
+      expect(rows[1].val_a).toBe('A1');
+      expect(rows[1].val_b).toBe('B2');
+      expect(rows[2].val_a).toBe('A2');
+      expect(rows[2].val_b).toBe('B1');
+      expect(rows[3].val_a).toBe('A2');
+      expect(rows[3].val_b).toBe('B2');
+    });
+
     test("3.3 Aggregation & GROUP BY", async () => {
       const rows = await db.query(`
         SELECT user_id, COUNT(id) as post_count 
