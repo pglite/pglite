@@ -2496,6 +2496,47 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 53: DO block dynamic constraint dropping", () => {
+    test("53.1 Execute DO block to drop foreign key constraint", async () => {
+      // 1. Create referenced table
+      await db.exec(`CREATE TABLE users_53 (id SERIAL PRIMARY KEY)`);
+      // 2. Create referencing table
+      await db.exec(`CREATE TABLE classes_53 (id SERIAL PRIMARY KEY, teacher_id INT REFERENCES users_53(id))`);
+
+      // 3. Verify foreign key exists
+      const beforeRows = await db.query(`
+        SELECT * FROM pg_constraint WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'classes_53') AND contype = 'f'
+      `);
+      expect(beforeRows.length).toBe(1);
+
+      // 4. Run the DO block dynamically
+      const sql = `
+        DO $ 
+        DECLARE 
+            r RECORD;
+        BEGIN 
+            FOR r IN (
+                SELECT conname, conrelid::regclass::text as tablename
+                FROM pg_constraint 
+                WHERE contype = 'f' 
+                  AND conrelid = 'classes_53'::regclass
+                  AND confrelid = 'users_53'::regclass
+            ) LOOP
+                EXECUTE 'ALTER TABLE classes_53 DROP CONSTRAINT ' || r.conname;
+            END LOOP;
+        END $;
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      // 5. Verify foreign key is dropped successfully
+      const afterRows = await db.query(`
+        SELECT * FROM pg_constraint WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = 'classes_53') AND contype = 'f'
+      `);
+      expect(afterRows.length).toBe(0);
+    });
+  });
+
   describe("LEVEL 52: DROP CONSTRAINT and DROP INDEX", () => {
     test("52.1 ALTER TABLE DROP CONSTRAINT and DROP INDEX", async () => {
       await db.exec(`CREATE TABLE classes (id SERIAL PRIMARY KEY, teacher_id INT UNIQUE)`);

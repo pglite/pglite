@@ -694,6 +694,81 @@ export class Executor {
       case "Do": {
         // Handle anonymous block execution
         // For standard "Lite" implementation, we return success and metadata
+
+        // --- HACK: Support TypeORM / Prisma dynamic constraint dropping ---
+        const code = stmt.code;
+        if (/ALTER\s+TABLE\s+.*?\s+DROP\s+CONSTRAINT/i.test(code) && /pg_constraint/i.test(code)) {
+            const relMatch = code.match(/conrelid\s*=\s*'([^']+)'::regclass/i);
+            const targetMatch = code.match(/confrelid\s*=\s*'([^']+)'::regclass/i);
+            
+            let sourceTable = relMatch ? relMatch[1].replace(/"/g, '') : null;
+            if (!sourceTable) {
+               const alterMatch = code.match(/ALTER\s+TABLE\s+([a-zA-Z0-9_]+)/i);
+               if (alterMatch) sourceTable = alterMatch[1];
+            }
+
+            const targetTable = targetMatch ? targetMatch[1].replace(/"/g, '') : null;
+            
+            if (sourceTable) {
+               const isFk = /contype\s*=\s*'f'/i.test(code);
+               const isUnique = /contype\s*=\s*'u'/i.test(code);
+               const isPk = /contype\s*=\s*'p'/i.test(code);
+               
+               const dropFk = isFk || !!targetTable;
+               
+               const conNameMatch = code.match(/DROP\s+CONSTRAINT\s+(?!'|"|\||r\.conname)([\w_]+)/i);
+               const explicitConName = conNameMatch ? conNameMatch[1] : null;
+
+               const dropAll = !isFk && !isUnique && !isPk && !targetTable && !explicitConName;
+               
+               const tableInfo = await (storage as any).getTableAsync(sourceTable);
+               if (tableInfo) {
+                   let dropped = false;
+                   for (const col of tableInfo.columns) {
+                       if (explicitConName) {
+                           if (explicitConName === `${sourceTable}_pkey` && col.isPrimaryKey) { col.isPrimaryKey = false; dropped = true; }
+                           else if (explicitConName === `${sourceTable}_${col.name}_key` && col.isUnique) { col.isUnique = false; dropped = true; }
+                           else if (explicitConName === `${sourceTable}_${col.name}_fkey` && col.references) { col.references = undefined; dropped = true; }
+                       } else {
+                           if ((dropFk || dropAll) && col.references) {
+                               if (!targetTable || col.references.table === targetTable) {
+                                   col.references = undefined;
+                                   dropped = true;
+                               }
+                           }
+                           if ((isUnique || dropAll) && col.isUnique && !col.isPrimaryKey) {
+                               col.isUnique = false;
+                               dropped = true;
+                           }
+                           if ((isPk || dropAll) && col.isPrimaryKey) {
+                               col.isPrimaryKey = false;
+                               dropped = true;
+                           }
+                       }
+                   }
+                   if (dropped) {
+                       await storage.updateTableSchema(sourceTable, tableInfo);
+                       await storage.updateRows('pg_catalog.pg_attribute', 
+                          async (r: any) => r.attrelid === tableInfo.firstPage,
+                          async (r: any) => {
+                            const c = tableInfo.columns.find((col: any) => col.name === r.attname);
+                            if (c) {
+                                r.attprimary = !!c.isPrimaryKey;
+                                r.attunique = !!c.isUnique;
+                                if (!c.references) {
+                                  r.attref_table = null;
+                                  r.attref_col = null;
+                                  r.attref_on_delete = null;
+                                  r.attref_on_update = null;
+                                }
+                            }
+                          }
+                       );
+                   }
+               }
+            }
+        }
+
         return { 
           success: true, 
           executed_block: stmt.code, 
