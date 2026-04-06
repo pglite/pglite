@@ -231,6 +231,8 @@ export class LitePostgres {
     } catch (error: any) {
       if (this.storage.isInTransaction()) {
         await this.storage.rollback();
+      } else {
+        await this.storage.rollbackStatement();
       }
       if (this.txRelease) {
         this.txRelease();

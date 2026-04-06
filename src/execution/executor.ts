@@ -22,6 +22,24 @@ export class Executor {
 
   constructor() {}
 
+  private async rewriteTableData(storage: StorageEngine, tableName: string, schemaModifier: () => Promise<void>, rowModifier: (row: any) => Promise<void> | void) {
+    const oldRows = [];
+    for await (const row of storage.scanRows(tableName)) {
+      oldRows.push(row);
+    }
+    
+    const visited = new Set<string>();
+    const tablesInStmt = new Set<string>([storage.getFullTableName(tableName)]);
+    await storage.truncateTable(tableName, false, false, visited, tablesInStmt);
+
+    await schemaModifier();
+
+    for (const row of oldRows) {
+      await rowModifier(row);
+      await storage.insertRow(tableName, row);
+    }
+  }
+
   public async execute(storage: StorageEngine, stmt: Statement, params: any[] = []): Promise<any> {
     switch (stmt.type) {
       case "Begin":
@@ -130,22 +148,19 @@ export class Executor {
             throw new Error(`Column ${action.columnName} does not exist`);
           }
           const colNum = colIndex + 1;
-          table.columns.splice(colIndex, 1);
-          await storage.updateTableSchema(stmt.tableName, table);
           
-          await storage.deleteRows('pg_catalog.pg_attribute', async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName);
-          await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === colNum);
-
-          await storage.updateRows(
-            stmt.tableName,
-            async () => true,
-            async (row: any) => {
-              delete row[action.columnName];
-            },
-          );
+          await this.rewriteTableData(storage, stmt.tableName, async () => {
+            table.columns.splice(colIndex, 1);
+            await storage.updateTableSchema(stmt.tableName, table);
+            await storage.deleteRows('pg_catalog.pg_attribute', async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName);
+            await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === colNum);
+          }, (row) => {
+            delete row[action.columnName];
+          });
         } else if (action.type === 'RenameColumn') {
           const col = table.columns.find((c: any) => c.name === action.oldColumnName);
           if (!col) throw new Error(`Column ${action.oldColumnName} does not exist`);
+          
           col.name = action.newColumnName;
           await storage.updateTableSchema(stmt.tableName, table);
           
@@ -153,28 +168,24 @@ export class Executor {
             async (r: any) => r.attrelid === table.firstPage && r.attname === action.oldColumnName,
             async (r: any) => { r.attname = action.newColumnName; }
           );
-
-          await storage.updateRows(
-            stmt.tableName,
-            async () => true,
-            async (row: any) => {
-              if (row[action.oldColumnName] !== undefined) {
-                row[action.newColumnName] = row[action.oldColumnName];
-                delete row[action.oldColumnName];
-              }
-            },
-          );
         } else if (action.type === 'RenameTable') {
           await storage.renameTable(stmt.tableName, action.newTableName);
         } else if (action.type === 'AlterColumnType') {
           const col = table.columns.find((c: any) => c.name === action.columnName);
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
-          col.dataType = action.dataType;
-          await storage.updateTableSchema(stmt.tableName, table);
-          await storage.updateRows('pg_catalog.pg_attribute', 
-            async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
-            async (r: any) => { r.atttypid = action.dataType; }
-          );
+          
+          await this.rewriteTableData(storage, stmt.tableName, async () => {
+            col.dataType = action.dataType;
+            await storage.updateTableSchema(stmt.tableName, table);
+            await storage.updateRows('pg_catalog.pg_attribute', 
+              async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
+              async (r: any) => { r.atttypid = action.dataType; }
+            );
+          }, async (row) => {
+             if (row[action.columnName] !== undefined && row[action.columnName] !== null) {
+               row[action.columnName] = await this.castValue(storage, row[action.columnName], action.dataType);
+             }
+          });
         } else if (action.type === 'AlterColumnSetDefault') {
           const colIndex = table.columns.findIndex((c: any) => c.name === action.columnName);
           const col = table.columns[colIndex];

@@ -1070,6 +1070,12 @@ export class Parser {
       if (this.match('KEYWORD', 'TYPE')) {
         this.consume();
         const dataType = this.parseDataType();
+        if (this.match('KEYWORD', 'USING')) {
+           this.consume(); this.parseExpr(); // skip USING expression for now
+        }
+        if (this.match('KEYWORD', 'CASCADE') || this.match('KEYWORD', 'RESTRICT')) {
+          this.consume();
+        }
         return { type: 'AlterTable', tableName, action: { type: 'AlterColumnType', columnName, dataType } };
       } else if (this.match('KEYWORD', 'SET')) {
         this.consume();

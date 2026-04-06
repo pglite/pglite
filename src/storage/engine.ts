@@ -2848,6 +2848,18 @@ export class StorageEngine {
     }
   }
 
+  public async rollbackStatement(): Promise<void> {
+    await this.pager.clearDirty();
+    this.tableCache.clear();
+    this.schemaCache = [];
+    this.pkIndexes.clear();
+    this.currentDbName = undefined;
+    if (this.dbMeta) {
+      StorageEngine.dbMetaCache.delete(`${this.filepath}:${this.dbMeta.name}`);
+    }
+    this.clusterInitialized = false;
+  }
+
   public async flush(): Promise<void> {
     if (!this.inTransaction) await this.pager.flush();
   }
