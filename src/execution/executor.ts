@@ -45,18 +45,28 @@ export class Executor {
       }
       
       case "DropSchema": {
-        await storage.dropSchema(stmt.schemaName, stmt.ifExists, stmt.cascade);
-        return { success: true, message: `Schema ${stmt.schemaName} dropped.` };
+        for (const schemaName of stmt.schemaNames) {
+          await storage.dropSchema(schemaName, stmt.ifExists, stmt.cascade);
+        }
+        return { success: true, message: `Schemas ${stmt.schemaNames.join(', ')} dropped.` };
       }
 
       case "DropTable": {
-        await storage.dropTable(stmt.tableName, stmt.ifExists);
-        return { success: true, message: `Table ${stmt.tableName} dropped.` };
+        for (const tableName of stmt.tableNames) {
+          await storage.dropTable(tableName, stmt.ifExists, stmt.cascade);
+        }
+        return { success: true, message: `Tables ${stmt.tableNames.join(', ')} dropped.` };
       }
 
       case "DropIndex": {
-        await storage.dropIndex(stmt.indexName, !!stmt.ifExists);
-        return { success: true, message: `Index ${stmt.indexName} dropped.` };
+        for (const indexName of stmt.indexNames) {
+          await storage.dropIndex(indexName, !!stmt.ifExists, stmt.cascade);
+        }
+        return { success: true, message: `Indexes ${stmt.indexNames.join(', ')} dropped.` };
+      }
+
+      case "DropOther": {
+        return { success: true, message: `Ignored DROP ${stmt.objectType} ${stmt.names.join(', ')}.` };
       }
 
       case "AlterTable": {

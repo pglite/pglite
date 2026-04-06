@@ -876,7 +876,13 @@ export class Parser {
           ifExists = true;
         }
         const constraintName = this.consumeIdentifier();
-        return { type: 'AlterTable', tableName, action: { type: 'DropConstraint', constraintName, ifExists } };
+        let cascade = false;
+        if (this.match('KEYWORD', 'CASCADE')) {
+          this.consume(); cascade = true;
+        } else if (this.match('KEYWORD', 'RESTRICT')) {
+          this.consume();
+        }
+        return { type: 'AlterTable', tableName, action: { type: 'DropConstraint', constraintName, ifExists, cascade } };
       }
       if (this.match('KEYWORD', 'COLUMN')) this.consume();
       let ifExists = false;
@@ -885,7 +891,13 @@ export class Parser {
         ifExists = true;
       }
       const columnName = this.consumeIdentifier();
-      return { type: 'AlterTable', tableName, action: { type: 'DropColumn', columnName, ifExists } };
+      let cascade = false;
+      if (this.match('KEYWORD', 'CASCADE')) {
+        this.consume(); cascade = true;
+      } else if (this.match('KEYWORD', 'RESTRICT')) {
+        this.consume();
+      }
+      return { type: 'AlterTable', tableName, action: { type: 'DropColumn', columnName, ifExists, cascade } };
     } else if (this.match('KEYWORD', 'ADD')) {
       this.consume();
       
@@ -1515,14 +1527,20 @@ export class Parser {
         this.consume(); this.consume('KEYWORD', 'EXISTS');
         ifExists = true;
       }
-      const schemaName = this.consumeIdentifier();
+      const schemaNames = [];
+      schemaNames.push(this.consumeIdentifier());
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        schemaNames.push(this.consumeIdentifier());
+      }
+      
       let cascade = false;
       if (this.match('KEYWORD', 'CASCADE')) {
         this.consume(); cascade = true;
       } else if (this.match('KEYWORD', 'RESTRICT')) {
         this.consume();
       }
-      return { type: 'DropSchema', schemaName, ifExists, cascade };
+      return { type: 'DropSchema', schemaNames, ifExists, cascade };
     } else if (this.match('KEYWORD', 'TABLE')) {
       this.consume();
       let ifExists = false;
@@ -1530,8 +1548,21 @@ export class Parser {
         this.consume(); this.consume('KEYWORD', 'EXISTS');
         ifExists = true;
       }
-      const tableName = this.parseTableName();
-      return { type: 'DropTable', tableName, ifExists };
+      
+      const tableNames = [];
+      tableNames.push(this.parseTableName());
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        tableNames.push(this.parseTableName());
+      }
+      
+      let cascade = false;
+      if (this.match('KEYWORD', 'CASCADE')) {
+        this.consume(); cascade = true;
+      } else if (this.match('KEYWORD', 'RESTRICT')) {
+        this.consume();
+      }
+      return { type: 'DropTable', tableNames, ifExists, cascade };
     } else if (this.match('KEYWORD', 'INDEX')) {
       this.consume();
       let ifExists = false;
@@ -1539,9 +1570,51 @@ export class Parser {
         this.consume(); this.consume('KEYWORD', 'EXISTS');
         ifExists = true;
       }
-      const indexName = this.parseTableName();
-      return { type: 'DropIndex', indexName, ifExists };
+      
+      const indexNames = [];
+      indexNames.push(this.parseTableName());
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        indexNames.push(this.parseTableName());
+      }
+      
+      let cascade = false;
+      if (this.match('KEYWORD', 'CASCADE')) {
+        this.consume(); cascade = true;
+      } else if (this.match('KEYWORD', 'RESTRICT')) {
+        this.consume();
+      }
+      return { type: 'DropIndex', indexNames, ifExists, cascade };
     }
+    
+    // Ignore other DROPs like VIEW, TYPE, SEQUENCE to avoid parsing errors
+    let dropType = this.current()?.value.toUpperCase();
+    if (['TYPE', 'VIEW', 'SEQUENCE', 'MATERIALIZED', 'DOMAIN', 'ROLE', 'USER', 'EXTENSION'].includes(dropType || '')) {
+      if (dropType === 'MATERIALIZED') {
+        this.consume();
+        if (this.match('KEYWORD', 'VIEW')) this.consume();
+      } else {
+        this.consume();
+      }
+      
+      if (this.match('KEYWORD', 'IF')) {
+        this.consume(); this.consume('KEYWORD', 'EXISTS');
+      }
+      
+      const names = [];
+      names.push(this.parseTableName());
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        names.push(this.parseTableName());
+      }
+
+      if (this.match('KEYWORD', 'CASCADE') || this.match('KEYWORD', 'RESTRICT')) {
+        this.consume();
+      }
+
+      return { type: 'DropOther', objectType: dropType, names };
+    }
+
     throw new Error(`Parse Error: Unsupported DROP statement`);
   }
 

@@ -2496,6 +2496,61 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 54: DROP ... CASCADE and RESTRICT", () => {
+    test("54.1 DROP TABLE CASCADE drops table and referencing foreign keys", async () => {
+      await db.exec(`CREATE TABLE parent_cascade_drop (id SERIAL PRIMARY KEY)`);
+      await db.exec(`CREATE TABLE child_cascade_drop (id SERIAL PRIMARY KEY, p_id INT REFERENCES parent_cascade_drop(id))`);
+      
+      // Attempting to drop parent without CASCADE should throw
+      expect(async () => {
+        await db.exec(`DROP TABLE parent_cascade_drop`);
+      }).toThrow(/cannot drop table/);
+
+      // Dropping with CASCADE should succeed
+      const res = await db.exec(`DROP TABLE parent_cascade_drop CASCADE`);
+      expect(res.success).toBe(true);
+
+      // Verify the child table still exists but constraint is gone
+      const rows = await db.query(`
+        SELECT attref_table 
+        FROM pg_attribute 
+        WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'child_cascade_drop')
+          AND attname = 'p_id'
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].attref_table).toBeNull();
+    });
+
+    test("54.2 DROP INDEX CASCADE", async () => {
+      await db.exec(`CREATE TABLE index_drop_cascade (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`CREATE INDEX idx_val ON index_drop_cascade(val)`);
+      const res = await db.exec(`DROP INDEX idx_val CASCADE`);
+      expect(res.success).toBe(true);
+    });
+
+    test("54.3 DROP VIEW, TYPE, SEQUENCE (ignored but parseable)", async () => {
+      const res1 = await db.exec(`DROP TYPE IF EXISTS my_enum CASCADE`);
+      expect(res1.success).toBe(true);
+
+      const res2 = await db.exec(`DROP VIEW my_view RESTRICT`);
+      expect(res2.success).toBe(true);
+
+      const res3 = await db.exec(`DROP SEQUENCE s1, s2`);
+      expect(res3.success).toBe(true);
+    });
+
+    test("54.4 Multiple tables drop", async () => {
+      await db.exec(`CREATE TABLE multi_drop1 (id INT)`);
+      await db.exec(`CREATE TABLE multi_drop2 (id INT)`);
+      
+      const res = await db.exec(`DROP TABLE multi_drop1, multi_drop2 CASCADE`);
+      expect(res.success).toBe(true);
+      
+      const rows = await db.query(`SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'multi_drop%'`);
+      expect(rows.length).toBe(0);
+    });
+  });
+
   describe("LEVEL 53: DO block dynamic constraint dropping", () => {
     test("53.1 Execute DO block to drop foreign key constraint", async () => {
       // 1. Create referenced table

@@ -1593,7 +1593,7 @@ export class StorageEngine {
     this.tableCache.delete(fullNewName);
   }
 
-  public async dropIndex(indexName: string, ifExists: boolean = false): Promise<void> {
+  public async dropIndex(indexName: string, ifExists: boolean = false, cascade: boolean = false): Promise<void> {
     const idxFullName = this.getFullTableName(indexName);
     const parts = idxFullName.split(".");
     const schema = parts[0]!;
@@ -1625,12 +1625,42 @@ export class StorageEngine {
   public async dropTable(
     name: string,
     ifExists: boolean = false,
+    cascade: boolean = false,
   ): Promise<void> {
     const fullName = this.getFullTableName(name);
     const table = await this.getTableAsync(fullName);
     if (!table) {
       if (ifExists) return;
       throw new Error(`Table ${fullName} not found`);
+    }
+
+    const referencing = await this.getReferencingColumnsInternal(fullName);
+    if (referencing.length > 0 && !cascade) {
+      throw new Error(`cannot drop table ${fullName} because other objects depend on it`);
+    }
+
+    // Drop referencing constraints if cascade is true
+    if (cascade) {
+      for (const ref of referencing) {
+        const childTable = await this.getTableAsync(ref.childTable);
+        if (childTable) {
+          const col = childTable.columns.find((c) => c.name === ref.childColumn);
+          if (col && col.references) {
+            col.references = undefined;
+            await this.updateTableSchema(ref.childTable, childTable);
+            await this.updateRowsInCatalog(
+              this.pgAttributeDef,
+              async (r) => r.attrelid === childTable.firstPage && r.attname === ref.childColumn,
+              async (r) => {
+                r.attref_table = null;
+                r.attref_col = null;
+                r.attref_on_delete = null;
+                r.attref_on_update = null;
+              }
+            );
+          }
+        }
+      }
     }
 
     await this.deleteRowsInCatalog(
