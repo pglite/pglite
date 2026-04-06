@@ -40,7 +40,7 @@ export class Executor {
     }
   }
 
-  public async execute(storage: StorageEngine, stmt: Statement, params: any[] = []): Promise<any> {
+  public async execute(storage: StorageEngine, stmt: Statement, params: any = []): Promise<any> {
     switch (stmt.type) {
       case "Begin":
         storage.begin();
@@ -801,7 +801,7 @@ export class Executor {
   }
 
   // Volcano Model Iterator Pattern
-  private async *executeSelect(storage: StorageEngine, stmt: any, params: any[] = [], outerRow: any = {}): AsyncIterableIterator<any> {
+  private async *executeSelect(storage: StorageEngine, stmt: any, params: any = [], outerRow: any = {}): AsyncIterableIterator<any> {
     if (stmt.ctes) {
       for (const cte of stmt.ctes) {
         if (cte.recursive && (cte.stmt.union || cte.stmt.unionAll)) {
@@ -1203,7 +1203,7 @@ export class Executor {
     storage: StorageEngine,
     source: AsyncIterableIterator<any>,
     join: JoinClause,
-    params: any[] = []
+    params: any = []
   ) {
     if (join.type === 'RIGHT' || join.type === 'FULL') {
       const leftRows = [];
@@ -1445,7 +1445,7 @@ export class Executor {
     source: AsyncIterableIterator<any>,
     rightRows: any[],
     join: JoinClause,
-    params: any[] = [],
+    params: any = [],
   ) {
     if (join.type === 'RIGHT' || join.type === 'FULL') {
       const leftRows = [];
@@ -1484,7 +1484,7 @@ export class Executor {
     }
   }
 
-  private async *distinctStream(source: AsyncIterableIterator<any>, distinctOn?: Expr[], storage?: StorageEngine, params?: any[]) {
+  private async *distinctStream(source: AsyncIterableIterator<any>, distinctOn?: Expr[], storage?: StorageEngine, params?: any) {
     const seen = new Set<string>();
     for await (const row of source) {
       let key;
@@ -1603,7 +1603,7 @@ export class Executor {
     }
   }
 
-  private async *externalSortStream(storage: StorageEngine, source: AsyncIterableIterator<any>, orderBy: OrderBy[], params: any[] = []): AsyncIterableIterator<any> {
+  private async *externalSortStream(storage: StorageEngine, source: AsyncIterableIterator<any>, orderBy: OrderBy[], params: any = []): AsyncIterableIterator<any> {
     const CHUNK_SIZE = 100000;
     let chunk = [];
     let fileIndex = 0;
@@ -1697,13 +1697,24 @@ export class Executor {
     await Promise.all(tempFiles.map((f: string) => vfs.unlink(f)));
   }
 
-  private async projectRow(storage: StorageEngine, row: any, columns: Expr[], params: any[] = [], exclusions?: Set<string>): Promise<any> {
+  private async projectRow(storage: StorageEngine, row: any, columns: Expr[], params: any = [], exclusions?: Set<string>): Promise<any> {
     const outRow: any = {};
     for (const col of columns) {
-      if (col.type === "Identifier" && col.name === "*") {
-        for (const k of Object.keys(row)) {
-          if (!k.startsWith("__") && !k.startsWith("___") && (!exclusions || !exclusions.has(k)))
-            outRow[k] = row[k];
+      if (col.type === "Identifier" && (col.name === "*" || col.name.endsWith(".*"))) {
+        if (col.name === "*") {
+          for (const k of Object.keys(row)) {
+            if (!k.startsWith("__") && !k.startsWith("___") && (!exclusions || !exclusions.has(k)))
+              outRow[k] = row[k];
+          }
+        } else {
+          const prefix = col.name.substring(0, col.name.length - 2);
+          const targetObj = row[prefix];
+          if (targetObj && typeof targetObj === 'object') {
+            for (const k of Object.keys(targetObj)) {
+              if (!k.startsWith("__") && !k.startsWith("___"))
+                outRow[k] = targetObj[k];
+            }
+          }
         }
       } else if (col.type === "Alias") {
         const key = this.getExprKey(col.expr);
@@ -1725,7 +1736,7 @@ export class Executor {
     return outRow;
   }
 
-  private async *processWindowFunctions(storage: StorageEngine, rows: any[], columns: any[], params: any[]): AsyncIterableIterator<any> {
+  private async *processWindowFunctions(storage: StorageEngine, rows: any[], columns: any[], params: any): AsyncIterableIterator<any> {
     for (const col of columns) {
       let expr = col;
       if (col.type === 'Alias') expr = col.expr;
@@ -1847,7 +1858,7 @@ export class Executor {
     for (const row of rows) yield row;
   }
 
-  private async *streamingAggregate(storage: StorageEngine, source: AsyncIterableIterator<any>, stmt: any, params: any[] = []) {
+  private async *streamingAggregate(storage: StorageEngine, source: AsyncIterableIterator<any>, stmt: any, params: any = []) {
     const groups = new Map<string, any>();
     
     for await (const row of source) {
@@ -2232,12 +2243,14 @@ export class Executor {
     return 'null';
   }
 
-  private async evaluateExpr(storage: StorageEngine, expr: Expr, row: any, params: any[] = []): Promise<any> {
+  private async evaluateExpr(storage: StorageEngine, expr: Expr, row: any, params: any = []): Promise<any> {
     switch (expr.type) {
       case "Literal":
         return expr.value;
       case "Parameter":
         return params[expr.index - 1];
+      case "NamedParameter":
+        return params[expr.name];
       case "Identifier": {
         const nameUpper = expr.name.toUpperCase();
         if (nameUpper === "CURRENT_TIMESTAMP") return new Date().toISOString();

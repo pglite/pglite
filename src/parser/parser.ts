@@ -436,6 +436,10 @@ export class Parser {
       const index = parseInt(val.substring(1));
       return { type: 'Parameter', index };
     }
+    if (this.match('NAMED_PARAMETER')) {
+      const val = this.consume().value;
+      return { type: 'NamedParameter', name: val };
+    }
     if (this.match('SYMBOL', '*')) {
       this.consume();
       return { type: 'Identifier', name: '*' };
@@ -467,7 +471,12 @@ export class Parser {
 
       while (this.match('SYMBOL', '.')) {
         this.consume();
-        name += '.' + this.consumeIdentifier();
+        if (this.match('SYMBOL', '*')) {
+          this.consume();
+          name += '.*';
+        } else {
+          name += '.' + this.consumeIdentifier();
+        }
       }
 
       if (this.match('SYMBOL', '(')) {

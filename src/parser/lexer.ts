@@ -118,6 +118,15 @@ export class Lexer {
         continue;
       }
 
+      if (char === ":") {
+        const paramMatch = this.input.slice(this.pos).match(/^:([a-zA-Z0-9_]+)/);
+        if (paramMatch) {
+          tokens.push({ type: "NAMED_PARAMETER", value: paramMatch[1] });
+          this.pos += paramMatch[0].length;
+          continue;
+        }
+      }
+
       if (/[=><*+,();\/.:;[\]|!~?\-]/.test(char)) {
         tokens.push({ type: "SYMBOL", value: char });
         this.pos++;

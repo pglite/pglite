@@ -46,12 +46,12 @@ export class LitePostgres {
   /**
    * Used for statements that do not return rows (CREATE, INSERT, UPDATE, DELETE)
    */
-  public async exec<T = any>(sql: string, params?: any[] | string, dbName?: string): Promise<T> {
-    let actualParams: any[] =[];
+  public async exec<T = any>(sql: string, params?: any[] | Record<string, any> | string, dbName?: string): Promise<T> {
+    let actualParams: any = [];
     let actualDbName = dbName;
     if (typeof params === 'string') {
       actualDbName = params;
-    } else if (Array.isArray(params)) {
+    } else if (params !== undefined && params !== null) {
       actualParams = params;
     }
 
@@ -69,12 +69,12 @@ export class LitePostgres {
   /**
    * Used for statements that return rows (SELECT)
    */
-  public async query<T = any>(sql: string, params?: any[] | string, dbName?: string): Promise<T[]> {
-    let actualParams: any[] =[];
+  public async query<T = any>(sql: string, params?: any[] | Record<string, any> | string, dbName?: string): Promise<T[]> {
+    let actualParams: any = [];
     let actualDbName = dbName;
     if (typeof params === 'string') {
       actualDbName = params;
-    } else if (Array.isArray(params)) {
+    } else if (params !== undefined && params !== null) {
       actualParams = params;
     }
 
@@ -104,16 +104,16 @@ export class LitePostgres {
           
           const txObj = new Proxy(this, {
             get: (target, prop) => {
-              if (prop === 'exec') return (sql: string, p?: any[] | string, db?: string) => {
-                let actualP: any[] =[];
+              if (prop === 'exec') return (sql: string, p?: any[] | Record<string, any> | string, db?: string) => {
+                let actualP: any = [];
                 let actualDb = db;
-                if (typeof p === 'string') { actualDb = p; } else if (Array.isArray(p)) { actualP = p; }
+                if (typeof p === 'string') { actualDb = p; } else if (p !== undefined && p !== null) { actualP = p; }
                 return target.run(sql, actualP, actualDb || txDb);
               };
-              if (prop === 'query') return async (sql: string, p?: any[] | string, db?: string) => {
-                let actualP: any[] =[];
+              if (prop === 'query') return async (sql: string, p?: any[] | Record<string, any> | string, db?: string) => {
+                let actualP: any = [];
                 let actualDb = db;
-                if (typeof p === 'string') { actualDb = p; } else if (Array.isArray(p)) { actualP = p; }
+                if (typeof p === 'string') { actualDb = p; } else if (p !== undefined && p !== null) { actualP = p; }
                 const res = await target.run(sql, actualP, actualDb || txDb);
                 return Array.isArray(res) ? res :[];
               };
@@ -176,7 +176,7 @@ export class LitePostgres {
     });
   }
 
-  private async run(sql: string, params: any[] = [], dbName: string): Promise<any> {
+  private async run(sql: string, params: any = [], dbName: string): Promise<any> {
     let release: (() => void) | undefined;
     
     if (!this.storage.isInTransaction()) {

@@ -2496,6 +2496,43 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 55: Specific Syntax Compatibility", () => {
+    test("55.1 Table alias wildcard and named parameters", async () => {
+      await db.exec(`CREATE TABLE students (id SERIAL PRIMARY KEY, full_name TEXT, student_code TEXT, deleted_at TIMESTAMP)`);
+      await db.exec(`CREATE TABLE enrollments (id SERIAL PRIMARY KEY, student_id INT, class_id INT, deleted_at TIMESTAMP)`);
+      
+      await db.exec(`INSERT INTO students (full_name, student_code) VALUES ('Nguyen Van A', 'SV001'), ('Le Thi B', 'SV002')`);
+      await db.exec(`INSERT INTO enrollments (student_id, class_id) VALUES (1, 101)`);
+      
+      const sql = `
+        SELECT 
+            s.*,
+            EXISTS (
+                SELECT 1 
+                FROM enrollments e 
+                WHERE e.student_id = s.id 
+                AND e.class_id = :classId 
+                AND e.deleted_at IS NULL
+            ) as is_enrolled
+        FROM students s
+        WHERE s.deleted_at IS NULL
+        AND (s.full_name ILIKE :search OR s.student_code ILIKE :search);
+      `;
+
+      const rows = await db.query(sql, { classId: 101, search: '%Nguyen%' });
+      
+      expect(rows.length).toBe(1);
+      expect(rows[0].full_name).toBe('Nguyen Van A');
+      expect(rows[0].student_code).toBe('SV001');
+      expect(rows[0].is_enrolled).toBe(true);
+
+      const rows2 = await db.query(sql, { classId: 102, search: '%Le Thi%' });
+      expect(rows2.length).toBe(1);
+      expect(rows2[0].full_name).toBe('Le Thi B');
+      expect(rows2[0].is_enrolled).toBe(false);
+    });
+  });
+
   describe("LEVEL 54: DROP ... CASCADE and RESTRICT", () => {
     test("54.1 DROP TABLE CASCADE drops table and referencing foreign keys", async () => {
       await db.exec(`CREATE TABLE parent_cascade_drop (id SERIAL PRIMARY KEY)`);

@@ -1,4 +1,4 @@
-export type TokenType = 'KEYWORD' | 'IDENTIFIER' | 'STRING' | 'NUMBER' | 'SYMBOL' | 'EOF' | 'PARAMETER';
+export type TokenType = 'KEYWORD' | 'IDENTIFIER' | 'STRING' | 'NUMBER' | 'SYMBOL' | 'EOF' | 'PARAMETER' | 'NAMED_PARAMETER';
 
 export interface Token {
   type: TokenType;
@@ -9,6 +9,7 @@ export type Expr =
   | { type: 'Literal'; value: string | number | boolean | null }
   | { type: 'Identifier'; name: string }
   | { type: 'Parameter'; index: number }
+  | { type: 'NamedParameter'; name: string }
   | { type: 'Binary'; left: Expr; operator: string; right: Expr }
   | { type: 'Logical'; left: Expr; operator: string; right: Expr }
   | { type: 'Not'; expr: Expr }
