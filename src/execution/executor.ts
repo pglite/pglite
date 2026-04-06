@@ -782,7 +782,7 @@ export class Executor {
         (c: Expr) => {
           let target = c;
           if (c.type === "Alias") target = c.expr;
-          return target.type === "Call" && !target.over && ["COUNT", "AVG", "SUM", "MIN", "MAX", "ARRAY_AGG"].includes(target.fnName);
+          return target.type === "Call" && !target.over && ["COUNT", "AVG", "SUM", "MIN", "MAX", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG"].includes(target.fnName);
         }
       );
 
@@ -1352,7 +1352,7 @@ export class Executor {
       }
       
       if (!groups.has(key)) {
-        groups.set(key, { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, __DISTINCTS__: {}, baseRow: row });
+        groups.set(key, { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, __JSON_OBJ_AGGS__: {}, __DISTINCTS__: {}, baseRow: row });
       }
       const state = groups.get(key);
       state.__COUNT__++;
@@ -1413,7 +1413,7 @@ export class Executor {
                state.__SUMS__[colName] += await this.evaluateExpr(storage, target.args[0], row, params);
                state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
             }
-          } else if (target.fnName === "ARRAY_AGG") {
+          } else if (target.fnName === "ARRAY_AGG" || target.fnName === "JSON_AGG" || target.fnName === "JSONB_AGG") {
             if (!state.__ARRAYS__[colName]) state.__ARRAYS__[colName] = [];
             if (target.args && target.args[0]) {
                const val = await this.evaluateExpr(storage, target.args[0], row, params);
@@ -1425,13 +1425,22 @@ export class Executor {
                  state.__ARRAYS__[colName].push(val);
                }
             }
+          } else if (target.fnName === "JSON_OBJECT_AGG" || target.fnName === "JSONB_OBJECT_AGG") {
+            if (!state.__JSON_OBJ_AGGS__[colName]) state.__JSON_OBJ_AGGS__[colName] = {};
+            if (target.args && target.args.length >= 2) {
+               const k = await this.evaluateExpr(storage, target.args[0], row, params);
+               const v = await this.evaluateExpr(storage, target.args[1], row, params);
+               if (k !== null) {
+                  state.__JSON_OBJ_AGGS__[colName][String(k)] = v;
+               }
+            }
           }
         }
       }
     }
     
     if (groups.size === 0 && !stmt.groupBy) {
-       groups.set("all", { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, __DISTINCTS__: {}, baseRow: {} });
+       groups.set("all", { __COUNT__: 0, __COUNTS__: {}, __SUMS__: {}, __ARRAYS__: {}, __JSON_OBJ_AGGS__: {}, __DISTINCTS__: {}, baseRow: {} });
     }
 
     for (const state of groups.values()) {
@@ -1443,22 +1452,23 @@ export class Executor {
           
           if (target.type === "Call") {
              const colName = this.getExprKey(target);
-             if (target.fnName === "COUNT") {
+             const fn = target.fnName;
+             if (fn === "COUNT") {
                 const count = target.distinct ? (state.__DISTINCTS__[colName]?.size || 0) : (state.__COUNTS__[colName] || 0);
                 outRow[alias || "count"] = count;
                 outRow[colName] = count;
-             } else if (target.fnName === "SUM" || target.fnName === "MIN" || target.fnName === "MAX") {
+             } else if (fn === "SUM" || fn === "MIN" || fn === "MAX") {
                 const val = state.__SUMS__[colName] === undefined ? null : state.__SUMS__[colName];
-                outRow[alias || target.fnName.toLowerCase()] = val;
+                outRow[alias || fn.toLowerCase()] = val;
                 outRow[colName] = val;
-             } else if (target.fnName === "AVG") {
+             } else if (fn === "AVG") {
                 const sum = state.__SUMS__[colName] || 0;
                 const count = state.__COUNTS__[colName] || 0;
                 const avg = count ? sum / count : 0;
                 outRow[alias || "avg"] = avg;
                 outRow["__AVG__"] = avg;
                 outRow[colName] = avg;
-             } else if (target.fnName === "ARRAY_AGG") {
+             } else if (fn === "ARRAY_AGG" || fn === "JSON_AGG" || fn === "JSONB_AGG") {
                 let arr = state.__ARRAYS__[colName] || [];
                 const obList = target.argsOrderBy;
                 if (obList && arr.length > 0) {
@@ -1472,8 +1482,14 @@ export class Executor {
                   });
                   arr = arr.map((x: any) => x.val);
                 }
-                outRow[alias || "array_agg"] = arr;
+                const outKey = alias || (fn === "ARRAY_AGG" ? "array_agg" : (fn === "JSON_AGG" ? "json_agg" : "jsonb_agg"));
+                outRow[outKey] = arr;
                 outRow[colName] = arr;
+             } else if (fn === "JSON_OBJECT_AGG" || fn === "JSONB_OBJECT_AGG") {
+                const obj = state.__JSON_OBJ_AGGS__[colName] || {};
+                const outKey = alias || (fn === "JSON_OBJECT_AGG" ? "json_object_agg" : "jsonb_object_agg");
+                outRow[outKey] = obj;
+                outRow[colName] = obj;
              }
           } else {
              const name = (target as any).name;
@@ -1617,6 +1633,96 @@ export class Executor {
 
     let res = parts.length === 0 ? "0 days" : parts.join(" ");
     return isNegative ? `-${res}` : res;
+  }
+
+  private deepSet(obj: any, path: any[], value: any, createMissing: boolean): any {
+    if (path.length === 0) return value;
+    const key = path[0];
+    
+    if (obj === null || (typeof obj !== 'object' && !Array.isArray(obj))) {
+        if (!createMissing) return obj;
+        obj = {}; 
+    }
+
+    let nextObj: any;
+    let actualKey: any = key;
+
+    if (Array.isArray(obj)) {
+        nextObj = [...obj];
+        actualKey = parseInt(String(key));
+        if (isNaN(actualKey)) return obj;
+    } else {
+        nextObj = { ...obj };
+    }
+    
+    if (path.length === 1) {
+        if (!createMissing && nextObj[actualKey] === undefined) return obj;
+        nextObj[actualKey] = value;
+        return nextObj;
+    }
+
+    if (nextObj[actualKey] === undefined) {
+        if (!createMissing) return obj;
+        nextObj[actualKey] = {};
+    }
+
+    nextObj[actualKey] = this.deepSet(nextObj[actualKey], path.slice(1), value, createMissing);
+    return nextObj;
+  }
+
+  private deepInsert(obj: any, path: any[], value: any, insertAfter: boolean): any {
+    if (path.length === 0) return value;
+    const key = path[0];
+    
+    if (path.length === 1) {
+        if (!Array.isArray(obj)) return obj;
+        const newArr = [...obj];
+        let idx = parseInt(String(key));
+        if (isNaN(idx)) return obj;
+        if (idx < 0) idx = newArr.length + idx;
+        newArr.splice(insertAfter ? idx + 1 : idx, 0, value);
+        return newArr;
+    }
+
+    if (obj === null || typeof obj !== 'object') return obj;
+
+    let nextObj = Array.isArray(obj) ? [...obj] : { ...obj };
+    let actualKey: any = key;
+    if (Array.isArray(obj)) {
+        actualKey = parseInt(String(key));
+        if (isNaN(actualKey)) return obj;
+    }
+    
+    if (nextObj[actualKey] === undefined) return obj;
+
+    nextObj[actualKey] = this.deepInsert(nextObj[actualKey], path.slice(1), value, insertAfter);
+    return nextObj;
+  }
+
+  private stripNulls(obj: any): any {
+    if (Array.isArray(obj)) {
+        return obj.map(v => this.stripNulls(v));
+    }
+    if (obj !== null && typeof obj === 'object') {
+        const res: any = {};
+        for (const k in obj) {
+            if (obj[k] !== null) {
+                res[k] = this.stripNulls(obj[k]);
+            }
+        }
+        return res;
+    }
+    return obj;
+  }
+
+  private jsonTypeof(val: any): string {
+    if (val === null) return 'null';
+    if (Array.isArray(val)) return 'array';
+    if (typeof val === 'object') return 'object';
+    if (typeof val === 'number') return 'number';
+    if (typeof val === 'string') return 'string';
+    if (typeof val === 'boolean') return 'boolean';
+    return 'null';
   }
 
   private async evaluateExpr(storage: StorageEngine, expr: Expr, row: any, params: any[] = []): Promise<any> {
@@ -1828,7 +1934,8 @@ export class Executor {
         if (fnName === "COUNT") return row.__COUNT__ || 0;
         if (fnName === "AVG") return row.__AVG__ || 0;
         if (fnName === "SUM" || fnName === "MIN" || fnName === "MAX") return null;
-        if (fnName === "ARRAY_AGG") return [];
+        if (fnName === "ARRAY_AGG" || fnName === "JSON_AGG" || fnName === "JSONB_AGG") return [];
+        if (fnName === "JSON_OBJECT_AGG" || fnName === "JSONB_OBJECT_AGG") return {};
 
         const args = [];
         for (const argExpr of expr.args) {
@@ -1958,7 +2065,7 @@ export class Executor {
         if (fnName === "DEGREES") return args[0] != null ? Number(args[0]) * (180 / Math.PI) : null;
         if (fnName === "RADIANS") return args[0] != null ? Number(args[0]) * (Math.PI / 180) : null;
 
-        if (fnName === "JSON_EXTRACT") {
+        if (fnName === "JSON_EXTRACT" || fnName === "JSONB_EXTRACT") {
           let json = args[0];
           if (typeof json === "string") {
             try { json = JSON.parse(json); } catch { return null; }
@@ -1968,6 +2075,50 @@ export class Executor {
             current = current?.[args[i]];
           }
           return current;
+        }
+
+        if (fnName === "JSON_BUILD_OBJECT" || fnName === "JSONB_BUILD_OBJECT") {
+          const obj: any = {};
+          for (let i = 0; i < args.length; i += 2) {
+            if (args[i] !== undefined && args[i] !== null) {
+              obj[String(args[i])] = args[i + 1];
+            }
+          }
+          return obj;
+        }
+
+        if (fnName === "JSON_BUILD_ARRAY" || fnName === "JSONB_BUILD_ARRAY") {
+          return args;
+        }
+
+        if (fnName === "JSONB_SET") {
+          const target = args[0];
+          const path = args[1];
+          const newValue = args[2];
+          const createMissing = args[3] !== false;
+          if (!Array.isArray(path)) return target;
+          return this.deepSet(target, path, newValue, createMissing);
+        }
+
+        if (fnName === "JSONB_INSERT") {
+          const target = args[0];
+          const path = args[1];
+          const newValue = args[2];
+          const insertAfter = args[3] === true;
+          if (!Array.isArray(path)) return target;
+          return this.deepInsert(target, path, newValue, insertAfter);
+        }
+
+        if (fnName === "JSON_TYPEOF" || fnName === "JSONB_TYPEOF") {
+          return this.jsonTypeof(args[0]);
+        }
+
+        if (fnName === "JSON_STRIP_NULLS" || fnName === "JSONB_STRIP_NULLS") {
+          return this.stripNulls(args[0]);
+        }
+
+        if (fnName === "JSONB_PRETTY") {
+          return JSON.stringify(args[0], null, 2);
         }
         if (fnName === "DATE_TRUNC") {
           const unit = String(args[0]).toLowerCase();

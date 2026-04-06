@@ -1098,6 +1098,49 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].res5).toBe(true);
     });
 
+    test("21.2.1 Advanced JSON Functions", async () => {
+      const rows = await db.query(`
+        SELECT 
+          JSONB_BUILD_OBJECT('name', 'Alice', 'age', 30) as obj,
+          JSONB_BUILD_ARRAY(1, 'two', false) as arr,
+          JSONB_SET('{"a": 1}'::json, ARRAY['b'], '2'::json) as set1,
+          JSONB_SET('{"a": 1}'::json, ARRAY['a'], '10'::json) as set2,
+          JSONB_TYPEOF('{"a": 1}'::json) as t1,
+          JSONB_TYPEOF('[1,2]'::json) as t2,
+          JSONB_STRIP_NULLS('{"a": 1, "b": null}'::json) as strip
+      `);
+      expect(rows[0].obj).toEqual({ name: 'Alice', age: 30 });
+      expect(rows[0].arr).toEqual([1, 'two', false]);
+      expect(rows[0].set1).toEqual({ a: 1, b: 2 });
+      expect(rows[0].set2).toEqual({ a: 10 });
+      expect(rows[0].t1).toBe('object');
+      expect(rows[0].t2).toBe('array');
+      expect(rows[0].strip).toEqual({ a: 1 });
+    });
+
+    test("21.2.2 JSON Aggregates", async () => {
+      await db.exec(`CREATE TABLE json_agg_test (id INT, val TEXT)`);
+      await db.exec(`INSERT INTO json_agg_test VALUES (1, 'A'), (1, 'B'), (2, 'C')`);
+      
+      const rows = await db.query(`
+        SELECT 
+          id, 
+          JSONB_AGG(val) as vals,
+          JSONB_OBJECT_AGG(val, val || '_suff') as obj
+        FROM json_agg_test 
+        GROUP BY id
+        ORDER BY id
+      `);
+      
+      expect(rows.length).toBe(2);
+      expect(rows[0].id).toBe(1);
+      expect(rows[0].vals).toEqual(['A', 'B']);
+      expect(rows[0].obj).toEqual({ 'A': 'A_suff', 'B': 'B_suff' });
+      expect(rows[1].id).toBe(2);
+      expect(rows[1].vals).toEqual(['C']);
+      expect(rows[1].obj).toEqual({ 'C': 'C_suff' });
+    });
+
     test("21.3 Array Operators (&&, @>)", async () => {
       const rows = await db.query(`
         SELECT 
