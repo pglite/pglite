@@ -2211,6 +2211,48 @@ export class StorageEngine {
     return row;
   }
 
+  public async truncateTable(name: string, cascade: boolean = false, restartIdentity: boolean = false, visited: Set<string> = new Set(), tablesInStmt: Set<string> = new Set()) {
+    const fullName = this.getFullTableName(name);
+    if (visited.has(fullName)) return;
+    visited.add(fullName);
+
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} not found`);
+
+    const referencing = await this.getReferencingColumnsInternal(fullName);
+    if (cascade) {
+      for (const ref of referencing) {
+         await this.truncateTable(ref.childTable, true, restartIdentity, visited, tablesInStmt);
+      }
+    } else {
+      for (const ref of referencing) {
+         if (!tablesInStmt.has(ref.childTable) && !visited.has(ref.childTable)) {
+            throw new Error(`Cannot truncate table "${fullName}" because it is referenced by foreign key from table "${ref.childTable}"`);
+         }
+      }
+    }
+
+    const firstPageBuf = Buffer.alloc(PAGE_SIZE);
+    firstPageBuf.writeUInt32LE(0xffffffff, 0);
+    firstPageBuf.writeUInt16LE(0, 4);
+    firstPageBuf.writeUInt16LE(PAGE_SIZE, 6);
+    await this.pager.writePage(table.firstPage, firstPageBuf);
+
+    table.lastPage = table.firstPage;
+    if (restartIdentity) table.sequence = 0;
+    
+    await this.updateTableSchema(fullName, table);
+
+    if (table.indexRootPage && table.indexRootPage !== 0 && table.indexRootPage !== 0xffffffff) {
+      const rootBuf = Buffer.alloc(PAGE_SIZE);
+      rootBuf.writeUInt8(1, 0);
+      rootBuf.writeUInt16LE(0, 1);
+      rootBuf.writeUInt32LE(0xffffffff, 3);
+      await this.pager.writePage(table.indexRootPage, rootBuf);
+      this.pkIndexes.delete(fullName);
+    }
+  }
+
   public async getPKColumn(name: string): Promise<string | null> {
     const table = await this.getTableAsync(name);
     return table?.pkColumn || null;

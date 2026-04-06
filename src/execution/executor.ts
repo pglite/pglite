@@ -547,6 +547,15 @@ export class Executor {
         return { success: true, updated: updatedCount };
       }
 
+      case "Truncate": {
+        const visited = new Set<string>();
+        const tableNamesToTruncate = new Set(stmt.tableNames.map(t => storage.getFullTableName(t)));
+        for (const tableName of stmt.tableNames) {
+           await storage.truncateTable(tableName, stmt.cascade, stmt.restartIdentity, visited, tableNamesToTruncate);
+        }
+        return { success: true, message: `Truncated ${stmt.tableNames.join(', ')}` };
+      }
+
       case "Delete": {
         const referencingCols = await storage.getReferencingColumns(stmt.tableName);
         const deletedRows: any[] = [];

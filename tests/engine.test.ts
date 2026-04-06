@@ -3161,6 +3161,68 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 50: TRUNCATE TABLE", () => {
+    test("50.1 TRUNCATE simple table", async () => {
+      await db.exec(`CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`INSERT INTO trunc_test (val) VALUES ('A'), ('B')`);
+      const res = await db.exec(`TRUNCATE TABLE trunc_test`);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT * FROM trunc_test`);
+      expect(rows.length).toBe(0);
+      
+      // Without RESTART IDENTITY, sequence should continue
+      const res2 = await db.query(`INSERT INTO trunc_test (val) VALUES ('C') RETURNING id`);
+      expect(res2[0].id).toBe(3);
+    });
+
+    test("50.2 TRUNCATE with RESTART IDENTITY", async () => {
+      await db.exec(`TRUNCATE TABLE trunc_test RESTART IDENTITY`);
+      
+      const res = await db.query(`INSERT INTO trunc_test (val) VALUES ('D') RETURNING id`);
+      expect(res[0].id).toBe(1);
+    });
+
+    test("50.3 TRUNCATE multiple tables", async () => {
+      await db.exec(`CREATE TABLE trunc_multi_1 (id INT)`);
+      await db.exec(`CREATE TABLE trunc_multi_2 (id INT)`);
+      await db.exec(`INSERT INTO trunc_multi_1 VALUES (1)`);
+      await db.exec(`INSERT INTO trunc_multi_2 VALUES (2)`);
+      
+      await db.exec(`TRUNCATE trunc_multi_1, trunc_multi_2`);
+      
+      const r1 = await db.query(`SELECT * FROM trunc_multi_1`);
+      const r2 = await db.query(`SELECT * FROM trunc_multi_2`);
+      expect(r1.length).toBe(0);
+      expect(r2.length).toBe(0);
+    });
+
+    test("50.4 TRUNCATE with foreign keys and CASCADE", async () => {
+      await db.exec(`CREATE TABLE trunc_parent (id INT PRIMARY KEY)`);
+      await db.exec(`CREATE TABLE trunc_child (id INT REFERENCES trunc_parent(id))`);
+      
+      await db.exec(`INSERT INTO trunc_parent VALUES (1)`);
+      await db.exec(`INSERT INTO trunc_child VALUES (1)`);
+      
+      // Should fail without cascade
+      expect(async () => {
+        await db.exec(`TRUNCATE trunc_parent`);
+      }).toThrow();
+      
+      // Should succeed if both are in statement
+      await db.exec(`TRUNCATE trunc_parent, trunc_child`);
+      
+      await db.exec(`INSERT INTO trunc_parent VALUES (2)`);
+      await db.exec(`INSERT INTO trunc_child VALUES (2)`);
+      
+      // Should succeed with CASCADE
+      await db.exec(`TRUNCATE trunc_parent CASCADE`);
+      
+      const cRows = await db.query(`SELECT * FROM trunc_child`);
+      expect(cRows.length).toBe(0);
+    });
+  });
+
   describe("LEVEL 48: FIRST_VALUE and LAST_VALUE Window Functions", () => {
     test("48.1 FIRST_VALUE and LAST_VALUE with PARTITION BY and ORDER BY", async () => {
       const rows = await db.query(`

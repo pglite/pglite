@@ -72,6 +72,7 @@ export class Parser {
         case 'VALUES': stmt = this.parseValues(); break;
         case 'UPDATE': stmt = this.parseUpdate(); break;
         case 'DELETE': stmt = this.parseDelete(); break;
+        case 'TRUNCATE': stmt = this.parseTruncate(); break;
         case 'ALTER': stmt = this.parseAlter(); break;
         case 'DROP': stmt = this.parseDrop(); break;
         case 'COMMENT': stmt = this.parseComment(); break;
@@ -1406,6 +1407,37 @@ export class Parser {
     }
     
     return { type: 'Delete', tableName, where, returning };
+  }
+
+  private parseTruncate(): Statement {
+    this.consume('KEYWORD', 'TRUNCATE');
+    if (this.match('KEYWORD', 'TABLE')) this.consume();
+    
+    const tableNames: string[] = [];
+    tableNames.push(this.parseTableName());
+    while (this.match('SYMBOL', ',')) {
+      this.consume();
+      tableNames.push(this.parseTableName());
+    }
+
+    let restartIdentity = false;
+    if (this.match('KEYWORD', 'RESTART')) {
+      this.consume();
+      if (this.match('KEYWORD', 'IDENTITY')) this.consume();
+      restartIdentity = true;
+    } else if (this.match('KEYWORD', 'CONTINUE')) {
+      this.consume();
+      if (this.match('KEYWORD', 'IDENTITY')) this.consume();
+    }
+
+    let cascade = false;
+    if (this.match('KEYWORD', 'CASCADE')) {
+      this.consume(); cascade = true;
+    } else if (this.match('KEYWORD', 'RESTRICT')) {
+      this.consume();
+    }
+
+    return { type: 'Truncate', tableNames, cascade, restartIdentity };
   }
 
   private parseDrop(): Statement {
