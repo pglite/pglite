@@ -690,13 +690,35 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(async () => await db.query(sql)).not.toThrow();
     });
 
-    test("5.3 UNION and INTERSECT", async () => {
-      const sql = `
-        SELECT name FROM users WHERE age < 30
+    test("5.3 UNION, INTERSECT, and EXCEPT", async () => {
+      await db.exec(`CREATE TABLE set_ops_test (val INT)`);
+      await db.exec(`INSERT INTO set_ops_test (val) VALUES (1), (2), (3), (4), (5)`);
+
+      const unionRows = await db.query(`
+        SELECT val FROM set_ops_test WHERE val < 3
         UNION
-        SELECT name FROM users WHERE age > 40
-      `;
-      expect(async () => await db.query(sql)).not.toThrow();
+        SELECT val FROM set_ops_test WHERE val > 4
+      `);
+      expect(unionRows.length).toBe(3);
+      const unionVals = unionRows.map((r: any) => r.val).sort();
+      expect(unionVals).toEqual([1, 2, 5]);
+
+      const intersectRows = await db.query(`
+        SELECT val FROM set_ops_test WHERE val < 4
+        INTERSECT
+        SELECT val FROM set_ops_test WHERE val > 2
+      `);
+      expect(intersectRows.length).toBe(1);
+      expect(intersectRows[0].val).toBe(3);
+
+      const exceptRows = await db.query(`
+        SELECT val FROM set_ops_test WHERE val < 5
+        EXCEPT
+        SELECT val FROM set_ops_test WHERE val < 3
+      `);
+      expect(exceptRows.length).toBe(2);
+      const exceptVals = exceptRows.map((r: any) => r.val).sort();
+      expect(exceptVals).toEqual([3, 4]);
     });
 
     test("5.4 Complex catalog query with NOT IN and obj_description", async () => {

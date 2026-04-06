@@ -106,6 +106,7 @@ export type Statement =
       ctes?: { name: string; stmt: Statement }[];
       union?: Statement;
       intersect?: Statement;
+      except?: Statement;
     }
   | { type: 'Update'; tableName: string; assignments: Record<string, Expr>; where?: Expr; returning?: Expr[] }
   | { type: 'Delete'; tableName: string; where?: Expr; returning?: Expr[] }

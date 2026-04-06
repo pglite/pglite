@@ -819,6 +819,16 @@ export class Executor {
          sourceStream = this.concatStreams(sourceStream, rightStream);
       }
 
+      if (stmt.intersect) {
+         const rightStream = this.executeSelect(storage, stmt.intersect, params, outerRow);
+         sourceStream = this.intersectStream(sourceStream, rightStream);
+      }
+
+      if (stmt.except) {
+         const rightStream = this.executeSelect(storage, stmt.except, params, outerRow);
+         sourceStream = this.exceptStream(sourceStream, rightStream);
+      }
+
       if (stmt.orderBy) {
          sourceStream = this.externalSortStream(storage, sourceStream, stmt.orderBy, params);
       }
@@ -1079,6 +1089,42 @@ export class Executor {
   private async *concatStreams(s1: AsyncIterableIterator<any>, s2: AsyncIterableIterator<any>) {
     for await (const r of s1) yield r;
     for await (const r of s2) yield r;
+  }
+
+  private async *intersectStream(s1: AsyncIterableIterator<any>, s2: AsyncIterableIterator<any>) {
+    const rightSet = new Set<string>();
+    for await (const r of s2) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      rightSet.add(JSON.stringify(proj));
+    }
+
+    const seen = new Set<string>();
+    for await (const r of s1) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      const key = JSON.stringify(proj);
+      if (rightSet.has(key) && !seen.has(key)) {
+        seen.add(key);
+        yield r;
+      }
+    }
+  }
+
+  private async *exceptStream(s1: AsyncIterableIterator<any>, s2: AsyncIterableIterator<any>) {
+    const rightSet = new Set<string>();
+    for await (const r of s2) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      rightSet.add(JSON.stringify(proj));
+    }
+
+    const seen = new Set<string>();
+    for await (const r of s1) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      const key = JSON.stringify(proj);
+      if (!rightSet.has(key) && !seen.has(key)) {
+        seen.add(key);
+        yield r;
+      }
+    }
   }
 
   private async *applyOffset(source: AsyncIterableIterator<any>, offset: number) {

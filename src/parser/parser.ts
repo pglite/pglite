@@ -114,7 +114,7 @@ export class Parser {
         this.consume();
         const alias = this.consumeIdentifier();
         expr = { type: 'Alias', expr, alias };
-      } else if (this.matchIdentifier() && !['FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT', 'HAVING', 'RETURNING'].includes(this.current()?.value.toUpperCase() || '')) {
         const alias = this.consumeIdentifier();
         expr = { type: 'Alias', expr, alias };
       }
@@ -488,7 +488,7 @@ export class Parser {
     // e.g., TIMESTAMP WITH TIME ZONE, integer[], USER-DEFINED
     const stopKeywords = new Set([
       'PRIMARY', 'UNIQUE', 'NOT', 'NULL', 'REFERENCES', 'DEFAULT', 'CONSTRAINT', 'CHECK', 'GENERATED',
-      'AS', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT',
+      'AS', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
       'HAVING', 'RETURNING', 'ON', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'VALUES', 'SET', 'CONFLICT', 'DO',
       'END', 'THEN', 'ELSE', 'WHEN', 'FILTER', 'OVER', 'PARTITION', 'AND', 'OR', 'IS', 'IN',
       'ASC', 'DESC', 'TRUE', 'FALSE', 'LIKE'
@@ -1009,7 +1009,7 @@ export class Parser {
       if (this.match('KEYWORD', 'AS')) {
         this.consume(); const alias = this.consumeIdentifier();
         expr = { type: 'Alias', expr, alias };
-      } else if (this.matchIdentifier() && !['FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT', 'HAVING', 'RETURNING'].includes(this.current()?.value.toUpperCase() || '')) {
         const alias = this.consumeIdentifier();
         expr = { type: 'Alias', expr, alias };
       }
@@ -1062,7 +1062,7 @@ export class Parser {
           this.consume('SYMBOL', ')');
           from.columnAliases = columnAliases;
         }
-      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
         from.alias = this.consumeIdentifier();
       }
     }
@@ -1137,7 +1137,7 @@ export class Parser {
           this.consume('SYMBOL', ')');
           columnAliases = aliases;
         }
-      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT', 'HAVING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
         alias = this.consumeIdentifier();
       }
       
@@ -1203,6 +1203,10 @@ export class Parser {
     if (this.match('KEYWORD', 'INTERSECT')) {
       this.consume(); const right = this.parseSelect();
       stmt = { ...stmt, intersect: right };
+    }
+    if (this.match('KEYWORD', 'EXCEPT')) {
+      this.consume(); const right = this.parseSelect();
+      stmt = { ...stmt, except: right };
     }
 
     return stmt;
