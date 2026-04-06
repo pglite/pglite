@@ -1468,22 +1468,24 @@ export class Executor {
         }
 
         let rank = 0;
+        let denseRank = 0;
         let lastOrderVals: any[] = [];
 
         for (let i = 0; i < pRows.length; i++) {
           const row = pRows[i];
           if (expr.fnName === 'ROW_NUMBER') {
             row[windowKey] = i + 1;
-          } else if (expr.fnName === 'RANK') {
+          } else if (expr.fnName === 'RANK' || expr.fnName === 'DENSE_RANK') {
             if (expr.over.orderBy) {
               const currentOrderVals = [];
               for (const ob of expr.over.orderBy) currentOrderVals.push(await this.evaluateExpr(storage, ob.expr, row, params));
               
               if (i === 0 || JSON.stringify(currentOrderVals) !== JSON.stringify(lastOrderVals)) {
                 rank = i + 1;
+                denseRank++;
                 lastOrderVals = currentOrderVals;
               }
-              row[windowKey] = rank;
+              row[windowKey] = expr.fnName === 'RANK' ? rank : denseRank;
             } else {
               row[windowKey] = 1;
             }

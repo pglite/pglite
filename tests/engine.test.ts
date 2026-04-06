@@ -1467,7 +1467,28 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[2].next_salary).toBeNull();
     });
 
-    test("11.4 LEAD() with offset and default", async () => {
+    test("11.4 DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...)", async () => {
+      const rows = await db.query(`
+        SELECT name, department, salary, DENSE_RANK() OVER (PARTITION BY department ORDER BY salary DESC) as drnk
+        FROM employees
+        ORDER BY department, drnk
+      `);
+
+      const itRows = rows.filter((r) => r.department === "IT");
+      // IT salaries: Bob (6000), Alice (5000), David (5000)
+      expect(itRows[0].name).toBe("Bob");
+      expect(itRows[0].drnk).toBe(1);
+      expect(itRows[1].salary).toBe(5000);
+      expect(itRows[1].drnk).toBe(2);
+      expect(itRows[2].drnk).toBe(2); // Same rank for same salary
+
+      const hrRows = rows.filter((r) => r.department === "HR");
+      // HR salaries: Charlie (4500), Eve (4500)
+      expect(hrRows[0].drnk).toBe(1);
+      expect(hrRows[1].drnk).toBe(1);
+    });
+
+    test("11.5 LEAD() with offset and default", async () => {
       const rows = await db.query(`
         SELECT 
           name,
