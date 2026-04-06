@@ -106,6 +106,7 @@ export type Statement =
       offset?: Expr;
       ctes?: { name: string; stmt: Statement }[];
       union?: Statement;
+      unionAll?: Statement;
       intersect?: Statement;
       except?: Statement;
     }

@@ -814,9 +814,14 @@ export class Executor {
          sourceStream = this.distinctStream(sourceStream);
       }
 
+      if (stmt.unionAll) {
+         const rightStream = this.executeSelect(storage, stmt.unionAll, params, outerRow);
+         sourceStream = this.concatStreams(sourceStream, rightStream);
+      }
+
       if (stmt.union) {
          const rightStream = this.executeSelect(storage, stmt.union, params, outerRow);
-         sourceStream = this.concatStreams(sourceStream, rightStream);
+         sourceStream = this.distinctStream(this.concatStreams(sourceStream, rightStream));
       }
 
       if (stmt.intersect) {

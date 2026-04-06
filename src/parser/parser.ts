@@ -1224,8 +1224,18 @@ export class Parser {
     let stmt: Statement = { type: 'Select', columns, distinct, distinctOn, from, joins, where, groupBy, having, orderBy, limit, offset };
 
     if (this.match('KEYWORD', 'UNION')) {
-      this.consume(); const right = this.parseSelect();
-      stmt = { ...stmt, union: right };
+      this.consume();
+      let isAll = false;
+      if (this.match('KEYWORD', 'ALL')) {
+        this.consume();
+        isAll = true;
+      }
+      const right = this.parseSelect();
+      if (isAll) {
+        stmt = { ...stmt, unionAll: right };
+      } else {
+        stmt = { ...stmt, union: right };
+      }
     }
     if (this.match('KEYWORD', 'INTERSECT')) {
       this.consume(); const right = this.parseSelect();

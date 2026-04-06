@@ -721,6 +721,28 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(exceptVals).toEqual([3, 4]);
     });
 
+    test("5.15 UNION and UNION ALL", async () => {
+      await db.exec(`CREATE TABLE union_test (val INT)`);
+      await db.exec(`INSERT INTO union_test (val) VALUES (1), (1), (2)`);
+
+      const unionAllRows = await db.query(`
+        SELECT val FROM union_test WHERE val = 1
+        UNION ALL
+        SELECT val FROM union_test WHERE val = 1
+      `);
+      // Should have 4 rows (1, 1 from left + 1, 1 from right)
+      expect(unionAllRows.length).toBe(4);
+
+      const unionRows = await db.query(`
+        SELECT val FROM union_test WHERE val = 1
+        UNION
+        SELECT val FROM union_test WHERE val = 1
+      `);
+      // UNION implies DISTINCT across the entire result set
+      expect(unionRows.length).toBe(1);
+      expect(unionRows[0].val).toBe(1);
+    });
+
     test("5.4 Complex catalog query with NOT IN and obj_description", async () => {
       await db.exec(`COMMENT ON TABLE users IS 'User record table'`);
       const sql = `
