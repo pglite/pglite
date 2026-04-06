@@ -22,6 +22,7 @@ export type Expr =
   | { type: 'Case'; cases: { when: Expr; then: Expr }[]; elseExpr?: Expr }
   | { type: 'Array'; elements: Expr[] }
   | { type: 'Interval'; value: string }
+  | { type: 'Extract'; field: string; source: Expr }
   | { type: 'Exists'; stmt: Statement };
 
 export interface OnConflict {

@@ -2855,4 +2855,40 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].m).toBe(1);
     });
   });
+
+  describe("LEVEL 46: Advanced Date Functions", () => {
+    test("46.1 EXTRACT() function", async () => {
+      const sql = "SELECT EXTRACT(YEAR FROM '2024-05-20'::timestamp) as yr, EXTRACT(MONTH FROM '2024-05-20'::timestamp) as mon";
+      const rows = await db.query(sql);
+      expect(rows[0].yr).toBe(2024);
+      expect(rows[0].mon).toBe(5);
+    });
+
+    test("46.2 AGE() function", async () => {
+      const sql = "SELECT AGE('2024-05-20'::timestamp, '2023-01-01'::timestamp) as age_val";
+      const rows = await db.query(sql);
+      expect(rows[0].age_val).toContain("1 year");
+      expect(rows[0].age_val).toContain("4 months");
+      expect(rows[0].age_val).toContain("19 days");
+    });
+
+    test("46.3 TO_CHAR() function", async () => {
+      const sql = "SELECT TO_CHAR('2024-05-20'::timestamp, 'YYYY-MM-DD') as fmt";
+      const rows = await db.query(sql);
+      expect(rows[0].fmt).toBe("2024-05-20");
+    });
+
+    test("46.4 DATE_PART() function", async () => {
+      const sql = "SELECT DATE_PART('year', '2024-05-20'::timestamp) as yr";
+      const rows = await db.query(sql);
+      expect(rows[0].yr).toBe(2024);
+    });
+
+    test("46.5 Date Constants", async () => {
+      const sql = "SELECT CURRENT_DATE as cd, LOCALTIMESTAMP as lts";
+      const rows = await db.query(sql);
+      expect(rows[0].cd).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(rows[0].lts).toBeDefined();
+    });
+  });
 });

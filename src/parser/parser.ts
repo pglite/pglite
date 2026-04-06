@@ -297,6 +297,15 @@ export class Parser {
       const val = this.consume('STRING').value;
       return { type: 'Interval', value: val };
     }
+    if (this.match('KEYWORD', 'EXTRACT')) {
+      this.consume();
+      this.consume('SYMBOL', '(');
+      const field = this.consumeIdentifier();
+      this.consume('KEYWORD', 'FROM');
+      const source = this.parseExpr();
+      this.consume('SYMBOL', ')');
+      return { type: 'Extract', field, source };
+    }
     if (this.match('KEYWORD', 'EXISTS') && this.tokens[this.pos + 1]?.value === '(') {
       this.consume(); // EXISTS
       this.consume('SYMBOL', '(');

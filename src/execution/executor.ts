@@ -1538,6 +1538,87 @@ export class Executor {
     return val;
   }
 
+  private getDatePart(date: Date, field: string): number {
+    field = field.toUpperCase();
+    switch (field) {
+      case "YEAR":
+        return date.getFullYear();
+      case "MONTH":
+        return date.getMonth() + 1;
+      case "DAY":
+        return date.getDate();
+      case "HOUR":
+        return date.getHours();
+      case "MINUTE":
+        return date.getMinutes();
+      case "SECOND":
+        return date.getSeconds();
+      case "MILLISECONDS":
+        return date.getMilliseconds();
+      case "EPOCH":
+        return Math.floor(date.getTime() / 1000);
+      case "DOW":
+        return date.getDay();
+      case "DOY": {
+        const start = new Date(date.getFullYear(), 0, 0);
+        const diff = date.getTime() - start.getTime();
+        const oneDay = 1000 * 60 * 60 * 24;
+        return Math.floor(diff / oneDay);
+      }
+      case "QUARTER":
+        return Math.floor(date.getMonth() / 3) + 1;
+      case "WEEK": {
+        const d = new Date(
+          Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
+        );
+        const dayNum = d.getUTCDay() || 7;
+        d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+        const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+        return Math.ceil(
+          ((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7
+        );
+      }
+      default:
+        return 0;
+    }
+  }
+
+  private calculateAge(ts1: Date, ts2: Date): string {
+    let diff = ts1.getTime() - ts2.getTime();
+    const isNegative = diff < 0;
+    if (isNegative) {
+      const temp = ts1;
+      ts1 = ts2;
+      ts2 = temp;
+    }
+
+    let years = ts1.getFullYear() - ts2.getFullYear();
+    let months = ts1.getMonth() - ts2.getMonth();
+    let days = ts1.getDate() - ts2.getDate();
+
+    if (days < 0) {
+      months -= 1;
+      const prevMonthLastDay = new Date(
+        ts1.getFullYear(),
+        ts1.getMonth(),
+        0
+      ).getDate();
+      days += prevMonthLastDay;
+    }
+    if (months < 0) {
+      years -= 1;
+      months += 12;
+    }
+
+    const parts = [];
+    if (years !== 0) parts.push(`${years} year${years > 1 ? "s" : ""}`);
+    if (months !== 0) parts.push(`${months} month${months > 1 ? "s" : ""}`);
+    if (days !== 0) parts.push(`${days} day${days > 1 ? "s" : ""}`);
+
+    let res = parts.length === 0 ? "0 days" : parts.join(" ");
+    return isNegative ? `-${res}` : res;
+  }
+
   private async evaluateExpr(storage: StorageEngine, expr: Expr, row: any, params: any[] = []): Promise<any> {
     switch (expr.type) {
       case "Literal":
@@ -1545,7 +1626,16 @@ export class Executor {
       case "Parameter":
         return params[expr.index - 1];
       case "Identifier": {
-        if (expr.name.toUpperCase() === "CURRENT_TIMESTAMP") return new Date().toISOString();
+        const nameUpper = expr.name.toUpperCase();
+        if (nameUpper === "CURRENT_TIMESTAMP") return new Date().toISOString();
+        if (nameUpper === "CURRENT_DATE")
+          return new Date().toISOString().split("T")[0];
+        if (nameUpper === "CURRENT_TIME")
+          return new Date().toISOString().split("T")[1];
+        if (nameUpper === "LOCALTIMESTAMP") return new Date().toISOString();
+        if (nameUpper === "LOCALTIME")
+          return new Date().toISOString().split("T")[1];
+
         if (expr.name === "*") return "*";
         if (expr.name.includes(".")) {
           const parts = expr.name.split(".");
@@ -1698,6 +1788,13 @@ export class Executor {
       }
       case "Interval":
         return expr.value;
+      case "Extract": {
+        const val = await this.evaluateExpr(storage, expr.source, row, params);
+        if (val == null) return null;
+        const d = new Date(val);
+        if (isNaN(d.getTime())) return null;
+        return this.getDatePart(d, expr.field);
+      }
       case "Alias":
         return await this.evaluateExpr(storage, expr.expr, row, params);
       case "Not":
@@ -1887,6 +1984,53 @@ export class Executor {
             case "second": d.setMilliseconds(0); break;
           }
           return d.toISOString();
+        }
+        if (fnName === "AGE") {
+          if (args.length === 0) return null;
+          const t1 = new Date(args[0]);
+          const t2 = args.length > 1 ? new Date(args[1]) : new Date();
+          if (isNaN(t1.getTime()) || isNaN(t2.getTime())) return null;
+          if (args.length === 1) return this.calculateAge(new Date(), t1);
+          return this.calculateAge(t1, t2);
+        }
+        if (fnName === "TO_CHAR") {
+          const val = args[0];
+          const format = args[1];
+          if (val == null || format == null) return null;
+          const d = new Date(val);
+          if (isNaN(d.getTime())) return String(val);
+          let result = String(format);
+          const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+          const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+          const pad = (n: number, l: number = 2) => String(n).padStart(l, "0");
+          const replacements: Record<string, () => string> = {
+            YYYY: () => String(d.getFullYear()),
+            YY: () => String(d.getFullYear()).slice(-2),
+            MM: () => pad(d.getMonth() + 1),
+            DD: () => pad(d.getDate()),
+            HH24: () => pad(d.getHours()),
+            HH: () => pad(d.getHours() % 12 || 12),
+            MI: () => pad(d.getMinutes()),
+            SS: () => pad(d.getSeconds()),
+            MS: () => pad(d.getMilliseconds(), 3),
+            Month: () => months[d.getMonth()]!,
+            Mon: () => months[d.getMonth()]!.slice(0, 3),
+            Day: () => days[d.getDay()]!,
+            Dy: () => days[d.getDay()]!.slice(0, 3),
+          };
+          const sortedPatterns = Object.keys(replacements).sort((a, b) => b.length - a.length);
+          for (const pattern of sortedPatterns) {
+            result = result.replace(new RegExp(pattern, "g"), replacements[pattern]!());
+          }
+          return result;
+        }
+        if (fnName === "DATE_PART") {
+          const field = args[0];
+          const source = args[1];
+          if (field == null || source == null) return null;
+          const d = new Date(source);
+          if (isNaN(d.getTime())) return null;
+          return this.getDatePart(d, String(field));
         }
         if (fnName === "OBJ_DESCRIPTION") {
           if (args[0] == null) return null;
