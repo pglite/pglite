@@ -1487,6 +1487,28 @@ export class Executor {
             } else {
               row[windowKey] = 1;
             }
+          } else if (expr.fnName === 'LEAD' || expr.fnName === 'LAG') {
+            const offsetExpr = expr.args[1];
+            const defaultExpr = expr.args[2];
+
+            let offset = 1;
+            if (offsetExpr) {
+              const offVal = await this.evaluateExpr(storage, offsetExpr, row, params);
+              offset = Number(offVal);
+            }
+
+            const targetIdx = expr.fnName === 'LEAD' ? i + offset : i - offset;
+
+            if (targetIdx >= 0 && targetIdx < pRows.length) {
+              const targetRow = pRows[targetIdx];
+              row[windowKey] = await this.evaluateExpr(storage, expr.args[0], targetRow, params);
+            } else {
+              if (defaultExpr) {
+                row[windowKey] = await this.evaluateExpr(storage, defaultExpr, row, params);
+              } else {
+                row[windowKey] = null;
+              }
+            }
           }
           orderedRows.push(row);
         }

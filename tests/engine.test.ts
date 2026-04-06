@@ -1439,6 +1439,49 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(hrRows[0].rnk).toBe(1);
       expect(hrRows[1].rnk).toBe(1); // Tie
     });
+
+    test("11.3 LEAD() and LAG()", async () => {
+      const rows = await db.query(`
+        SELECT 
+          name, 
+          salary,
+          LAG(salary) OVER (ORDER BY salary ASC) as prev_salary,
+          LEAD(salary) OVER (ORDER BY salary ASC) as next_salary
+        FROM employees
+        WHERE department = 'IT'
+        ORDER BY salary ASC
+      `);
+      // IT salaries: 5000 (Alice), 5000 (David), 6000 (Bob)
+      expect(rows.length).toBe(3);
+      
+      // Alice (5000)
+      expect(rows[0].prev_salary).toBeNull();
+      expect(rows[0].next_salary).toBe(5000);
+      
+      // David (5000)
+      expect(rows[1].prev_salary).toBe(5000);
+      expect(rows[1].next_salary).toBe(6000);
+      
+      // Bob (6000)
+      expect(rows[2].prev_salary).toBe(5000);
+      expect(rows[2].next_salary).toBeNull();
+    });
+
+    test("11.4 LEAD() with offset and default", async () => {
+      const rows = await db.query(`
+        SELECT 
+          name,
+          LEAD(name, 2, 'N/A') OVER (ORDER BY name ASC) as lead_two
+        FROM employees
+        ORDER BY name ASC
+      `);
+      // Names: Alice, Bob, Charlie, David, Eve
+      expect(rows[0].name).toBe('Alice');
+      expect(rows[0].lead_two).toBe('Charlie');
+      
+      expect(rows[3].name).toBe('David');
+      expect(rows[3].lead_two).toBe('N/A');
+    });
   });
 
   describe("LEVEL 14: Multiple Row Inserts and Advanced Schema Definitions", () => {
