@@ -3246,6 +3246,52 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 51: WITH RECURSIVE", () => {
+    test("51.1 Basic RECURSIVE CTE for counting", async () => {
+      const sql = `
+        WITH RECURSIVE cnt(x) AS (
+          VALUES (1)
+          UNION ALL
+          SELECT x + 1 FROM cnt WHERE x < 5
+        )
+        SELECT * FROM cnt;
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(5);
+      expect(rows[0].x).toBe(1);
+      expect(rows[4].x).toBe(5);
+    });
+
+    test("51.2 RECURSIVE CTE for hierarchical data", async () => {
+      await db.exec(`CREATE TABLE categories_rec (id INT PRIMARY KEY, parent_id INT, name TEXT)`);
+      await db.exec(`INSERT INTO categories_rec VALUES 
+        (1, NULL, 'Electronics'),
+        (2, 1, 'Computers'),
+        (3, 2, 'Laptops'),
+        (4, 2, 'Desktops'),
+        (5, NULL, 'Clothing'),
+        (6, 5, 'Shirts')
+      `);
+
+      const sql = `
+        WITH RECURSIVE cat_tree AS (
+          SELECT id, parent_id, name, 1 as level
+          FROM categories_rec
+          WHERE parent_id IS NULL
+          UNION ALL
+          SELECT c.id, c.parent_id, c.name, ct.level + 1
+          FROM categories_rec c
+          JOIN cat_tree ct ON c.parent_id = ct.id
+        )
+        SELECT name, level FROM cat_tree ORDER BY id;
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(6);
+      const laptops = rows.find((r: any) => r.name === 'Laptops');
+      expect(laptops.level).toBe(3);
+    });
+  });
+
   describe("LEVEL 48: FIRST_VALUE and LAST_VALUE Window Functions", () => {
     test("48.1 FIRST_VALUE and LAST_VALUE with PARTITION BY and ORDER BY", async () => {
       const rows = await db.query(`

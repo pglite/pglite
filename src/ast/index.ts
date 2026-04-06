@@ -104,7 +104,7 @@ export type Statement =
       orderBy?: OrderBy[];
       limit?: Expr;
       offset?: Expr;
-      ctes?: { name: string; stmt: Statement }[];
+      ctes?: { name: string; columnAliases?: string[]; stmt: Statement; recursive?: boolean }[];
       union?: Statement;
       unionAll?: Statement;
       intersect?: Statement;
@@ -115,7 +115,7 @@ export type Statement =
   | { type: 'Update'; tableName: string; assignments: Record<string, Expr>; where?: Expr; returning?: Expr[] }
   | { type: 'Delete'; tableName: string; where?: Expr; returning?: Expr[] }
   | { type: 'Truncate'; tableNames: string[]; cascade?: boolean; restartIdentity?: boolean }
-  | { type: 'Values'; values: Expr[][]; ctes?: { name: string; stmt: Statement }[] }
+  | { type: 'Values'; values: Expr[][]; ctes?: { name: string; columnAliases?: string[]; stmt: Statement; recursive?: boolean }[] }
   | { type: 'AlterTable'; tableName: string; action: AlterTableAction }
   | { type: 'Do'; code: string; language?: string }
   | { type: 'Comment'; objectType: string; objectName: string; comment: string }

@@ -660,9 +660,94 @@ export class Executor {
   private async *executeSelect(storage: StorageEngine, stmt: any, params: any[] = [], outerRow: any = {}): AsyncIterableIterator<any> {
     if (stmt.ctes) {
       for (const cte of stmt.ctes) {
-        const rows = [];
-        for await (const r of this.executeSelect(storage, cte.stmt, params, outerRow)) rows.push(r);
-        storage.createTempTable(cte.name, rows);
+        if (cte.recursive && (cte.stmt.union || cte.stmt.unionAll)) {
+           const baseStmt = { ...cte.stmt, union: undefined, unionAll: undefined };
+           const recStmt = cte.stmt.unionAll || cte.stmt.union;
+           const isUnionAll = !!cte.stmt.unionAll;
+           
+           let workingTable = [];
+           for await (const r of this.executeSelect(storage, baseStmt, params, outerRow)) {
+             workingTable.push(r);
+           }
+           
+           let effectiveColumnAliases = cte.columnAliases;
+           if (!effectiveColumnAliases && workingTable.length > 0) {
+             effectiveColumnAliases = Object.keys(workingTable[0]).filter(k => !k.startsWith('__'));
+           }
+
+           workingTable = workingTable.map(r => {
+             if (effectiveColumnAliases) {
+               const mapped: any = {};
+               const keys = Object.keys(r).filter(k => !k.startsWith('__'));
+               for (let i = 0; i < effectiveColumnAliases.length; i++) {
+                 mapped[effectiveColumnAliases[i]] = r[keys[i]];
+               }
+               return mapped;
+             }
+             return r;
+           });
+           
+           let finalTable = [...workingTable];
+           const seen = new Set<string>();
+           
+           const getRowKey = (row: any) => {
+             const clean: any = {};
+             for (const k in row) if (!k.startsWith('__')) clean[k] = row[k];
+             return JSON.stringify(clean);
+           };
+
+           if (!isUnionAll) {
+             workingTable.forEach(r => seen.add(getRowKey(r)));
+           }
+           
+           storage.createTempTable(cte.name, workingTable);
+           
+           let iterations = 0;
+           const MAX_ITERATIONS = 10000;
+           while (workingTable.length > 0) {
+             iterations++;
+             if (iterations > MAX_ITERATIONS) {
+               throw new Error("Recursive CTE exceeded max iterations (10000). Possible infinite loop.");
+             }
+             const nextWorkingTable = [];
+             for await (const r of this.executeSelect(storage, recStmt, params, outerRow)) {
+               let mapped = r;
+               if (effectiveColumnAliases) {
+                 mapped = {};
+                 const keys = Object.keys(r).filter(k => !k.startsWith('__'));
+                 for (let i = 0; i < effectiveColumnAliases.length; i++) {
+                   mapped[effectiveColumnAliases[i]] = r[keys[i]];
+                 }
+               }
+
+               if (!isUnionAll) {
+                  const key = getRowKey(mapped);
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+               }
+               nextWorkingTable.push(mapped);
+               finalTable.push(mapped);
+             }
+             workingTable = nextWorkingTable;
+             storage.createTempTable(cte.name, workingTable);
+           }
+           storage.createTempTable(cte.name, finalTable);
+        } else {
+           const rows = [];
+           for await (const r of this.executeSelect(storage, cte.stmt, params, outerRow)) {
+             let mapped = r;
+             if (cte.columnAliases) {
+               mapped = {};
+               const keys = Object.keys(r).filter(k => !k.startsWith('__'));
+               for (let i = 0; i < keys.length; i++) {
+                 if (cte.columnAliases[i]) mapped[cte.columnAliases[i]] = r[keys[i]];
+                 else mapped[keys[i]] = r[keys[i]];
+               }
+             }
+             rows.push(mapped);
+           }
+           storage.createTempTable(cte.name, rows);
+        }
       }
     }
 

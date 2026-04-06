@@ -48,13 +48,29 @@ export class Parser {
     let ctes: any[] =[];
     if (this.match('KEYWORD', 'WITH')) {
       this.consume();
+      let recursive = false;
+      if (this.match('KEYWORD', 'RECURSIVE')) {
+        this.consume();
+        recursive = true;
+      }
       while (true) {
         const name = this.consumeIdentifier();
+        let columnAliases: string[] | undefined;
+        if (this.match('SYMBOL', '(')) {
+          this.consume();
+          columnAliases = [];
+          columnAliases.push(this.consumeIdentifier());
+          while (this.match('SYMBOL', ',')) {
+            this.consume();
+            columnAliases.push(this.consumeIdentifier());
+          }
+          this.consume('SYMBOL', ')');
+        }
         this.consume('KEYWORD', 'AS');
         this.consume('SYMBOL', '(');
-        const stmt = this.parseSelect();
+        const stmt = this.parseQuery();
         this.consume('SYMBOL', ')');
-        ctes.push({ name, stmt });
+        ctes.push({ name, columnAliases, stmt, recursive });
         if (this.match('SYMBOL', ',')) {
           this.consume();
         } else break;
@@ -107,10 +123,50 @@ export class Parser {
   private parseExpr(): Expr { return this.parseOr(); }
 
   private parseQuery(): Statement {
+    let stmt: Statement;
     if (this.match('KEYWORD', 'WITH')) return this.parse();
-    if (this.match('KEYWORD', 'SELECT')) return this.parseSelect();
-    if (this.match('KEYWORD', 'VALUES')) return this.parseValues();
-    throw new Error(`Parse Error: Expected SELECT or VALUES, got ${this.current()?.value}`);
+    if (this.match('KEYWORD', 'SELECT')) stmt = this.parseSelect();
+    else if (this.match('KEYWORD', 'VALUES')) stmt = this.parseValues();
+    else if (this.match('SYMBOL', '(')) {
+      this.consume();
+      stmt = this.parseQuery();
+      this.consume('SYMBOL', ')');
+    } else {
+      throw new Error(`Parse Error: Expected SELECT or VALUES, got ${this.current()?.value}`);
+    }
+
+    if (this.match('KEYWORD', 'UNION')) {
+      this.consume();
+      let isAll = false;
+      if (this.match('KEYWORD', 'ALL')) {
+        this.consume();
+        isAll = true;
+      }
+      const right = this.parseQuery();
+      if (isAll) stmt = { ...stmt, unionAll: right } as Statement;
+      else stmt = { ...stmt, union: right } as Statement;
+    } else if (this.match('KEYWORD', 'INTERSECT')) {
+      this.consume();
+      let isAll = false;
+      if (this.match('KEYWORD', 'ALL')) {
+        this.consume();
+        isAll = true;
+      }
+      const right = this.parseQuery();
+      if (isAll) stmt = { ...stmt, intersectAll: right } as Statement;
+      else stmt = { ...stmt, intersect: right } as Statement;
+    } else if (this.match('KEYWORD', 'EXCEPT')) {
+      this.consume();
+      let isAll = false;
+      if (this.match('KEYWORD', 'ALL')) {
+        this.consume();
+        isAll = true;
+      }
+      const right = this.parseQuery();
+      if (isAll) stmt = { ...stmt, exceptAll: right } as Statement;
+      else stmt = { ...stmt, except: right } as Statement;
+    }
+    return stmt;
   }
 
   private parseValues(): Statement {
