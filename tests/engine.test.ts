@@ -1163,6 +1163,29 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].strip).toEqual({ a: 1 });
     });
 
+    test("21.2.3 JSONB Additional Operators (||, -, #-)", async () => {
+      const rows = await db.query(`
+        SELECT 
+          '{"a": 1}'::jsonb || '{"b": 2}'::jsonb as concat_obj,
+          '[1, 2]'::jsonb || '[3, 4]'::jsonb as concat_arr,
+          '{"a": 1, "b": 2, "c": 3}'::jsonb - 'b' as del_key,
+          '{"a": 1, "b": 2, "c": 3}'::jsonb - ARRAY['a', 'c'] as del_keys,
+          '["a", "b", "c"]'::jsonb - 1 as del_arr_idx,
+          '["a", "b", "c"]'::jsonb - -1 as del_arr_idx_neg,
+          '["a", "b", "c"]'::jsonb - 'b' as del_arr_elem,
+          '{"a": {"b": {"c": 1, "d": 2}}}'::jsonb #- ARRAY['a', 'b', 'c'] as del_path
+      `);
+      
+      expect(rows[0].concat_obj).toEqual({ a: 1, b: 2 });
+      expect(rows[0].concat_arr).toEqual([1, 2, 3, 4]);
+      expect(rows[0].del_key).toEqual({ a: 1, c: 3 });
+      expect(rows[0].del_keys).toEqual({ b: 2 });
+      expect(rows[0].del_arr_idx).toEqual(["a", "c"]);
+      expect(rows[0].del_arr_idx_neg).toEqual(["a", "b"]);
+      expect(rows[0].del_arr_elem).toEqual(["a", "c"]);
+      expect(rows[0].del_path).toEqual({ a: { b: { d: 2 } } });
+    });
+
     test("21.2.2 JSON Aggregates", async () => {
       await db.exec(`CREATE TABLE json_agg_test (id INT, val TEXT)`);
       await db.exec(`INSERT INTO json_agg_test VALUES (1, 'A'), (1, 'B'), (2, 'C')`);

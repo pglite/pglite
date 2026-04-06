@@ -2050,6 +2050,29 @@ export class Executor {
             return left <= right;
           case "+":
           case "-": {
+            if (expr.operator === "-") {
+              if (left !== null && typeof left === "object") {
+                if (Array.isArray(left)) {
+                  if (typeof right === "number") {
+                    let idx = right;
+                    if (idx < 0) idx = left.length + idx;
+                    return left.filter((_, i) => i !== idx);
+                  } else {
+                    return left.filter(v => String(v) !== String(right));
+                  }
+                } else {
+                  if (typeof right === "string") {
+                    const res = { ...left };
+                    delete res[right];
+                    return res;
+                  } else if (Array.isArray(right)) {
+                    const res = { ...left };
+                    for (const k of right) delete res[String(k)];
+                    return res;
+                  }
+                }
+              }
+            }
             if (typeof left === "string" && !isNaN(Date.parse(left)) && typeof right === "string") {
               const parts = right.toLowerCase().trim().split(/\s+/);
               const val = parseFloat(parts[0] || "0");
@@ -2072,6 +2095,12 @@ export class Executor {
             return left / right;
           case "||":
             if (left == null || right == null) return null;
+            if (typeof left === 'object' && typeof right === 'object') {
+              if (Array.isArray(left) && Array.isArray(right)) return [...left, ...right];
+              if (Array.isArray(left)) return [...left, right];
+              if (Array.isArray(right)) return [left, ...right];
+              return { ...left, ...right };
+            }
             return String(left) + String(right);
           case "~":
             return left != null && right != null && new RegExp(String(right)).test(String(left));
@@ -2088,6 +2117,49 @@ export class Executor {
             let curr = left;
             for (const p of right) curr = curr?.[p];
             return curr;
+          }
+          case "#-": {
+            if (left == null || !Array.isArray(right)) return left;
+            
+            const deletePath = (obj: any, path: any[]): any => {
+              if (path.length === 0) return obj;
+              if (obj === null || typeof obj !== 'object') return obj;
+              
+              const key = path[0];
+              if (path.length === 1) {
+                if (Array.isArray(obj)) {
+                  let idx = parseInt(String(key));
+                  if (isNaN(idx)) return obj;
+                  if (idx < 0) idx = obj.length + idx;
+                  if (idx < 0 || idx >= obj.length) return obj;
+                  const newArr = [...obj];
+                  newArr.splice(idx, 1);
+                  return newArr;
+                } else {
+                  const newObj = { ...obj };
+                  delete newObj[key];
+                  return newObj;
+                }
+              }
+              
+              if (Array.isArray(obj)) {
+                let idx = parseInt(String(key));
+                if (isNaN(idx)) return obj;
+                if (idx < 0) idx = obj.length + idx;
+                if (idx < 0 || idx >= obj.length) return obj;
+                
+                const newArr = [...obj];
+                newArr[idx] = deletePath(newArr[idx], path.slice(1));
+                return newArr;
+              } else {
+                if (obj[key] === undefined) return obj;
+                const newObj = { ...obj };
+                newObj[key] = deletePath(newObj[key], path.slice(1));
+                return newObj;
+              }
+            };
+            
+            return deletePath(left, right);
           }
           case "@>":
             if (Array.isArray(left) && Array.isArray(right)) return right.every(v => left.includes(v));

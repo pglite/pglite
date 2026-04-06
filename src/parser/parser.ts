@@ -187,7 +187,7 @@ export class Parser {
 
   private parseCondition(): Expr {
     let left = this.parseAdditive();
-    const ops = ['=', '>', '<', '>=', '<=', '!=', '->', '->>', '#>', '@>', '?', '&&', '~', '~*', '!~'];
+    const ops = ['=', '>', '<', '>=', '<=', '!=', '->', '->>', '#>', '#-', '@>', '?', '&&', '~', '~*', '!~'];
     if (ops.includes(this.current()?.value || "") || this.match('KEYWORD', 'LIKE') || this.match('KEYWORD', 'ILIKE')) {
       const opToken = this.consume();
       const op = opToken.value.toUpperCase();

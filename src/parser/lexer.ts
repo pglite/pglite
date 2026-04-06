@@ -111,7 +111,7 @@ export class Lexer {
       }
 
       const twoChar = this.input.slice(this.pos, this.pos + 2);
-      if (['>=', '<=', '!=', '::', '||', '->', '~*', '!~', '#>', '@>', '&&'].includes(twoChar)) {
+      if (['>=', '<=', '!=', '::', '||', '->', '~*', '!~', '#>', '#-', '@>', '&&'].includes(twoChar)) {
         tokens.push({ type: "SYMBOL", value: twoChar });
         this.pos += 2;
         continue;
