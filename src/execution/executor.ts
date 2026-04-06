@@ -1740,6 +1740,82 @@ export class Executor {
 
         if (fnName === "NOW") return new Date().toISOString();
         if (fnName === "UPPER") return args[0] != null ? String(args[0]).toUpperCase() : null;
+        if (fnName === "LOWER") return args[0] != null ? String(args[0]).toLowerCase() : null;
+        if (fnName === "LENGTH") return args[0] != null ? String(args[0]).length : null;
+        if (fnName === "TRIM") return args[0] != null ? String(args[0]).trim() : null;
+        if (fnName === "REPLACE") {
+          if (args[0] == null || args[1] == null || args[2] == null) return args[0];
+          return String(args[0]).split(String(args[1])).join(String(args[2]));
+        }
+        if (fnName === "SUBSTRING") {
+          if (args[0] == null) return null;
+          const str = String(args[0]);
+          const start = (args[1] != null ? Number(args[1]) : 1) - 1;
+          if (args[2] != null) {
+            const count = Number(args[2]);
+            return str.substring(start, start + count);
+          }
+          return str.substring(start);
+        }
+        if (fnName === "CONCAT") {
+          return args.filter(v => v != null).map(v => String(v)).join('');
+        }
+        if (fnName === "CONCAT_WS") {
+          if (args[0] == null) return null;
+          const sep = String(args[0]);
+          return args.slice(1).filter(v => v != null).map(v => String(v)).join(sep);
+        }
+        if (fnName === "LTRIM") return args[0] != null ? String(args[0]).trimStart() : null;
+        if (fnName === "RTRIM") return args[0] != null ? String(args[0]).trimEnd() : null;
+        if (fnName === "LEFT") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          return n >= 0 ? str.substring(0, n) : str.substring(0, Math.max(0, str.length + n));
+        }
+        if (fnName === "RIGHT") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          return n >= 0 ? str.substring(Math.max(0, str.length - n)) : str.substring(Math.max(0, -n));
+        }
+        if (fnName === "LPAD") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          const fill = String(args[2] ?? ' ');
+          return str.length > n ? str.substring(0, n) : str.padStart(n, fill);
+        }
+        if (fnName === "RPAD") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          const fill = String(args[2] ?? ' ');
+          return str.length > n ? str.substring(0, n) : str.padEnd(n, fill);
+        }
+        if (fnName === "INITCAP") {
+          if (args[0] == null) return null;
+          const str = String(args[0]).toLowerCase();
+          return str.replace(/(^|\s)\S/g, l => l.toUpperCase());
+        }
+        if (fnName === "REVERSE") {
+          return args[0] != null ? String(args[0]).split('').reverse().join('') : null;
+        }
+        if (fnName === "STRPOS") {
+          if (args[0] == null || args[1] == null) return null;
+          return String(args[0]).indexOf(String(args[1])) + 1;
+        }
+        if (fnName === "REPEAT") {
+          if (args[0] == null || args[1] == null) return null;
+          const n = Number(args[1]);
+          return n > 0 ? String(args[0]).repeat(n) : '';
+        }
+        if (fnName === "SPLIT_PART") {
+          if (args[0] == null || args[1] == null || args[2] == null) return null;
+          const parts = String(args[0]).split(String(args[1]));
+          const idx = Number(args[2]);
+          return (idx > 0 && idx <= parts.length) ? parts[idx - 1] : '';
+        }
         if (fnName === "COALESCE") {
           for (const val of args) {
             if (val !== null && val !== undefined) return val;

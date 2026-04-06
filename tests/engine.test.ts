@@ -2671,4 +2671,105 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows.length).toBe(12); // 2 * 3 * 2
     });
   });
+
+  describe("LEVEL 43: String Functions", () => {
+    test("43.1 LOWER() and LENGTH()", async () => {
+      const rows = await db.query("SELECT LOWER('HeLLo') as l, LENGTH('world') as len, LENGTH(NULL) as ln");
+      expect(rows[0].l).toBe('hello');
+      expect(rows[0].len).toBe(5);
+      expect(rows[0].ln).toBeNull();
+    });
+
+    test("43.2 TRIM() and REPLACE()", async () => {
+      const rows = await db.query("SELECT TRIM('  spaces  ') as t, REPLACE('banana', 'a', 'o') as r");
+      expect(rows[0].t).toBe('spaces');
+      expect(rows[0].r).toBe('bonono');
+    });
+
+    test("43.3 SUBSTRING()", async () => {
+      const rows = await db.query(`
+        SELECT 
+          SUBSTRING('alphabet', 3, 2) as s1, 
+          SUBSTRING('alphabet', 3) as s2,
+          SUBSTRING(NULL, 1) as s3
+      `);
+      expect(rows[0].s1).toBe('ph');
+      expect(rows[0].s2).toBe('phabet');
+      expect(rows[0].s3).toBeNull();
+    });
+
+    test("43.4 CONCAT_WS()", async () => {
+      const rows = await db.query(`
+        SELECT 
+          CONCAT_WS('-', '2024', '05', '20') as date,
+          CONCAT_WS(',', 'a', NULL, 'b', 'c') as list,
+          CONCAT_WS(NULL, 'a', 'b') as n
+      `);
+      expect(rows[0].date).toBe('2024-05-20');
+      expect(rows[0].list).toBe('a,b,c');
+      expect(rows[0].n).toBeNull();
+    });
+  });
+
+  describe("LEVEL 44: Extended String Functions", () => {
+    test("44.1 CONCAT, LTRIM, RTRIM", async () => {
+      const rows = await db.query(`
+        SELECT 
+          CONCAT('Post', 'gres', 'Lite') as c,
+          LTRIM('   left') as l,
+          RTRIM('right   ') as r
+      `);
+      expect(rows[0].c).toBe('PostgresLite');
+      expect(rows[0].l).toBe('left');
+      expect(rows[0].r).toBe('right');
+    });
+
+    test("44.2 LEFT and RIGHT", async () => {
+      const rows = await db.query(`
+        SELECT 
+          LEFT('abcde', 2) as l1,
+          LEFT('abcde', -2) as l2,
+          RIGHT('abcde', 2) as r1,
+          RIGHT('abcde', -2) as r2
+      `);
+      expect(rows[0].l1).toBe('ab');
+      expect(rows[0].l2).toBe('abc');
+      expect(rows[0].r1).toBe('de');
+      expect(rows[0].r2).toBe('cde');
+    });
+
+    test("44.3 LPAD and RPAD", async () => {
+      const rows = await db.query(`
+        SELECT 
+          LPAD('hi', 5, 'x') as l1,
+          RPAD('hi', 5, 'y') as r1,
+          LPAD('longstring', 4) as l2
+      `);
+      expect(rows[0].l1).toBe('xxxhi');
+      expect(rows[0].r1).toBe('hiyyy');
+      expect(rows[0].l2).toBe('long');
+    });
+
+    test("44.4 INITCAP and REVERSE", async () => {
+      const rows = await db.query(`
+        SELECT 
+          INITCAP('hELLO wORLD') as i,
+          REVERSE('desserts') as r
+      `);
+      expect(rows[0].i).toBe('Hello World');
+      expect(rows[0].r).toBe('stressed');
+    });
+
+    test("44.5 STRPOS, REPEAT, SPLIT_PART", async () => {
+      const rows = await db.query(`
+        SELECT 
+          STRPOS('high', 'ig') as s,
+          REPEAT('a', 3) as r,
+          SPLIT_PART('a,b,c', ',', 2) as sp
+      `);
+      expect(rows[0].s).toBe(2);
+      expect(rows[0].r).toBe('aaa');
+      expect(rows[0].sp).toBe('b');
+    });
+  });
 });
