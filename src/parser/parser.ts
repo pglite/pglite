@@ -868,6 +868,16 @@ export class Parser {
       }
     } else if (this.match('KEYWORD', 'DROP')) {
       this.consume();
+      if (this.match('KEYWORD', 'CONSTRAINT')) {
+        this.consume();
+        let ifExists = false;
+        if (this.match('KEYWORD', 'IF')) {
+          this.consume(); this.consume('KEYWORD', 'EXISTS');
+          ifExists = true;
+        }
+        const constraintName = this.consumeIdentifier();
+        return { type: 'AlterTable', tableName, action: { type: 'DropConstraint', constraintName, ifExists } };
+      }
       if (this.match('KEYWORD', 'COLUMN')) this.consume();
       let ifExists = false;
       if (this.match('KEYWORD', 'IF')) {
@@ -1522,6 +1532,15 @@ export class Parser {
       }
       const tableName = this.parseTableName();
       return { type: 'DropTable', tableName, ifExists };
+    } else if (this.match('KEYWORD', 'INDEX')) {
+      this.consume();
+      let ifExists = false;
+      if (this.match('KEYWORD', 'IF')) {
+        this.consume(); this.consume('KEYWORD', 'EXISTS');
+        ifExists = true;
+      }
+      const indexName = this.parseTableName();
+      return { type: 'DropIndex', indexName, ifExists };
     }
     throw new Error(`Parse Error: Unsupported DROP statement`);
   }

@@ -1593,6 +1593,35 @@ export class StorageEngine {
     this.tableCache.delete(fullNewName);
   }
 
+  public async dropIndex(indexName: string, ifExists: boolean = false): Promise<void> {
+    const idxFullName = this.getFullTableName(indexName);
+    const parts = idxFullName.split(".");
+    const schema = parts[0]!;
+    const relname = parts[1]!;
+
+    const nspOid = await this.getSchemaOid(schema);
+    if (!nspOid) {
+      if (ifExists) return;
+      throw new Error(`Schema ${schema} does not exist`);
+    }
+
+    let indexOid = null;
+    for await (const row of this.scanCatalog(this.pgClassDef)) {
+      if (row.relnamespace === nspOid && row.relname === relname && row.relkind === 'i') {
+        indexOid = row.oid;
+        break;
+      }
+    }
+
+    if (!indexOid) {
+      if (ifExists) return;
+      throw new Error(`Index ${idxFullName} does not exist`);
+    }
+
+    await this.deleteRowsInCatalog(this.pgClassDef, async (r) => r.oid === indexOid);
+    await this.deleteRowsInCatalog(this.pgIndexDef, async (r) => r.indexrelid === indexOid);
+  }
+
   public async dropTable(
     name: string,
     ifExists: boolean = false,

@@ -75,13 +75,15 @@ export type AlterTableAction =
   | { type: 'AlterColumnDropDefault'; columnName: string }
   | { type: 'AlterColumnSetNotNull'; columnName: string }
   | { type: 'AlterColumnDropNotNull'; columnName: string }
-  | { type: 'AddForeignKey'; columnName: string; references: { table: string; column: string; onDelete?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION'; onUpdate?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION' } };
+  | { type: 'AddForeignKey'; columnName: string; references: { table: string; column: string; onDelete?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION'; onUpdate?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION' } }
+  | { type: 'DropConstraint'; constraintName: string; ifExists?: boolean };
 
 export type Statement =
   | { type: 'CreateSchema'; schemaName: string; ifNotExists?: boolean }
   | { type: 'CreateIndex'; indexName: string; tableName: string; columns: string[]; unique?: boolean; ifNotExists?: boolean }
   | { type: 'DropSchema'; schemaName: string; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropTable'; tableName: string; ifExists?: boolean }
+  | { type: 'DropIndex'; indexName: string; ifExists?: boolean }
   | { type: 'CreateTable'; tableName: string; columns: ColumnDef[]; ifNotExists?: boolean }
   | { type: 'Insert'; tableName: string; columns: string[]; values?: Expr[][] | Expr[]; select?: Statement; returning?: Expr[]; onConflict?: OnConflict }
   | { 

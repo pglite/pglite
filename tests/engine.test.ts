@@ -2496,6 +2496,38 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 52: DROP CONSTRAINT and DROP INDEX", () => {
+    test("52.1 ALTER TABLE DROP CONSTRAINT and DROP INDEX", async () => {
+      await db.exec(`CREATE TABLE classes (id SERIAL PRIMARY KEY, teacher_id INT UNIQUE)`);
+      await db.exec(`CREATE UNIQUE INDEX idx_classes_teacher_id_unique ON classes(teacher_id)`);
+
+      const sql = `
+        DO $ 
+        BEGIN 
+            IF EXISTS (
+                SELECT 1 
+                FROM pg_constraint 
+                WHERE conname = 'classes_teacher_id_key'
+            ) THEN 
+                ALTER TABLE classes DROP CONSTRAINT classes_teacher_id_key; 
+            END IF; 
+        END $;
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      const res2 = await db.exec(`DROP INDEX IF EXISTS idx_classes_teacher_id_unique`);
+      expect(res2.success).toBe(true);
+
+      // Actually execute the ALTER TABLE directly to test its logic
+      const res3 = await db.exec(`ALTER TABLE classes DROP CONSTRAINT IF EXISTS classes_teacher_id_key`);
+      expect(res3.success).toBe(true);
+
+      const rows = await db.query(`SELECT indisunique FROM pg_index WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_classes_teacher_id_unique')`);
+      expect(rows.length).toBe(0);
+    });
+  });
+
   describe("LEVEL 31: Complex DDL with ADD CONSTRAINT", () => {
     test("31.1 Parse and execute ALTER TABLE ADD CONSTRAINT FOREIGN KEY", async () => {
       const sql = `

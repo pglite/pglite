@@ -54,6 +54,11 @@ export class Executor {
         return { success: true, message: `Table ${stmt.tableName} dropped.` };
       }
 
+      case "DropIndex": {
+        await storage.dropIndex(stmt.indexName, !!stmt.ifExists);
+        return { success: true, message: `Index ${stmt.indexName} dropped.` };
+      }
+
       case "AlterTable": {
         const table = await (storage as any).getTableAsync(stmt.tableName);
         if (!table) throw new Error(`Table ${stmt.tableName} not found`);
@@ -232,6 +237,49 @@ export class Executor {
               r.attref_on_update = action.references.onUpdate || null;
             }
           );
+        } else if (action.type === 'DropConstraint') {
+          let dropped = false;
+          const tableShortName = stmt.tableName.includes('.') ? stmt.tableName.split('.').pop()! : stmt.tableName;
+          for (const col of table.columns) {
+            if (action.constraintName === `${tableShortName}_pkey`) {
+              if (col.isPrimaryKey) {
+                col.isPrimaryKey = false;
+                dropped = true;
+              }
+            } else if (action.constraintName === `${tableShortName}_${col.name}_key`) {
+              if (col.isUnique) {
+                col.isUnique = false;
+                dropped = true;
+              }
+            } else if (action.constraintName === `${tableShortName}_${col.name}_fkey`) {
+              if (col.references) {
+                col.references = undefined;
+                dropped = true;
+              }
+            }
+          }
+          if (!dropped && !action.ifExists) {
+             throw new Error(`Constraint ${action.constraintName} does not exist`);
+          }
+          if (dropped) {
+             await storage.updateTableSchema(stmt.tableName, table);
+             await storage.updateRows('pg_catalog.pg_attribute', 
+                async (r: any) => r.attrelid === table.firstPage,
+                async (r: any) => {
+                  const c = table.columns.find((col: any) => col.name === r.attname);
+                  if (c) {
+                    r.attprimary = !!c.isPrimaryKey;
+                    r.attunique = !!c.isUnique;
+                    if (!c.references) {
+                      r.attref_table = null;
+                      r.attref_col = null;
+                      r.attref_on_delete = null;
+                      r.attref_on_update = null;
+                    }
+                  }
+                }
+             );
+          }
         }
 
         return { success: true };
