@@ -108,7 +108,9 @@ export type Statement =
       union?: Statement;
       unionAll?: Statement;
       intersect?: Statement;
+      intersectAll?: Statement;
       except?: Statement;
+      exceptAll?: Statement;
     }
   | { type: 'Update'; tableName: string; assignments: Record<string, Expr>; where?: Expr; returning?: Expr[] }
   | { type: 'Delete'; tableName: string; where?: Expr; returning?: Expr[] }

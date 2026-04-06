@@ -829,9 +829,19 @@ export class Executor {
          sourceStream = this.intersectStream(sourceStream, rightStream);
       }
 
+      if (stmt.intersectAll) {
+         const rightStream = this.executeSelect(storage, stmt.intersectAll, params, outerRow);
+         sourceStream = this.intersectAllStream(sourceStream, rightStream);
+      }
+
       if (stmt.except) {
          const rightStream = this.executeSelect(storage, stmt.except, params, outerRow);
          sourceStream = this.exceptStream(sourceStream, rightStream);
+      }
+
+      if (stmt.exceptAll) {
+         const rightStream = this.executeSelect(storage, stmt.exceptAll, params, outerRow);
+         sourceStream = this.exceptAllStream(sourceStream, rightStream);
       }
 
       if (stmt.orderBy) {
@@ -1114,6 +1124,25 @@ export class Executor {
     }
   }
 
+  private async *intersectAllStream(s1: AsyncIterableIterator<any>, s2: AsyncIterableIterator<any>) {
+    const rightCounts = new Map<string, number>();
+    for await (const r of s2) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      const key = JSON.stringify(proj);
+      rightCounts.set(key, (rightCounts.get(key) || 0) + 1);
+    }
+
+    for await (const r of s1) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      const key = JSON.stringify(proj);
+      const count = rightCounts.get(key) || 0;
+      if (count > 0) {
+        yield r;
+        rightCounts.set(key, count - 1);
+      }
+    }
+  }
+
   private async *exceptStream(s1: AsyncIterableIterator<any>, s2: AsyncIterableIterator<any>) {
     const rightSet = new Set<string>();
     for await (const r of s2) {
@@ -1127,6 +1156,26 @@ export class Executor {
       const key = JSON.stringify(proj);
       if (!rightSet.has(key) && !seen.has(key)) {
         seen.add(key);
+        yield r;
+      }
+    }
+  }
+
+  private async *exceptAllStream(s1: AsyncIterableIterator<any>, s2: AsyncIterableIterator<any>) {
+    const rightCounts = new Map<string, number>();
+    for await (const r of s2) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      const key = JSON.stringify(proj);
+      rightCounts.set(key, (rightCounts.get(key) || 0) + 1);
+    }
+
+    for await (const r of s1) {
+      const proj = r.___lpg_projected___ ? r.___lpg_projected___ : r;
+      const key = JSON.stringify(proj);
+      const count = rightCounts.get(key) || 0;
+      if (count > 0) {
+        rightCounts.set(key, count - 1);
+      } else {
         yield r;
       }
     }

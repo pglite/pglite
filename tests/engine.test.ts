@@ -721,26 +721,49 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(exceptVals).toEqual([3, 4]);
     });
 
-    test("5.15 UNION and UNION ALL", async () => {
-      await db.exec(`CREATE TABLE union_test (val INT)`);
-      await db.exec(`INSERT INTO union_test (val) VALUES (1), (1), (2)`);
+    test("5.15 Set Operations - UNION, INTERSECT, EXCEPT and ALL variants", async () => {
+      await db.exec(`CREATE TABLE set_ops_all (val INT)`);
+      await db.exec(`INSERT INTO set_ops_all (val) VALUES (1), (1), (1), (2)`);
+      await db.exec(`CREATE TABLE set_ops_all_right (val INT)`);
+      await db.exec(`INSERT INTO set_ops_all_right (val) VALUES (1), (1), (3)`);
 
-      const unionAllRows = await db.query(`
-        SELECT val FROM union_test WHERE val = 1
-        UNION ALL
-        SELECT val FROM union_test WHERE val = 1
+      // 1. UNION ALL (1,1,1,2 + 1,1,3)
+      const unionAll = await db.query(`
+        SELECT val FROM set_ops_all UNION ALL SELECT val FROM set_ops_all_right
       `);
-      // Should have 4 rows (1, 1 from left + 1, 1 from right)
-      expect(unionAllRows.length).toBe(4);
+      expect(unionAll.length).toBe(7);
 
-      const unionRows = await db.query(`
-        SELECT val FROM union_test WHERE val = 1
-        UNION
-        SELECT val FROM union_test WHERE val = 1
+      // 2. INTERSECT (Distinct intersection of {1,1,1,2} and {1,1,3}) -> {1}
+      const intersectDistinct = await db.query(`
+        SELECT val FROM set_ops_all INTERSECT SELECT val FROM set_ops_all_right
       `);
-      // UNION implies DISTINCT across the entire result set
-      expect(unionRows.length).toBe(1);
-      expect(unionRows[0].val).toBe(1);
+      expect(intersectDistinct.length).toBe(1);
+      expect(intersectDistinct[0].val).toBe(1);
+
+      // 3. INTERSECT ALL (Multiset intersection) -> {1, 1}
+      // Left has three 1s, Right has two 1s. Intersection has min(3, 2) = 2.
+      const intersectAll = await db.query(`
+        SELECT val FROM set_ops_all INTERSECT ALL SELECT val FROM set_ops_all_right
+      `);
+      expect(intersectAll.length).toBe(2);
+      expect(intersectAll.filter(r => r.val === 1).length).toBe(2);
+
+      // 4. EXCEPT (Distinct difference) -> {2}
+      // {1,1,1,2} - {1,1,3} -> remove all 1s from left that appear in right.
+      const exceptDistinct = await db.query(`
+        SELECT val FROM set_ops_all EXCEPT SELECT val FROM set_ops_all_right
+      `);
+      expect(exceptDistinct.length).toBe(1);
+      expect(exceptDistinct[0].val).toBe(2);
+
+      // 5. EXCEPT ALL (Multiset difference) -> {1, 2}
+      // Left has three 1s, Right has two 1s. Result has max(3-2, 0) = 1 one.
+      const exceptAll = await db.query(`
+        SELECT val FROM set_ops_all EXCEPT ALL SELECT val FROM set_ops_all_right
+      `);
+      expect(exceptAll.length).toBe(2);
+      const exceptAllVals = exceptAll.map(r => r.val).sort();
+      expect(exceptAllVals).toEqual([1, 2]);
     });
 
     test("5.4 Complex catalog query with NOT IN and obj_description", async () => {

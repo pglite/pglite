@@ -1238,12 +1238,32 @@ export class Parser {
       }
     }
     if (this.match('KEYWORD', 'INTERSECT')) {
-      this.consume(); const right = this.parseSelect();
-      stmt = { ...stmt, intersect: right };
+      this.consume();
+      let isAll = false;
+      if (this.match('KEYWORD', 'ALL')) {
+        this.consume();
+        isAll = true;
+      }
+      const right = this.parseSelect();
+      if (isAll) {
+        stmt = { ...stmt, intersectAll: right };
+      } else {
+        stmt = { ...stmt, intersect: right };
+      }
     }
     if (this.match('KEYWORD', 'EXCEPT')) {
-      this.consume(); const right = this.parseSelect();
-      stmt = { ...stmt, except: right };
+      this.consume();
+      let isAll = false;
+      if (this.match('KEYWORD', 'ALL')) {
+        this.consume();
+        isAll = true;
+      }
+      const right = this.parseSelect();
+      if (isAll) {
+        stmt = { ...stmt, exceptAll: right };
+      } else {
+        stmt = { ...stmt, except: right };
+      }
     }
 
     return stmt;
