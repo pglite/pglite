@@ -3067,4 +3067,43 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(tags.value).toEqual(["a", "b"]);
     });
   });
+
+  describe("LEVEL 48: FIRST_VALUE and LAST_VALUE Window Functions", () => {
+    test("48.1 FIRST_VALUE and LAST_VALUE with PARTITION BY and ORDER BY", async () => {
+      const rows = await db.query(`
+        SELECT 
+          name, 
+          department, 
+          salary,
+          FIRST_VALUE(name) OVER (PARTITION BY department ORDER BY salary DESC) as top_earner,
+          LAST_VALUE(name) OVER (PARTITION BY department ORDER BY salary DESC) as lowest_earner
+        FROM employees
+        ORDER BY department, salary DESC
+      `);
+      
+      const itRows = rows.filter(r => r.department === 'IT');
+      // IT salaries: Bob (6000), Alice (5000), David (5000)
+      expect(itRows[0].top_earner).toBe('Bob');
+      expect(itRows[0].lowest_earner).toBe('David');
+      expect(itRows[1].top_earner).toBe('Bob');
+      expect(itRows[2].lowest_earner).toBe('David');
+
+      const hrRows = rows.filter(r => r.department === 'HR');
+      // HR salaries: Charlie (4500), Eve (4500)
+      expect(hrRows[0].top_earner).toBe('Charlie');
+      expect(hrRows[1].top_earner).toBe('Charlie');
+      expect(hrRows[1].lowest_earner).toBe('Eve');
+    });
+
+    test("48.2 FIRST_VALUE without partition", async () => {
+      const rows = await db.query(`
+        SELECT name, FIRST_VALUE(salary) OVER (ORDER BY name ASC) as first_sal
+        FROM employees
+        ORDER BY name ASC
+      `);
+      // Names alphabetically: Alice, Bob, Charlie, David, Eve
+      // Alice's salary is 5000
+      expect(rows.every(r => r.first_sal === 5000)).toBe(true);
+    });
+  });
 });
