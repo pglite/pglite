@@ -1482,6 +1482,33 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[3].name).toBe('David');
       expect(rows[3].lead_two).toBe('N/A');
     });
+
+    test("11.5 FIRST_VALUE() and LAST_VALUE()", async () => {
+      const rows = await db.query(`
+        SELECT 
+          name, 
+          department,
+          salary,
+          FIRST_VALUE(name) OVER (PARTITION BY department ORDER BY salary ASC) as first_emp,
+          LAST_VALUE(name) OVER (PARTITION BY department ORDER BY salary ASC) as last_emp
+        FROM employees
+        ORDER BY department, salary
+      `);
+
+      // HR department: Charlie (4500), Eve (4500)
+      const hrRows = rows.filter(r => r.department === 'HR');
+      expect(hrRows[0].first_emp).toBe('Charlie');
+      expect(hrRows[0].last_emp).toBe('Eve');
+      expect(hrRows[1].first_emp).toBe('Charlie');
+      expect(hrRows[1].last_emp).toBe('Eve');
+
+      // IT department: Alice (5000), David (5000), Bob (6000)
+      const itRows = rows.filter(r => r.department === 'IT');
+      expect(itRows[0].first_emp).toBe('Alice');
+      expect(itRows[0].last_emp).toBe('Bob');
+      expect(itRows[2].first_emp).toBe('Alice');
+      expect(itRows[2].last_emp).toBe('Bob');
+    });
   });
 
   describe("LEVEL 14: Multiple Row Inserts and Advanced Schema Definitions", () => {

@@ -5,7 +5,7 @@ export class Lexer {
   private readonly input: string;
   private readonly KEYWORDS = new Set([
     "CREATE", "TABLE", "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "UPDATE", "SET", "DELETE",
-    "PRIMARY", "KEY", "SERIAL", "TEXT", "NUMBER", "AND", "OR", "NOT", "IN", "LIKE", "ORDER", "BY",
+    "PRIMARY", "KEY", "SERIAL", "TEXT", "NUMBER", "AND", "OR", "NOT", "IN", "LIKE", "ORDER", "BY", "FIRST_VALUE", "LAST_VALUE",
     "DESC", "ASC", "LIMIT", "OFFSET", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "JOIN", "ON", "GROUP", "HAVING", "AS", "RETURNING", "BETWEEN",
     "UNIQUE", "NULL", "IS", "REFERENCES", "ALTER", "ADD", "COLUMN", "DEFAULT", "BEGIN", "COMMIT", "ROLLBACK",
     "CONFLICT", "NOTHING", "OVER", "PARTITION", "CASE", "WHEN", "THEN", "ELSE", "ARRAY", "UNNEST", "JSON_EACH", "JSONB_EACH", "JSON_ARRAY_ELEMENTS", "JSONB_ARRAY_ELEMENTS", "ORDINALITY",
