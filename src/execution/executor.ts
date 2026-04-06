@@ -1822,6 +1822,45 @@ export class Executor {
           }
           return null;
         }
+        if (fnName === "ABS") return args[0] != null ? Math.abs(Number(args[0])) : null;
+        if (fnName === "CEIL" || fnName === "CEILING") return args[0] != null ? Math.ceil(Number(args[0])) : null;
+        if (fnName === "FLOOR") return args[0] != null ? Math.floor(Number(args[0])) : null;
+        if (fnName === "ROUND") {
+          if (args[0] == null) return null;
+          const num = Number(args[0]);
+          const precision = args[1] != null ? Math.floor(Number(args[1])) : 0;
+          const factor = Math.pow(10, precision);
+          return Math.round(num * factor) / factor;
+        }
+        if (fnName === "TRUNC") {
+          if (args[0] == null) return null;
+          const num = Number(args[0]);
+          const precision = args[1] != null ? Math.floor(Number(args[1])) : 0;
+          const factor = Math.pow(10, precision);
+          return Math.trunc(num * factor) / factor;
+        }
+        if (fnName === "POWER" || fnName === "POW") {
+          if (args[0] == null || args[1] == null) return null;
+          return Math.pow(Number(args[0]), Number(args[1]));
+        }
+        if (fnName === "SQRT") return args[0] != null ? Math.sqrt(Number(args[0])) : null;
+        if (fnName === "EXP") return args[0] != null ? Math.exp(Number(args[0])) : null;
+        if (fnName === "LN") return args[0] != null ? Math.log(Number(args[0])) : null;
+        if (fnName === "LOG") return args[0] != null ? Math.log10(Number(args[0])) : null;
+        if (fnName === "MOD") {
+          if (args[0] == null || args[1] == null) return null;
+          return Number(args[0]) % Number(args[1]);
+        }
+        if (fnName === "SIGN") {
+          if (args[0] == null) return null;
+          const n = Number(args[0]);
+          return n > 0 ? 1 : (n < 0 ? -1 : 0);
+        }
+        if (fnName === "PI") return Math.PI;
+        if (fnName === "RANDOM") return Math.random();
+        if (fnName === "DEGREES") return args[0] != null ? Number(args[0]) * (180 / Math.PI) : null;
+        if (fnName === "RADIANS") return args[0] != null ? Number(args[0]) * (Math.PI / 180) : null;
+
         if (fnName === "JSON_EXTRACT") {
           let json = args[0];
           if (typeof json === "string") {

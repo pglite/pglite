@@ -2772,4 +2772,87 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].sp).toBe('b');
     });
   });
+
+  describe("LEVEL 45: Mathematical Functions", () => {
+    test("45.1 Basic Math: ABS, CEIL, FLOOR, SIGN", async () => {
+      const rows = await db.query(`
+        SELECT 
+          ABS(-10.5) as a,
+          CEIL(4.2) as c1,
+          CEILING(-4.2) as c2,
+          FLOOR(4.8) as f1,
+          FLOOR(-4.8) as f2,
+          SIGN(-50) as s1,
+          SIGN(0) as s2,
+          SIGN(50) as s3
+      `);
+      expect(rows[0].a).toBe(10.5);
+      expect(rows[0].c1).toBe(5);
+      expect(rows[0].c2).toBe(-4);
+      expect(rows[0].f1).toBe(4);
+      expect(rows[0].f2).toBe(-5);
+      expect(rows[0].s1).toBe(-1);
+      expect(rows[0].s2).toBe(0);
+      expect(rows[0].s3).toBe(1);
+    });
+
+    test("45.2 Rounding and Truncation", async () => {
+      const rows = await db.query(`
+        SELECT 
+          ROUND(10.4) as r1,
+          ROUND(10.5) as r2,
+          ROUND(10.6) as r3,
+          ROUND(1.2345, 2) as r4,
+          TRUNC(1.2345, 2) as t1,
+          TRUNC(1.99) as t2
+      `);
+      expect(rows[0].r1).toBe(10);
+      expect(rows[0].r2).toBe(11);
+      expect(rows[0].r3).toBe(11);
+      expect(rows[0].r4).toBe(1.23);
+      expect(rows[0].t1).toBe(1.23);
+      expect(rows[0].t2).toBe(1);
+    });
+
+    test("45.3 Power, Square Root, Exponential and Logarithm", async () => {
+      const rows = await db.query(`
+        SELECT 
+          POWER(2, 3) as p1,
+          POW(3, 2) as p2,
+          SQRT(16) as s,
+          EXP(1) as e,
+          LN(2.718281828459) as ln,
+          LOG(100) as log10
+      `);
+      expect(rows[0].p1).toBe(8);
+      expect(rows[0].p2).toBe(9);
+      expect(rows[0].s).toBe(4);
+      expect(rows[0].e).toBeCloseTo(2.71828);
+      expect(rows[0].ln).toBeCloseTo(1);
+      expect(rows[0].log10).toBe(2);
+    });
+
+    test("45.4 Trigonometry Helpers: PI, DEGREES, RADIANS", async () => {
+      const rows = await db.query(`
+        SELECT 
+          PI() as p,
+          DEGREES(PI()) as d,
+          RADIANS(180) as r
+      `);
+      expect(rows[0].p).toBeCloseTo(Math.PI);
+      expect(rows[0].d).toBe(180);
+      expect(rows[0].r).toBeCloseTo(Math.PI);
+    });
+
+    test("45.5 RANDOM and MOD", async () => {
+      const rows = await db.query(`
+        SELECT 
+          RANDOM() as rnd,
+          MOD(10, 3) as m
+      `);
+      expect(rows[0].rnd).toBeGreaterThanOrEqual(0);
+      expect(rows[0].rnd).toBeLessThan(1);
+      expect(rows[0].m).toBe(1);
+    });
+  });
 });
