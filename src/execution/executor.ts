@@ -261,12 +261,16 @@ export class Executor {
             ? (stmt.values as Expr[][]) 
             : [stmt.values as Expr[]];
             
+          const colsToUse = stmt.columns && stmt.columns.length > 0 
+            ? stmt.columns 
+            : table.columns.map((c: any) => c.name);
+
           for (const rowVals of valuesList) {
             const record: any = {};
-            for (let idx = 0; idx < stmt.columns.length; idx++) {
-              if (!rowVals[idx]) record[stmt.columns[idx]!] = undefined;
+            for (let idx = 0; idx < colsToUse.length; idx++) {
+              if (!rowVals[idx]) record[colsToUse[idx]!] = undefined;
               else
-                record[stmt.columns[idx]!] = await this.evaluateExpr(
+                record[colsToUse[idx]!] = await this.evaluateExpr(
                   storage,
                   rowVals[idx]!,
                   {},
@@ -861,9 +865,9 @@ export class Executor {
     join: JoinClause,
     params: any[] = []
   ) {
-    if (join.type === 'RIGHT') {
+    if (join.type === 'RIGHT' || join.type === 'FULL') {
       const leftRows = [];
-      for await (const r of source) leftRows.push(r);
+      for await (const r of source) leftRows.push({ row: r, matched: false });
 
       let rightSource: AsyncIterableIterator<any>;
 
@@ -918,15 +922,24 @@ export class Executor {
 
       for await (const jRow of rightSource) {
         let matched = false;
-        for (const row of leftRows) {
-          const candidate = { ...row, ...jRow };
+        for (const item of leftRows) {
+          const candidate = { ...item.row, ...jRow };
           if (await this.evaluateExpr(storage, join.on, candidate, params)) {
             yield candidate;
             matched = true;
+            item.matched = true;
           }
         }
         if (!matched) {
           yield { ...jRow };
+        }
+      }
+
+      if (join.type === 'FULL') {
+        for (const item of leftRows) {
+          if (!item.matched) {
+            yield { ...item.row };
+          }
         }
       }
     } else {
@@ -1004,20 +1017,27 @@ export class Executor {
     join: JoinClause,
     params: any[] = [],
   ) {
-    if (join.type === 'RIGHT') {
+    if (join.type === 'RIGHT' || join.type === 'FULL') {
       const leftRows = [];
-      for await (const r of source) leftRows.push(r);
+      for await (const r of source) leftRows.push({ row: r, matched: false });
       
       for (const jRow of rightRows) {
         let matched = false;
-        for (const row of leftRows) {
-          const candidate = { ...row, ...jRow };
+        for (const item of leftRows) {
+          const candidate = { ...item.row, ...jRow };
           if (await this.evaluateExpr(storage, join.on, candidate, params)) {
             yield candidate;
             matched = true;
+            item.matched = true;
           }
         }
         if (!matched) yield { ...jRow };
+      }
+
+      if (join.type === 'FULL') {
+        for (const item of leftRows) {
+          if (!item.matched) yield { ...item.row };
+        }
       }
     } else {
       for await (const row of source) {

@@ -251,6 +251,73 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(pglite.name).toBe('Bob');
     });
 
+    test("3.2.2 FULL OUTER JOIN", async () => {
+      await db.exec(`CREATE TABLE full_a (id NUMBER, val_a TEXT)`);
+      await db.exec(`CREATE TABLE full_b (id NUMBER, val_b TEXT)`);
+      await db.exec(`INSERT INTO full_a VALUES (1, 'A1'), (2, 'A2')`);
+      await db.exec(`INSERT INTO full_b VALUES (2, 'B2'), (3, 'B3')`);
+
+      const rows = await db.query(`
+        SELECT full_a.id as a_id, full_a.val_a, full_b.id as b_id, full_b.val_b
+        FROM full_a
+        FULL OUTER JOIN full_b ON full_a.id = full_b.id
+        ORDER BY COALESCE(full_a.id, full_b.id)
+      `);
+
+      expect(rows.length).toBe(3);
+      
+      // 1 (only in A)
+      expect(rows[0].a_id).toBe(1);
+      expect(rows[0].val_a).toBe('A1');
+      expect(rows[0].b_id).toBeUndefined();
+      
+      // 2 (in both)
+      expect(rows[1].a_id).toBe(2);
+      expect(rows[1].val_a).toBe('A2');
+      expect(rows[1].b_id).toBe(2);
+      expect(rows[1].val_b).toBe('B2');
+
+      // 3 (only in B)
+      expect(rows[2].a_id).toBeUndefined();
+      expect(rows[2].b_id).toBe(3);
+      expect(rows[2].val_b).toBe('B3');
+    });
+
+    test("3.2.2 FULL OUTER JOIN", async () => {
+      await db.exec(`DROP TABLE IF EXISTS full_a`);
+      await db.exec(`DROP TABLE IF EXISTS full_b`);
+      await db.exec(`CREATE TABLE full_a (id NUMBER, val_a TEXT)`);
+      await db.exec(`CREATE TABLE full_b (id NUMBER, val_b TEXT)`);
+      // Đã test luôn tính năng tự nhận diện cột khi insert (sau khi fix ở executor)
+      await db.exec(`INSERT INTO full_a VALUES (1, 'A1'), (2, 'A2')`);
+      await db.exec(`INSERT INTO full_b VALUES (2, 'B2'), (3, 'B3')`);
+
+      const rows = await db.query(`
+        SELECT full_a.id as a_id, full_a.val_a, full_b.id as b_id, full_b.val_b
+        FROM full_a
+        FULL OUTER JOIN full_b ON full_a.id = full_b.id
+        ORDER BY COALESCE(full_a.id, full_b.id)
+      `);
+
+      expect(rows.length).toBe(3);
+      
+      // 1 (only in A)
+      expect(rows[0].a_id).toBe(1);
+      expect(rows[0].val_a).toBe('A1');
+      expect(rows[0].b_id).toBeUndefined();
+      
+      // 2 (in both)
+      expect(rows[1].a_id).toBe(2);
+      expect(rows[1].val_a).toBe('A2');
+      expect(rows[1].b_id).toBe(2);
+      expect(rows[1].val_b).toBe('B2');
+
+      // 3 (only in B)
+      expect(rows[2].a_id).toBeUndefined();
+      expect(rows[2].b_id).toBe(3);
+      expect(rows[2].val_b).toBe('B3');
+    });
+
     test("3.3 Aggregation & GROUP BY", async () => {
       const rows = await db.query(`
         SELECT user_id, COUNT(id) as post_count 
