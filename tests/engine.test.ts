@@ -2631,4 +2631,44 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       if (existsSync(customDbFile + ".wal")) unlinkSync(customDbFile + ".wal");
     });
   });
+
+  describe("LEVEL 42: Multiple Table FROM (Implicit CROSS JOIN)", () => {
+    test("42.1 Basic cross join with comma syntax", async () => {
+      await db.exec(`CREATE TABLE colors (id SERIAL PRIMARY KEY, name TEXT)`);
+      await db.exec(`CREATE TABLE sizes (id SERIAL PRIMARY KEY, name TEXT)`);
+      
+      await db.exec(`INSERT INTO colors (name) VALUES ('Red'), ('Blue')`);
+      await db.exec(`INSERT INTO sizes (name) VALUES ('S'), ('M'), ('L')`);
+
+      const rows = await db.query(`
+        SELECT colors.name as color, sizes.name as size 
+        FROM colors, sizes
+        ORDER BY color, size
+      `);
+
+      expect(rows.length).toBe(6);
+      expect(rows[0].color).toBe('Blue');
+      expect(rows[0].size).toBe('L');
+    });
+
+    test("42.2 Comma FROM with WHERE clause (Implicit INNER JOIN)", async () => {
+      const rows = await db.query(`
+        SELECT c.name as color, s.name as size
+        FROM colors c, sizes s
+        WHERE c.name = 'Red' AND s.name = 'M'
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].color).toBe('Red');
+      expect(rows[0].size).toBe('M');
+    });
+
+    test("42.3 Triple cross join", async () => {
+      await db.exec(`CREATE TABLE shapes (name TEXT)`);
+      await db.exec(`INSERT INTO shapes VALUES ('Circle'), ('Square')`);
+
+      const rows = await db.query(`SELECT * FROM colors, sizes, shapes`);
+      expect(rows.length).toBe(12); // 2 * 3 * 2
+    });
+  });
 });

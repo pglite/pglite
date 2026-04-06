@@ -1024,33 +1024,33 @@ export class Parser {
     }
     
     let from: any = undefined;
-    if (this.match('KEYWORD', 'FROM')) {
-      this.consume();
+    const joins: JoinClause[] = [];
+
+    const parseFromSource = () => {
+      let source: any = {};
       if (this.match('SYMBOL', '(')) {
         this.consume();
         const stmt = this.parseSelect();
         this.consume('SYMBOL', ')');
-        from = { stmt };
+        source.stmt = stmt;
       } else {
         const next = this.tokens[this.pos + 1];
         if (this.matchIdentifier() && next?.type === 'SYMBOL' && next.value === '(') {
-          const fn = this.parseExpr();
-          from = { fn };
+          source.fn = this.parseExpr();
         } else {
-          const tableName = this.parseTableName();
-          from = { tableName };
+          source.tableName = this.parseTableName();
         }
       }
 
       if (this.match('KEYWORD', 'WITH')) {
         this.consume();
         this.consume('KEYWORD', 'ORDINALITY');
-        from.withOrdinality = true;
+        source.withOrdinality = true;
       }
 
       if (this.match('KEYWORD', 'AS')) {
         this.consume();
-        from.alias = this.consumeIdentifier();
+        source.alias = this.consumeIdentifier();
         if (this.match('SYMBOL', '(')) {
           this.consume();
           const columnAliases = [];
@@ -1060,14 +1060,32 @@ export class Parser {
             columnAliases.push(this.consumeIdentifier());
           }
           this.consume('SYMBOL', ')');
-          from.columnAliases = columnAliases;
+          source.columnAliases = columnAliases;
         }
-      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
-        from.alias = this.consumeIdentifier();
+      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT', 'HAVING', 'RETURNING', 'WITH', 'ON', 'LATERAL'].includes(this.current()?.value.toUpperCase() || '')) {
+        source.alias = this.consumeIdentifier();
+      }
+      return source;
+    };
+
+    if (this.match('KEYWORD', 'FROM')) {
+      this.consume();
+      from = parseFromSource();
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        const nextSource = parseFromSource();
+        joins.push({
+          type: 'CROSS',
+          tableName: nextSource.tableName,
+          stmt: nextSource.stmt,
+          fn: nextSource.fn,
+          withOrdinality: nextSource.withOrdinality,
+          columnAliases: nextSource.columnAliases,
+          alias: nextSource.alias,
+          on: { type: 'Literal', value: true }
+        });
       }
     }
-
-    const joins: JoinClause[] =[];
     while (this.match('KEYWORD', 'INNER') || this.match('KEYWORD', 'LEFT') || this.match('KEYWORD', 'RIGHT') || this.match('KEYWORD', 'FULL') || this.match('KEYWORD', 'CROSS') || this.match('KEYWORD', 'JOIN')) {
       let type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL' | 'CROSS' = 'INNER';
       if (this.match('KEYWORD', 'LEFT')) {
