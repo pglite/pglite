@@ -676,6 +676,36 @@ export class Executor {
                 return row;
               });
             }
+          } else if (fnExpr.type === 'Call' && (fnExpr.fnName === 'JSONB_EACH' || fnExpr.fnName === 'JSON_EACH')) {
+            const obj = await this.evaluateExpr(storage, fnExpr.args[0], outerRow, params);
+            if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+              rows = Object.entries(obj).map(([k, v], idx) => {
+                const row: any = {};
+                const alias1 = stmt.from.columnAliases?.[0] || 'key';
+                const alias2 = stmt.from.columnAliases?.[1] || 'value';
+                row[alias1] = k;
+                row[alias2] = v;
+                if (stmt.from.withOrdinality) {
+                  const alias3 = stmt.from.columnAliases?.[2] || 'ordinality';
+                  row[alias3] = idx + 1;
+                }
+                return row;
+              });
+            }
+          } else if (fnExpr.type === 'Call' && (fnExpr.fnName === 'JSONB_ARRAY_ELEMENTS' || fnExpr.fnName === 'JSON_ARRAY_ELEMENTS')) {
+            const arr = await this.evaluateExpr(storage, fnExpr.args[0], outerRow, params);
+            if (Array.isArray(arr)) {
+              rows = arr.map((item, idx) => {
+                const row: any = {};
+                const alias1 = stmt.from.columnAliases?.[0] || 'value';
+                row[alias1] = item;
+                if (stmt.from.withOrdinality) {
+                  const alias2 = stmt.from.columnAliases?.[1] || 'ordinality';
+                  row[alias2] = idx + 1;
+                }
+                return row;
+              });
+            }
           }
           source = (async function* () {
             for (const r of rows) {
@@ -804,9 +834,22 @@ export class Executor {
         sourceStream = this.processWindowFunctions(storage, bufferedRows, stmt.columns, params);
       }
 
+      const exclusions = new Set<string>();
+      if (stmt.from) {
+        if (stmt.from.tableName) exclusions.add(stmt.from.tableName);
+        if (stmt.from.alias) exclusions.add(stmt.from.alias);
+        else if (stmt.from.fn) exclusions.add('t');
+      }
+      if (stmt.joins) {
+        for (const join of stmt.joins) {
+          if (join.tableName) exclusions.add(join.tableName);
+          if (join.alias) exclusions.add(join.alias);
+        }
+      }
+
       const _this = this;
       sourceStream = this.mapStream(sourceStream, async function(r) {
-         const proj = await _this.projectRow(storage, r, stmt.columns, params);
+         const proj = await _this.projectRow(storage, r, stmt.columns, params, exclusions);
          return { ...r, ...proj, ___lpg_projected___: proj };
       });
 
@@ -923,6 +966,36 @@ export class Executor {
               return r;
             });
           }
+        } else if (fnExpr.type === 'Call' && (fnExpr.fnName === 'JSONB_EACH' || fnExpr.fnName === 'JSON_EACH')) {
+          const obj = await this.evaluateExpr(storage, fnExpr.args[0], {}, params);
+          if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+            rows = Object.entries(obj).map(([k, v], idx) => {
+              const r: any = {};
+              const alias1 = join.columnAliases?.[0] || 'key';
+              const alias2 = join.columnAliases?.[1] || 'value';
+              r[alias1] = k;
+              r[alias2] = v;
+              if (join.withOrdinality) {
+                const alias3 = join.columnAliases?.[2] || 'ordinality';
+                r[alias3] = idx + 1;
+              }
+              return r;
+            });
+          }
+        } else if (fnExpr.type === 'Call' && (fnExpr.fnName === 'JSONB_ARRAY_ELEMENTS' || fnExpr.fnName === 'JSON_ARRAY_ELEMENTS')) {
+          const arr = await this.evaluateExpr(storage, fnExpr.args[0], {}, params);
+          if (Array.isArray(arr)) {
+            rows = arr.map((item, idx) => {
+              const r: any = {};
+              const alias1 = join.columnAliases?.[0] || 'value';
+              r[alias1] = item;
+              if (join.withOrdinality) {
+                const alias2 = join.columnAliases?.[1] || 'ordinality';
+                r[alias2] = idx + 1;
+              }
+              return r;
+            });
+          }
         }
         rightSource = (async function* () {
           for (const r of rows) {
@@ -984,22 +1057,52 @@ export class Executor {
         } else if (join.fn) {
           const fnExpr = join.fn;
           let rows: any[] = [];
-          if (fnExpr.type === 'Call' && fnExpr.fnName === 'UNNEST') {
-            if (!fnExpr.args[0]) throw new Error("UNNEST requires an array argument");
-            const arr = await this.evaluateExpr(storage, fnExpr.args[0], row, params);
-            if (Array.isArray(arr)) {
-              rows = arr.map((item, idx) => {
-                const r: any = {};
-                const alias1 = join.columnAliases?.[0] || 'unnest';
-                r[alias1] = item;
-                if (join.withOrdinality) {
-                  const alias2 = join.columnAliases?.[1] || 'ordinality';
-                  r[alias2] = idx + 1;
-                }
-                return r;
-              });
-            }
+        if (fnExpr.type === 'Call' && fnExpr.fnName === 'UNNEST') {
+          if (!fnExpr.args[0]) throw new Error("UNNEST requires an array argument");
+          const arr = await this.evaluateExpr(storage, fnExpr.args[0], row, params);
+          if (Array.isArray(arr)) {
+            rows = arr.map((item, idx) => {
+              const r: any = {};
+              const alias1 = join.columnAliases?.[0] || 'unnest';
+              r[alias1] = item;
+              if (join.withOrdinality) {
+                const alias2 = join.columnAliases?.[1] || 'ordinality';
+                r[alias2] = idx + 1;
+              }
+              return r;
+            });
           }
+        } else if (fnExpr.type === 'Call' && (fnExpr.fnName === 'JSONB_EACH' || fnExpr.fnName === 'JSON_EACH')) {
+          const obj = await this.evaluateExpr(storage, fnExpr.args[0], row, params);
+          if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+            rows = Object.entries(obj).map(([k, v], idx) => {
+              const r: any = {};
+              const alias1 = join.columnAliases?.[0] || 'key';
+              const alias2 = join.columnAliases?.[1] || 'value';
+              r[alias1] = k;
+              r[alias2] = v;
+              if (join.withOrdinality) {
+                const alias3 = join.columnAliases?.[2] || 'ordinality';
+                r[alias3] = idx + 1;
+              }
+              return r;
+            });
+          }
+        } else if (fnExpr.type === 'Call' && (fnExpr.fnName === 'JSONB_ARRAY_ELEMENTS' || fnExpr.fnName === 'JSON_ARRAY_ELEMENTS')) {
+          const arr = await this.evaluateExpr(storage, fnExpr.args[0], row, params);
+          if (Array.isArray(arr)) {
+            rows = arr.map((item, idx) => {
+              const r: any = {};
+              const alias1 = join.columnAliases?.[0] || 'value';
+              r[alias1] = item;
+              if (join.withOrdinality) {
+                const alias2 = join.columnAliases?.[1] || 'ordinality';
+                r[alias2] = idx + 1;
+              }
+              return r;
+            });
+          }
+        }
           rightSource = (async function* () {
             for (const r of rows) {
               yield {
@@ -1292,12 +1395,12 @@ export class Executor {
     await Promise.all(tempFiles.map((f: string) => vfs.unlink(f)));
   }
 
-  private async projectRow(storage: StorageEngine, row: any, columns: Expr[], params: any[] = []): Promise<any> {
+  private async projectRow(storage: StorageEngine, row: any, columns: Expr[], params: any[] = [], exclusions?: Set<string>): Promise<any> {
     const outRow: any = {};
     for (const col of columns) {
       if (col.type === "Identifier" && col.name === "*") {
         for (const k of Object.keys(row)) {
-          if ((row[k] === null || typeof row[k] !== "object") && !k.startsWith("__"))
+          if (!k.startsWith("__") && !k.startsWith("___") && (!exclusions || !exclusions.has(k)))
             outRow[k] = row[k];
         }
       } else if (col.type === "Alias") {

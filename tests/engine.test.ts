@@ -2979,4 +2979,49 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].lts).toBeDefined();
     });
   });
+
+  describe("LEVEL 47: JSON Set Returning Functions", () => {
+    test("47.1 jsonb_each()", async () => {
+      const sql = `SELECT * FROM jsonb_each('{"a": 1, "b": "foo"}'::json) AS t(k, v)`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].k).toBe("a");
+      expect(rows[0].v).toBe(1);
+      expect(rows[1].k).toBe("b");
+      expect(rows[1].v).toBe("foo");
+    });
+
+    test("47.2 jsonb_array_elements()", async () => {
+      const sql = `SELECT * FROM jsonb_array_elements('[1, "foo", {"x": 10}]'::json) AS t(val)`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(3);
+      expect(rows[0].val).toBe(1);
+      expect(rows[1].val).toBe("foo");
+      expect(rows[2].val).toEqual({"x": 10});
+    });
+
+    test("47.3 jsonb_each() with ordinality", async () => {
+      const sql = `SELECT k, v, n FROM jsonb_each('{"x": 10, "y": 20}'::json) WITH ORDINALITY AS t(k, v, n)`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].n).toBe(1);
+      expect(rows[1].n).toBe(2);
+    });
+
+    test("47.4 LATERAL join with jsonb_each", async () => {
+      await db.exec(`CREATE TABLE json_data (id INT, doc JSONB)`);
+      await db.exec(`INSERT INTO json_data VALUES (1, '{"tags": ["a", "b"], "meta": {"owner": "alice"}}')`);
+      
+      const sql = `
+        SELECT j.id, kv.key, kv.value
+        FROM json_data j
+        CROSS JOIN LATERAL jsonb_each(j.doc) AS kv(key, value)
+        WHERE j.id = 1
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      const tags = rows.find(r => r.key === 'tags');
+      expect(tags.value).toEqual(["a", "b"]);
+    });
+  });
 });
