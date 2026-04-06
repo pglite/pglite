@@ -3116,6 +3116,51 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 49: VALUES in FROM clause", () => {
+    test("49.1 Basic VALUES in FROM with column aliases", async () => {
+      const sql = `SELECT id, name FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, name)`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].id).toBe(1);
+      expect(rows[0].name).toBe('a');
+      expect(rows[1].id).toBe(2);
+      expect(rows[1].name).toBe('b');
+    });
+
+    test("49.2 VALUES as a standalone statement", async () => {
+      const sql = `VALUES (1, 'foo'), (2, 'bar')`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].column1).toBe(1);
+      expect(rows[0].column2).toBe('foo');
+    });
+
+    test("49.3 VALUES with expressions", async () => {
+      const sql = `SELECT * FROM (VALUES (1+1, UPPER('hello'))) AS t(num, str)`;
+      const rows = await db.query(sql);
+      expect(rows[0].num).toBe(2);
+      expect(rows[0].str).toBe('HELLO');
+    });
+
+    test("49.4 JOIN with VALUES subquery", async () => {
+      await db.exec(`CREATE TABLE users_49 (id INT, email TEXT)`);
+      await db.exec(`INSERT INTO users_49 VALUES (1, 'a@b.com'), (2, 'c@d.com')`);
+      
+      const sql = `
+        SELECT u.email, v.role
+        FROM users_49 u
+        JOIN (VALUES (1, 'admin'), (2, 'user')) AS v(user_id, role)
+        ON u.id = v.user_id
+        ORDER BY u.id
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(2);
+      expect(rows[0].email).toBe('a@b.com');
+      expect(rows[0].role).toBe('admin');
+      expect(rows[1].role).toBe('user');
+    });
+  });
+
   describe("LEVEL 48: FIRST_VALUE and LAST_VALUE Window Functions", () => {
     test("48.1 FIRST_VALUE and LAST_VALUE with PARTITION BY and ORDER BY", async () => {
       const rows = await db.query(`

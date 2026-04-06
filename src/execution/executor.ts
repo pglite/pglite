@@ -451,6 +451,14 @@ export class Executor {
         return rows;
       }
 
+      case "Values": {
+        const rows = [];
+        for await (const row of this.executeSelect(storage, stmt, params)) {
+          rows.push(row);
+        }
+        return rows;
+      }
+
       case "Update": {
         const table = await (storage as any).getTableAsync(stmt.tableName);
         if (!table) throw new Error(`Table ${stmt.tableName} not found`);
@@ -650,10 +658,36 @@ export class Executor {
     }
 
     try {
+      if (stmt.type === 'Values') {
+        for (const rowExprs of stmt.values) {
+          const row: any = {};
+          for (let i = 0; i < rowExprs.length; i++) {
+            row[`column${i + 1}`] = await this.evaluateExpr(storage, rowExprs[i], outerRow, params);
+          }
+          yield row;
+        }
+        return;
+      }
+
       let source: any;
       if (stmt.from) {
         if (stmt.from.stmt) {
           source = this.executeSelect(storage, stmt.from.stmt, params, outerRow);
+
+          if (stmt.from.columnAliases) {
+            const aliases = stmt.from.columnAliases;
+            source = this.mapStream(source, (r) => {
+              const newR: any = {};
+              const keys = Object.keys(r).filter(k => !k.startsWith('__'));
+              for (let i = 0; i < aliases.length; i++) {
+                if (keys[i]) {
+                  newR[aliases[i]] = r[keys[i]];
+                }
+              }
+              return newR;
+            });
+          }
+
           if (stmt.from.alias)
             source = this.mapStream(source, (r) => ({
               ...r,
@@ -941,6 +975,21 @@ export class Executor {
 
       if (join.stmt) {
         rightSource = this.executeSelect(storage, join.stmt, params, {});
+
+        if (join.columnAliases) {
+          const aliases = join.columnAliases;
+          rightSource = this.mapStream(rightSource, (r) => {
+            const newR: any = {};
+            const keys = Object.keys(r).filter(k => !k.startsWith('__'));
+            for (let i = 0; i < aliases.length; i++) {
+              if (keys[i]) {
+                newR[aliases[i]] = r[keys[i]];
+              }
+            }
+            return newR;
+          });
+        }
+
         if (join.alias) {
           const alias = join.alias;
           rightSource = this.mapStream(rightSource, (r) => ({
@@ -1047,6 +1096,21 @@ export class Executor {
 
         if (join.stmt) {
           rightSource = this.executeSelect(storage, join.stmt, params, row);
+
+          if (join.columnAliases) {
+            const aliases = join.columnAliases;
+            rightSource = this.mapStream(rightSource, (r) => {
+              const newR: any = {};
+              const keys = Object.keys(r).filter(k => !k.startsWith('__'));
+              for (let i = 0; i < aliases.length; i++) {
+                if (keys[i]) {
+                  newR[aliases[i]] = r[keys[i]];
+                }
+              }
+              return newR;
+            });
+          }
+
           if (join.alias) {
             const alias = join.alias;
             rightSource = this.mapStream(rightSource, (r) => ({

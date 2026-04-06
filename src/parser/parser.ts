@@ -69,6 +69,7 @@ export class Parser {
         case 'CREATE': stmt = this.parseCreate(); break;
         case 'INSERT': stmt = this.parseInsert(); break;
         case 'SELECT': stmt = this.parseSelect(); break;
+        case 'VALUES': stmt = this.parseValues(); break;
         case 'UPDATE': stmt = this.parseUpdate(); break;
         case 'DELETE': stmt = this.parseDelete(); break;
         case 'ALTER': stmt = this.parseAlter(); break;
@@ -98,11 +99,37 @@ export class Parser {
       throw new Error(`Parse Error: Expected statement, got ${token.type}`);
     }
 
-    if (ctes.length > 0 && stmt.type === 'Select') stmt.ctes = ctes;
+    if (ctes.length > 0 && (stmt.type === 'Select' || stmt.type === 'Values')) (stmt as any).ctes = ctes;
     return stmt;
   }
 
   private parseExpr(): Expr { return this.parseOr(); }
+
+  private parseQuery(): Statement {
+    if (this.match('KEYWORD', 'WITH')) return this.parse();
+    if (this.match('KEYWORD', 'SELECT')) return this.parseSelect();
+    if (this.match('KEYWORD', 'VALUES')) return this.parseValues();
+    throw new Error(`Parse Error: Expected SELECT or VALUES, got ${this.current()?.value}`);
+  }
+
+  private parseValues(): Statement {
+    this.consume('KEYWORD', 'VALUES');
+    const valuesList: Expr[][] = [];
+    do {
+      this.consume('SYMBOL', '(');
+      const values: Expr[] = [];
+      if (!this.match('SYMBOL', ')')) {
+        values.push(this.parseExpr());
+        while (this.match('SYMBOL', ',')) {
+          this.consume();
+          values.push(this.parseExpr());
+        }
+      }
+      this.consume('SYMBOL', ')');
+      valuesList.push(values);
+    } while (this.match('SYMBOL', ',') && this.consume());
+    return { type: 'Values', values: valuesList };
+  }
 
   private parseReturning(): Expr[] {
     this.consume('KEYWORD', 'RETURNING');
@@ -1039,7 +1066,7 @@ export class Parser {
       let source: any = {};
       if (this.match('SYMBOL', '(')) {
         this.consume();
-        const stmt = this.parseSelect();
+        const stmt = this.parseQuery();
         this.consume('SYMBOL', ')');
         source.stmt = stmt;
       } else {
@@ -1132,7 +1159,7 @@ export class Parser {
 
       if (this.match('SYMBOL', '(')) {
         this.consume();
-        stmt_join = this.parseSelect();
+        stmt_join = this.parseQuery();
         this.consume('SYMBOL', ')');
       } else {
         const next = this.tokens[this.pos + 1];
@@ -1288,20 +1315,8 @@ export class Parser {
     let selectStmt: Statement | undefined;
 
     if (this.match('KEYWORD', 'VALUES')) {
-      this.consume('KEYWORD', 'VALUES');
-      valuesList = [];
-      do {
-        this.consume('SYMBOL', '(');
-        const values: Expr[] =[];
-        if (!this.match('SYMBOL', ')')) {
-          values.push(this.parseExpr());
-          while (this.match('SYMBOL', ',')) {
-            this.consume(); values.push(this.parseExpr());
-          }
-        }
-        this.consume('SYMBOL', ')');
-        valuesList.push(values);
-      } while (this.match('SYMBOL', ',') && this.consume());
+      const vStmt = this.parseValues() as any;
+      valuesList = vStmt.values;
     } else if (this.match('KEYWORD', 'SELECT')) {
       selectStmt = this.parseSelect();
     } else {
