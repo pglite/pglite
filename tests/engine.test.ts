@@ -2363,6 +2363,40 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 41: Foreign Key with Parameter Type Coercion", () => {
+    test("41.1 Insert into child table with string param when FK is integer", async () => {
+      await db.exec(`CREATE TABLE parent_fk_coerce (id SERIAL PRIMARY KEY, name TEXT)`);
+      await db.exec(`CREATE TABLE child_fk_coerce (id SERIAL PRIMARY KEY, parent_id INTEGER REFERENCES parent_fk_coerce(id))`);
+
+      await db.exec(`INSERT INTO parent_fk_coerce (name) VALUES ('Parent 1')`);
+      
+      // Should correctly coerce '1' to 1 for the foreign key check and insertion
+      const res = await db.exec(`INSERT INTO child_fk_coerce (parent_id) VALUES ($1)`, ['1']);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT * FROM child_fk_coerce`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].parent_id).toBe(1); // Should be number, not string
+    });
+    
+    test("41.2 Update child table with string param when FK is integer", async () => {
+      await db.exec(`INSERT INTO parent_fk_coerce (name) VALUES ('Parent 2')`);
+      
+      // Update with string parameter
+      const res = await db.exec(`UPDATE child_fk_coerce SET parent_id = $1 WHERE id = 1`, ['2']);
+      expect(res.updated).toBe(1);
+
+      const rows = await db.query(`SELECT * FROM child_fk_coerce`);
+      expect(rows[0].parent_id).toBe(2);
+    });
+
+    test("41.3 Index lookup pushdown with string param for integer PK", async () => {
+      const rows = await db.query(`SELECT name FROM parent_fk_coerce WHERE id = $1`, ['2']);
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe('Parent 2');
+    });
+  });
+
   describe("LEVEL 40: Corrupted dbMetaCache on Rollback", () => {
     test("40.1 Table columns are not lost after a failed transaction causes rollback", async () => {
       try {

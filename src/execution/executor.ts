@@ -325,6 +325,13 @@ export class Executor {
               record[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, record, params);
             }
           }
+          
+          // 2c. Cast values to column types
+          for (const col of table.columns) {
+            if (record[col.name] !== undefined && record[col.name] !== null) {
+              record[col.name] = await this.castValue(storage, record[col.name], col.dataType);
+            }
+          }
           endBenchmarks("serial_default_assignment");
 
           // 3. Unique/Conflict Checking
@@ -369,7 +376,12 @@ export class Executor {
                 async (r) => {
                   const evalContext = { ...r, excluded: record };
                   for (const [col, expr] of Object.entries(stmt.onConflict!.assignments!)) {
-                    r[col] = await this.evaluateExpr(storage, expr, evalContext, params);
+                    let newVal = await this.evaluateExpr(storage, expr, evalContext, params);
+                    const colDef = table.columns.find((c: any) => c.name === col);
+                    if (colDef && newVal !== undefined && newVal !== null) {
+                      newVal = await this.castValue(storage, newVal, colDef.dataType);
+                    }
+                    r[col] = newVal;
                   }
                   if (stmt.returning) {
                     updatedRows.push(await this.projectRow(storage, r, stmt.returning, params));
@@ -448,10 +460,14 @@ export class Executor {
           async (row: any) => {
             const oldRow = { ...row };
             for (const [colName, expr] of Object.entries(stmt.assignments)) {
-              const newVal = await this.evaluateExpr(storage, expr, row, params);
+              let newVal = await this.evaluateExpr(storage, expr, row, params);
+
+              const colDef = table.columns.find((c: any) => c.name === colName);
+              if (colDef && newVal !== undefined && newVal !== null) {
+                newVal = await this.castValue(storage, newVal, colDef.dataType);
+              }
 
               // 1. Validate outgoing Foreign Key constraints (Child side)
-              const colDef = table.columns.find((c: any) => c.name === colName);
               if (colDef?.references && newVal !== undefined && newVal !== null) {
                 let exists = false;
                 // Optimization: Use O(log N) index lookup if referenced column is the Primary Key
@@ -683,7 +699,12 @@ export class Executor {
               (stmt.where.right.type === "Literal" || stmt.where.right.type === "Parameter" || stmt.where.right.type === "Identifier")
             ) {
               useIndex = true;
-              const val = await this.evaluateExpr(storage, stmt.where.right, outerRow, params);
+              let val = await this.evaluateExpr(storage, stmt.where.right, outerRow, params);
+              const tableInfo = await (storage as any).getTableAsync(stmt.from.tableName);
+              const pkCol = tableInfo?.columns.find((c: any) => c.name === pkColName);
+              if (pkCol) {
+                val = await this.castValue(storage, val, pkCol.dataType);
+              }
               const row = await storage.getRowByPK(
                 stmt.from.tableName,
                 val,
@@ -1301,6 +1322,55 @@ export class Executor {
     }
   }
 
+  private async castValue(storage: StorageEngine, val: any, dataType: string): Promise<any> {
+    if (val === null || val === undefined) return null;
+    const dt = dataType.toUpperCase().split('(')[0]?.trim();
+    
+    const numerics = ["INT", "INTEGER", "SMALLINT", "BIGINT", "DECIMAL", "NUMERIC", "REAL", "DOUBLE", "PRECISION", "NUMBER", "SERIAL", "BIGSERIAL", "SMALLSERIAL", "MONEY", "OID", "REGCLASS", "REGTYPE", "REGNAMESPACE", "INT2", "INT4", "INT8", "FLOAT4", "FLOAT8"];
+    if (numerics.includes(dt!)) {
+      if ((dt === "REGCLASS" || dt === "REGTYPE" || dt === "REGNAMESPACE")) {
+        if (typeof val === "string") {
+          try {
+            if (dt === "REGNAMESPACE") {
+              const name = val.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
+              for await (const row of storage.scanRows('pg_namespace')) {
+                if (row.nspname === name) return row.oid;
+              }
+              return null;
+            } else {
+              const tableName = val.split('.').map(p => p.trim().replace(/^"|"$/g, '').replace(/""/g, '"')).join('.');
+              const tbl = await (storage as any).getTableAsync(tableName);
+              return tbl?.firstPage || null;
+            }
+          } catch {
+            return null;
+          }
+        } else if (typeof val === "number") {
+          return val;
+        }
+      }
+      const num = Number(val);
+      return isNaN(num) ? null : num;
+    } else if (dt === "BOOLEAN" || dt === "BOOL") {
+      if (typeof val === "boolean") return val;
+      const s = String(val).toUpperCase();
+      if (s === "TRUE" || s === "T" || s === "1" || s === "Y" || s === "YES") return true;
+      if (s === "FALSE" || s === "F" || s === "0" || s === "N" || s === "NO") return false;
+      return Boolean(val);
+    } else if (dt === "TEXT" || dt === "VARCHAR" || dt === "CHAR" || dt === "CHARACTER" || dt === "UUID" || dt === "STRING") {
+      return typeof val === "object" ? JSON.stringify(val) : String(val);
+    } else if (dt?.includes("JSON")) {
+      if (typeof val === "string") {
+        try { return JSON.parse(val); } catch { return null; }
+      }
+      return val;
+    } else if (dt?.includes("DATE") || dt?.includes("TIME") || dt?.includes("TIMESTAMP")) {
+      const d = new Date(val);
+      return isNaN(d.getTime()) ? null : d.toISOString();
+    }
+    return val;
+  }
+
   private async evaluateExpr(storage: StorageEngine, expr: Expr, row: any, params: any[] = []): Promise<any> {
     switch (expr.type) {
       case "Literal":
@@ -1326,9 +1396,9 @@ export class Executor {
         const right = await this.evaluateExpr(storage, expr.right, row, params);
         switch (expr.operator) {
           case "=":
-            return left === right;
+            return left == right;
           case "!=":
-            return left !== right;
+            return left != right;
           case ">":
             return left > right;
           case "<":
@@ -1438,12 +1508,12 @@ export class Executor {
           const vals = await Promise.all(
             expr.right.map((e) => this.evaluateExpr(storage, e, row, params)),
           );
-          res = vals.includes(left);
+          res = vals.some(v => v == left);
         } else {
           const results = [];
           for await (const r of this.executeSelect(storage, expr.right, params, row)) results.push(r);
           const vals = results.map((r: any) => Object.values(r)[0]);
-          res = vals.includes(left);
+          res = vals.some(v => v == left);
         }
         return (expr as any).not ? !res : res;
       }
@@ -1484,52 +1554,7 @@ export class Executor {
       }
       case "Cast": {
         let val = await this.evaluateExpr(storage, expr.expr, row, params);
-        if (val === null || val === undefined) return null;
-        const dt = expr.dataType.toUpperCase().split('(')[0]?.trim();
-        
-        const numerics = ["INT", "INTEGER", "SMALLINT", "BIGINT", "DECIMAL", "NUMERIC", "REAL", "DOUBLE", "PRECISION", "NUMBER", "SERIAL", "BIGSERIAL", "SMALLSERIAL", "MONEY", "OID", "REGCLASS", "REGTYPE", "REGNAMESPACE", "INT2", "INT4", "INT8", "FLOAT4", "FLOAT8"];
-        if (numerics.includes(dt!)) {
-          if ((dt === "REGCLASS" || dt === "REGTYPE" || dt === "REGNAMESPACE")) {
-            if (typeof val === "string") {
-              try {
-                if (dt === "REGNAMESPACE") {
-                  const name = val.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
-                  for await (const row of storage.scanRows('pg_namespace')) {
-                    if (row.nspname === name) return row.oid;
-                  }
-                  return null;
-                } else {
-                  const tableName = val.split('.').map(p => p.trim().replace(/^"|"$/g, '').replace(/""/g, '"')).join('.');
-                  const tbl = await (storage as any).getTableAsync(tableName);
-                  return tbl?.firstPage || null;
-                }
-              } catch {
-                return null;
-              }
-            } else if (typeof val === "number") {
-              return val;
-            }
-          }
-          const num = Number(val);
-          return isNaN(num) ? null : num;
-        } else if (dt === "BOOLEAN") {
-          if (typeof val === "boolean") return val;
-          const s = String(val).toUpperCase();
-          if (s === "TRUE" || s === "T" || s === "1" || s === "Y" || s === "YES") return true;
-          if (s === "FALSE" || s === "F" || s === "0" || s === "N" || s === "NO") return false;
-          return Boolean(val);
-        } else if (dt === "TEXT" || dt === "VARCHAR" || dt === "CHAR" || dt === "CHARACTER" || dt === "UUID" || dt === "STRING") {
-          return typeof val === "object" ? JSON.stringify(val) : String(val);
-        } else if (dt?.includes("JSON")) {
-          if (typeof val === "string") {
-            try { return JSON.parse(val); } catch { return null; }
-          }
-          return val;
-        } else if (dt?.includes("DATE") || dt?.includes("TIME")) {
-          const d = new Date(val);
-          return isNaN(d.getTime()) ? null : d.toISOString();
-        }
-        return val;
+        return await this.castValue(storage, val, expr.dataType);
       }
       case "Call": {
         const key = this.getExprKey(expr);
