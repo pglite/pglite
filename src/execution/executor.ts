@@ -861,12 +861,14 @@ export class Executor {
     join: JoinClause,
     params: any[] = []
   ) {
-    for await (const row of source) {
-      let matched = false;
+    if (join.type === 'RIGHT') {
+      const leftRows = [];
+      for await (const r of source) leftRows.push(r);
+
       let rightSource: AsyncIterableIterator<any>;
 
       if (join.stmt) {
-        rightSource = this.executeSelect(storage, join.stmt, params, row);
+        rightSource = this.executeSelect(storage, join.stmt, params, {});
         if (join.alias) {
           const alias = join.alias;
           rightSource = this.mapStream(rightSource, (r) => ({
@@ -879,7 +881,7 @@ export class Executor {
         let rows: any[] = [];
         if (fnExpr.type === 'Call' && fnExpr.fnName === 'UNNEST') {
           if (!fnExpr.args[0]) throw new Error("UNNEST requires an array argument");
-          const arr = await this.evaluateExpr(storage, fnExpr.args[0], row, params);
+          const arr = await this.evaluateExpr(storage, fnExpr.args[0], {}, params);
           if (Array.isArray(arr)) {
             rows = arr.map((item, idx) => {
               const r: any = {};
@@ -915,14 +917,82 @@ export class Executor {
       }
 
       for await (const jRow of rightSource) {
-        const candidate = { ...row, ...jRow };
-        if (await this.evaluateExpr(storage, join.on, candidate, params)) {
-          yield candidate;
-          matched = true;
+        let matched = false;
+        for (const row of leftRows) {
+          const candidate = { ...row, ...jRow };
+          if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+            yield candidate;
+            matched = true;
+          }
+        }
+        if (!matched) {
+          yield { ...jRow };
         }
       }
-      if (!matched && join.type === "LEFT") {
-        yield { ...row };
+    } else {
+      for await (const row of source) {
+        let matched = false;
+        let rightSource: AsyncIterableIterator<any>;
+
+        if (join.stmt) {
+          rightSource = this.executeSelect(storage, join.stmt, params, row);
+          if (join.alias) {
+            const alias = join.alias;
+            rightSource = this.mapStream(rightSource, (r) => ({
+              ...r,
+              [alias]: r,
+            }));
+          }
+        } else if (join.fn) {
+          const fnExpr = join.fn;
+          let rows: any[] = [];
+          if (fnExpr.type === 'Call' && fnExpr.fnName === 'UNNEST') {
+            if (!fnExpr.args[0]) throw new Error("UNNEST requires an array argument");
+            const arr = await this.evaluateExpr(storage, fnExpr.args[0], row, params);
+            if (Array.isArray(arr)) {
+              rows = arr.map((item, idx) => {
+                const r: any = {};
+                const alias1 = join.columnAliases?.[0] || 'unnest';
+                r[alias1] = item;
+                if (join.withOrdinality) {
+                  const alias2 = join.columnAliases?.[1] || 'ordinality';
+                  r[alias2] = idx + 1;
+                }
+                return r;
+              });
+            }
+          }
+          rightSource = (async function* () {
+            for (const r of rows) {
+              yield {
+                ...r,
+                ...(join.alias ? { [join.alias]: r } : { t: r })
+              };
+            }
+          })();
+        } else if (join.tableName) {
+          rightSource = this.mapStream(
+            storage.scanRows(join.tableName),
+            (r) => ({
+              ...r,
+              [join.tableName!]: r,
+              ...(join.alias ? { [join.alias]: r } : {})
+            })
+          );
+        } else {
+          rightSource = (async function*() { yield {}; })();
+        }
+
+        for await (const jRow of rightSource) {
+          const candidate = { ...row, ...jRow };
+          if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+            yield candidate;
+            matched = true;
+          }
+        }
+        if (!matched && join.type === "LEFT") {
+          yield { ...row };
+        }
       }
     }
   }
@@ -934,16 +1004,33 @@ export class Executor {
     join: JoinClause,
     params: any[] = [],
   ) {
-    for await (const row of source) {
-      let matched = false;
+    if (join.type === 'RIGHT') {
+      const leftRows = [];
+      for await (const r of source) leftRows.push(r);
+      
       for (const jRow of rightRows) {
-        const candidate = { ...row, ...jRow };
-        if (await this.evaluateExpr(storage, join.on, candidate, params)) {
-          yield candidate;
-          matched = true;
+        let matched = false;
+        for (const row of leftRows) {
+          const candidate = { ...row, ...jRow };
+          if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+            yield candidate;
+            matched = true;
+          }
         }
+        if (!matched) yield { ...jRow };
       }
-      if (!matched && join.type === "LEFT") yield { ...row };
+    } else {
+      for await (const row of source) {
+        let matched = false;
+        for (const jRow of rightRows) {
+          const candidate = { ...row, ...jRow };
+          if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+            yield candidate;
+            matched = true;
+          }
+        }
+        if (!matched && join.type === "LEFT") yield { ...row };
+      }
     }
   }
 

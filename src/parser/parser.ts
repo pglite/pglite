@@ -1062,16 +1062,18 @@ export class Parser {
           this.consume('SYMBOL', ')');
           from.columnAliases = columnAliases;
         }
-      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'JOIN', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'RETURNING', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
         from.alias = this.consumeIdentifier();
       }
     }
 
     const joins: JoinClause[] =[];
-    while (this.match('KEYWORD', 'INNER') || this.match('KEYWORD', 'LEFT') || this.match('KEYWORD', 'JOIN')) {
-      let type: 'INNER' | 'LEFT' = 'INNER';
+    while (this.match('KEYWORD', 'INNER') || this.match('KEYWORD', 'LEFT') || this.match('KEYWORD', 'RIGHT') || this.match('KEYWORD', 'JOIN')) {
+      let type: 'INNER' | 'LEFT' | 'RIGHT' = 'INNER';
       if (this.match('KEYWORD', 'LEFT')) {
         this.consume(); type = 'LEFT'; this.consume('KEYWORD', 'JOIN');
+      } else if (this.match('KEYWORD', 'RIGHT')) {
+        this.consume(); type = 'RIGHT'; this.consume('KEYWORD', 'JOIN');
       } else if (this.match('KEYWORD', 'INNER')) {
         this.consume(); this.consume('KEYWORD', 'JOIN');
       } else {
@@ -1124,7 +1126,7 @@ export class Parser {
           this.consume('SYMBOL', ')');
           columnAliases = aliases;
         }
-      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'INNER', 'LEFT', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'HAVING', 'INNER', 'LEFT', 'RIGHT', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
         alias = this.consumeIdentifier();
       }
       

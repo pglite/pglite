@@ -231,6 +231,26 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].title).toBeUndefined();
     });
 
+    test("3.2.1 RIGHT JOIN", async () => {
+      await db.exec(`INSERT INTO posts (title, user_id) VALUES ('Orphan Post', 99)`);
+      const rows = await db.query(`
+        SELECT users.name, posts.title 
+        FROM users 
+        RIGHT JOIN posts ON users.id = posts.user_id 
+        ORDER BY posts.id
+      `);
+      // posts have 4 rows total now: 
+      // Hello World (user 1), Bun is fast (user 1), Postgres Lite (user 2), Orphan Post (user 99)
+      expect(rows.length).toBe(4);
+      const orphan = rows.find(r => r.title === 'Orphan Post');
+      expect(orphan).toBeDefined();
+      expect(orphan.name).toBeUndefined();
+      
+      const pglite = rows.find(r => r.title === 'Postgres Lite');
+      expect(pglite).toBeDefined();
+      expect(pglite.name).toBe('Bob');
+    });
+
     test("3.3 Aggregation & GROUP BY", async () => {
       const rows = await db.query(`
         SELECT user_id, COUNT(id) as post_count 
@@ -272,11 +292,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         GROUP BY user_id
         ORDER BY user_id ASC
       `);
-      expect(rows.length).toBe(2);
+      expect(rows.length).toBe(3);
       expect(rows[0].user_id).toBe(1);
       expect(rows[0].titles).toEqual(["Hello World", "Bun is fast"]);
       expect(rows[1].user_id).toBe(2);
       expect(rows[1].titles).toEqual(["Postgres Lite"]);
+      expect(rows[2].user_id).toBe(99);
+      expect(rows[2].titles).toEqual(["Orphan Post"]);
     });
   });
 

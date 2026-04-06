@@ -48,7 +48,7 @@ export interface ColumnDef {
 }
 
 export interface JoinClause {
-  type: 'INNER' | 'LEFT';
+  type: 'INNER' | 'LEFT' | 'RIGHT';
   tableName?: string;
   stmt?: Statement;
   fn?: Expr;
