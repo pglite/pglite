@@ -2073,6 +2073,25 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   });
 
   describe("LEVEL 30: DISTINCT and AS alias", () => {
+    test("30.2 SELECT DISTINCT ON", async () => {
+      await db.exec(`CREATE TABLE distinct_on_test (id SERIAL PRIMARY KEY, group_id INT, val TEXT)`);
+      await db.exec(`INSERT INTO distinct_on_test (group_id, val) VALUES 
+        (1, 'A'), (1, 'B'), (2, 'C'), (2, 'D')`);
+      
+      // ORDER BY causes B to appear before A for group 1 and D before C for group 2.
+      // DISTINCT ON removes duplicates based on group_id and picks the first encountered.
+      const rows = await db.query(`
+        SELECT DISTINCT ON (group_id) group_id, val 
+        FROM distinct_on_test 
+        ORDER BY group_id, val DESC
+      `);
+      expect(rows.length).toBe(2);
+      expect(rows[0].group_id).toBe(1);
+      expect(rows[0].val).toBe('B');
+      expect(rows[1].group_id).toBe(2);
+      expect(rows[1].val).toBe('D');
+    });
+
     test("30.1 SELECT DISTINCT with multiple AS aliases", async () => {
       await db.exec(`CREATE TABLE products (id SERIAL PRIMARY KEY, category TEXT)`);
       await db.exec(`INSERT INTO products (category) VALUES ('Electronics'), ('Clothing'), ('Electronics'), ('Home')`);

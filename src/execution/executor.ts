@@ -806,7 +806,7 @@ export class Executor {
          return { ...r, ...proj, ___lpg_projected___: proj };
       });
 
-      if (stmt.distinct) {
+      if (stmt.distinct && !stmt.distinctOn) {
          sourceStream = this.distinctStream(sourceStream);
       }
 
@@ -817,6 +817,10 @@ export class Executor {
 
       if (stmt.orderBy) {
          sourceStream = this.externalSortStream(storage, sourceStream, stmt.orderBy, params);
+      }
+
+      if (stmt.distinctOn) {
+         sourceStream = this.distinctStream(sourceStream, stmt.distinctOn, storage, params);
       }
 
       if (stmt.offset) {
@@ -943,11 +947,21 @@ export class Executor {
     }
   }
 
-  private async *distinctStream(source: AsyncIterableIterator<any>) {
+  private async *distinctStream(source: AsyncIterableIterator<any>, distinctOn?: Expr[], storage?: StorageEngine, params?: any[]) {
     const seen = new Set<string>();
     for await (const row of source) {
-      const proj = row.___lpg_projected___ ? row.___lpg_projected___ : row;
-      const key = JSON.stringify(proj);
+      let key;
+      if (distinctOn && distinctOn.length > 0 && storage && params) {
+        const vals = [];
+        for (const expr of distinctOn) {
+          vals.push(await this.evaluateExpr(storage, expr, row, params));
+        }
+        key = JSON.stringify(vals);
+      } else {
+        const proj = row.___lpg_projected___ ? row.___lpg_projected___ : row;
+        key = JSON.stringify(proj);
+      }
+      
       if (!seen.has(key)) {
         seen.add(key);
         yield row;

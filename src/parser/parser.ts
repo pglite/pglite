@@ -985,9 +985,21 @@ export class Parser {
     this.consume('KEYWORD', 'SELECT');
     
     let distinct = false;
+    let distinctOn: Expr[] | undefined;
     if (this.match('KEYWORD', 'DISTINCT')) {
       this.consume();
       distinct = true;
+      if (this.match('KEYWORD', 'ON')) {
+        this.consume();
+        this.consume('SYMBOL', '(');
+        distinctOn = [];
+        distinctOn.push(this.parseExpr());
+        while (this.match('SYMBOL', ',')) {
+          this.consume();
+          distinctOn.push(this.parseExpr());
+        }
+        this.consume('SYMBOL', ')');
+      }
     }
 
     const columns: Expr[] =[];
@@ -1169,7 +1181,7 @@ export class Parser {
       this.consume(); offset = this.parseExpr();
     }
 
-    let stmt: Statement = { type: 'Select', columns, distinct, from, joins, where, groupBy, having, orderBy, limit, offset };
+    let stmt: Statement = { type: 'Select', columns, distinct, distinctOn, from, joins, where, groupBy, having, orderBy, limit, offset };
 
     if (this.match('KEYWORD', 'UNION')) {
       this.consume(); const right = this.parseSelect();
