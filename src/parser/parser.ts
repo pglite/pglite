@@ -1618,7 +1618,7 @@ export class Parser {
         this.consume();
       }
 
-      return { type: 'DropOther', objectType: dropType, names };
+      return { type: 'DropOther', objectType: dropType!, names };
     }
 
     throw new Error(`Parse Error: Unsupported DROP statement`);
