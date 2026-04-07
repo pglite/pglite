@@ -377,6 +377,41 @@ class Pager {
 
   async init() {
     if (this.initialized) return;
+
+    if (await this.vfs.exists(this.filepath + ".wal")) {
+      try {
+        const walHandle = await this.vfs.open(this.filepath + ".wal", "r");
+        const stat = await walHandle.stat();
+        if (stat.size > 0) {
+          if (!(await this.vfs.exists(this.filepath))) {
+            await this.vfs.writeFile(this.filepath, new Uint8Array(0));
+          }
+          const dbHandle = await FileHandlePool.getHandle(this.vfs, this.filepath, "r+");
+          
+          let offset = 0;
+          const headerBuf = Buffer.alloc(8);
+          while (offset < stat.size) {
+            const bytesRead = await walHandle.read(headerBuf, 0, 8, offset);
+            if (bytesRead < 8) break;
+            const pageId = headerBuf.readUInt32LE(0);
+            const dataLen = headerBuf.readUInt32LE(4);
+            
+            if (offset + 8 + dataLen > stat.size) break;
+            
+            const dataBuf = Buffer.alloc(dataLen);
+            await walHandle.read(dataBuf, 0, dataLen, offset + 8);
+            
+            await dbHandle.write(dataBuf, 0, dataLen, pageId * PAGE_SIZE);
+            offset += 8 + dataLen;
+          }
+        }
+        await walHandle.close();
+        await this.vfs.writeFile(this.filepath + ".wal", new Uint8Array(0));
+      } catch (e) {
+        console.warn("WAL recovery failed", e);
+      }
+    }
+
     await this.wal.open();
     if (!(await this.vfs.exists(this.filepath))) {
       await this.vfs.writeFile(this.filepath, new Uint8Array(0));
@@ -887,7 +922,31 @@ class BTree {
   }
 
   async delete(key: any) {
-    /* simplified tombstone */
+    if (this.rootPageId === 0 || this.rootPageId === 0xffffffff) return;
+    const path = [];
+    let currId = this.rootPageId;
+    while (currId !== 0xffffffff && currId !== 0) {
+      const node = await this.fetchNode(currId);
+      path.push(node);
+      if (node.isLeaf) break;
+      let i = 0;
+      while (i < node.keys.length && key > node.keys[i]) i++;
+      if (i < node.keys.length && key === node.keys[i]) i++;
+      currId = node.children[i];
+    }
+
+    const leaf = path[path.length - 1];
+    if (leaf && leaf.isLeaf) {
+      let i = 0;
+      while (i < leaf.keys.length && key > leaf.keys[i]) i++;
+      if (i < leaf.keys.length && leaf.keys[i] === key) {
+        leaf.keys.splice(i, 1);
+        leaf.vals.splice(i, 1);
+        const buf = await this.pager.readPage(leaf.pageId);
+        this.serializeNode(leaf, buf);
+        await this.pager.writePage(leaf.pageId, buf);
+      }
+    }
   }
 }
 
@@ -1536,6 +1595,10 @@ export class StorageEngine {
       this.pgNamespaceDef,
       async (r) => r.nspname === name,
     );
+    if (this.dbMeta) {
+      const btree = new BTree(this.pager, this.dbMeta.nspIdx);
+      await btree.delete(name);
+    }
     this.schemaCache = [];
   }
 
@@ -1552,6 +1615,11 @@ export class StorageEngine {
 
     const oldTable = await this.getTableAsync(fullOldName);
     if (!oldTable) throw new Error(`Table ${fullOldName} does not exist`);
+
+    const partsOld = fullOldName.split(".");
+    const oldSchema = partsOld[0]!;
+    const oldRelName = partsOld[1]!;
+    const oldNspOid = await this.getSchemaOid(oldSchema);
 
     const parts = fullNewName.split(".");
     const newSchema = parts[0]!;
@@ -1572,6 +1640,7 @@ export class StorageEngine {
 
     if (location) {
       const btree = new BTree(this.pager, this.dbMeta.clsIdx);
+      await btree.delete(`${oldNspOid}:${oldRelName}`);
       const newRoot = await btree.insert(
         `${newNspOid}:${newRelName}`,
         location,
@@ -1671,6 +1740,12 @@ export class StorageEngine {
       this.pgAttributeDef,
       async (r) => r.attrelid === table.firstPage,
     );
+    if (this.dbMeta) {
+      const btree = new BTree(this.pager, this.dbMeta.clsIdx);
+      const parts = fullName.split(".");
+      const nspOid = await this.getSchemaOid(parts[0]!);
+      await btree.delete(`${nspOid}:${parts[1]!}`);
+    }
     this.tableCache.delete(fullName);
     this.pkIndexes.delete(fullName);
   }

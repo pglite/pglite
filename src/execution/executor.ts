@@ -991,41 +991,49 @@ export class Executor {
           await (storage as any).getTableAsync(stmt.from.tableName);
           let useIndex = false;
           // Predicate Pushdown + O(1) Index Lookup
-          if (
-            !stmt.joins &&
-            stmt.where &&
-            stmt.where.type === "Binary" &&
-            stmt.where.operator === "="
-          ) {
+          if (!stmt.joins && stmt.where) {
             const pkColName = await storage.getPKColumn(stmt.from.tableName);
-            if (
-              pkColName &&
-              stmt.where.left.type === "Identifier" &&
-              stmt.where.left.name === pkColName &&
-              (stmt.where.right.type === "Literal" || stmt.where.right.type === "Parameter" || stmt.where.right.type === "Identifier")
-            ) {
-              useIndex = true;
-              let val = await this.evaluateExpr(storage, stmt.where.right, outerRow, params);
-              const tableInfo = await (storage as any).getTableAsync(stmt.from.tableName);
-              const pkCol = tableInfo?.columns.find((c: any) => c.name === pkColName);
-              if (pkCol) {
-                val = await this.castValue(storage, val, pkCol.dataType);
-              }
-              const row = await storage.getRowByPK(
-                stmt.from.tableName,
-                val,
-              );
-              source = (async function* () {
-                if (row) {
-                  row[stmt.from.tableName!] = row;
-                  if (stmt.from.alias) row[stmt.from.alias] = row;
-                  if (Object.keys(outerRow).length > 0) {
-                    yield { ...outerRow, ...row };
-                  } else {
-                    yield row;
+            if (pkColName) {
+              let pkExpr: Expr | null = null;
+              
+              const findPkCondition = (expr: Expr): Expr | null => {
+                if (expr.type === "Binary" && expr.operator === "=") {
+                  if (expr.left.type === "Identifier" && expr.left.name === pkColName &&
+                      (expr.right.type === "Literal" || expr.right.type === "Parameter" || expr.right.type === "Identifier")) {
+                    return expr;
                   }
+                } else if (expr.type === "Logical" && expr.operator === "AND") {
+                  return findPkCondition(expr.left) || findPkCondition(expr.right);
                 }
-              })();
+                return null;
+              };
+
+              pkExpr = findPkCondition(stmt.where);
+
+              if (pkExpr && pkExpr.type === "Binary") {
+                useIndex = true;
+                let val = await this.evaluateExpr(storage, pkExpr.right, outerRow, params);
+                const tableInfo = await (storage as any).getTableAsync(stmt.from.tableName);
+                const pkCol = tableInfo?.columns.find((c: any) => c.name === pkColName);
+                if (pkCol) {
+                  val = await this.castValue(storage, val, pkCol.dataType);
+                }
+                const row = await storage.getRowByPK(
+                  stmt.from.tableName,
+                  val,
+                );
+                source = (async function* () {
+                  if (row) {
+                    row[stmt.from.tableName!] = row;
+                    if (stmt.from.alias) row[stmt.from.alias] = row;
+                    if (Object.keys(outerRow).length > 0) {
+                      yield { ...outerRow, ...row };
+                    } else {
+                      yield row;
+                    }
+                  }
+                })();
+              }
             }
           }
 
@@ -1449,6 +1457,87 @@ export class Executor {
     join: JoinClause,
     params: any = [],
   ) {
+    let hashKeyLeft: Expr | null = null;
+    let hashKeyRight: Expr | null = null;
+    let isEquiJoin = false;
+
+    if (join.on.type === 'Binary' && join.on.operator === '=') {
+      isEquiJoin = true;
+      hashKeyLeft = join.on.left;
+      hashKeyRight = join.on.right;
+    }
+
+    if (isEquiJoin && hashKeyLeft && hashKeyRight) {
+      const rightMap = new Map<string, any[]>();
+      let rightKeyExpr = hashKeyRight;
+      let leftKeyExpr = hashKeyLeft;
+
+      if (rightRows.length > 0) {
+        try {
+          const testRight = await this.evaluateExpr(storage, hashKeyRight, rightRows[0], params);
+          const testLeft = await this.evaluateExpr(storage, hashKeyLeft, rightRows[0], params);
+          if (testRight !== undefined && testLeft === undefined) {
+             rightKeyExpr = hashKeyRight;
+             leftKeyExpr = hashKeyLeft;
+          } else if (testLeft !== undefined && testRight === undefined) {
+             rightKeyExpr = hashKeyLeft;
+             leftKeyExpr = hashKeyRight;
+          }
+        } catch (e) {}
+
+        for (const jRow of rightRows) {
+           const k = String(await this.evaluateExpr(storage, rightKeyExpr, jRow, params));
+           if (!rightMap.has(k)) rightMap.set(k, []);
+           rightMap.get(k)!.push(jRow);
+        }
+      }
+
+      if (join.type === 'RIGHT' || join.type === 'FULL') {
+        const leftRows = [];
+        for await (const r of source) leftRows.push({ row: r, matched: false });
+        
+        for (const jRow of rightRows) {
+          let matched = false;
+          const kRight = String(await this.evaluateExpr(storage, rightKeyExpr, jRow, params));
+          for (const item of leftRows) {
+            const kLeft = String(await this.evaluateExpr(storage, leftKeyExpr, item.row, params));
+            if (kLeft === kRight) {
+               const candidate = { ...item.row, ...jRow };
+               if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+                 yield candidate;
+                 matched = true;
+                 item.matched = true;
+               }
+            }
+          }
+          if (!matched) yield { ...jRow };
+        }
+
+        if (join.type === 'FULL') {
+          for (const item of leftRows) {
+            if (!item.matched) yield { ...item.row };
+          }
+        }
+      } else {
+        for await (const row of source) {
+          let matched = false;
+          const kLeft = String(await this.evaluateExpr(storage, leftKeyExpr, row, params));
+          const matches = rightMap.get(kLeft);
+          if (matches) {
+            for (const jRow of matches) {
+              const candidate = { ...row, ...jRow };
+              if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+                yield candidate;
+                matched = true;
+              }
+            }
+          }
+          if (!matched && join.type === "LEFT") yield { ...row };
+        }
+      }
+      return;
+    }
+
     if (join.type === 'RIGHT' || join.type === 'FULL') {
       const leftRows = [];
       for await (const r of source) leftRows.push({ row: r, matched: false });
@@ -2254,7 +2343,10 @@ export class Executor {
       case "NamedParameter":
         return params[expr.name];
       case "Identifier": {
-        const nameUpper = expr.name.toUpperCase();
+        if ((expr as any)._nameUpper === undefined) {
+           (expr as any)._nameUpper = expr.name.toUpperCase();
+        }
+        const nameUpper = (expr as any)._nameUpper;
         if (nameUpper === "CURRENT_TIMESTAMP") return new Date().toISOString();
         if (nameUpper === "CURRENT_DATE")
           return new Date().toISOString().split("T")[0];
@@ -2265,12 +2357,19 @@ export class Executor {
           return new Date().toISOString().split("T")[1];
 
         if (expr.name === "*") return "*";
-        if (expr.name.includes(".")) {
-          const parts = expr.name.split(".");
-          if (parts.length >= 2) {
-            const c = parts.pop()!;
-            const t = parts.join(".");
-            if (row[t] && row[t][c] !== undefined) return row[t][c];
+
+        if ((expr as any)._isNested === undefined) {
+           (expr as any)._isNested = expr.name.includes(".");
+           if ((expr as any)._isNested) {
+              const parts = expr.name.split(".");
+              (expr as any)._col = parts.pop()!;
+              (expr as any)._tbl = parts.join(".");
+           }
+        }
+
+        if ((expr as any)._isNested) {
+          if (row[(expr as any)._tbl] && row[(expr as any)._tbl][(expr as any)._col] !== undefined) {
+             return row[(expr as any)._tbl][(expr as any)._col];
           }
           if (row[expr.name] !== undefined) return row[expr.name];
         }
@@ -2317,7 +2416,7 @@ export class Executor {
                 }
               }
             }
-            if (typeof left === "string" && !isNaN(Date.parse(left)) && typeof right === "string") {
+            if (typeof left === "string" && left.includes("-") && !isNaN(Date.parse(left)) && typeof right === "string") {
               const parts = right.toLowerCase().trim().split(/\s+/);
               const val = parseFloat(parts[0] || "0");
               const unit = parts[1] || "day";
@@ -2524,7 +2623,10 @@ export class Executor {
         const key = this.getExprKey(expr);
         if (row[key] !== undefined) return row[key];
 
-        const fnName = expr.fnName.toUpperCase();
+        if ((expr as any)._fnNameUpper === undefined) {
+           (expr as any)._fnNameUpper = expr.fnName.toUpperCase();
+        }
+        const fnName = (expr as any)._fnNameUpper;
         if (fnName === "COUNT") return row.__COUNT__ || 0;
         if (fnName === "AVG") return row.__AVG__ || 0;
         if (fnName === "SUM" || fnName === "MIN" || fnName === "MAX") return null;
