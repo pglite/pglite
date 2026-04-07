@@ -47,6 +47,9 @@ export interface ColumnDef {
   defaultVal?: Expr;
   generatedExpr?: Expr;
   comment?: string;
+  _isNumeric?: boolean;
+  _isBool?: boolean;
+  _isJson?: boolean;
 }
 
 export interface JoinClause {

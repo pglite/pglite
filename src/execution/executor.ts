@@ -1016,13 +1016,15 @@ export class Executor {
                 val,
               );
               source = (async function* () {
-                if (row)
-                  yield {
-                    ...outerRow,
-                    ...row,
-                    [stmt.from.tableName]: row,
-                    ...(stmt.from.alias ? { [stmt.from.alias]: row } : {}),
-                  };
+                if (row) {
+                  row[stmt.from.tableName!] = row;
+                  if (stmt.from.alias) row[stmt.from.alias] = row;
+                  if (Object.keys(outerRow).length > 0) {
+                    yield { ...outerRow, ...row };
+                  } else {
+                    yield row;
+                  }
+                }
               })();
             }
           }
@@ -1030,12 +1032,14 @@ export class Executor {
           if (!useIndex) {
             source = this.mapStream(
               storage.scanRows(stmt.from.tableName),
-              (r) => ({
-                ...outerRow,
-                ...r,
-                [stmt.from.tableName]: r,
-                ...(stmt.from.alias ? { [stmt.from.alias]: r } : {}),
-              }),
+              (r) => {
+                r[stmt.from.tableName!] = r;
+                if (stmt.from.alias) r[stmt.from.alias] = r;
+                if (Object.keys(outerRow).length > 0) {
+                  return { ...outerRow, ...r };
+                }
+                return r;
+              }
             );
             if (!stmt.joins && stmt.where)
               source = this.filterStream(
@@ -1058,11 +1062,9 @@ export class Executor {
             // In-memory Hash Join optimization
             const rightRows = [];
             for await (const r of storage.scanRows(join.tableName!)) {
-              rightRows.push({
-                ...r,
-                [join.tableName!]: r,
-                ...(join.alias ? { [join.alias]: r } : {}),
-              });
+              r[join.tableName!] = r;
+              if (join.alias) r[join.alias] = r;
+              rightRows.push(r);
             }
             source = this.hashJoinStream(storage, source, rightRows, join, params);
           }
@@ -1295,11 +1297,11 @@ export class Executor {
       } else if (join.tableName) {
         rightSource = this.mapStream(
           storage.scanRows(join.tableName),
-          (r) => ({
-            ...r,
-            [join.tableName!]: r,
-            ...(join.alias ? { [join.alias]: r } : {})
-          })
+          (r) => {
+            r[join.tableName!] = r;
+            if (join.alias) r[join.alias] = r;
+            return r;
+          }
         );
       } else {
         rightSource = (async function*() { yield {}; })();
@@ -1416,11 +1418,11 @@ export class Executor {
         } else if (join.tableName) {
           rightSource = this.mapStream(
             storage.scanRows(join.tableName),
-            (r) => ({
-              ...r,
-              [join.tableName!]: r,
-              ...(join.alias ? { [join.alias]: r } : {})
-            })
+            (r) => {
+              r[join.tableName!] = r;
+              if (join.alias) r[join.alias] = r;
+              return r;
+            }
           );
         } else {
           rightSource = (async function*() { yield {}; })();

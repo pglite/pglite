@@ -1092,7 +1092,7 @@ export class StorageEngine {
         const page = new SlottedPage(buf);
         for (const t of page.getTuples()) {
           if (t.slotIdx === loc.slotIdx) {
-            const resolved = await this.resolveOverflow(t.data);
+            const resolved = this.isOverflow(t.data) ? await this.resolveOverflow(t.data) : t.data;
             meta = this.deserializeRow(
               StorageEngine.CLUSTER_CATALOG_COLS,
               resolved,
@@ -1704,7 +1704,7 @@ export class StorageEngine {
       let relRow = null;
       for (const t of page.getTuples()) {
         if (t.slotIdx === loc.slotIdx) {
-          const resolved = await this.resolveOverflow(t.data);
+          const resolved = this.isOverflow(t.data) ? await this.resolveOverflow(t.data) : t.data;
           relRow = this.deserializeRow(StorageEngine.PG_CLASS_COLS, resolved);
           break;
         }
@@ -1970,7 +1970,7 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         yield this.deserializeRow(def.columns, resolved);
       }
       pageId = page.nextPageId;
@@ -1987,7 +1987,7 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let mod = false;
       for (const tuple of page.getTuples()) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         if (await filter(this.deserializeRow(def.columns, resolved))) {
           page.deleteTuple(tuple.slotIdx);
           mod = true;
@@ -2012,7 +2012,7 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let mod = false;
       for (const tuple of page.getTuples()) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         const row = this.deserializeRow(def.columns, resolved);
         if (await filter(row)) {
           const locObj = { pageId, slotIdx: tuple.slotIdx };
@@ -2120,27 +2120,25 @@ export class StorageEngine {
     return ptrBuf;
   }
 
+  private isOverflow(data: Buffer): boolean {
+    return data.length === 10 && (data.readUInt16LE(0) & 0x8000) !== 0;
+  }
+
   private async resolveOverflow(data: Buffer): Promise<Buffer> {
-    if (data.length === 10) {
-      const colLen = data.readUInt16LE(0);
-      if ((colLen & 0x8000) !== 0) {
-        const firstPageId = data.readUInt32LE(2);
-        const totalLen = data.readUInt32LE(6);
-        const fullData = Buffer.allocUnsafe(totalLen);
-        let currPageId = firstPageId;
-        let offset = 0;
-        while (currPageId !== 0xffffffff && currPageId !== 0) {
-          const buf = await this.pager.readPage(currPageId);
-          const nextId = buf.readUInt32LE(0);
-          const chunkLen = Math.min(totalLen - offset, PAGE_SIZE - 4);
-          buf.copy(fullData, offset, 4, 4 + chunkLen);
-          offset += chunkLen;
-          currPageId = nextId;
-        }
-        return fullData;
-      }
+    const firstPageId = data.readUInt32LE(2);
+    const totalLen = data.readUInt32LE(6);
+    const fullData = Buffer.allocUnsafe(totalLen);
+    let currPageId = firstPageId;
+    let offset = 0;
+    while (currPageId !== 0xffffffff && currPageId !== 0) {
+      const buf = await this.pager.readPage(currPageId);
+      const nextId = buf.readUInt32LE(0);
+      const chunkLen = Math.min(totalLen - offset, PAGE_SIZE - 4);
+      buf.copy(fullData, offset, 4, 4 + chunkLen);
+      offset += chunkLen;
+      currPageId = nextId;
     }
-    return data;
+    return fullData;
   }
 
   private serializeRow(columns: ColumnDef[], row: any): Buffer {
@@ -2155,11 +2153,18 @@ export class StorageEngine {
       const val = row[col!.name];
       if (val === null || val === undefined) continue;
 
-      const dt = col!.dataType.toUpperCase();
-      if (this.isNumericType(dt)) {
+      let isNum = col!._isNumeric;
+      if (isNum === undefined) {
+        const dt = col!.dataType.toUpperCase();
+        col!._isNumeric = isNum = this.isNumericType(dt);
+        col!._isBool = dt.startsWith("BOOL");
+        col!._isJson = dt.includes("JSON") || dt.endsWith("[]");
+      }
+
+      if (isNum) {
         payloadSize += 8;
         cache[i] = 1;
-      } else if (dt.startsWith("BOOL")) {
+      } else if (col!._isBool) {
         payloadSize += 1;
         cache[i] = 2;
       } else {
@@ -2227,16 +2232,23 @@ export class StorageEngine {
     for (let i = 0; i < maxIdx; i++) {
       const col = columns[i];
       // Fast bitwise null check
-      if (((buf as any)[2 + (i >> 3)] & (1 << (i & 7))) !== 0) {
+      if ((buf[2 + (i >> 3)] & (1 << (i & 7))) !== 0) {
         row[col!.name] = null;
         continue;
       }
 
-      const dt = col!.dataType.toUpperCase();
-      if (this.isNumericType(dt)) {
+      let isNum = col!._isNumeric;
+      if (isNum === undefined) {
+        const dt = col!.dataType.toUpperCase();
+        col!._isNumeric = isNum = this.isNumericType(dt);
+        col!._isBool = dt.startsWith("BOOL");
+        col!._isJson = dt.includes("JSON") || dt.endsWith("[]");
+      }
+
+      if (isNum) {
         row[col!.name] = buf.readDoubleLE(offset);
         offset += 8;
-      } else if (dt.startsWith("BOOL")) {
+      } else if (col!._isBool) {
         row[col!.name] = buf[offset] === 1;
         offset += 1;
       } else {
@@ -2247,7 +2259,7 @@ export class StorageEngine {
 
         // Optimization: Lazy check for JSON structure
         if (
-          (dt.includes("JSON") || dt.endsWith("[]")) &&
+          col!._isJson &&
           (str[0] === "{" || str[0] === "[")
         ) {
           try {
@@ -2393,7 +2405,7 @@ export class StorageEngine {
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
         for (const tuple of page.getTuples()) {
-          const resolved = await this.resolveOverflow(tuple.data);
+          const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
           const row = this.deserializeRow(table.columns, resolved);
           const rootId = await btree.insert(row[pkCol.name], {
             pageId,
@@ -2434,7 +2446,7 @@ export class StorageEngine {
     const page = new SlottedPage(buf);
     for (const tuple of page.getTuples()) {
       if (tuple.slotIdx === loc.slotIdx) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         return this.deserializeRow(table.columns, resolved);
       }
     }
@@ -2655,7 +2667,7 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         yield this.deserializeRow(table.columns, resolved);
       }
       pageId = page.nextPageId;
@@ -2732,7 +2744,7 @@ export class StorageEngine {
       let pageModified = false;
 
       for (const tuple of page.getTuples()) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
           const oldRow = { ...row };
@@ -2790,7 +2802,7 @@ export class StorageEngine {
       let pageModified = false;
 
       for (const tuple of page.getTuples()) {
-        const resolved = await this.resolveOverflow(tuple.data);
+        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
         const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
           page.deleteTuple(tuple.slotIdx);
