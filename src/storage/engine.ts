@@ -221,8 +221,8 @@ class LRUCache<K, V> {
   private cache = new Map<K, V>();
   constructor(private capacity: number) {}
   get(key: K): V | undefined {
-    if (!this.cache.has(key)) return undefined;
-    const val = this.cache.get(key)!;
+    const val = this.cache.get(key);
+    if (val === undefined) return undefined;
     this.cache.delete(key);
     this.cache.set(key, val);
     return val;
@@ -618,27 +618,24 @@ class SlottedPage {
     return slotIdx;
   }
 
-  *getTuples(): IterableIterator<{
-    offset: number;
-    len: number;
-    data: Buffer;
-    slotIdx: number;
-  }> {
+  getTuples(): { offset: number; len: number; data: Buffer; slotIdx: number }[] {
     const buffer = this.buf;
     const num = buffer.readUInt16LE(4);
+    const result = [];
     for (let i = 0; i < num; i++) {
       const slotOffset = 8 + i * 4;
       const dataOffset = buffer.readUInt16LE(slotOffset);
       if (dataOffset === 0) continue;
 
       const dataLen = buffer.readUInt16LE(slotOffset + 2);
-      yield {
+      result.push({
         offset: dataOffset,
         len: dataLen,
         data: buffer.subarray(dataOffset, dataOffset + dataLen),
         slotIdx: i,
-      };
+      });
     }
+    return result;
   }
 
   deleteTuple(slotIdx: number) {
@@ -2229,17 +2226,18 @@ export class StorageEngine {
       if (val === null || val === undefined) continue;
 
       let isNum = col!._isNumeric;
+      let isBool = col!._isBool;
       if (isNum === undefined) {
         const dt = col!.dataType.toUpperCase();
         col!._isNumeric = isNum = this.isNumericType(dt);
-        col!._isBool = dt.startsWith("BOOL");
+        col!._isBool = isBool = dt.startsWith("BOOL");
         col!._isJson = dt.includes("JSON") || dt.endsWith("[]");
       }
 
       if (isNum) {
         payloadSize += 8;
         cache[i] = 1;
-      } else if (col!._isBool) {
+      } else if (isBool) {
         payloadSize += 1;
         cache[i] = 2;
       } else {
@@ -2313,17 +2311,19 @@ export class StorageEngine {
       }
 
       let isNum = col!._isNumeric;
+      let isBool = col!._isBool;
+      let isJson = col!._isJson;
       if (isNum === undefined) {
         const dt = col!.dataType.toUpperCase();
         col!._isNumeric = isNum = this.isNumericType(dt);
-        col!._isBool = dt.startsWith("BOOL");
-        col!._isJson = dt.includes("JSON") || dt.endsWith("[]");
+        col!._isBool = isBool = dt.startsWith("BOOL");
+        col!._isJson = isJson = dt.includes("JSON") || dt.endsWith("[]");
       }
 
       if (isNum) {
         row[col!.name] = buf.readDoubleLE(offset);
         offset += 8;
-      } else if (col!._isBool) {
+      } else if (isBool) {
         row[col!.name] = buf[offset] === 1;
         offset += 1;
       } else {
@@ -2529,8 +2529,9 @@ export class StorageEngine {
   }
 
   public async *scanRows(name: string): AsyncIterableIterator<any> {
-    if (this.tempTables.has(name)) {
-      for (const row of this.tempTables.get(name)!) yield row;
+    let temp = this.tempTables.get(name);
+    if (temp !== undefined) {
+      for (let i = 0; i < temp.length; i++) yield temp[i];
       return;
     }
     const tableInfo = await this.getTableAsync(name);
@@ -2540,8 +2541,9 @@ export class StorageEngine {
         fullName = `pg_catalog.${name}`;
     }
 
-    if (this.tempTables.has(fullName)) {
-      for (const row of this.tempTables.get(fullName)!) yield row;
+    temp = this.tempTables.get(fullName);
+    if (temp !== undefined) {
+      for (let i = 0; i < temp.length; i++) yield temp[i];
       return;
     }
 
@@ -2738,12 +2740,13 @@ export class StorageEngine {
     if (!table) throw new Error(`Table ${fullName} not found`);
 
     let pageId = table.firstPage;
+    const columns = table.columns;
     while (pageId !== 0xffffffff && pageId !== 0) {
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
         const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
-        yield this.deserializeRow(table.columns, resolved);
+        yield this.deserializeRow(columns, resolved);
       }
       pageId = page.nextPageId;
     }

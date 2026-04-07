@@ -378,12 +378,13 @@ export class Executor {
 
           // 2. Apply Serials and Defaults before checking constraints
           startBenchmarks();
-          for (const col of table.columns) {
-            const dt = col.dataType.toUpperCase();
-            if (
-              (dt === "SERIAL" || dt === "BIGSERIAL" || dt === "SMALLSERIAL") &&
-              record[col.name] === undefined
-            ) {
+          for (let i = 0; i < table.columns.length; i++) {
+            const col = table.columns[i];
+            if (col._isSerial === undefined) {
+               const dt = col.dataType.toUpperCase();
+               col._isSerial = (dt === "SERIAL" || dt === "BIGSERIAL" || dt === "SMALLSERIAL");
+            }
+            if (col._isSerial && record[col.name] === undefined) {
               table.sequence += 1;
               schemaUpdated = true;
               record[col.name] = table.sequence;
@@ -393,14 +394,16 @@ export class Executor {
             }
           }
           // 2b. Evaluate generated columns
-          for (const col of table.columns) {
+          for (let i = 0; i < table.columns.length; i++) {
+            const col = table.columns[i];
             if ((col as any).generatedExpr) {
               record[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, record, params);
             }
           }
           
           // 2c. Cast values to column types
-          for (const col of table.columns) {
+          for (let i = 0; i < table.columns.length; i++) {
+            const col = table.columns[i];
             if (record[col.name] !== undefined && record[col.name] !== null) {
               record[col.name] = await this.castValue(storage, record[col.name], col.dataType);
             }
@@ -1038,17 +1041,20 @@ export class Executor {
           }
 
           if (!useIndex) {
-            source = this.mapStream(
-              storage.scanRows(stmt.from.tableName),
-              (r) => {
-                r[stmt.from.tableName!] = r;
-                if (stmt.from.alias) r[stmt.from.alias] = r;
-                if (Object.keys(outerRow).length > 0) {
-                  return { ...outerRow, ...r };
-                }
-                return r;
+          const fromTableName = stmt.from.tableName!;
+          const fromAlias = stmt.from.alias;
+          const hasOuterRow = Object.keys(outerRow).length > 0;
+          source = this.mapStream(
+            storage.scanRows(fromTableName),
+            (r) => {
+              r[fromTableName] = r;
+              if (fromAlias) r[fromAlias] = r;
+              if (hasOuterRow) {
+                return { ...outerRow, ...r };
               }
-            );
+              return r;
+            }
+          );
             if (!stmt.joins && stmt.where)
               source = this.filterStream(
                 source,
@@ -1485,10 +1491,12 @@ export class Executor {
           }
         } catch (e) {}
 
-        for (const jRow of rightRows) {
+        for (let i = 0; i < rightRows.length; i++) {
+           const jRow = rightRows[i];
            const k = String(await this.evaluateExpr(storage, rightKeyExpr, jRow, params));
-           if (!rightMap.has(k)) rightMap.set(k, []);
-           rightMap.get(k)!.push(jRow);
+           let arr = rightMap.get(k);
+           if (!arr) { arr = []; rightMap.set(k, arr); }
+           arr.push(jRow);
         }
       }
 
@@ -1790,18 +1798,26 @@ export class Executor {
 
   private async projectRow(storage: StorageEngine, row: any, columns: Expr[], params: any = [], exclusions?: Set<string>): Promise<any> {
     const outRow: any = {};
-    for (const col of columns) {
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
       if (col.type === "Identifier" && (col.name === "*" || col.name.endsWith(".*"))) {
         if (col.name === "*") {
-          for (const k of Object.keys(row)) {
+          const keys = Object.keys(row);
+          for (let j = 0; j < keys.length; j++) {
+            const k = keys[j];
             if (!k.startsWith("__") && !k.startsWith("___") && (!exclusions || !exclusions.has(k)))
               outRow[k] = row[k];
           }
         } else {
-          const prefix = col.name.substring(0, col.name.length - 2);
+          if ((col as any)._prefix === undefined) {
+             (col as any)._prefix = col.name.substring(0, col.name.length - 2);
+          }
+          const prefix = (col as any)._prefix;
           const targetObj = row[prefix];
           if (targetObj && typeof targetObj === 'object') {
-            for (const k of Object.keys(targetObj)) {
+            const keys = Object.keys(targetObj);
+            for (let j = 0; j < keys.length; j++) {
+              const k = keys[j];
               if (!k.startsWith("__") && !k.startsWith("___"))
                 outRow[k] = targetObj[k];
             }
@@ -2368,8 +2384,9 @@ export class Executor {
         }
 
         if ((expr as any)._isNested) {
-          if (row[(expr as any)._tbl] && row[(expr as any)._tbl][(expr as any)._col] !== undefined) {
-             return row[(expr as any)._tbl][(expr as any)._col];
+          const tblObj = row[(expr as any)._tbl];
+          if (tblObj && tblObj[(expr as any)._col] !== undefined) {
+             return tblObj[(expr as any)._col];
           }
           if (row[expr.name] !== undefined) return row[expr.name];
         }
@@ -2613,7 +2630,12 @@ export class Executor {
         return null;
       }
       case "Array": {
-        return await Promise.all(expr.elements.map(e => this.evaluateExpr(storage, e, row, params)));
+        const elements = expr.elements;
+        const res = new Array(elements.length);
+        for (let i = 0; i < elements.length; i++) {
+          res[i] = await this.evaluateExpr(storage, elements[i], row, params);
+        }
+        return res;
       }
       case "Cast": {
         let val = await this.evaluateExpr(storage, expr.expr, row, params);
