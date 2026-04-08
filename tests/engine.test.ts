@@ -1235,6 +1235,38 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   });
 
   describe("LEVEL 13: Type Casting", () => {
+    test("13.0.1 Cast DATE type strictly to YYYY-MM-DD", async () => {
+      await db.exec(`CREATE TABLE date_test (id SERIAL PRIMARY KEY, d DATE)`);
+      const res = await db.exec(`INSERT INTO date_test (d) VALUES ($1)`, ["2024-12-31T20:00:00.000Z"]);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT d FROM date_test`);
+      expect(rows[0].d).toBe("2024-12-31");
+    });
+
+    test("13.0.2 Cast Postgres Array literal {...} to JS Array", async () => {
+      await db.exec(`CREATE TABLE array_test (id SERIAL PRIMARY KEY, tags TEXT[])`);
+      const res = await db.exec(`INSERT INTO array_test (tags) VALUES ($1)`, ["{\"tech\", \"news\"}"]);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT tags FROM array_test`);
+      expect(Array.isArray(rows[0].tags)).toBe(true);
+      expect(rows[0].tags).toEqual(["tech", "news"]);
+    });
+
+    test("13.0 Cast string to TIME type", async () => {
+      await db.exec(`CREATE TABLE class_schedules (id SERIAL PRIMARY KEY, class_id INT, day_of_week INT, start_time TIME NOT NULL, end_time TIME)`);
+      const res = await db.exec(
+        `insert into "class_schedules" ("class_id", "day_of_week", "start_time", "end_time") values ($1, $2, $3, $4)`,
+        [13, 2, "18:00", "19:30"]
+      );
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT start_time, end_time FROM class_schedules`);
+      expect(rows[0].start_time).toBe("18:00");
+      expect(rows[0].end_time).toBe("19:30");
+    });
+
     test("13.1 Cast string to integer with :: syntax", async () => {
       const rows = await db.query("SELECT '100'::int + 5 as result");
       expect(rows[0].result).toBe(105);

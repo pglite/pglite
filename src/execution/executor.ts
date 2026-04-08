@@ -2172,9 +2172,44 @@ export class Executor {
         try { return JSON.parse(val); } catch { return null; }
       }
       return val;
-    } else if (dt?.includes("DATE") || dt?.includes("TIME") || dt?.includes("TIMESTAMP")) {
+    } else if (dt?.endsWith("[]") || dt === "ARRAY") {
+      if (typeof val === "string") {
+        // Parse format mảng của Postgres: '{1,2,3}' -> '[1,2,3]'
+        if (val.trim().startsWith("{") && val.trim().endsWith("}")) {
+          try {
+            const jsonStr = val.trim().replace(/^{/, '[').replace(/}$/, ']').replace(/NULL/ig, 'null');
+            return JSON.parse(jsonStr);
+          } catch {
+            return val;
+          }
+        }
+        try { return JSON.parse(val); } catch { return [val]; }
+      }
+      return Array.isArray(val) ? val : [val];
+    } else if (dt?.includes("TIMESTAMP")) {
       const d = new Date(val);
       return isNaN(d.getTime()) ? null : d.toISOString();
+    } else if (dt?.includes("DATE")) {
+      if (typeof val === "string" && /^\d{4}-\d{2}-\d{2}$/.test(val.trim())) return val.trim();
+      const d = new Date(val);
+      return isNaN(d.getTime()) ? null : d.toISOString().split("T")[0];
+    } else if (dt?.includes("TIME")) {
+      if (typeof val === "string") {
+        if (/^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[-+]\d{2}(:?\d{2})?)?$/i.test(val.trim())) return val;
+      }
+      const d = new Date(val);
+      if (!isNaN(d.getTime())) {
+        const timePart = d.toISOString().split("T")[1];
+        return timePart ? timePart.replace("Z", "") : val;
+      }
+      const t = new Date(`1970-01-01T${val}Z`);
+      if (!isNaN(t.getTime())) return String(val);
+      const t2 = new Date(`1970-01-01 ${val}`);
+      if (!isNaN(t2.getTime())) {
+        const timePart = t2.toISOString().split("T")[1];
+        return timePart ? timePart.replace("Z", "") : val;
+      }
+      return null;
     }
     return val;
   }
