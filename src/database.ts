@@ -99,6 +99,7 @@ export class LitePostgres {
     const txDb = dbName || this.defaultDb;
     return new Promise((resolve, reject) => {
       this.queue = this.queue.then(async () => {
+        let txQueue = Promise.resolve();
         try {
           await this.run('BEGIN',[], txDb);
           
@@ -108,14 +109,25 @@ export class LitePostgres {
                 let actualP: any = [];
                 let actualDb = db;
                 if (typeof p === 'string') { actualDb = p; } else if (p !== undefined && p !== null) { actualP = p; }
-                return target.run(sql, actualP, actualDb || txDb);
+                return new Promise((resolve, reject) => {
+                  txQueue = txQueue.then(async () => {
+                    try { resolve(await target.run(sql, actualP, actualDb || txDb)); }
+                    catch (e) { reject(e); }
+                  });
+                });
               };
-              if (prop === 'query') return async (sql: string, p?: any[] | Record<string, any> | string, db?: string) => {
+              if (prop === 'query') return (sql: string, p?: any[] | Record<string, any> | string, db?: string) => {
                 let actualP: any = [];
                 let actualDb = db;
                 if (typeof p === 'string') { actualDb = p; } else if (p !== undefined && p !== null) { actualP = p; }
-                const res = await target.run(sql, actualP, actualDb || txDb);
-                return Array.isArray(res) ? res :[];
+                return new Promise((resolve, reject) => {
+                  txQueue = txQueue.then(async () => {
+                    try {
+                      const res = await target.run(sql, actualP, actualDb || txDb);
+                      resolve(Array.isArray(res) ? res : []);
+                    } catch (e) { reject(e); }
+                  });
+                });
               };
               if (prop === 'transaction') return async () => { throw new Error("Nested transactions not supported"); };
               return (target as any)[prop];
@@ -124,11 +136,14 @@ export class LitePostgres {
 
           const result = await callback(txObj as unknown as LitePostgres);
           
+          await txQueue;
+
           if (this.storage.isInTransaction()) {
             await this.run('COMMIT',[], txDb);
           }
           resolve(result);
         } catch (error) {
+          await txQueue;
           if (this.storage.isInTransaction()) {
             try {
               await this.run('ROLLBACK',[], txDb);
