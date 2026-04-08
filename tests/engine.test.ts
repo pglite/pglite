@@ -2528,6 +2528,47 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 56: Concurrent Connections & Cache Consistency", () => {
+    test("56.1 Multiple instances sharing the same file do not lose data on page splits", async () => {
+      const DB_FILE_CONCURRENT = "test_concurrent.db";
+      if (existsSync(DB_FILE_CONCURRENT)) unlinkSync(DB_FILE_CONCURRENT);
+      if (existsSync(DB_FILE_CONCURRENT + ".wal")) unlinkSync(DB_FILE_CONCURRENT + ".wal");
+
+      // Giả lập 2 connections (như cơ chế connection pooling)
+      const conn1 = new LitePostgres(DB_FILE_CONCURRENT, { adapter: new NodeFSAdapter() });
+      const conn2 = new LitePostgres(DB_FILE_CONCURRENT, { adapter: new NodeFSAdapter() });
+
+      // 1. Tạo table
+      await conn1.exec(`CREATE TABLE concurrent_test (id SERIAL PRIMARY KEY, val TEXT)`);
+
+      // 2. Ép cả 2 connection load bảng vào cache (khiến chúng nhớ lastPage hiện tại)
+      await conn1.query(`SELECT * FROM concurrent_test`);
+      await conn2.query(`SELECT * FROM concurrent_test`);
+
+      // 3. conn1 insert dữ liệu LỚN (> 4KB) để ép file cấp phát page mới, thay đổi lastPage
+      const largeString1 = "A".repeat(5000);
+      await conn1.exec(`INSERT INTO concurrent_test (val) VALUES ($1)`, [largeString1]);
+
+      // 4. conn2 insert dữ liệu. Nếu cache không được share (không dùng static), 
+      // conn2 sẽ trỏ vào lastPage cũ, làm đứt gãy liên kết (linked-list) của page và mất dữ liệu của conn1.
+      const largeString2 = "B".repeat(5000);
+      await conn2.exec(`INSERT INTO concurrent_test (val) VALUES ($1)`, [largeString2]);
+
+      // 5. Query để kiểm tra tính toàn vẹn của dữ liệu
+      const rows = await conn1.query(`SELECT id, SUBSTRING(val, 1, 1) as prefix FROM concurrent_test ORDER BY id`);
+
+      // Phải tồn tại ĐẦY ĐỦ 2 rows, không có cái nào bị ghi đè hay biến mất
+      expect(rows.length).toBe(2);
+      expect(rows[0].prefix).toBe("A");
+      expect(rows[1].prefix).toBe("B");
+
+      await conn1.close();
+      await conn2.close();
+      if (existsSync(DB_FILE_CONCURRENT)) unlinkSync(DB_FILE_CONCURRENT);
+      if (existsSync(DB_FILE_CONCURRENT + ".wal")) unlinkSync(DB_FILE_CONCURRENT + ".wal");
+    });
+  });
+
   describe("LEVEL 55: Specific Syntax Compatibility", () => {
     test("55.1 Table alias wildcard and named parameters", async () => {
       await db.exec(`CREATE TABLE students (id SERIAL PRIMARY KEY, full_name TEXT, student_code TEXT, deleted_at TIMESTAMP)`);

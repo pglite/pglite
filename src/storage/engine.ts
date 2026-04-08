@@ -1057,9 +1057,9 @@ export class StorageEngine {
   public vfs: VFS;
   // Metadata caches shared across database contexts in this cluster
   private static dbMetaCache = new LRUCache<string, DbMetadata>(1000);
-  private tableCache = new LRUCache<string, TableData>(500);
-  private schemaCache: string[] = [];
-  private pkIndexes = new LRUCache<string, BTree>(500);
+  private static tableCache = new LRUCache<string, TableData>(500);
+  private static schemaCache = new Map<string, string[]>();
+  private static pkIndexes = new LRUCache<string, BTree>(500);
   private tempTables = new Map<string, any[]>();
   private inTransaction = false;
   private txDbMetaBackup: string | null = null;
@@ -1360,8 +1360,6 @@ export class StorageEngine {
       this.refreshCatalogDefs();
     }
     this.currentDbName = dbName;
-    this.tableCache.clear();
-    this.schemaCache = [];
   }
 
   private refreshCatalogDefs() {
@@ -1623,16 +1621,18 @@ export class StorageEngine {
       oid: maxOid + 1,
       nspname: name,
     });
-    this.schemaCache = [];
+    StorageEngine.schemaCache.delete(`${this.filepath}:${this.currentDbName}`);
   }
 
   private async getSchemas(): Promise<string[]> {
-    if (this.schemaCache.length > 0) return this.schemaCache;
-    const schemas = [];
+    const key = `${this.filepath}:${this.currentDbName}`;
+    let schemas = StorageEngine.schemaCache.get(key);
+    if (schemas) return schemas;
+    schemas = [];
     for await (const row of this.scanCatalog(this.pgNamespaceDef)) {
       schemas.push(row.nspname);
     }
-    this.schemaCache = schemas;
+    StorageEngine.schemaCache.set(key, schemas);
     return schemas;
   }
 
@@ -1679,7 +1679,7 @@ export class StorageEngine {
       const btree = new BTree(this.pager, this.dbMeta.nspIdx);
       await btree.delete(name);
     }
-    this.schemaCache = [];
+    StorageEngine.schemaCache.delete(`${this.filepath}:${this.currentDbName}`);
   }
 
   private async getSchemaOid(name: string): Promise<number | null> {
@@ -1738,8 +1738,8 @@ export class StorageEngine {
       }
     }
 
-    this.tableCache.delete(fullOldName);
-    this.tableCache.delete(fullNewName);
+    StorageEngine.tableCache.delete(`${this.filepath}:${this.currentDbName}:${fullOldName}`);
+    StorageEngine.tableCache.delete(`${this.filepath}:${this.currentDbName}:${fullNewName}`);
   }
 
   public async dropIndex(
@@ -1870,14 +1870,15 @@ export class StorageEngine {
       const nspOid = await this.getSchemaOid(parts[0]!);
       await btree.delete(`${nspOid}:${parts[1]!}`);
     }
-    this.tableCache.delete(fullName);
-    this.pkIndexes.delete(fullName);
+    StorageEngine.tableCache.delete(`${this.filepath}:${this.currentDbName}:${fullName}`);
+    StorageEngine.pkIndexes.delete(`${this.filepath}:${this.currentDbName}:${fullName}`);
   }
 
   public getTable(name: string): TableData {
     // Synchronous access required by executor for some logic
     const fullName = this.getFullTableName(name);
-    const cached = this.tableCache.get(fullName);
+    const key = `${this.filepath}:${this.currentDbName}:${fullName}`;
+    const cached = StorageEngine.tableCache.get(key);
     if (cached) return cached;
     throw new Error(
       `Metadata error: Table definition for ${fullName} not in cache. Ensure it was fetched first.`,
@@ -1886,7 +1887,8 @@ export class StorageEngine {
 
   public async getTableAsync(name: string): Promise<TableData | null> {
     let fullName = name.includes(".") ? name : `public.${name}`;
-    const cached = this.tableCache.get(fullName);
+    const key = `${this.filepath}:${this.currentDbName}:${fullName}`;
+    const cached = StorageEngine.tableCache.get(key);
     if (cached) return cached;
 
     const loadTable = async (schema: string, table: string) => {
@@ -2006,7 +2008,7 @@ export class StorageEngine {
         data.indexRootPage = this.clusterCatalogDef.indexRootPage;
       }
 
-      this.tableCache.set(fullName, data);
+      StorageEngine.tableCache.set(`${this.filepath}:${this.currentDbName}:${fullName}`, data);
       return data;
     };
 
@@ -2140,7 +2142,7 @@ export class StorageEngine {
 
   public invalidateTableCache(name: string) {
     const fullName = this.getFullTableName(name);
-    this.tableCache.delete(fullName);
+    StorageEngine.tableCache.delete(`${this.filepath}:${this.currentDbName}:${fullName}`);
   }
 
   public async updateTableSchema(name: string, tableData: TableData) {
@@ -2165,7 +2167,7 @@ export class StorageEngine {
         r.relsequence = tableData.sequence;
       },
     );
-    this.tableCache.set(fullName, tableData);
+    StorageEngine.tableCache.set(`${this.filepath}:${this.currentDbName}:${fullName}`, tableData);
   }
 
   private async *scanCatalog(def: TableData): AsyncIterableIterator<any> {
@@ -2599,7 +2601,7 @@ export class StorageEngine {
       rootBuf.writeUInt16LE(0, 1);
       rootBuf.writeUInt32LE(0xffffffff, 3);
       await this.pager.writePage(table.indexRootPage, rootBuf);
-      this.pkIndexes.delete(fullName);
+      StorageEngine.pkIndexes.delete(`${this.filepath}:${this.currentDbName}:${fullName}`);
     }
   }
 
@@ -2699,9 +2701,9 @@ export class StorageEngine {
         }
         pageId = page.nextPageId;
       }
-      this.pkIndexes.set(fullName, btree);
+      StorageEngine.pkIndexes.set(`${this.filepath}:${this.currentDbName}:${fullName}`, btree);
     } else {
-      this.pkIndexes.set(fullName, new BTree(this.pager, table.indexRootPage));
+      StorageEngine.pkIndexes.set(`${this.filepath}:${this.currentDbName}:${fullName}`, new BTree(this.pager, table.indexRootPage));
     }
   }
 
@@ -2714,11 +2716,12 @@ export class StorageEngine {
         : this.getFullTableName(name);
 
     // Ensure index is loaded/built for the requested table
-    if (!this.pkIndexes.has(fullName)) {
+    const cacheKey = `${this.filepath}:${this.currentDbName}:${fullName}`;
+    if (!StorageEngine.pkIndexes.has(cacheKey)) {
       await this.buildIndexes(fullName);
     }
 
-    const index = this.pkIndexes.get(fullName);
+    const index = StorageEngine.pkIndexes.get(cacheKey);
     if (!index) return null;
     const loc = await index.get(pkValue);
     if (!loc) return null;
@@ -2745,7 +2748,7 @@ export class StorageEngine {
     const tableInfo = await this.getTableAsync(name);
     let fullName = name.includes(".") ? name : `public.${name}`;
     if (tableInfo && !name.includes(".")) {
-      if (this.tableCache.has(`pg_catalog.${name}`))
+      if (StorageEngine.tableCache.has(`${this.filepath}:${this.currentDbName}:pg_catalog.${name}`))
         fullName = `pg_catalog.${name}`;
     }
 
@@ -3004,8 +3007,9 @@ export class StorageEngine {
 
     const pkCol = table.columns.find((c) => c.isPrimaryKey);
     if (pkCol && row[pkCol.name] !== undefined) {
-      if (!this.pkIndexes.has(fullName)) await this.buildIndexes(fullName);
-      const btree = this.pkIndexes.get(fullName)!;
+      const cacheKey = `${this.filepath}:${this.currentDbName}:${fullName}`;
+      if (!StorageEngine.pkIndexes.has(cacheKey)) await this.buildIndexes(fullName);
+      const btree = StorageEngine.pkIndexes.get(cacheKey)!;
       const newRoot = await btree.insert(row[pkCol.name], { pageId, slotIdx });
       if (newRoot !== table.indexRootPage) {
         table.indexRootPage = newRoot;
@@ -3069,8 +3073,8 @@ export class StorageEngine {
             }
             if (pkCol && oldRow[pkCol.name] !== row[pkCol.name]) {
               // PK value changed but row still fits in page, update index
-              if (this.pkIndexes.has(fullName)) {
-                const btree = this.pkIndexes.get(fullName)!;
+              if (StorageEngine.pkIndexes.has(`${this.filepath}:${this.currentDbName}:${fullName}`)) {
+                const btree = StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!;
                 await btree.delete(oldRow[pkCol.name]);
                 const newRoot = await btree.insert(row[pkCol.name], {
                   pageId: pageId!,
@@ -3120,8 +3124,8 @@ export class StorageEngine {
             await this.freeOverflowPages(tuple.data);
           }
           page.deleteTuple(tuple.slotIdx);
-          if (pkCol && this.pkIndexes.has(fullName))
-            await this.pkIndexes.get(fullName)!.delete(row[pkCol.name]);
+          if (pkCol && StorageEngine.pkIndexes.has(`${this.filepath}:${this.currentDbName}:${fullName}`))
+            await StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!.delete(row[pkCol.name]);
           pageModified = true;
           deleted++;
         }
@@ -3156,9 +3160,9 @@ export class StorageEngine {
   public async rollback(): Promise<void> {
     if (this.inTransaction) {
       await this.pager.clearDirty();
-      this.tableCache.clear();
-      this.schemaCache = [];
-      this.pkIndexes.clear();
+      StorageEngine.tableCache.clear();
+      StorageEngine.schemaCache.clear();
+      StorageEngine.pkIndexes.clear();
       this.inTransaction = false;
 
       if (this.txDbMetaBackup) {
@@ -3179,9 +3183,9 @@ export class StorageEngine {
 
   public async rollbackStatement(): Promise<void> {
     await this.pager.clearDirty();
-    this.tableCache.clear();
-    this.schemaCache = [];
-    this.pkIndexes.clear();
+    StorageEngine.tableCache.clear();
+    StorageEngine.schemaCache.clear();
+    StorageEngine.pkIndexes.clear();
     this.currentDbName = undefined;
     if (this.dbMeta) {
       StorageEngine.dbMetaCache.delete(`${this.filepath}:${this.dbMeta.name}`);
