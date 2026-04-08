@@ -2491,7 +2491,12 @@ export class StorageEngine {
         payloadSize += 1;
         cache[i] = 2;
       } else {
-        const str = typeof val === "object" ? JSON.stringify(val) : String(val);
+        let str;
+        if (val instanceof Date) {
+          str = val.toISOString();
+        } else {
+          str = typeof val === "object" ? JSON.stringify(val) : String(val);
+        }
         const byteLen = Buffer.byteLength(str);
         payloadSize += 4 + byteLen;
         cache[i] = str;

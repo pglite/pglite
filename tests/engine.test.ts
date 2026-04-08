@@ -2528,6 +2528,85 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 57: Date and Time Quoting Bug Fix", () => {
+    test("57.1 DATETIME, TIMESTAMP, and DATE should not have extra quotes", async () => {
+      await db.exec(`DROP TABLE IF EXISTS dt_test_57`);
+      await db.exec(`
+        CREATE TABLE dt_test_57 (
+          id SERIAL PRIMARY KEY, 
+          created_at DATETIME, 
+          updated_at TIMESTAMP,
+          my_date DATE,
+          my_time TIME
+        )
+      `);
+
+      // Insert using Date objects as parameters
+      const dateObj = new Date("2026-03-31T04:28:02.265Z");
+      await db.exec(`INSERT INTO dt_test_57 (created_at, updated_at, my_date, my_time) VALUES ($1, $2, $3, $4)`, [dateObj, dateObj, dateObj, dateObj]);
+
+      const rows = await db.query(`SELECT * FROM dt_test_57 ORDER BY id ASC`);
+      expect(rows.length).toBe(1);
+
+      // It should be a proper string without wrapped quotes
+      expect(rows[0].created_at).toBe("2026-03-31T04:28:02.265Z");
+      expect(rows[0].updated_at).toBe("2026-03-31T04:28:02.265Z");
+      expect(rows[0].my_date).toBe("2026-03-31");
+      expect(rows[0].my_time).toBe("04:28:02.265");
+
+      // Insert using string with extra quotes (simulating bad JSON stringify injection)
+      await db.exec(`INSERT INTO dt_test_57 (created_at, updated_at, my_date) VALUES ($1, $2, $3)`, [
+        '"2026-04-01T00:00:00.000Z"', 
+        '"2026-04-01T00:00:00.000Z"', 
+        '"2026-04-01"'
+      ]);
+
+      const rows2 = await db.query(`SELECT * FROM dt_test_57 WHERE id = 2`);
+      expect(rows2[0].created_at).toBe("2026-04-01T00:00:00.000Z");
+      expect(rows2[0].updated_at).toBe("2026-04-01T00:00:00.000Z");
+      expect(rows2[0].my_date).toBe("2026-04-01");
+    });
+  });
+
+  describe("LEVEL 57: Date and Time Quoting Bug Fix", () => {
+    test("57.1 DATETIME, TIMESTAMP, and DATE should not have extra quotes", async () => {
+      await db.exec(`
+        CREATE TABLE dt_test (
+          id SERIAL PRIMARY KEY, 
+          created_at DATETIME, 
+          updated_at TIMESTAMP,
+          my_date DATE,
+          my_time TIME
+        )
+      `);
+
+      // Insert using Date objects as parameters
+      const dateObj = new Date("2026-03-31T04:28:02.265Z");
+      await db.exec(`INSERT INTO dt_test (created_at, updated_at, my_date, my_time) VALUES ($1, $2, $3, $4)`, [dateObj, dateObj, dateObj, dateObj]);
+
+      const rows = await db.query(`SELECT * FROM dt_test`);
+      expect(rows.length).toBe(1);
+
+      // It should be a proper string without wrapped quotes
+      expect(rows[0].created_at).toBe("2026-03-31T04:28:02.265Z");
+      expect(rows[0].updated_at).toBe("2026-03-31T04:28:02.265Z");
+      expect(rows[0].my_date).toBe("2026-03-31");
+      expect(rows[0].my_time).toBe("04:28:02.265");
+
+      // Insert using string with extra quotes (simulating bad JSON stringify injection)
+      await db.exec(`INSERT INTO dt_test (created_at, updated_at, my_date) VALUES ($1, $2, $3)`, [
+        '"2026-04-01T00:00:00.000Z"', 
+        '"2026-04-01T00:00:00.000Z"', 
+        '"2026-04-01"'
+      ]);
+
+      const rows2 = await db.query(`SELECT * FROM dt_test WHERE id = 2`);
+      expect(rows2[0].created_at).toBe("2026-04-01T00:00:00.000Z");
+      expect(rows2[0].updated_at).toBe("2026-04-01T00:00:00.000Z");
+      expect(rows2[0].my_date).toBe("2026-04-01");
+    });
+  });
+
   describe("LEVEL 56: Concurrent Connections & Cache Consistency", () => {
     test("56.1 Multiple instances sharing the same file do not lose data on page splits", async () => {
       const DB_FILE_CONCURRENT = "test_concurrent.db";

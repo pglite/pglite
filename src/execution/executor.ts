@@ -2166,6 +2166,7 @@ export class Executor {
       if (s === "FALSE" || s === "F" || s === "0" || s === "N" || s === "NO") return false;
       return Boolean(val);
     } else if (dt === "TEXT" || dt === "VARCHAR" || dt === "CHAR" || dt === "CHARACTER" || dt === "UUID" || dt === "STRING") {
+      if (val instanceof Date) return val.toISOString();
       return typeof val === "object" ? JSON.stringify(val) : String(val);
     } else if (dt?.includes("JSON")) {
       if (typeof val === "string") {
@@ -2186,28 +2187,40 @@ export class Executor {
         try { return JSON.parse(val); } catch { return [val]; }
       }
       return Array.isArray(val) ? val : [val];
-    } else if (dt?.includes("TIMESTAMP")) {
-      const d = new Date(val);
+    } else if (dt?.includes("TIMESTAMP") || dt?.includes("DATETIME")) {
+      if (val instanceof Date) return val.toISOString();
+      let strVal = val;
+      if (typeof val === 'string') strVal = val.replace(/^"|"$/g, '');
+      const d = new Date(strVal);
       return isNaN(d.getTime()) ? null : d.toISOString();
     } else if (dt?.includes("DATE")) {
-      if (typeof val === "string" && /^\d{4}-\d{2}-\d{2}$/.test(val.trim())) return val.trim();
-      const d = new Date(val);
+      if (val instanceof Date) return val.toISOString().split("T")[0];
+      let strVal = val;
+      if (typeof val === 'string') strVal = val.replace(/^"|"$/g, '').trim();
+      if (typeof strVal === "string" && /^\d{4}-\d{2}-\d{2}$/.test(strVal)) return strVal;
+      const d = new Date(strVal);
       return isNaN(d.getTime()) ? null : d.toISOString().split("T")[0];
     } else if (dt?.includes("TIME")) {
-      if (typeof val === "string") {
-        if (/^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[-+]\d{2}(:?\d{2})?)?$/i.test(val.trim())) return val;
+      if (val instanceof Date) {
+        const timePart = val.toISOString().split("T")[1];
+        return timePart ? timePart.replace("Z", "") : null;
       }
-      const d = new Date(val);
+      let strVal = val;
+      if (typeof val === "string") {
+        strVal = val.replace(/^"|"$/g, '').trim();
+        if (/^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[-+]\d{2}(:?\d{2})?)?$/i.test(strVal)) return strVal;
+      }
+      const d = new Date(strVal);
       if (!isNaN(d.getTime())) {
         const timePart = d.toISOString().split("T")[1];
-        return timePart ? timePart.replace("Z", "") : val;
+        return timePart ? timePart.replace("Z", "") : strVal;
       }
-      const t = new Date(`1970-01-01T${val}Z`);
-      if (!isNaN(t.getTime())) return String(val);
-      const t2 = new Date(`1970-01-01 ${val}`);
+      const t = new Date(`1970-01-01T${strVal}Z`);
+      if (!isNaN(t.getTime())) return String(strVal);
+      const t2 = new Date(`1970-01-01 ${strVal}`);
       if (!isNaN(t2.getTime())) {
         const timePart = t2.toISOString().split("T")[1];
-        return timePart ? timePart.replace("Z", "") : val;
+        return timePart ? timePart.replace("Z", "") : strVal;
       }
       return null;
     }
