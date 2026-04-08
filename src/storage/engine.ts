@@ -659,6 +659,20 @@ class SlottedPage {
     return slotIdx;
   }
 
+  getTuple(targetSlotIdx: number): { offset: number; len: number; data: Buffer; slotIdx: number } | null {
+    if (targetSlotIdx >= this.numSlots) return null;
+    const slotOffset = 8 + targetSlotIdx * 4;
+    const dataOffset = this.buf.readUInt16LE(slotOffset);
+    if (dataOffset === 0) return null;
+    const dataLen = this.buf.readUInt16LE(slotOffset + 2);
+    return {
+      offset: dataOffset,
+      len: dataLen,
+      data: this.buf.subarray(dataOffset, dataOffset + dataLen),
+      slotIdx: targetSlotIdx
+    };
+  }
+
   getTuples(): {
     offset: number;
     len: number;
@@ -822,49 +836,39 @@ class BTree {
   async get(key: any): Promise<{ pageId: number; slotIdx: number } | null> {
     if (this.rootPageId === 0 || this.rootPageId === 0xffffffff) return null;
     let currId = this.rootPageId;
-    const target = key;
 
     while (currId !== 0xffffffff && currId !== 0) {
-      const buf = await this.pager.readPage(currId);
-      const isLeaf = buf.readUInt8(0) === 1;
-      const numKeys = buf.readUInt16LE(1);
-      let offset = 7;
-      let foundChild = false;
+      const node = await this.fetchNode(currId);
+      
+      let left = 0;
+      let right = node.keys.length - 1;
+      let foundIdx = -1;
+      let insertIdx = node.keys.length;
 
-      for (let i = 0; i < numKeys; i++) {
-        const kLen = buf.readUInt16LE(offset);
-        const kStr = buf.toString("utf8", offset + 2, offset + 2 + kLen);
-        const typeInd = kStr[0];
-        const valStr = kStr.substring(1);
-        let nodeKey;
-        if (typeInd !== "N" && typeInd !== "S") {
-          nodeKey = isNaN(Number(kStr)) ? kStr : Number(kStr);
+      while (left <= right) {
+        const mid = (left + right) >> 1;
+        const midKey = node.keys[mid];
+        if (midKey === key) {
+          foundIdx = mid;
+          break;
+        } else if (midKey < key) {
+          left = mid + 1;
         } else {
-          nodeKey = typeInd === "N" ? Number(valStr) : valStr;
+          insertIdx = mid;
+          right = mid - 1;
         }
-
-        if (isLeaf) {
-          if (target === nodeKey) {
-            const valOffset = offset + 2 + kLen;
-            return {
-              pageId: buf.readUInt32LE(valOffset),
-              slotIdx: buf.readUInt16LE(valOffset + 4),
-            };
-          } else if (target < nodeKey) {
-            return null;
-          }
-        } else {
-          if (target < nodeKey) {
-            currId = buf.readUInt32LE(offset + 2 + kLen);
-            foundChild = true;
-            break;
-          }
-        }
-        offset += 2 + kLen + (isLeaf ? 6 : 4);
       }
 
-      if (isLeaf) return null;
-      if (!foundChild) currId = buf.readUInt32LE(offset);
+      if (node.isLeaf) {
+        if (foundIdx !== -1) return node.vals[foundIdx];
+        return null;
+      } else {
+        if (foundIdx !== -1) {
+          currId = node.children[foundIdx + 1];
+        } else {
+          currId = node.children[insertIdx];
+        }
+      }
     }
     return null;
   }
@@ -895,19 +899,55 @@ class BTree {
       const node = await this.fetchNode(currId);
       path.push(node);
       if (node.isLeaf) break;
-      let i = 0;
-      while (i < node.keys.length && key > node.keys[i]) i++;
-      if (i < node.keys.length && key === node.keys[i]) i++;
-      currId = node.children[i];
+      
+      let left = 0;
+      let right = node.keys.length - 1;
+      let foundIdx = -1;
+      let insertIdx = node.keys.length;
+
+      while (left <= right) {
+        const mid = (left + right) >> 1;
+        const midKey = node.keys[mid];
+        if (midKey === key) {
+          foundIdx = mid;
+          break;
+        } else if (midKey < key) {
+          left = mid + 1;
+        } else {
+          insertIdx = mid;
+          right = mid - 1;
+        }
+      }
+
+      if (foundIdx !== -1) currId = node.children[foundIdx + 1];
+      else currId = node.children[insertIdx];
     }
 
     const leaf = path[path.length - 1];
-    let i = 0;
-    while (i < leaf.keys.length && key > leaf.keys[i]) i++;
-    if (i < leaf.keys.length && leaf.keys[i] === key) leaf.vals[i] = val;
-    else {
-      leaf.keys.splice(i, 0, key);
-      leaf.vals.splice(i, 0, val);
+    let left = 0;
+    let right = leaf.keys.length - 1;
+    let foundIdx = -1;
+    let insertIdx = leaf.keys.length;
+
+    while (left <= right) {
+      const mid = (left + right) >> 1;
+      const midKey = leaf.keys[mid];
+      if (midKey === key) {
+        foundIdx = mid;
+        break;
+      } else if (midKey < key) {
+        left = mid + 1;
+      } else {
+        insertIdx = mid;
+        right = mid - 1;
+      }
+    }
+
+    if (foundIdx !== -1) {
+      leaf.vals[foundIdx] = val;
+    } else {
+      leaf.keys.splice(insertIdx, 0, key);
+      leaf.vals.splice(insertIdx, 0, val);
     }
 
     if (
@@ -975,9 +1015,18 @@ class BTree {
         break;
       } else {
         const parent = path[path.length - 1];
-        let pIdx = 0;
-        while (pIdx < parent.keys.length && promoteKey > parent.keys[pIdx])
-          pIdx++;
+        let pLeft = 0;
+        let pRight = parent.keys.length - 1;
+        let pIdx = parent.keys.length;
+        while (pLeft <= pRight) {
+          const mid = (pLeft + pRight) >> 1;
+          if (parent.keys[mid] < promoteKey) {
+            pLeft = mid + 1;
+          } else {
+            pIdx = mid;
+            pRight = mid - 1;
+          }
+        }
         parent.keys.splice(pIdx, 0, promoteKey);
         parent.children.splice(pIdx + 1, 0, rightNode.pageId);
         currNode = parent;
@@ -1001,19 +1050,52 @@ class BTree {
       const node = await this.fetchNode(currId);
       path.push(node);
       if (node.isLeaf) break;
-      let i = 0;
-      while (i < node.keys.length && key > node.keys[i]) i++;
-      if (i < node.keys.length && key === node.keys[i]) i++;
-      currId = node.children[i];
+      
+      let left = 0;
+      let right = node.keys.length - 1;
+      let foundIdx = -1;
+      let insertIdx = node.keys.length;
+
+      while (left <= right) {
+        const mid = (left + right) >> 1;
+        const midKey = node.keys[mid];
+        if (midKey === key) {
+          foundIdx = mid;
+          break;
+        } else if (midKey < key) {
+          left = mid + 1;
+        } else {
+          insertIdx = mid;
+          right = mid - 1;
+        }
+      }
+      
+      if (foundIdx !== -1) currId = node.children[foundIdx + 1];
+      else currId = node.children[insertIdx];
     }
 
     const leaf = path[path.length - 1];
     if (leaf && leaf.isLeaf) {
-      let i = 0;
-      while (i < leaf.keys.length && key > leaf.keys[i]) i++;
-      if (i < leaf.keys.length && leaf.keys[i] === key) {
-        leaf.keys.splice(i, 1);
-        leaf.vals.splice(i, 1);
+      let left = 0;
+      let right = leaf.keys.length - 1;
+      let foundIdx = -1;
+
+      while (left <= right) {
+        const mid = (left + right) >> 1;
+        const midKey = leaf.keys[mid];
+        if (midKey === key) {
+          foundIdx = mid;
+          break;
+        } else if (midKey < key) {
+          left = mid + 1;
+        } else {
+          right = mid - 1;
+        }
+      }
+
+      if (foundIdx !== -1) {
+        leaf.keys.splice(foundIdx, 1);
+        leaf.vals.splice(foundIdx, 1);
         const buf = await this.pager.readPage(leaf.pageId);
         this.serializeNode(leaf, buf);
         await this.pager.writePage(leaf.pageId, buf);
@@ -1222,19 +1304,17 @@ export class StorageEngine {
       if (loc) {
         const buf = await this.pager.readPage(loc.pageId);
         const page = new SlottedPage(buf);
-        for (const t of page.getTuples()) {
-          if (t.slotIdx === loc.slotIdx) {
-            const resolved = this.isOverflow(t.data)
-              ? await this.resolveOverflow(t.data)
-              : t.data;
-            meta = this.deserializeRow(
-              StorageEngine.CLUSTER_CATALOG_COLS,
-              resolved,
-            );
-            // Persist found meta to cache
-            if (meta) StorageEngine.dbMetaCache.set(cacheKey, meta);
-            break;
-          }
+        const t = page.getTuple(loc.slotIdx);
+        if (t) {
+          const resolved = this.isOverflow(t.data)
+            ? await this.resolveOverflow(t.data)
+            : t.data;
+          meta = this.deserializeRow(
+            StorageEngine.CLUSTER_CATALOG_COLS,
+            resolved,
+          );
+          // Persist found meta to cache
+          if (meta) StorageEngine.dbMetaCache.set(cacheKey, meta);
         }
       }
     }
@@ -1903,14 +1983,12 @@ export class StorageEngine {
       const buf = await this.pager.readPage(loc.pageId);
       const page = new SlottedPage(buf);
       let relRow = null;
-      for (const t of page.getTuples()) {
-        if (t.slotIdx === loc.slotIdx) {
-          const resolved = this.isOverflow(t.data)
-            ? await this.resolveOverflow(t.data)
-            : t.data;
-          relRow = this.deserializeRow(StorageEngine.PG_CLASS_COLS, resolved);
-          break;
-        }
+      const t = page.getTuple(loc.slotIdx);
+      if (t) {
+        const resolved = this.isOverflow(t.data)
+          ? await this.resolveOverflow(t.data)
+          : t.data;
+        relRow = this.deserializeRow(StorageEngine.PG_CLASS_COLS, resolved);
       }
 
       if (!relRow || relRow.relname !== table || relRow.relnamespace !== nspOid)
@@ -2728,13 +2806,12 @@ export class StorageEngine {
 
     const buf = await this.pager.readPage(loc.pageId);
     const page = new SlottedPage(buf);
-    for (const tuple of page.getTuples()) {
-      if (tuple.slotIdx === loc.slotIdx) {
-        const resolved = this.isOverflow(tuple.data)
-          ? await this.resolveOverflow(tuple.data)
-          : tuple.data;
-        return this.deserializeRow(table.columns, resolved);
-      }
+    const tuple = page.getTuple(loc.slotIdx);
+    if (tuple) {
+      const resolved = this.isOverflow(tuple.data)
+        ? await this.resolveOverflow(tuple.data)
+        : tuple.data;
+      return this.deserializeRow(table.columns, resolved);
     }
     return null;
   }
