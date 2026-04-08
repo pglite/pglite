@@ -2528,6 +2528,60 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 58: Parameter Binding Validation & SUM on empty set", () => {
+    test("58.1 Throw error when query has more parameters than provided", async () => {
+      await db.exec(`CREATE TABLE tx_params_test (id SERIAL PRIMARY KEY, type TEXT, amount NUMBER, created_at TIMESTAMP)`);
+      await db.exec(`INSERT INTO tx_params_test (type, amount, created_at) VALUES ('tuition_deduction', 100, '2026-04-04T18:00:00.000Z')`);
+
+      // The user provided 3 values but query has 4 parameters ($1, $2, $3, $4)
+      const params = [
+        "tuition_deduction",
+        "2026-04-04T17:00:00.000Z",
+        "2026-04-05T17:00:00.000Z"
+      ];
+      const sql = `select sum("amount") as "total" from "tx_params_test" where "type" in ($1, $2) and "created_at" >= $3 and "created_at" < $4`;
+      
+      let error: any;
+      try {
+        await db.query(sql, params);
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeDefined();
+      expect(error.message).toContain("bind message supplies 3 parameters, but prepared statement requires at least 4");
+    });
+
+    test("58.2 IN with single array parameter unrolling", async () => {
+      // If we provide 1 array param, IN ($1) should automatically unroll it to IN ('A', 'B')
+      const rows = await db.query(`select sum(amount) as total from tx_params_test where type in ($1)`, [
+        ["tuition_deduction", "other_type"]
+      ]);
+      expect(rows[0].total).toBe(100);
+    });
+
+    test("58.3 SUM on 0 matched rows should return null, not 0 (Standard PostgreSQL behavior)", async () => {
+      // If the query is completely valid but matches 0 rows, SUM returns NULL
+      const params = [
+        "tuition_deduction",
+        "2027-04-04T17:00:00.000Z",
+        "2027-04-05T17:00:00.000Z"
+      ];
+      // Here we correctly supply 3 parameters for 3 placeholders
+      const sql = `select sum("amount") as "total" from "tx_params_test" where "type" in ($1) and "created_at" >= $2 and "created_at" < $3`;
+      
+      const rows = await db.query(sql, params);
+      expect(rows[0].total).toBeNull();
+    });
+
+    test("58.4 SUM correctly adds numbers even if stored as strings", async () => {
+      await db.exec(`CREATE TABLE tx_str_test (id SERIAL PRIMARY KEY, amount TEXT)`);
+      await db.exec(`INSERT INTO tx_str_test (amount) VALUES ('150'), ('250')`);
+      
+      const rows = await db.query(`SELECT SUM(amount) as total FROM tx_str_test`);
+      expect(rows[0].total).toBe(400); // Should be 400, not "0150250"
+    });
+  });
+
   describe("LEVEL 57: Date and Time Quoting Bug Fix", () => {
     test("57.1 DATETIME, TIMESTAMP, and DATE should not have extra quotes", async () => {
       await db.exec(`DROP TABLE IF EXISTS dt_test_57`);

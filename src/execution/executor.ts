@@ -2012,8 +2012,11 @@ export class Executor {
             if (target.args && target.args[0]) {
                const val = await this.evaluateExpr(storage, target.args[0], row, params);
                if (val !== null && val !== undefined) {
-                 if (state.__SUMS__[colName] === null) state.__SUMS__[colName] = 0;
-                 state.__SUMS__[colName] += val;
+                 const num = Number(val);
+                 if (!isNaN(num)) {
+                   if (state.__SUMS__[colName] === null) state.__SUMS__[colName] = 0;
+                   state.__SUMS__[colName] += num;
+                 }
                }
             }
           } else if (target.fnName === "MIN") {
@@ -2035,8 +2038,14 @@ export class Executor {
           } else if (target.fnName === "AVG") {
             if (!state.__SUMS__[colName]) state.__SUMS__[colName] = 0;
             if (target.args && target.args[0]) {
-               state.__SUMS__[colName] += await this.evaluateExpr(storage, target.args[0], row, params);
-               state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
+               const val = await this.evaluateExpr(storage, target.args[0], row, params);
+               if (val !== null && val !== undefined) {
+                 const num = Number(val);
+                 if (!isNaN(num)) {
+                   state.__SUMS__[colName] += num;
+                   state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
+                 }
+               }
             }
           } else if (target.fnName === "ARRAY_AGG" || target.fnName === "JSON_AGG" || target.fnName === "JSONB_AGG") {
             if (!state.__ARRAYS__[colName]) state.__ARRAYS__[colName] = [];
@@ -2089,7 +2098,7 @@ export class Executor {
              } else if (fn === "AVG") {
                 const sum = state.__SUMS__[colName] || 0;
                 const count = state.__COUNTS__[colName] || 0;
-                const avg = count ? sum / count : 0;
+                const avg = count ? sum / count : null;
                 outRow[alias || "avg"] = avg;
                 outRow["__AVG__"] = avg;
                 outRow[colName] = avg;
@@ -2403,8 +2412,14 @@ export class Executor {
       case "Literal":
         return expr.value;
       case "Parameter":
+        if (!Array.isArray(params) || expr.index > params.length) {
+          throw new Error(`bind message supplies ${Array.isArray(params) ? params.length : 0} parameters, but prepared statement requires at least ${expr.index}`);
+        }
         return params[expr.index - 1];
       case "NamedParameter":
+        if (!params || (params[expr.name] === undefined && !(expr.name in params))) {
+          throw new Error(`bind message does not supply named parameter '${expr.name}'`);
+        }
         return params[expr.name];
       case "Identifier": {
         if ((expr as any)._nameUpper === undefined) {
@@ -2626,9 +2641,15 @@ export class Executor {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
         let res = false;
         if (Array.isArray(expr.right)) {
-          const vals = await Promise.all(
-            expr.right.map((e) => this.evaluateExpr(storage, e, row, params)),
-          );
+          let vals: any[] = [];
+          for (const e of expr.right) {
+            const evaluated = await this.evaluateExpr(storage, e, row, params);
+            if (Array.isArray(evaluated) && expr.right.length === 1) {
+              vals = vals.concat(evaluated);
+            } else {
+              vals.push(evaluated);
+            }
+          }
           res = vals.some(v => v == left);
         } else {
           const results = [];
