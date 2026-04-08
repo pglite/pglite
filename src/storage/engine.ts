@@ -386,8 +386,12 @@ class Pager {
           if (!(await this.vfs.exists(this.filepath))) {
             await this.vfs.writeFile(this.filepath, new Uint8Array(0));
           }
-          const dbHandle = await FileHandlePool.getHandle(this.vfs, this.filepath, "r+");
-          
+          const dbHandle = await FileHandlePool.getHandle(
+            this.vfs,
+            this.filepath,
+            "r+",
+          );
+
           let offset = 0;
           const headerBuf = Buffer.alloc(8);
           while (offset < stat.size) {
@@ -395,12 +399,12 @@ class Pager {
             if (bytesRead < 8) break;
             const pageId = headerBuf.readUInt32LE(0);
             const dataLen = headerBuf.readUInt32LE(4);
-            
+
             if (offset + 8 + dataLen > stat.size) break;
-            
+
             const dataBuf = Buffer.alloc(dataLen);
             await walHandle.read(dataBuf, 0, dataLen, offset + 8);
-            
+
             await dbHandle.write(dataBuf, 0, dataLen, pageId * PAGE_SIZE);
             offset += 8 + dataLen;
           }
@@ -618,7 +622,12 @@ class SlottedPage {
     return slotIdx;
   }
 
-  getTuples(): { offset: number; len: number; data: Buffer; slotIdx: number }[] {
+  getTuples(): {
+    offset: number;
+    len: number;
+    data: Buffer;
+    slotIdx: number;
+  }[] {
     const buffer = this.buf;
     const num = buffer.readUInt16LE(4);
     const result = [];
@@ -680,6 +689,17 @@ class BTree {
     return node;
   }
 
+  private getNodeSize(node: any): number {
+    let size = 7;
+    for (let i = 0; i < node.keys.length; i++) {
+      const typeInd = typeof node.keys[i] === "number" ? "N" : "S";
+      const keyStr = typeInd + String(node.keys[i]);
+      size += 2 + Buffer.byteLength(keyStr) + (node.isLeaf ? 6 : 4);
+    }
+    if (!node.isLeaf) size += 4;
+    return size;
+  }
+
   private serializeNode(node: any, buf: Buffer) {
     buf.fill(0, 0, 7); // Reset header area
     buf.writeUInt8(node.isLeaf ? 1 : 0, 0);
@@ -697,6 +717,7 @@ class BTree {
         buf.writeUInt16LE(actualNumKeys, 1);
         break;
       }
+
       buf.writeUInt16LE(kLen, offset);
       offset += 2;
       buf.write(keyStr, offset);
@@ -852,9 +873,26 @@ class BTree {
       leaf.vals.splice(i, 0, val);
     }
 
+    if (
+      this.getNodeSize({
+        isLeaf: true,
+        keys: [key],
+        vals: [val],
+        children: [],
+        nextLeaf: 0xffffffff,
+      }) > PAGE_SIZE
+    ) {
+      throw new Error("Index key is too large to fit in a B-Tree page");
+    }
+
     let currNode = leaf;
-    while (currNode.keys.length > 32) {
+    while (
+      currNode.keys.length > 32 ||
+      this.getNodeSize(currNode) > PAGE_SIZE
+    ) {
       const splitIdx = Math.floor(currNode.keys.length / 2);
+      if (splitIdx === 0)
+        throw new Error("Index key too large causing infinite split");
       const rightPageId = await this.pager.allocatePage();
       const rightBuf = await this.pager.readPage(rightPageId);
       const rightNode = {
@@ -1148,7 +1186,9 @@ export class StorageEngine {
         const page = new SlottedPage(buf);
         for (const t of page.getTuples()) {
           if (t.slotIdx === loc.slotIdx) {
-            const resolved = this.isOverflow(t.data) ? await this.resolveOverflow(t.data) : t.data;
+            const resolved = this.isOverflow(t.data)
+              ? await this.resolveOverflow(t.data)
+              : t.data;
             meta = this.deserializeRow(
               StorageEngine.CLUSTER_CATALOG_COLS,
               resolved,
@@ -1459,7 +1499,7 @@ export class StorageEngine {
     tableName: string,
     columns: string[],
     unique: boolean,
-    ifNotExists: boolean
+    ifNotExists: boolean,
   ): Promise<void> {
     const fullName = this.getFullTableName(tableName);
     const table = await this.getTableAsync(fullName);
@@ -1476,7 +1516,8 @@ export class StorageEngine {
     let existing = false;
     for await (const row of this.scanCatalog(this.pgClassDef)) {
       if (row.relnamespace === nspOid && row.relname === relname) {
-        existing = true; break;
+        existing = true;
+        break;
       }
     }
 
@@ -1489,12 +1530,16 @@ export class StorageEngine {
     for (const col of columns) {
       let attrIdx = table.columns.findIndex((c) => c.name === col);
       if (attrIdx === -1) {
-        const cleanCol = col.replace(/^"|"$/g, '').trim().toLowerCase();
-        attrIdx = table.columns.findIndex((c) => c.name.replace(/^"|"$/g, '').trim().toLowerCase() === cleanCol);
+        const cleanCol = col.replace(/^"|"$/g, "").trim().toLowerCase();
+        attrIdx = table.columns.findIndex(
+          (c) => c.name.replace(/^"|"$/g, "").trim().toLowerCase() === cleanCol,
+        );
       }
       if (attrIdx === -1) {
-        const available = table.columns.map(c => c.name).join(', ');
-        throw new Error(`Column '${col}' does not exist in table ${fullName}. Available columns: [${available}]`);
+        const available = table.columns.map((c) => c.name).join(", ");
+        throw new Error(
+          `Column '${col}' does not exist in table ${fullName}. Available columns: [${available}]`,
+        );
       }
       attNums.push(attrIdx + 1);
     }
@@ -1659,7 +1704,11 @@ export class StorageEngine {
     this.tableCache.delete(fullNewName);
   }
 
-  public async dropIndex(indexName: string, ifExists: boolean = false, cascade: boolean = false): Promise<void> {
+  public async dropIndex(
+    indexName: string,
+    ifExists: boolean = false,
+    cascade: boolean = false,
+  ): Promise<void> {
     const idxFullName = this.getFullTableName(indexName);
     const parts = idxFullName.split(".");
     const schema = parts[0]!;
@@ -1673,7 +1722,11 @@ export class StorageEngine {
 
     let indexOid = null;
     for await (const row of this.scanCatalog(this.pgClassDef)) {
-      if (row.relnamespace === nspOid && row.relname === relname && row.relkind === 'i') {
+      if (
+        row.relnamespace === nspOid &&
+        row.relname === relname &&
+        row.relkind === "i"
+      ) {
         indexOid = row.oid;
         break;
       }
@@ -1684,8 +1737,14 @@ export class StorageEngine {
       throw new Error(`Index ${idxFullName} does not exist`);
     }
 
-    await this.deleteRowsInCatalog(this.pgClassDef, async (r) => r.oid === indexOid);
-    await this.deleteRowsInCatalog(this.pgIndexDef, async (r) => r.indexrelid === indexOid);
+    await this.deleteRowsInCatalog(
+      this.pgClassDef,
+      async (r) => r.oid === indexOid,
+    );
+    await this.deleteRowsInCatalog(
+      this.pgIndexDef,
+      async (r) => r.indexrelid === indexOid,
+    );
   }
 
   public async dropTable(
@@ -1702,7 +1761,9 @@ export class StorageEngine {
 
     const referencing = await this.getReferencingColumnsInternal(fullName);
     if (referencing.length > 0 && !cascade) {
-      throw new Error(`cannot drop table ${fullName} because other objects depend on it`);
+      throw new Error(
+        `cannot drop table ${fullName} because other objects depend on it`,
+      );
     }
 
     // Drop referencing constraints if cascade is true
@@ -1710,19 +1771,23 @@ export class StorageEngine {
       for (const ref of referencing) {
         const childTable = await this.getTableAsync(ref.childTable);
         if (childTable) {
-          const col = childTable.columns.find((c) => c.name === ref.childColumn);
+          const col = childTable.columns.find(
+            (c) => c.name === ref.childColumn,
+          );
           if (col && col.references) {
             col.references = undefined;
             await this.updateTableSchema(ref.childTable, childTable);
             await this.updateRowsInCatalog(
               this.pgAttributeDef,
-              async (r) => r.attrelid === childTable.firstPage && r.attname === ref.childColumn,
+              async (r) =>
+                r.attrelid === childTable.firstPage &&
+                r.attname === ref.childColumn,
               async (r) => {
                 r.attref_table = null;
                 r.attref_col = null;
                 r.attref_on_delete = null;
                 r.attref_on_update = null;
-              }
+              },
             );
           }
         }
@@ -1776,7 +1841,9 @@ export class StorageEngine {
       let relRow = null;
       for (const t of page.getTuples()) {
         if (t.slotIdx === loc.slotIdx) {
-          const resolved = this.isOverflow(t.data) ? await this.resolveOverflow(t.data) : t.data;
+          const resolved = this.isOverflow(t.data)
+            ? await this.resolveOverflow(t.data)
+            : t.data;
           relRow = this.deserializeRow(StorageEngine.PG_CLASS_COLS, resolved);
           break;
         }
@@ -1869,7 +1936,10 @@ export class StorageEngine {
         } else if (relRow.oid === this.dbMeta.idx_f) {
           data.lastPage = this.dbMeta.idx_l;
         }
-      } else if (this.clusterCatalogDef && relRow.oid === this.clusterCatalogDef.firstPage) {
+      } else if (
+        this.clusterCatalogDef &&
+        relRow.oid === this.clusterCatalogDef.firstPage
+      ) {
         data.lastPage = this.clusterCatalogDef.lastPage;
         data.indexRootPage = this.clusterCatalogDef.indexRootPage;
       }
@@ -2042,7 +2112,9 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         yield this.deserializeRow(def.columns, resolved);
       }
       pageId = page.nextPageId;
@@ -2059,7 +2131,9 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let mod = false;
       for (const tuple of page.getTuples()) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         if (await filter(this.deserializeRow(def.columns, resolved))) {
           page.deleteTuple(tuple.slotIdx);
           mod = true;
@@ -2078,13 +2152,22 @@ export class StorageEngine {
       loc?: { pageId: number; slotIdx: number },
     ) => Promise<void>,
   ) {
-    let pageId = def.firstPage;
-    while (pageId !== 0xffffffff && pageId !== 0) {
+    const pagesToVisit = [];
+    let pId = def.firstPage;
+    while (pId !== 0xffffffff && pId !== 0) {
+      pagesToVisit.push(pId);
+      const buf = await this.pager.readPage(pId);
+      pId = new SlottedPage(buf).nextPageId;
+    }
+
+    for (const pageId of pagesToVisit) {
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       let mod = false;
       for (const tuple of page.getTuples()) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         const row = this.deserializeRow(def.columns, resolved);
         if (await filter(row)) {
           const locObj = { pageId, slotIdx: tuple.slotIdx };
@@ -2101,7 +2184,6 @@ export class StorageEngine {
         }
       }
       if (mod) await this.pager.writePage(pageId, page.buf);
-      pageId = page.nextPageId;
     }
   }
 
@@ -2333,10 +2415,7 @@ export class StorageEngine {
         offset += len;
 
         // Optimization: Lazy check for JSON structure
-        if (
-          col!._isJson &&
-          (str[0] === "{" || str[0] === "[")
-        ) {
+        if (col!._isJson && (str[0] === "{" || str[0] === "[")) {
           try {
             row[col!.name] = JSON.parse(str);
           } catch {
@@ -2357,7 +2436,13 @@ export class StorageEngine {
     return row;
   }
 
-  public async truncateTable(name: string, cascade: boolean = false, restartIdentity: boolean = false, visited: Set<string> = new Set(), tablesInStmt: Set<string> = new Set()) {
+  public async truncateTable(
+    name: string,
+    cascade: boolean = false,
+    restartIdentity: boolean = false,
+    visited: Set<string> = new Set(),
+    tablesInStmt: Set<string> = new Set(),
+  ) {
     const fullName = this.getFullTableName(name);
     if (visited.has(fullName)) return;
     visited.add(fullName);
@@ -2368,13 +2453,21 @@ export class StorageEngine {
     const referencing = await this.getReferencingColumnsInternal(fullName);
     if (cascade) {
       for (const ref of referencing) {
-         await this.truncateTable(ref.childTable, true, restartIdentity, visited, tablesInStmt);
+        await this.truncateTable(
+          ref.childTable,
+          true,
+          restartIdentity,
+          visited,
+          tablesInStmt,
+        );
       }
     } else {
       for (const ref of referencing) {
-         if (!tablesInStmt.has(ref.childTable) && !visited.has(ref.childTable)) {
-            throw new Error(`Cannot truncate table "${fullName}" because it is referenced by foreign key from table "${ref.childTable}"`);
-         }
+        if (!tablesInStmt.has(ref.childTable) && !visited.has(ref.childTable)) {
+          throw new Error(
+            `Cannot truncate table "${fullName}" because it is referenced by foreign key from table "${ref.childTable}"`,
+          );
+        }
       }
     }
 
@@ -2386,10 +2479,14 @@ export class StorageEngine {
 
     table.lastPage = table.firstPage;
     if (restartIdentity) table.sequence = 0;
-    
+
     await this.updateTableSchema(fullName, table);
 
-    if (table.indexRootPage && table.indexRootPage !== 0 && table.indexRootPage !== 0xffffffff) {
+    if (
+      table.indexRootPage &&
+      table.indexRootPage !== 0 &&
+      table.indexRootPage !== 0xffffffff
+    ) {
       const rootBuf = Buffer.alloc(PAGE_SIZE);
       rootBuf.writeUInt8(1, 0);
       rootBuf.writeUInt16LE(0, 1);
@@ -2480,7 +2577,9 @@ export class StorageEngine {
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
         for (const tuple of page.getTuples()) {
-          const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+          const resolved = this.isOverflow(tuple.data)
+            ? await this.resolveOverflow(tuple.data)
+            : tuple.data;
           const row = this.deserializeRow(table.columns, resolved);
           const rootId = await btree.insert(row[pkCol.name], {
             pageId,
@@ -2521,7 +2620,9 @@ export class StorageEngine {
     const page = new SlottedPage(buf);
     for (const tuple of page.getTuples()) {
       if (tuple.slotIdx === loc.slotIdx) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         return this.deserializeRow(table.columns, resolved);
       }
     }
@@ -2745,7 +2846,9 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         yield this.deserializeRow(columns, resolved);
       }
       pageId = page.nextPageId;
@@ -2813,16 +2916,27 @@ export class StorageEngine {
     const table = await this.getTableAsync(fullName);
     if (!table) throw new Error(`Table ${fullName} not found`);
     const pkCol = table.columns.find((c) => c.isPrimaryKey);
-    let pageId = table.firstPage;
-    let updated = 0;
 
-    while (pageId !== 0xffffffff && pageId !== 0) {
-      const buf = await this.pager.readPage(pageId!);
+    // Thu thập danh sách các page ban đầu để tránh dính "Halloween Problem"
+    // khi một Row bị phình to và relocate xuống lastPage.
+    const pagesToVisit = [];
+    let pId = table.firstPage;
+    while (pId !== 0xffffffff && pId !== 0) {
+      pagesToVisit.push(pId);
+      const buf = await this.pager.readPage(pId);
+      pId = new SlottedPage(buf).nextPageId;
+    }
+
+    let updated = 0;
+    for (const pageId of pagesToVisit) {
+      const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       let pageModified = false;
 
       for (const tuple of page.getTuples()) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
           const oldRow = { ...row };
@@ -2858,7 +2972,6 @@ export class StorageEngine {
       }
 
       if (pageModified) await this.pager.writePage(pageId!, page.buf);
-      pageId = page.nextPageId;
     }
     return updated;
   }
@@ -2880,7 +2993,9 @@ export class StorageEngine {
       let pageModified = false;
 
       for (const tuple of page.getTuples()) {
-        const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
         const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
           page.deleteTuple(tuple.slotIdx);
@@ -2929,7 +3044,10 @@ export class StorageEngine {
         this.dbMeta = JSON.parse(this.txDbMetaBackup);
         this.refreshCatalogDefs();
         this.txDbMetaBackup = null;
-        StorageEngine.dbMetaCache.set(`${this.filepath}:${this.dbMeta.name}`, this.dbMeta);
+        StorageEngine.dbMetaCache.set(
+          `${this.filepath}:${this.dbMeta.name}`,
+          this.dbMeta,
+        );
       }
       if (this.txClusterMetaBackup) {
         this.clusterCatalogDef = JSON.parse(this.txClusterMetaBackup);
