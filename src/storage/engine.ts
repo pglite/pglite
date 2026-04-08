@@ -362,6 +362,9 @@ class Pager {
   }
 
   public numPages: number = 0;
+  public firstFreePage: number = 0xffffffff;
+  private txNumPagesBackup: number = 0;
+  private txFirstFreePageBackup: number = 0xffffffff;
   private cache = new LRUCache<number, Buffer>(2048);
   private wal: WAL;
   private dirtyPages = new Map<number, Buffer>();
@@ -427,9 +430,17 @@ class Pager {
 
     if (this.numPages === 0) {
       const masterPage = Buffer.alloc(PAGE_SIZE);
+      masterPage.writeUInt32LE(0xffffffff, 16);
       await this.writePage(0, masterPage);
       this.numPages = 1;
+      this.firstFreePage = 0xffffffff;
+    } else {
+      const p0 = await this.readPage(0);
+      this.firstFreePage = p0.readUInt32LE(16);
+      if (this.firstFreePage === 0) this.firstFreePage = 0xffffffff;
     }
+    this.txNumPagesBackup = this.numPages;
+    this.txFirstFreePageBackup = this.firstFreePage;
     this.initialized = true;
   }
 
@@ -456,14 +467,36 @@ class Pager {
   }
 
   async allocatePage(): Promise<number> {
-    const pageId = this.numPages;
-    this.numPages++;
+    let pageId: number;
+    if (this.firstFreePage !== 0xffffffff && this.firstFreePage !== 0) {
+      pageId = this.firstFreePage;
+      const buf = await this.readPage(pageId);
+      this.firstFreePage = buf.readUInt32LE(0);
+      
+      const p0 = await this.readPage(0);
+      p0.writeUInt32LE(this.firstFreePage, 16);
+      await this.writePage(0, p0);
+    } else {
+      pageId = this.numPages;
+      this.numPages++;
+    }
     const buf = Buffer.alloc(PAGE_SIZE);
     buf.writeUInt32LE(0xffffffff, 0);
     buf.writeUInt16LE(0, 4);
     buf.writeUInt16LE(PAGE_SIZE, 6);
     await this.writePage(pageId, buf);
     return pageId;
+  }
+
+  async freePage(pageId: number): Promise<void> {
+    const buf = Buffer.alloc(PAGE_SIZE);
+    buf.writeUInt32LE(this.firstFreePage, 0);
+    await this.writePage(pageId, buf);
+    
+    this.firstFreePage = pageId;
+    const p0 = await this.readPage(0);
+    p0.writeUInt32LE(this.firstFreePage, 16);
+    await this.writePage(0, p0);
   }
 
   async flush() {
@@ -524,6 +557,8 @@ class Pager {
 
     this.dirtyPages.clear();
     await this.wal.clear();
+    this.txNumPagesBackup = this.numPages;
+    this.txFirstFreePageBackup = this.firstFreePage;
   }
 
   async clearDirty() {
@@ -532,6 +567,8 @@ class Pager {
     }
     this.dirtyPages.clear();
     await this.wal.clear();
+    this.numPages = this.txNumPagesBackup;
+    this.firstFreePage = this.txFirstFreePageBackup;
   }
 
   public async close() {
@@ -1147,6 +1184,7 @@ export class StorageEngine {
       hBuf.writeUInt32LE(clusterHeader.f, 4);
       hBuf.writeUInt32LE(clusterHeader.l, 8);
       hBuf.writeUInt32LE(clusterHeader.idx, 12);
+      hBuf.writeUInt32LE(this.pager.firstFreePage, 16);
       await this.pager.writePage(0, hBuf);
     } else {
       clusterHeader = {
@@ -1737,6 +1775,10 @@ export class StorageEngine {
       throw new Error(`Index ${idxFullName} does not exist`);
     }
 
+    if (indexOid && indexOid !== 0 && indexOid !== 0xffffffff) {
+      await this.pager.freePage(indexOid);
+    }
+
     await this.deleteRowsInCatalog(
       this.pgClassDef,
       async (r) => r.oid === indexOid,
@@ -1792,6 +1834,26 @@ export class StorageEngine {
           }
         }
       }
+    }
+
+    // Free data pages and overflow pages
+    let pId = table.firstPage;
+    while (pId !== 0xffffffff && pId !== 0) {
+      const buf = await this.pager.readPage(pId);
+      const page = new SlottedPage(buf);
+      for (const t of page.getTuples()) {
+        if (this.isOverflow(t.data)) {
+          await this.freeOverflowPages(t.data);
+        }
+      }
+      const nextId = page.nextPageId;
+      await this.pager.freePage(pId);
+      pId = nextId;
+    }
+
+    // Free B-Tree pages for PK if any
+    if (table.indexRootPage && table.indexRootPage !== 0 && table.indexRootPage !== 0xffffffff) {
+      await this.pager.freePage(table.indexRootPage);
     }
 
     await this.deleteRowsInCatalog(
@@ -2135,6 +2197,9 @@ export class StorageEngine {
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;
         if (await filter(this.deserializeRow(def.columns, resolved))) {
+          if (this.isOverflow(tuple.data)) {
+            await this.freeOverflowPages(tuple.data);
+          }
           page.deleteTuple(tuple.slotIdx);
           mod = true;
         }
@@ -2174,11 +2239,22 @@ export class StorageEngine {
           await update(row, locObj);
           const rawRowData = this.serializeRow(def.columns, row);
           const rowData = await this.handleOverflow(rawRowData);
+          
+          const oldTupleData = Buffer.allocUnsafe(tuple.data.length);
+          tuple.data.copy(oldTupleData);
+
           if (!page.updateTuple(tuple.slotIdx, rowData)) {
+            if (this.isOverflow(oldTupleData)) {
+              await this.freeOverflowPages(oldTupleData);
+            }
             page.deleteTuple(tuple.slotIdx);
             const newLoc = await this.insertRowIntoCatalog(def, row);
             locObj.pageId = newLoc.pageId;
             locObj.slotIdx = newLoc.slotIdx;
+          } else {
+            if (this.isOverflow(oldTupleData)) {
+              await this.freeOverflowPages(oldTupleData);
+            }
           }
           mod = true;
         }
@@ -2276,6 +2352,18 @@ export class StorageEngine {
 
   private isOverflow(data: Buffer): boolean {
     return data.length === 10 && (data.readUInt16LE(0) & 0x8000) !== 0;
+  }
+
+  private async freeOverflowPages(data: Buffer): Promise<void> {
+    if (!this.isOverflow(data)) return;
+    const firstPageId = data.readUInt32LE(2);
+    let currPageId = firstPageId;
+    while (currPageId !== 0xffffffff && currPageId !== 0) {
+      const buf = await this.pager.readPage(currPageId);
+      const nextId = buf.readUInt32LE(0);
+      await this.pager.freePage(currPageId);
+      currPageId = nextId;
+    }
   }
 
   private async resolveOverflow(data: Buffer): Promise<Buffer> {
@@ -2469,6 +2557,25 @@ export class StorageEngine {
           );
         }
       }
+    }
+
+    // Free old data pages and overflow pages
+    let pId = table.firstPage;
+    const pagesToFree: number[] = [];
+    while (pId !== 0xffffffff && pId !== 0) {
+      const buf = await this.pager.readPage(pId);
+      const page = new SlottedPage(buf);
+      for (const t of page.getTuples()) {
+        if (this.isOverflow(t.data)) {
+          await this.freeOverflowPages(t.data);
+        }
+      }
+      if (pId !== table.firstPage) pagesToFree.push(pId);
+      pId = page.nextPageId;
+    }
+
+    for (const freeId of pagesToFree) {
+      await this.pager.freePage(freeId);
     }
 
     const firstPageBuf = Buffer.alloc(PAGE_SIZE);
@@ -2944,24 +3051,35 @@ export class StorageEngine {
           const rawData = this.serializeRow(table.columns, row);
           const newData = await this.handleOverflow(rawData);
 
+          const oldTupleData = Buffer.allocUnsafe(tuple.data.length);
+          tuple.data.copy(oldTupleData);
+
           if (!page.updateTuple(tuple.slotIdx, newData)) {
+            if (this.isOverflow(oldTupleData)) {
+              await this.freeOverflowPages(oldTupleData);
+            }
             page.deleteTuple(tuple.slotIdx);
             if (pkCol && this.pkIndexes.has(fullName)) {
               await this.pkIndexes.get(fullName)!.delete(oldRow[pkCol.name]);
             }
             await this.insertRow(name, row);
-          } else if (pkCol && oldRow[pkCol.name] !== row[pkCol.name]) {
-            // PK value changed but row still fits in page, update index
-            if (this.pkIndexes.has(fullName)) {
-              const btree = this.pkIndexes.get(fullName)!;
-              await btree.delete(oldRow[pkCol.name]);
-              const newRoot = await btree.insert(row[pkCol.name], {
-                pageId: pageId!,
-                slotIdx: tuple.slotIdx,
-              });
-              if (newRoot !== table.indexRootPage) {
-                table.indexRootPage = newRoot;
-                await this.updateTableSchema(fullName, table);
+          } else {
+            if (this.isOverflow(oldTupleData)) {
+              await this.freeOverflowPages(oldTupleData);
+            }
+            if (pkCol && oldRow[pkCol.name] !== row[pkCol.name]) {
+              // PK value changed but row still fits in page, update index
+              if (this.pkIndexes.has(fullName)) {
+                const btree = this.pkIndexes.get(fullName)!;
+                await btree.delete(oldRow[pkCol.name]);
+                const newRoot = await btree.insert(row[pkCol.name], {
+                  pageId: pageId!,
+                  slotIdx: tuple.slotIdx,
+                });
+                if (newRoot !== table.indexRootPage) {
+                  table.indexRootPage = newRoot;
+                  await this.updateTableSchema(fullName, table);
+                }
               }
             }
           }
@@ -2998,6 +3116,9 @@ export class StorageEngine {
           : tuple.data;
         const row = this.deserializeRow(table.columns, resolved);
         if (await filterFn(row)) {
+          if (this.isOverflow(tuple.data)) {
+            await this.freeOverflowPages(tuple.data);
+          }
           page.deleteTuple(tuple.slotIdx);
           if (pkCol && this.pkIndexes.has(fullName))
             await this.pkIndexes.get(fullName)!.delete(row[pkCol.name]);
