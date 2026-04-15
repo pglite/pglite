@@ -1713,6 +1713,8 @@ export class Executor {
       for (const ob of orderBy) {
          const vA = await this.evaluateExpr(storage, ob.expr, a, params);
          const vB = await this.evaluateExpr(storage, ob.expr, b, params);
+         if ((vA === null || vA === undefined) && (vB !== null && vB !== undefined)) return ob.nullsFirst ? -1 : (ob.nullsLast ? 1 : (ob.desc ? -1 : 1));
+         if ((vA !== null && vA !== undefined) && (vB === null || vB === undefined)) return ob.nullsFirst ? 1 : (ob.nullsLast ? -1 : (ob.desc ? 1 : -1));
          if (vA < vB) return ob.desc ? 1 : -1;
          if (vA > vB) return ob.desc ? -1 : 1;
       }
@@ -1730,8 +1732,13 @@ export class Executor {
           const vA = mapVals.get(a);
           const vB = mapVals.get(b);
           for (let i = 0; i < orderBy.length; i++) {
-             if (vA[i] < vB[i]) return orderBy[i]?.desc ? 1 : -1;
-             if (vA[i] > vB[i]) return orderBy[i]?.desc ? -1 : 1;
+             const ob = orderBy[i]!;
+             const valA = vA[i];
+             const valB = vB[i];
+             if ((valA === null || valA === undefined) && (valB !== null && valB !== undefined)) return ob.nullsFirst ? -1 : (ob.nullsLast ? 1 : (ob.desc ? -1 : 1));
+             if ((valA !== null && valA !== undefined) && (valB === null || valB === undefined)) return ob.nullsFirst ? 1 : (ob.nullsLast ? -1 : (ob.desc ? 1 : -1));
+             if (valA < valB) return ob.desc ? 1 : -1;
+             if (valA > valB) return ob.desc ? -1 : 1;
           }
           return 0;
        });
@@ -1871,6 +1878,8 @@ export class Executor {
             for (const ob of orderBy) {
               const vA = await this.evaluateExpr(storage, ob.expr, a, params);
               const vB = await this.evaluateExpr(storage, ob.expr, b, params);
+              if ((vA === null || vA === undefined) && (vB !== null && vB !== undefined)) return ob.nullsFirst ? -1 : (ob.nullsLast ? 1 : (ob.desc ? -1 : 1));
+              if ((vA !== null && vA !== undefined) && (vB === null || vB === undefined)) return ob.nullsFirst ? 1 : (ob.nullsLast ? -1 : (ob.desc ? 1 : -1));
               if (vA < vB) return ob.desc ? 1 : -1;
               if (vA > vB) return ob.desc ? -1 : 1;
             }
@@ -2109,8 +2118,12 @@ export class Executor {
                   arr.sort((a: any, b: any) => {
                     for (let i = 0; i < obList.length; i++) {
                       const ob = obList[i];
-                      if (a.orderVals[i] < b.orderVals[i]) return ob.desc ? 1 : -1;
-                      if (a.orderVals[i] > b.orderVals[i]) return ob.desc ? -1 : 1;
+                      const vA = a.orderVals[i];
+                      const vB = b.orderVals[i];
+                      if ((vA === null || vA === undefined) && (vB !== null && vB !== undefined)) return ob.nullsFirst ? -1 : (ob.nullsLast ? 1 : (ob.desc ? -1 : 1));
+                      if ((vA !== null && vA !== undefined) && (vB === null || vB === undefined)) return ob.nullsFirst ? 1 : (ob.nullsLast ? -1 : (ob.desc ? 1 : -1));
+                      if (vA < vB) return ob.desc ? 1 : -1;
+                      if (vA > vB) return ob.desc ? -1 : 1;
                     }
                     return 0;
                   });

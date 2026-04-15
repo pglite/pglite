@@ -3736,6 +3736,25 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 62: ORDER BY NULLS FIRST/LAST", () => {
+    test("62.1 Parse and sort with NULLS LAST", async () => {
+      await db.exec(`CREATE TABLE order_nulls (id SERIAL PRIMARY KEY, val NUMBER)`);
+      await db.exec(`INSERT INTO order_nulls (val) VALUES (10), (NULL), (20)`);
+      
+      const rows = await db.query(`SELECT val FROM order_nulls ORDER BY val DESC NULLS LAST`);
+      expect(rows.length).toBe(3);
+      expect(rows[0].val).toBe(20);
+      expect(rows[1].val).toBe(10);
+      expect(rows[2].val).toBeNull();
+
+      const rows2 = await db.query(`SELECT val FROM order_nulls ORDER BY val ASC NULLS FIRST`);
+      expect(rows2.length).toBe(3);
+      expect(rows2[0].val).toBeNull();
+      expect(rows2[1].val).toBe(10);
+      expect(rows2[2].val).toBe(20);
+    });
+  });
+
   describe("LEVEL 48: FIRST_VALUE and LAST_VALUE Window Functions", () => {
     test("48.1 FIRST_VALUE and LAST_VALUE with PARTITION BY and ORDER BY", async () => {
       const rows = await db.query(`

@@ -67,6 +67,8 @@ export interface JoinClause {
 export interface OrderBy {
   expr: Expr;
   desc: boolean;
+  nullsFirst?: boolean;
+  nullsLast?: boolean;
 }
 
 export type AlterTableAction =

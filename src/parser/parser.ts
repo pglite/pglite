@@ -504,7 +504,17 @@ export class Parser {
               let desc = false;
               if (this.match('KEYWORD', 'DESC')) { this.consume(); desc = true; }
               else if (this.match('KEYWORD', 'ASC')) { this.consume(); }
-              argsOrderBy.push({ expr, desc });
+              
+              let nullsFirst, nullsLast;
+              if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'NULLS') {
+                this.consume();
+                if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'FIRST') {
+                  this.consume(); nullsFirst = true;
+                } else if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'LAST') {
+                  this.consume(); nullsLast = true;
+                }
+              }
+              argsOrderBy.push({ expr, desc, nullsFirst, nullsLast });
             } while (this.match('SYMBOL', ',') && this.consume());
           }
         }
@@ -541,7 +551,17 @@ export class Parser {
               let desc = false;
               if (this.match('KEYWORD', 'DESC')) { this.consume(); desc = true; }
               else if (this.match('KEYWORD', 'ASC')) { this.consume(); }
-              orderBy.push({ expr, desc });
+              
+              let nullsFirst, nullsLast;
+              if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'NULLS') {
+                this.consume();
+                if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'FIRST') {
+                  this.consume(); nullsFirst = true;
+                } else if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'LAST') {
+                  this.consume(); nullsLast = true;
+                }
+              }
+              orderBy.push({ expr, desc, nullsFirst, nullsLast });
             } while (this.match('SYMBOL', ',') && this.consume());
           }
           this.consume('SYMBOL', ')');
@@ -1358,7 +1378,17 @@ export class Parser {
          let desc = false;
          if (this.match('KEYWORD', 'DESC')) { this.consume(); desc = true; }
          else if (this.match('KEYWORD', 'ASC')) { this.consume(); }
-         orderBy.push({ expr, desc });
+         
+         let nullsFirst, nullsLast;
+         if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'NULLS') {
+           this.consume();
+           if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'FIRST') {
+             this.consume(); nullsFirst = true;
+           } else if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'LAST') {
+             this.consume(); nullsLast = true;
+           }
+         }
+         orderBy.push({ expr, desc, nullsFirst, nullsLast });
       } while (this.match('SYMBOL', ',') && this.consume());
     }
 
