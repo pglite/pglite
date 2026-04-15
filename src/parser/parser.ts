@@ -660,8 +660,37 @@ export class Parser {
         columns.push(parseIndexCol());
       }
       this.consume('SYMBOL', ')');
+
+      if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'INCLUDE') {
+        this.consume();
+        if (this.match('SYMBOL', '(')) {
+          this.consume();
+          while (this.current() && !this.match('SYMBOL', ')')) this.consume();
+          this.consume('SYMBOL', ')');
+        }
+      }
+
+      if (this.match('KEYWORD', 'WITH')) {
+        this.consume();
+        if (this.match('SYMBOL', '(')) {
+          this.consume();
+          while (this.current() && !this.match('SYMBOL', ')')) this.consume();
+          this.consume('SYMBOL', ')');
+        }
+      }
+
+      if ((this.match('KEYWORD') || this.matchIdentifier()) && this.current()?.value.toUpperCase() === 'TABLESPACE') {
+        this.consume();
+        this.consumeIdentifier();
+      }
+
+      let where: Expr | undefined;
+      if (this.match('KEYWORD', 'WHERE')) {
+        this.consume();
+        where = this.parseExpr();
+      }
       
-      return { type: 'CreateIndex', indexName, tableName, columns, unique: isUnique, ifNotExists };
+      return { type: 'CreateIndex', indexName, tableName, columns, unique: isUnique, ifNotExists, where };
     } else if (isUnique) {
       throw new Error("Parse Error: UNIQUE can only be used with INDEX");
     }

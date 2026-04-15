@@ -3610,6 +3610,24 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 61: Partial Indexes (WHERE in CREATE INDEX)", () => {
+    test("61.1 Parse WHERE, INCLUDE, WITH and TABLESPACE in CREATE INDEX without crashing", async () => {
+      await db.exec(`CREATE TABLE partial_index_test (id SERIAL PRIMARY KEY, email TEXT)`);
+      
+      // Basic WHERE (Partial Index)
+      let res = await db.exec(`CREATE INDEX IF NOT EXISTS idx_partial_1 ON partial_index_test(email) WHERE email IS NOT NULL;`);
+      expect(res.success).toBe(true);
+
+      // WITH and WHERE
+      res = await db.exec(`CREATE INDEX idx_partial_2 ON partial_index_test(email) WITH (fillfactor = 70) WHERE email != '';`);
+      expect(res.success).toBe(true);
+
+      // INCLUDE (Covering Index)
+      res = await db.exec(`CREATE INDEX idx_partial_3 ON partial_index_test(email) INCLUDE (id) WHERE email IS NOT NULL;`);
+      expect(res.success).toBe(true);
+    });
+  });
+
   describe("LEVEL 50: TRUNCATE TABLE", () => {
     test("50.1 TRUNCATE simple table", async () => {
       await db.exec(`CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`);

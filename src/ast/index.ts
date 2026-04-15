@@ -84,7 +84,7 @@ export type AlterTableAction =
 
 export type Statement =
   | { type: 'CreateSchema'; schemaName: string; ifNotExists?: boolean }
-  | { type: 'CreateIndex'; indexName: string; tableName: string; columns: string[]; unique?: boolean; ifNotExists?: boolean }
+  | { type: 'CreateIndex'; indexName: string; tableName: string; columns: string[]; unique?: boolean; ifNotExists?: boolean; where?: Expr }
   | { type: 'DropSchema'; schemaNames: string[]; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropTable'; tableNames: string[]; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropIndex'; indexNames: string[]; ifExists?: boolean; cascade?: boolean }
