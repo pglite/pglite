@@ -40,8 +40,8 @@ async function runBenchmark() {
     for (let j = 0; j < batchSize; j++) {
       const idx = i + j + 1;
       const offset = j * 3;
-      placeholders.push(`(${offset + 1}, ${offset + 2}, ${offset + 3})`);
-      params.push(`User_${idx}`, idx % 100, idx % 2 === 0);
+      placeholders.push(`(${offset + 1}, ${offset + 2}, ${offset + 3})` as never);
+      params.push(`User_${idx}` as never, idx % 100 as never, (idx % 2 === 0) as unknown as never);
     }
     
     await db.exec(

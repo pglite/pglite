@@ -158,6 +158,7 @@ export class Lexer {
     let start = this.pos;
     let hasDot = false;
     let hasE = false;
+    let isIdentifier = false;
     while (this.pos < this.input.length) {
       const char = this.input[this.pos] || "";
       if (/[0-9]/.test(char)) {
@@ -166,17 +167,26 @@ export class Lexer {
         hasDot = true;
         this.pos++;
       } else if ((char === 'e' || char === 'E') && !hasE) {
-        hasE = true;
-        this.pos++;
-        const nextChar = this.input[this.pos] || "";
-        if (nextChar === '+' || nextChar === '-') {
+        const nextChar = this.input[this.pos + 1] || "";
+        if (/[0-9+\-]/.test(nextChar)) {
+          hasE = true;
+          this.pos++;
+          if (nextChar === '+' || nextChar === '-') {
+            this.pos++;
+          }
+        } else {
+          isIdentifier = true;
           this.pos++;
         }
+      } else if (/[a-zA-Z_$]/.test(char)) {
+        isIdentifier = true;
+        this.pos++;
       } else {
         break;
       }
     }
-    return { type: "NUMBER", value: this.input.slice(start, this.pos) };
+    const value = this.input.slice(start, this.pos);
+    return { type: isIdentifier ? "IDENTIFIER" : "NUMBER", value };
   }
 
   private readString(): Token {
@@ -200,7 +210,9 @@ export class Lexer {
         this.pos++;
       }
     }
-    throw new Error("Lexer Error: Unterminated string");
+    // Implicitly close at EOF for truncated queries
+    res += this.input.slice(start, this.pos);
+    return { type: "STRING", value: res };
   }
 
   private readQuotedIdentifier(): Token {
@@ -209,7 +221,10 @@ export class Lexer {
     while (this.pos < this.input.length && this.input[this.pos] !== '"') {
       this.pos++;
     }
-    if (this.pos >= this.input.length) throw new Error("Lexer Error: Unterminated quoted identifier");
+    if (this.pos >= this.input.length) {
+      // Implicitly close at EOF
+      return { type: "IDENTIFIER", value: this.input.slice(start, this.pos) };
+    }
     const id = this.input.slice(start, this.pos);
     this.pos++; // skip "
     return { type: "IDENTIFIER", value: id };
@@ -224,7 +239,9 @@ export class Lexer {
       }
       this.pos++;
     }
-    if (this.pos >= this.input.length) throw new Error("Lexer Error: Unterminated dollar-quoted string");
+    if (this.pos >= this.input.length) {
+      return { type: "STRING", value: this.input.slice(start, this.pos) };
+    }
     const str = this.input.slice(start, this.pos);
     this.pos += tag.length; // skip closing tag
     return { type: "STRING", value: str };

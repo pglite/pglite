@@ -3145,8 +3145,8 @@ export class StorageEngine {
               await this.freeOverflowPages(oldTupleData);
             }
             page.deleteTuple(tuple.slotIdx);
-            if (pkCol && this.pkIndexes.has(fullName)) {
-              await this.pkIndexes.get(fullName)!.delete(oldRow[pkCol.name]);
+            if (pkCol && StorageEngine.pkIndexes.has(`${this.filepath}:${this.currentDbName}:${fullName}`)) {
+              await StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!.delete(oldRow[pkCol.name]);
             }
             await this.insertRow(name, row);
           } else {

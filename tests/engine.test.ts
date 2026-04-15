@@ -3555,6 +3555,61 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 60: Bulk Inserts with dynamic placeholders", () => {
+    test("60.1 Insert multiple rows using dynamic params array", async () => {
+      await db.exec(`CREATE TABLE bulk_insert_test (id SERIAL PRIMARY KEY, username TEXT, age NUMBER, is_active BOOLEAN)`);
+      
+      const placeholders: string[] =[];
+      // Khai báo tường minh type any[] để TypeScript không báo lỗi khi push nhiều type khác nhau
+      const params: any[] =[];
+      
+      for (let idx = 0; idx < 50; idx++) {
+        const offset = idx * 3;
+        placeholders.push(`(${offset + 1}, ${offset + 2}, ${offset + 3})`);
+        params.push(`User_${idx}`, idx % 100, idx % 2 === 0);
+      }
+      
+      const sql = `INSERT INTO bulk_insert_test (username, age, is_active) VALUES ${placeholders.join(", ")}`;
+      const res = await db.exec(sql, params);
+      
+      expect(res.success).toBe(true);
+      const rows = await db.query(`SELECT COUNT(*) as total FROM bulk_insert_test`);
+      expect(rows[0].total).toBe(50);
+    });
+  });
+
+  describe("LEVEL 59: Truncated Queries and Unquoted UUIDs", () => {
+    test("59.1 Parse unquoted UUIDs as identifiers instead of splitting them", async () => {
+      await db.exec(`CREATE TABLE unquoted_uuid_test (db_key TEXT)`);
+      await db.exec(`INSERT INTO unquoted_uuid_test (db_key) VALUES ('1a5487d3-b2f1-4495')`);
+      
+      // Query with unquoted UUID which starts with a number.
+      // This should parse as a subtraction expression and not throw "Expected statement, got IDENTIFIER".
+      const sql = `SELECT * FROM unquoted_uuid_test WHERE db_key = 1a5487d3-b2f1-4495`;
+      
+      let parseError = false;
+      try {
+        await db.query(sql);
+      } catch (e: any) {
+        if (e.message.includes("Parse Error: Expected statement, got IDENTIFIER")) {
+          parseError = true;
+        }
+      }
+      expect(parseError).toBe(false);
+    });
+
+    test("59.2 Forgive truncated strings (implicitly close at EOF)", async () => {
+      await db.exec(`CREATE TABLE truncated_string_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`INSERT INTO truncated_string_test (val) VALUES ('1a5487d3-b2f1-4495')`);
+
+      // Missing closing quote
+      const sql = `SELECT val FROM truncated_string_test WHERE val = '1a5487d3-b2f1-4495`;
+      const rows = await db.query(sql);
+      expect(rows.length).toBe(1);
+      expect(rows[0].val).toBe('1a5487d3-b2f1-4495');
+    });
+  });
+
   describe("LEVEL 50: TRUNCATE TABLE", () => {
     test("50.1 TRUNCATE simple table", async () => {
       await db.exec(`CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`);
