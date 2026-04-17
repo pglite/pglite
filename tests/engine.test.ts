@@ -3628,6 +3628,50 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 63: Circular Reference Bug Fix", () => {
+    test("63.1 Selecting joined table fields does not cause [Circular]", async () => {
+      await db.exec(`CREATE TABLE circ_a (id SERIAL PRIMARY KEY, name TEXT)`);
+      await db.exec(`CREATE TABLE circ_b (id SERIAL PRIMARY KEY, a_id INT REFERENCES circ_a(id), val TEXT)`);
+      
+      await db.exec(`INSERT INTO circ_a (name) VALUES ('Alpha')`);
+      await db.exec(`INSERT INTO circ_b (a_id, val) VALUES (1, 'Beta')`);
+      
+      const rows = await db.query(`
+        SELECT a.*, b.* 
+        FROM circ_a a
+        JOIN circ_b b ON a.id = b.a_id
+      `);
+      
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe('Alpha');
+      expect(rows[0].val).toBe('Beta');
+      expect(rows[0].a_id).toBe(1);
+      
+      // Ensure JSON.stringify works without throwing "Converting circular structure to JSON"
+      let jsonError = false;
+      try {
+        JSON.stringify(rows);
+      } catch (e) {
+        jsonError = true;
+      }
+      expect(jsonError).toBe(false);
+    });
+
+    test("63.2 Subquery returning rows without circular refs", async () => {
+      const rows = await db.query(`
+        SELECT t.* FROM (SELECT * FROM circ_a) t
+      `);
+      let jsonError = false;
+      try {
+        JSON.stringify(rows);
+      } catch (e) {
+        jsonError = true;
+      }
+      expect(jsonError).toBe(false);
+      expect(rows[0].name).toBe('Alpha');
+    });
+  });
+
   describe("LEVEL 50: TRUNCATE TABLE", () => {
     test("50.1 TRUNCATE simple table", async () => {
       await db.exec(`CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`);

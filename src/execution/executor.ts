@@ -20,6 +20,17 @@ export class Executor {
     return key;
   }
 
+  private getTableCopy(r: any): any {
+    if (!r) return r;
+    const copy: any = {};
+    for (const k in r) {
+      if (!k.startsWith('__lpg_tbl_')) {
+        copy[k] = r[k];
+      }
+    }
+    return copy;
+  }
+
   constructor() {}
 
   private async rewriteTableData(storage: StorageEngine, tableName: string, schemaModifier: () => Promise<void>, rowModifier: (row: any) => Promise<void> | void) {
@@ -930,10 +941,11 @@ export class Executor {
           }
 
           if (stmt.from.alias)
-            source = this.mapStream(source, (r) => ({
-              ...r,
-              [stmt.from.alias]: r,
-            }));
+            source = this.mapStream(source, (r) => {
+              const newR = { ...r };
+              newR['__lpg_tbl_' + stmt.from.alias] = this.getTableCopy(r);
+              return newR;
+            });
         } else if (stmt.from.fn) {
           const fnExpr = stmt.from.fn;
           let rows: any[] = [];
@@ -982,14 +994,13 @@ export class Executor {
               });
             }
           }
-          source = (async function* () {
+          source = (async function* (_this) {
             for (const r of rows) {
-              yield {
-                ...r,
-                ...(stmt.from.alias ? { [stmt.from.alias]: r } : { t: r })
-              };
+              const newR = { ...r };
+              newR['__lpg_tbl_' + (stmt.from.alias ? stmt.from.alias : 't')] = _this.getTableCopy(r);
+              yield newR;
             }
-          })();
+          })(this);
         } else {
           await (storage as any).getTableAsync(stmt.from.tableName);
           let useIndex = false;
@@ -1025,17 +1036,18 @@ export class Executor {
                   stmt.from.tableName,
                   val,
                 );
-                source = (async function* () {
+                source = (async function* (_this) {
                   if (row) {
-                    row[stmt.from.tableName!] = row;
-                    if (stmt.from.alias) row[stmt.from.alias] = row;
+                    const tblCopy = _this.getTableCopy(row);
+                    row['__lpg_tbl_' + stmt.from.tableName!] = tblCopy;
+                    if (stmt.from.alias) row['__lpg_tbl_' + stmt.from.alias] = tblCopy;
                     if (Object.keys(outerRow).length > 0) {
                       yield { ...outerRow, ...row };
                     } else {
                       yield row;
                     }
                   }
-                })();
+                })(this);
               }
             }
           }
@@ -1047,8 +1059,9 @@ export class Executor {
           source = this.mapStream(
             storage.scanRows(fromTableName),
             (r) => {
-              r[fromTableName] = r;
-              if (fromAlias) r[fromAlias] = r;
+              const tblCopy = this.getTableCopy(r);
+              r['__lpg_tbl_' + fromTableName] = tblCopy;
+              if (fromAlias) r['__lpg_tbl_' + fromAlias] = tblCopy;
               if (hasOuterRow) {
                 return { ...outerRow, ...r };
               }
@@ -1074,10 +1087,11 @@ export class Executor {
              source = this.nestedLoopJoinStream(storage, source, join, params);
           } else {
             // In-memory Hash Join optimization
-            const rightRows = [];
+            const rightRows =[];
             for await (const r of storage.scanRows(join.tableName!)) {
-              r[join.tableName!] = r;
-              if (join.alias) r[join.alias] = r;
+              const tblCopy = this.getTableCopy(r);
+              r['__lpg_tbl_' + join.tableName!] = tblCopy;
+              if (join.alias) r['__lpg_tbl_' + join.alias] = tblCopy;
               rightRows.push(r);
             }
             source = this.hashJoinStream(storage, source, rightRows, join, params);
@@ -1246,10 +1260,11 @@ export class Executor {
 
         if (join.alias) {
           const alias = join.alias;
-          rightSource = this.mapStream(rightSource, (r) => ({
-            ...r,
-            [alias]: r,
-          }));
+          rightSource = this.mapStream(rightSource, (r) => {
+            const newR = { ...r };
+            newR['__lpg_tbl_' + alias] = this.getTableCopy(r);
+            return newR;
+          });
         }
       } else if (join.fn) {
         const fnExpr = join.fn;
@@ -1300,20 +1315,20 @@ export class Executor {
             });
           }
         }
-        rightSource = (async function* () {
+        rightSource = (async function* (_this) {
           for (const r of rows) {
-            yield {
-              ...r,
-              ...(join.alias ? { [join.alias]: r } : { t: r })
-            };
+            const newR = { ...r };
+            newR['__lpg_tbl_' + (join.alias ? join.alias : 't')] = _this.getTableCopy(r);
+            yield newR;
           }
-        })();
+        })(this);
       } else if (join.tableName) {
         rightSource = this.mapStream(
           storage.scanRows(join.tableName),
           (r) => {
-            r[join.tableName!] = r;
-            if (join.alias) r[join.alias] = r;
+            const tblCopy = this.getTableCopy(r);
+            r['__lpg_tbl_' + join.tableName!] = tblCopy;
+            if (join.alias) r['__lpg_tbl_' + join.alias] = tblCopy;
             return r;
           }
         );
@@ -1367,10 +1382,11 @@ export class Executor {
 
           if (join.alias) {
             const alias = join.alias;
-            rightSource = this.mapStream(rightSource, (r) => ({
-              ...r,
-              [alias]: r,
-            }));
+            rightSource = this.mapStream(rightSource, (r) => {
+              const newR = { ...r };
+              newR['__lpg_tbl_' + alias] = this.getTableCopy(r);
+              return newR;
+            });
           }
         } else if (join.fn) {
           const fnExpr = join.fn;
@@ -1421,20 +1437,20 @@ export class Executor {
             });
           }
         }
-          rightSource = (async function* () {
+          rightSource = (async function* (_this) {
             for (const r of rows) {
-              yield {
-                ...r,
-                ...(join.alias ? { [join.alias]: r } : { t: r })
-              };
+              const newR = { ...r };
+              newR['__lpg_tbl_' + (join.alias ? join.alias : 't')] = _this.getTableCopy(r);
+              yield newR;
             }
-          })();
+          })(this);
         } else if (join.tableName) {
           rightSource = this.mapStream(
             storage.scanRows(join.tableName),
             (r) => {
-              r[join.tableName!] = r;
-              if (join.alias) r[join.alias] = r;
+              const tblCopy = this.getTableCopy(r);
+              r['__lpg_tbl_' + join.tableName!] = tblCopy;
+              if (join.alias) r['__lpg_tbl_' + join.alias] = tblCopy;
               return r;
             }
           );
@@ -1820,7 +1836,7 @@ export class Executor {
              (col as any)._prefix = col.name.substring(0, col.name.length - 2);
           }
           const prefix = (col as any)._prefix;
-          const targetObj = row[prefix];
+          const targetObj = row['__lpg_tbl_' + prefix] || row[prefix];
           if (targetObj && typeof targetObj === 'object') {
             const keys = Object.keys(targetObj);
             for (let j = 0; j < keys.length; j++) {
@@ -2460,7 +2476,7 @@ export class Executor {
         }
 
         if ((expr as any)._isNested) {
-          const tblObj = row[(expr as any)._tbl];
+          const tblObj = row['__lpg_tbl_' + (expr as any)._tbl] || row[(expr as any)._tbl];
           if (tblObj && tblObj[(expr as any)._col] !== undefined) {
              return tblObj[(expr as any)._col];
           }
