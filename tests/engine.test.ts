@@ -3897,4 +3897,19 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows.every(r => r.first_sal === 5000)).toBe(true);
     });
   });
+
+  describe("LEVEL 66: Double Quoted String Fallback (SQLite Style)", () => {
+    test("66.1 Double quoted string falls back to string literal if column not found", async () => {
+      await db.exec(`CREATE TABLE fallback_test (id SERIAL PRIMARY KEY, provider TEXT)`);
+      await db.exec(`INSERT INTO fallback_test (provider) VALUES ('zalo_oa'), ('facebook')`);
+
+      const rows = await db.query(`SELECT * FROM fallback_test WHERE provider = "zalo_oa"`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].provider).toBe('zalo_oa');
+
+      // Also test function arguments
+      const rows2 = await db.query(`SELECT UPPER("hello") as val`);
+      expect(rows2[0].val).toBe('HELLO');
+    });
+  });
 });

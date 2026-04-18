@@ -2560,8 +2560,13 @@ export class Executor {
              return tblObj[(expr as any)._col];
           }
           if (row[expr.name] !== undefined) return row[expr.name];
+          if ((expr as any).isDoubleQuoted) return expr.name;
+          return undefined;
         }
-        return row[expr.name];
+
+        if (row[expr.name] !== undefined) return row[expr.name];
+        if ((expr as any).isDoubleQuoted) return expr.name;
+        return undefined;
       }
       case "Binary": {
         const left = await this.evaluateExpr(storage, expr.left, row, params);

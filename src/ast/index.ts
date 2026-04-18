@@ -3,11 +3,12 @@ export type TokenType = 'KEYWORD' | 'IDENTIFIER' | 'STRING' | 'NUMBER' | 'SYMBOL
 export interface Token {
   type: TokenType;
   value: string;
+  isDoubleQuoted?: boolean;
 }
 
 export type Expr =
   | { type: 'Literal'; value: string | number | boolean | null }
-  | { type: 'Identifier'; name: string }
+  | { type: 'Identifier'; name: string; isDoubleQuoted?: boolean }
   | { type: 'Parameter'; index: number }
   | { type: 'NamedParameter'; name: string }
   | { type: 'Binary'; left: Expr; operator: string; right: Expr }

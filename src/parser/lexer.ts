@@ -218,16 +218,25 @@ export class Lexer {
   private readQuotedIdentifier(): Token {
     this.pos++; // skip "
     let start = this.pos;
-    while (this.pos < this.input.length && this.input[this.pos] !== '"') {
-      this.pos++;
+    let res = "";
+    while (this.pos < this.input.length) {
+      if (this.input[this.pos] === '"') {
+        if (this.input[this.pos + 1] === '"') {
+          res += this.input.slice(start, this.pos) + '"';
+          this.pos += 2;
+          start = this.pos;
+        } else {
+          res += this.input.slice(start, this.pos);
+          this.pos++; // skip closing "
+          return { type: "IDENTIFIER", value: res, isDoubleQuoted: true };
+        }
+      } else {
+        this.pos++;
+      }
     }
-    if (this.pos >= this.input.length) {
-      // Implicitly close at EOF
-      return { type: "IDENTIFIER", value: this.input.slice(start, this.pos) };
-    }
-    const id = this.input.slice(start, this.pos);
-    this.pos++; // skip "
-    return { type: "IDENTIFIER", value: id };
+    // Implicitly close at EOF
+    res += this.input.slice(start, this.pos);
+    return { type: "IDENTIFIER", value: res, isDoubleQuoted: true };
   }
 
   private readDollarString(tag: string): Token {

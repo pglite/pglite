@@ -445,7 +445,10 @@ export class Parser {
       return { type: 'Identifier', name: '*' };
     }
     if (this.matchIdentifier()) {
-      let name = this.consume().value;
+      const token = this.consume();
+      let name = token.value;
+      let isDoubleQuoted = token.isDoubleQuoted;
+
       if (name.toUpperCase() === 'ARRAY' && this.match('SYMBOL', '[')) {
         this.consume(); // [
         const elements: Expr[] = [];
@@ -471,6 +474,7 @@ export class Parser {
 
       while (this.match('SYMBOL', '.')) {
         this.consume();
+        isDoubleQuoted = false;
         if (this.match('SYMBOL', '*')) {
           this.consume();
           name += '.*';
@@ -570,7 +574,7 @@ export class Parser {
 
         return { type: 'Call', fnName: name.toUpperCase(), args, distinct, argsOrderBy, over, filter };
       }
-      return { type: 'Identifier', name };
+      return { type: 'Identifier', name, isDoubleQuoted };
     }
     throw new Error(`Parse Error: Unexpected token ${this.current()?.value} at primary`);
   }
