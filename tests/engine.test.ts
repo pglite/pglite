@@ -3672,6 +3672,27 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 64: Fast UPDATE/DELETE by Primary Key and NOW() function", () => {
+    test("64.1 UPDATE ... SET deleted_at = NOW() WHERE id = $1 works and uses O(1) PK index", async () => {
+      await db.exec(`CREATE TABLE packages (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`);
+      await db.exec(`INSERT INTO packages (name) VALUES ('react'), ('vue'), ('svelte')`);
+      
+      const res = await db.exec(`UPDATE packages SET deleted_at = NOW() WHERE id = $1`, [2]);
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(1);
+
+      const rows = await db.query(`SELECT * FROM packages ORDER BY id`);
+      expect(rows.length).toBe(3);
+      expect(rows[1].name).toBe('vue');
+      expect(rows[1].deleted_at).toBeDefined();
+      expect(rows[1].deleted_at).not.toBeNull();
+      
+      // row 1 and 3 should not have deleted_at
+      expect(rows[0].deleted_at).toBeNull();
+      expect(rows[2].deleted_at).toBeNull();
+    });
+  });
+
   describe("LEVEL 50: TRUNCATE TABLE", () => {
     test("50.1 TRUNCATE simple table", async () => {
       await db.exec(`CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`);

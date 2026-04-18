@@ -3180,6 +3180,118 @@ export class StorageEngine {
     return updated;
   }
 
+  public async updateRowByPK(
+    name: string,
+    pkValue: any,
+    filterFn: (row: any) => Promise<boolean>,
+    updateFn: (row: any) => Promise<void>,
+  ): Promise<number> {
+    const fullName = this.getFullTableName(name);
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} not found`);
+    const pkCol = table.columns.find((c) => c.isPrimaryKey);
+    if (!pkCol) return 0;
+
+    const cacheKey = `${this.filepath}:${this.currentDbName}:${fullName}`;
+    if (!StorageEngine.pkIndexes.has(cacheKey)) {
+      await this.buildIndexes(fullName);
+    }
+    const index = StorageEngine.pkIndexes.get(cacheKey);
+    if (!index) return 0;
+
+    const loc = await index.get(pkValue);
+    if (!loc) return 0;
+
+    const pageId = loc.pageId;
+    const buf = await this.pager.readPage(pageId);
+    const page = new SlottedPage(buf);
+    const tuple = page.getTuple(loc.slotIdx);
+    if (!tuple) return 0;
+
+    const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+    const row = this.deserializeRow(table.columns, resolved);
+    if (!(await filterFn(row))) return 0;
+
+    const oldRow = { ...row };
+    
+    await updateFn(row);
+    
+    const rawData = this.serializeRow(table.columns, row);
+    const newData = await this.handleOverflow(rawData);
+    
+    const oldTupleData = Buffer.allocUnsafe(tuple.data.length);
+    tuple.data.copy(oldTupleData);
+
+    if (!page.updateTuple(loc.slotIdx, newData)) {
+      if (this.isOverflow(oldTupleData)) {
+        await this.freeOverflowPages(oldTupleData);
+      }
+      page.deleteTuple(loc.slotIdx);
+      await index.delete(oldRow[pkCol.name]);
+      await this.insertRow(name, row);
+    } else {
+      if (this.isOverflow(oldTupleData)) {
+        await this.freeOverflowPages(oldTupleData);
+      }
+      if (oldRow[pkCol.name] !== row[pkCol.name]) {
+        await index.delete(oldRow[pkCol.name]);
+        const newRoot = await index.insert(row[pkCol.name], {
+          pageId,
+          slotIdx: loc.slotIdx,
+        });
+        if (newRoot !== table.indexRootPage) {
+          table.indexRootPage = newRoot;
+          await this.updateTableSchema(fullName, table);
+        }
+      }
+    }
+
+    await this.pager.writePage(pageId, page.buf);
+    return 1;
+  }
+
+  public async deleteRowByPK(
+    name: string,
+    pkValue: any,
+    filterFn: (row: any) => Promise<boolean>
+  ): Promise<number> {
+    const fullName = this.getFullTableName(name);
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} not found`);
+    const pkCol = table.columns.find((c) => c.isPrimaryKey);
+    if (!pkCol) return 0;
+
+    const cacheKey = `${this.filepath}:${this.currentDbName}:${fullName}`;
+    if (!StorageEngine.pkIndexes.has(cacheKey)) {
+      await this.buildIndexes(fullName);
+    }
+    const index = StorageEngine.pkIndexes.get(cacheKey);
+    if (!index) return 0;
+
+    const loc = await index.get(pkValue);
+    if (!loc) return 0;
+
+    const pageId = loc.pageId;
+    const buf = await this.pager.readPage(pageId);
+    const page = new SlottedPage(buf);
+    const tuple = page.getTuple(loc.slotIdx);
+    if (!tuple) return 0;
+
+    const resolved = this.isOverflow(tuple.data) ? await this.resolveOverflow(tuple.data) : tuple.data;
+    const row = this.deserializeRow(table.columns, resolved);
+
+    if (await filterFn(row)) {
+      if (this.isOverflow(tuple.data)) {
+        await this.freeOverflowPages(tuple.data);
+      }
+      page.deleteTuple(loc.slotIdx);
+      await index.delete(pkValue);
+      await this.pager.writePage(pageId, page.buf);
+      return 1;
+    }
+    return 0;
+  }
+
   public async deleteRows(
     name: string,
     filterFn: (row: any) => Promise<boolean>,
