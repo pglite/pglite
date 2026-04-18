@@ -2615,6 +2615,7 @@ export class StorageEngine {
     restartIdentity: boolean = false,
     visited: Set<string> = new Set(),
     tablesInStmt: Set<string> = new Set(),
+    ignoreFkChecks: boolean = false,
   ) {
     const fullName = this.getFullTableName(name);
     if (visited.has(fullName)) return;
@@ -2623,23 +2624,26 @@ export class StorageEngine {
     const table = await this.getTableAsync(fullName);
     if (!table) throw new Error(`Table ${fullName} not found`);
 
-    const referencing = await this.getReferencingColumnsInternal(fullName);
-    if (cascade) {
-      for (const ref of referencing) {
-        await this.truncateTable(
-          ref.childTable,
-          true,
-          restartIdentity,
-          visited,
-          tablesInStmt,
-        );
-      }
-    } else {
-      for (const ref of referencing) {
-        if (!tablesInStmt.has(ref.childTable) && !visited.has(ref.childTable)) {
-          throw new Error(
-            `Cannot truncate table "${fullName}" because it is referenced by foreign key from table "${ref.childTable}"`,
+    if (!ignoreFkChecks) {
+      const referencing = await this.getReferencingColumnsInternal(fullName);
+      if (cascade) {
+        for (const ref of referencing) {
+          await this.truncateTable(
+            ref.childTable,
+            true,
+            restartIdentity,
+            visited,
+            tablesInStmt,
+            false
           );
+        }
+      } else {
+        for (const ref of referencing) {
+          if (!tablesInStmt.has(ref.childTable) && !visited.has(ref.childTable)) {
+            throw new Error(
+              `Cannot truncate table "${fullName}" because it is referenced by foreign key from table "${ref.childTable}"`,
+            );
+          }
         }
       }
     }

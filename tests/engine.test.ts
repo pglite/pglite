@@ -3672,6 +3672,30 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 65: ALTER COLUMN TYPE", () => {
+    test("65.1 ALTER COLUMN TYPE works even if table is referenced by a foreign key", async () => {
+      await db.exec(`CREATE TABLE _omni_contacts (id TEXT PRIMARY KEY)`);
+      await db.exec(`INSERT INTO _omni_contacts (id) VALUES ('C001')`);
+      
+      await db.exec(`CREATE TABLE user_packages_65 (id SERIAL PRIMARY KEY, contact_id INT)`);
+      await db.exec(`INSERT INTO user_packages_65 (contact_id) VALUES (10)`);
+      
+      await db.exec(`CREATE TABLE bookings_65 (id SERIAL PRIMARY KEY, package_id INT REFERENCES user_packages_65(id))`);
+      await db.exec(`INSERT INTO bookings_65 (package_id) VALUES (1)`);
+      
+      // Mặc dù user_packages_65 đang bị bookings_65 trỏ tới, nó vẫn cho phép rewrite type thành công
+      const res = await db.exec(`ALTER TABLE user_packages_65 ALTER COLUMN contact_id TYPE TEXT`);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT contact_id FROM user_packages_65`);
+      expect(rows[0].contact_id).toBe("10"); // Đã ép kiểu sang Text
+      
+      // Cũng test luôn việc móc nối thêm Constraint sau khi đã sửa kiểu dữ liệu
+      const resFK = await db.exec(`ALTER TABLE user_packages_65 ADD CONSTRAINT fk_contact FOREIGN KEY (contact_id) REFERENCES _omni_contacts(id)`);
+      expect(resFK.success).toBe(true);
+    });
+  });
+
   describe("LEVEL 64: Fast UPDATE/DELETE by Primary Key and NOW() function", () => {
     test("64.1 UPDATE ... SET deleted_at = NOW() WHERE id = $1 works and uses O(1) PK index", async () => {
       await db.exec(`CREATE TABLE packages (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`);

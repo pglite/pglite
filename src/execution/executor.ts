@@ -34,14 +34,14 @@ export class Executor {
   constructor() {}
 
   private async rewriteTableData(storage: StorageEngine, tableName: string, schemaModifier: () => Promise<void>, rowModifier: (row: any) => Promise<void> | void) {
-    const oldRows = [];
+    const oldRows =[];
     for await (const row of storage.scanRows(tableName)) {
       oldRows.push(row);
     }
     
     const visited = new Set<string>();
     const tablesInStmt = new Set<string>([storage.getFullTableName(tableName)]);
-    await storage.truncateTable(tableName, false, false, visited, tablesInStmt);
+    await storage.truncateTable(tableName, false, false, visited, tablesInStmt, true);
 
     await schemaModifier();
 
@@ -187,6 +187,10 @@ export class Executor {
           
           await this.rewriteTableData(storage, stmt.tableName, async () => {
             col.dataType = action.dataType;
+            col._isNumeric = undefined;
+            col._isBool = undefined;
+            col._isJson = undefined;
+            col._isSerial = undefined;
             await storage.updateTableSchema(stmt.tableName, table);
             await storage.updateRows('pg_catalog.pg_attribute', 
               async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
