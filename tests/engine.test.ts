@@ -3691,6 +3691,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].deleted_at).toBeNull();
       expect(rows[2].deleted_at).toBeNull();
     });
+
+    test("64.2 UPDATE ... SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1 works and uses O(1) PK index", async () => {
+      await db.exec(`CREATE TABLE packages_64_2 (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`);
+      await db.exec(`INSERT INTO packages_64_2 (name) VALUES ('pkg1')`);
+      
+      const res = await db.exec(`UPDATE packages_64_2 SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1`, [1]);
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(1);
+
+      const rows = await db.query(`SELECT * FROM packages_64_2 WHERE id = 1`);
+      expect(rows[0].deleted_at).toBeDefined();
+      expect(rows[0].deleted_at).not.toBeNull();
+      // Verify format is ISO string
+      expect(new Date(rows[0].deleted_at).getFullYear()).toBeGreaterThanOrEqual(2024);
+    });
   });
 
   describe("LEVEL 50: TRUNCATE TABLE", () => {

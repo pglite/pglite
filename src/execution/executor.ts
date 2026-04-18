@@ -2833,7 +2833,9 @@ export class Executor {
           args.push(await this.evaluateExpr(storage, argExpr, row, params));
         }
 
-        if (fnName === "NOW") return new Date().toISOString();
+        if (fnName === "NOW" || fnName === "CURRENT_TIMESTAMP" || fnName === "LOCALTIMESTAMP") return new Date().toISOString();
+        if (fnName === "CURRENT_DATE") return new Date().toISOString().split("T")[0];
+        if (fnName === "CURRENT_TIME" || fnName === "LOCALTIME") return new Date().toISOString().split("T")[1];
         if (fnName === "UPPER") return args[0] != null ? String(args[0]).toUpperCase() : null;
         if (fnName === "LOWER") return args[0] != null ? String(args[0]).toLowerCase() : null;
         if (fnName === "LENGTH") return args[0] != null ? String(args[0]).length : null;
