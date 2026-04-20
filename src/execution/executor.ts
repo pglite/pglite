@@ -433,9 +433,10 @@ export class Executor {
               let existing = null;
               if (col.isPrimaryKey) {
                 existing = await storage.getRowByPK(stmt.tableName, record[col.name]);
-              } else {
+              }
+              if (!existing) {
                 for await (const r of storage.scanRows(stmt.tableName)) {
-                  if (r[col.name] === record[col.name]) { existing = r; break; }
+                  if (r[col.name] == record[col.name]) { existing = r; break; }
                 }
               }
               if (existing) {
@@ -463,7 +464,7 @@ export class Executor {
               const updatedRows: any[] = [];
               await storage.updateRows(
                 stmt.tableName,
-                async (r) => r[pkColName] === pkVal,
+                async (r) => r[pkColName] == pkVal,
                 async (r) => {
                   const evalContext = { ...r, excluded: record };
                   for (const [col, expr] of Object.entries(stmt.onConflict!.assignments!)) {
@@ -498,12 +499,23 @@ export class Executor {
               if (refPK === col.references.column) {
                 const refRow = await storage.getRowByPK(col.references.table, record[col.name]);
                 if (refRow) exists = true;
-              } else {
+              }
+              if (!exists) {
                 for await (const r of storage.scanRows(col.references.table)) {
-                  if (r[col.references.column] === record[col.name]) { exists = true; break; }
+                  if (r[col.references.column] == record[col.name]) { exists = true; break; }
                 }
               }
-              if (!exists) throw new Error(`Foreign Key Error: insert or update on table "${stmt.tableName}" violates foreign key constraint on table "${col.references.table}"`);
+              if (!exists) {
+                const errorDetails = [
+                  `Foreign Key Violation (Insert): insert on table "${stmt.tableName}" violates foreign key constraint.`,
+                  `- Source Column: "${col.name}"`,
+                  `- Source Value: ${JSON.stringify(record[col.name])}`,
+                  `- Target Table: "${col.references.table}"`,
+                  `- Target Column: "${col.references.column}"`,
+                  `Reason: The value ${JSON.stringify(record[col.name])} was not found in the referenced column "${col.references.column}" of table "${col.references.table}".`
+                ].join('\n');
+                throw new Error(errorDetails);
+              }
             }
           }
           endBenchmarks("constraint_checks");
@@ -571,12 +583,23 @@ export class Executor {
               if (refPK === colDef.references.column) {
                 const refRow = await storage.getRowByPK(colDef.references.table, newVal);
                 if (refRow) exists = true;
-              } else {
+              }
+              if (!exists) {
                 for await (const r of storage.scanRows(colDef.references.table)) {
-                  if (r[colDef.references.column] === newVal) { exists = true; break; }
+                  if (r[colDef.references.column] == newVal) { exists = true; break; }
                 }
               }
-              if (!exists) throw new Error(`Foreign Key Error: value ${newVal} does not exist in referenced table ${colDef.references.table}`);
+              if (!exists) {
+                const errorDetails = [
+                  `Foreign Key Violation (Update): update on table "${stmt.tableName}" violates foreign key constraint.`,
+                  `- Source Column: "${colDef.name}"`,
+                  `- New Source Value: ${JSON.stringify(newVal)}`,
+                  `- Target Table: "${colDef.references.table}"`,
+                  `- Target Column: "${colDef.references.column}"`,
+                  `Reason: The updated value ${JSON.stringify(newVal)} was not found in the referenced column "${colDef.references.column}" of table "${colDef.references.table}".`
+                ].join('\n');
+                throw new Error(errorDetails);
+              }
             }
 
             // 2. Handle Referential Integrity for incoming references (Parent side)
@@ -592,21 +615,31 @@ export class Executor {
                     const childPK = await storage.getPKColumn(ref.childTable);
                     if (childPK === ref.childColumn) {
                       const r = await storage.getRowByPK(ref.childTable, oldVal);
-                      return !!r;
+                      if (r) return true;
                     }
                     for await (const r of storage.scanRows(ref.childTable)) {
-                      if (r[ref.childColumn] === oldVal) return true;
+                      if (r[ref.childColumn] == oldVal) return true;
                     }
                     return false;
                   };
 
                   if (await childrenExist()) {
                     if (action === 'RESTRICT' || action === 'NO ACTION') {
-                      throw new Error(`Foreign Key Violation: update on table "${stmt.tableName}" violates foreign key constraint on table "${ref.childTable}"`);
+                      const errorDetails = [
+                        `Foreign Key Violation (Update RESTRICT): update on table "${stmt.tableName}" violates foreign key constraint.`,
+                        `- Target Table: "${stmt.tableName}" (Parent)`,
+                        `- Target Column: "${ref.parentColumn}"`,
+                        `- Old Value: ${JSON.stringify(oldVal)}`,
+                        `- New Value: ${JSON.stringify(newVal)}`,
+                        `- Dependent Table: "${ref.childTable}" (Child)`,
+                        `- Dependent Column: "${ref.childColumn}"`,
+                        `Reason: Cannot update value from ${JSON.stringify(oldVal)} to ${JSON.stringify(newVal)} because child records exist in table "${ref.childTable}" and the ON UPDATE action is ${action}.`
+                      ].join('\n');
+                      throw new Error(errorDetails);
                     } else if (action === 'CASCADE') {
-                      await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] === oldVal, async (r) => { r[ref.childColumn] = newVal; });
+                      await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = newVal; });
                     } else if (action === 'SET NULL') {
-                      await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] === oldVal, async (r) => { r[ref.childColumn] = null; });
+                      await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = null; });
                     }
                   }
                 }
@@ -703,9 +736,10 @@ export class Executor {
                 if (childPK === ref.childColumn) {
                   const r = await storage.getRowByPK(ref.childTable, parentVal);
                   if (r) hasChildren = true;
-                } else {
+                }
+                if (!hasChildren) {
                   for await (const childRow of storage.scanRows(ref.childTable)) {
-                    if (childRow[ref.childColumn] === parentVal) {
+                    if (childRow[ref.childColumn] == parentVal) {
                       hasChildren = true;
                       break;
                     }
@@ -715,11 +749,20 @@ export class Executor {
                 if (hasChildren) {
                   const action = ref.onDelete;
                   if (action === 'RESTRICT' || action === 'NO ACTION') {
-                    throw new Error(`Foreign Key Violation: delete on table "${stmt.tableName}" violates foreign key constraint on table "${ref.childTable}"`);
+                    const errorDetails = [
+                      `Foreign Key Violation (Delete RESTRICT): delete on table "${stmt.tableName}" violates foreign key constraint.`,
+                      `- Target Table: "${stmt.tableName}" (Parent)`,
+                      `- Target Column: "${ref.parentColumn}"`,
+                      `- Deleted Value: ${JSON.stringify(parentVal)}`,
+                      `- Dependent Table: "${ref.childTable}" (Child)`,
+                      `- Dependent Column: "${ref.childColumn}"`,
+                      `Reason: Cannot delete record with value ${JSON.stringify(parentVal)} because child records depend on it in table "${ref.childTable}" and the ON DELETE action is ${action}.`
+                    ].join('\n');
+                    throw new Error(errorDetails);
                   } else if (action === 'CASCADE') {
-                    await storage.deleteRows(ref.childTable, async (r) => r[ref.childColumn] === parentVal);
+                    await storage.deleteRows(ref.childTable, async (r) => r[ref.childColumn] == parentVal);
                   } else if (action === 'SET NULL') {
-                    await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] === parentVal, async (r) => { r[ref.childColumn] = null; });
+                    await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == parentVal, async (r) => { r[ref.childColumn] = null; });
                   }
                 }
               }

@@ -1883,9 +1883,14 @@ export class StorageEngine {
 
     const referencing = await this.getReferencingColumnsInternal(fullName);
     if (referencing.length > 0 && !cascade) {
-      throw new Error(
-        `cannot drop table ${fullName} because other objects depend on it`,
-      );
+      const dependentTables = Array.from(new Set(referencing.map(r => r.childTable))).join(', ');
+      const errorDetails = [
+        `Foreign Key Violation (Drop Table): cannot drop table "${fullName}" because other objects depend on it.`,
+        `- Target Table: "${fullName}"`,
+        `- Dependent Tables: ${dependentTables}`,
+        `Reason: You must use CASCADE to drop the table and automatically drop the dependent foreign key constraints.`
+      ].join('\n');
+      throw new Error(errorDetails);
     }
 
     // Drop referencing constraints if cascade is true
@@ -2640,9 +2645,14 @@ export class StorageEngine {
       } else {
         for (const ref of referencing) {
           if (!tablesInStmt.has(ref.childTable) && !visited.has(ref.childTable)) {
-            throw new Error(
-              `Cannot truncate table "${fullName}" because it is referenced by foreign key from table "${ref.childTable}"`,
-            );
+            const errorDetails = [
+              `Foreign Key Violation (Truncate): Cannot truncate table "${fullName}".`,
+              `- Target Table: "${fullName}" (Parent)`,
+              `- Dependent Table: "${ref.childTable}" (Child)`,
+              `- Dependent Column: "${ref.childColumn}"`,
+              `Reason: The table is referenced by a foreign key constraint from table "${ref.childTable}". You must either truncate both tables simultaneously or use CASCADE.`
+            ].join('\n');
+            throw new Error(errorDetails);
           }
         }
       }

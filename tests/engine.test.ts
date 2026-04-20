@@ -3857,6 +3857,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         adapter: new NodeFSAdapter(),
         database: "DEMO",
       });
+      // remvove existing tables if they exist
+      await db.exec(`DROP TABLE IF EXISTS assignments`);
+      await db.exec(`DROP TABLE IF EXISTS teachers`);
       // 1. Create the Teachers table
       await db.exec(`
         CREATE TABLE teachers (
