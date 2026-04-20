@@ -232,23 +232,25 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("3.2.1 RIGHT JOIN", async () => {
-      await db.exec(`INSERT INTO posts (title, user_id) VALUES ('Orphan Post', 99)`);
+      await db.exec(
+        `INSERT INTO posts (title, user_id) VALUES ('Orphan Post', 99)`,
+      );
       const rows = await db.query(`
         SELECT users.name, posts.title 
         FROM users 
         RIGHT JOIN posts ON users.id = posts.user_id 
         ORDER BY posts.id
       `);
-      // posts have 4 rows total now: 
+      // posts have 4 rows total now:
       // Hello World (user 1), Bun is fast (user 1), Postgres Lite (user 2), Orphan Post (user 99)
       expect(rows.length).toBe(4);
-      const orphan = rows.find(r => r.title === 'Orphan Post');
+      const orphan = rows.find((r) => r.title === "Orphan Post");
       expect(orphan).toBeDefined();
       expect(orphan.name).toBeUndefined();
-      
-      const pglite = rows.find(r => r.title === 'Postgres Lite');
+
+      const pglite = rows.find((r) => r.title === "Postgres Lite");
       expect(pglite).toBeDefined();
-      expect(pglite.name).toBe('Bob');
+      expect(pglite.name).toBe("Bob");
     });
 
     test("3.2.2 FULL OUTER JOIN", async () => {
@@ -265,22 +267,22 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
 
       expect(rows.length).toBe(3);
-      
+
       // 1 (only in A)
       expect(rows[0].a_id).toBe(1);
-      expect(rows[0].val_a).toBe('A1');
+      expect(rows[0].val_a).toBe("A1");
       expect(rows[0].b_id).toBeUndefined();
-      
+
       // 2 (in both)
       expect(rows[1].a_id).toBe(2);
-      expect(rows[1].val_a).toBe('A2');
+      expect(rows[1].val_a).toBe("A2");
       expect(rows[1].b_id).toBe(2);
-      expect(rows[1].val_b).toBe('B2');
+      expect(rows[1].val_b).toBe("B2");
 
       // 3 (only in B)
       expect(rows[2].a_id).toBeUndefined();
       expect(rows[2].b_id).toBe(3);
-      expect(rows[2].val_b).toBe('B3');
+      expect(rows[2].val_b).toBe("B3");
     });
 
     test("3.2.2 FULL OUTER JOIN", async () => {
@@ -300,22 +302,22 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
 
       expect(rows.length).toBe(3);
-      
+
       // 1 (only in A)
       expect(rows[0].a_id).toBe(1);
-      expect(rows[0].val_a).toBe('A1');
+      expect(rows[0].val_a).toBe("A1");
       expect(rows[0].b_id).toBeUndefined();
-      
+
       // 2 (in both)
       expect(rows[1].a_id).toBe(2);
-      expect(rows[1].val_a).toBe('A2');
+      expect(rows[1].val_a).toBe("A2");
       expect(rows[1].b_id).toBe(2);
-      expect(rows[1].val_b).toBe('B2');
+      expect(rows[1].val_b).toBe("B2");
 
       // 3 (only in B)
       expect(rows[2].a_id).toBeUndefined();
       expect(rows[2].b_id).toBe(3);
-      expect(rows[2].val_b).toBe('B3');
+      expect(rows[2].val_b).toBe("B3");
     });
 
     test("3.2.3 CROSS JOIN", async () => {
@@ -332,14 +334,14 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
 
       expect(rows.length).toBe(4);
-      expect(rows[0].val_a).toBe('A1');
-      expect(rows[0].val_b).toBe('B1');
-      expect(rows[1].val_a).toBe('A1');
-      expect(rows[1].val_b).toBe('B2');
-      expect(rows[2].val_a).toBe('A2');
-      expect(rows[2].val_b).toBe('B1');
-      expect(rows[3].val_a).toBe('A2');
-      expect(rows[3].val_b).toBe('B2');
+      expect(rows[0].val_a).toBe("A1");
+      expect(rows[0].val_b).toBe("B1");
+      expect(rows[1].val_a).toBe("A1");
+      expect(rows[1].val_b).toBe("B2");
+      expect(rows[2].val_a).toBe("A2");
+      expect(rows[2].val_b).toBe("B1");
+      expect(rows[3].val_a).toBe("A2");
+      expect(rows[3].val_b).toBe("B2");
     });
 
     test("3.3 Aggregation & GROUP BY", async () => {
@@ -692,7 +694,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("5.3 UNION, INTERSECT, and EXCEPT", async () => {
       await db.exec(`CREATE TABLE set_ops_test (val INT)`);
-      await db.exec(`INSERT INTO set_ops_test (val) VALUES (1), (2), (3), (4), (5)`);
+      await db.exec(
+        `INSERT INTO set_ops_test (val) VALUES (1), (2), (3), (4), (5)`,
+      );
 
       const unionRows = await db.query(`
         SELECT val FROM set_ops_test WHERE val < 3
@@ -746,7 +750,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         SELECT val FROM set_ops_all INTERSECT ALL SELECT val FROM set_ops_all_right
       `);
       expect(intersectAll.length).toBe(2);
-      expect(intersectAll.filter(r => r.val === 1).length).toBe(2);
+      expect(intersectAll.filter((r) => r.val === 1).length).toBe(2);
 
       // 4. EXCEPT (Distinct difference) -> {2}
       // {1,1,1,2} - {1,1,3} -> remove all 1s from left that appear in right.
@@ -762,7 +766,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         SELECT val FROM set_ops_all EXCEPT ALL SELECT val FROM set_ops_all_right
       `);
       expect(exceptAll.length).toBe(2);
-      const exceptAllVals = exceptAll.map(r => r.val).sort();
+      const exceptAllVals = exceptAll.map((r) => r.val).sort();
       expect(exceptAllVals).toEqual([1, 2]);
     });
 
@@ -910,8 +914,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("5.14 Regression: Introspection query with quoted regclass cast", async () => {
-      await db.exec(`CREATE TABLE public.introspection_test (id SERIAL PRIMARY KEY)`);
-      await db.exec(`COMMENT ON TABLE public.introspection_test IS 'Introspection comment'`);
+      await db.exec(
+        `CREATE TABLE public.introspection_test (id SERIAL PRIMARY KEY)`,
+      );
+      await db.exec(
+        `COMMENT ON TABLE public.introspection_test IS 'Introspection comment'`,
+      );
 
       const sql = `
         SELECT 
@@ -923,7 +931,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'introspection_test'
       `;
-      
+
       const rows = await db.query(sql);
       expect(rows.length).toBe(1);
       expect(rows[0].schema_name).toBe("public");
@@ -1068,8 +1076,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 28: LIKE Escape and NOT LIKE with underscore", () => {
     test("28.1 NOT LIKE with escaped underscore filters correctly", async () => {
-      await db.exec(`CREATE TABLE _hidden_table (id SERIAL PRIMARY KEY, val TEXT)`);
-      await db.exec(`CREATE TABLE visible_table (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(
+        `CREATE TABLE _hidden_table (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
+      await db.exec(
+        `CREATE TABLE visible_table (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
 
       // Using escaped underscore to match literal underscore prefix
       const rows = await db.query(`
@@ -1109,7 +1121,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows.length).toBeGreaterThan(0);
       // No table starting with underscore should appear
       for (const r of rows) {
-        expect(r.table_name.startsWith('_')).toBe(false);
+        expect(r.table_name.startsWith("_")).toBe(false);
       }
     });
   });
@@ -1154,12 +1166,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           JSONB_TYPEOF('[1,2]'::json) as t2,
           JSONB_STRIP_NULLS('{"a": 1, "b": null}'::json) as strip
       `);
-      expect(rows[0].obj).toEqual({ name: 'Alice', age: 30 });
-      expect(rows[0].arr).toEqual([1, 'two', false]);
+      expect(rows[0].obj).toEqual({ name: "Alice", age: 30 });
+      expect(rows[0].arr).toEqual([1, "two", false]);
       expect(rows[0].set1).toEqual({ a: 1, b: 2 });
       expect(rows[0].set2).toEqual({ a: 10 });
-      expect(rows[0].t1).toBe('object');
-      expect(rows[0].t2).toBe('array');
+      expect(rows[0].t1).toBe("object");
+      expect(rows[0].t2).toBe("array");
       expect(rows[0].strip).toEqual({ a: 1 });
     });
 
@@ -1175,7 +1187,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           '["a", "b", "c"]'::jsonb - 'b' as del_arr_elem,
           '{"a": {"b": {"c": 1, "d": 2}}}'::jsonb #- ARRAY['a', 'b', 'c'] as del_path
       `);
-      
+
       expect(rows[0].concat_obj).toEqual({ a: 1, b: 2 });
       expect(rows[0].concat_arr).toEqual([1, 2, 3, 4]);
       expect(rows[0].del_key).toEqual({ a: 1, c: 3 });
@@ -1188,8 +1200,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("21.2.2 JSON Aggregates", async () => {
       await db.exec(`CREATE TABLE json_agg_test (id INT, val TEXT)`);
-      await db.exec(`INSERT INTO json_agg_test VALUES (1, 'A'), (1, 'B'), (2, 'C')`);
-      
+      await db.exec(
+        `INSERT INTO json_agg_test VALUES (1, 'A'), (1, 'B'), (2, 'C')`,
+      );
+
       const rows = await db.query(`
         SELECT 
           id, 
@@ -1199,14 +1213,14 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         GROUP BY id
         ORDER BY id
       `);
-      
+
       expect(rows.length).toBe(2);
       expect(rows[0].id).toBe(1);
-      expect(rows[0].vals).toEqual(['A', 'B']);
-      expect(rows[0].obj).toEqual({ 'A': 'A_suff', 'B': 'B_suff' });
+      expect(rows[0].vals).toEqual(["A", "B"]);
+      expect(rows[0].obj).toEqual({ A: "A_suff", B: "B_suff" });
       expect(rows[1].id).toBe(2);
-      expect(rows[1].vals).toEqual(['C']);
-      expect(rows[1].obj).toEqual({ 'C': 'C_suff' });
+      expect(rows[1].vals).toEqual(["C"]);
+      expect(rows[1].obj).toEqual({ C: "C_suff" });
     });
 
     test("21.3 Array Operators (&&, @>)", async () => {
@@ -1237,7 +1251,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   describe("LEVEL 13: Type Casting", () => {
     test("13.0.1 Cast DATE type strictly to YYYY-MM-DD", async () => {
       await db.exec(`CREATE TABLE date_test (id SERIAL PRIMARY KEY, d DATE)`);
-      const res = await db.exec(`INSERT INTO date_test (d) VALUES ($1)`, ["2024-12-31T20:00:00.000Z"]);
+      const res = await db.exec(`INSERT INTO date_test (d) VALUES ($1)`, [
+        "2024-12-31T20:00:00.000Z",
+      ]);
       expect(res.success).toBe(true);
 
       const rows = await db.query(`SELECT d FROM date_test`);
@@ -1245,8 +1261,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("13.0.2 Cast Postgres Array literal {...} to JS Array", async () => {
-      await db.exec(`CREATE TABLE array_test (id SERIAL PRIMARY KEY, tags TEXT[])`);
-      const res = await db.exec(`INSERT INTO array_test (tags) VALUES ($1)`, ["{\"tech\", \"news\"}"]);
+      await db.exec(
+        `CREATE TABLE array_test (id SERIAL PRIMARY KEY, tags TEXT[])`,
+      );
+      const res = await db.exec(`INSERT INTO array_test (tags) VALUES ($1)`, [
+        '{"tech", "news"}',
+      ]);
       expect(res.success).toBe(true);
 
       const rows = await db.query(`SELECT tags FROM array_test`);
@@ -1255,14 +1275,18 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("13.0 Cast string to TIME type", async () => {
-      await db.exec(`CREATE TABLE class_schedules (id SERIAL PRIMARY KEY, class_id INT, day_of_week INT, start_time TIME NOT NULL, end_time TIME)`);
+      await db.exec(
+        `CREATE TABLE class_schedules (id SERIAL PRIMARY KEY, class_id INT, day_of_week INT, start_time TIME NOT NULL, end_time TIME)`,
+      );
       const res = await db.exec(
         `insert into "class_schedules" ("class_id", "day_of_week", "start_time", "end_time") values ($1, $2, $3, $4)`,
-        [13, 2, "18:00", "19:30"]
+        [13, 2, "18:00", "19:30"],
       );
       expect(res.success).toBe(true);
 
-      const rows = await db.query(`SELECT start_time, end_time FROM class_schedules`);
+      const rows = await db.query(
+        `SELECT start_time, end_time FROM class_schedules`,
+      );
       expect(rows[0].start_time).toBe("18:00");
       expect(rows[0].end_time).toBe("19:30");
     });
@@ -1298,7 +1322,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("13.6 Cast string to regnamespace", async () => {
       const rows = await db.query("SELECT 'public'::regnamespace as oid");
       expect(rows[0].oid).toBe(2200);
-      
+
       const rows2 = await db.query("SELECT 'pg_catalog'::regnamespace as oid");
       expect(rows2[0].oid).toBe(11);
     });
@@ -1508,15 +1532,15 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
       // IT salaries: 5000 (Alice), 5000 (David), 6000 (Bob)
       expect(rows.length).toBe(3);
-      
+
       // Alice (5000)
       expect(rows[0].prev_salary).toBeNull();
       expect(rows[0].next_salary).toBe(5000);
-      
+
       // David (5000)
       expect(rows[1].prev_salary).toBe(5000);
       expect(rows[1].next_salary).toBe(6000);
-      
+
       // Bob (6000)
       expect(rows[2].prev_salary).toBe(5000);
       expect(rows[2].next_salary).toBeNull();
@@ -1552,11 +1576,11 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         ORDER BY name ASC
       `);
       // Names: Alice, Bob, Charlie, David, Eve
-      expect(rows[0].name).toBe('Alice');
-      expect(rows[0].lead_two).toBe('Charlie');
-      
-      expect(rows[3].name).toBe('David');
-      expect(rows[3].lead_two).toBe('N/A');
+      expect(rows[0].name).toBe("Alice");
+      expect(rows[0].lead_two).toBe("Charlie");
+
+      expect(rows[3].name).toBe("David");
+      expect(rows[3].lead_two).toBe("N/A");
     });
 
     test("11.5 FIRST_VALUE() and LAST_VALUE()", async () => {
@@ -1572,18 +1596,18 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
 
       // HR department: Charlie (4500), Eve (4500)
-      const hrRows = rows.filter(r => r.department === 'HR');
-      expect(hrRows[0].first_emp).toBe('Charlie');
-      expect(hrRows[0].last_emp).toBe('Eve');
-      expect(hrRows[1].first_emp).toBe('Charlie');
-      expect(hrRows[1].last_emp).toBe('Eve');
+      const hrRows = rows.filter((r) => r.department === "HR");
+      expect(hrRows[0].first_emp).toBe("Charlie");
+      expect(hrRows[0].last_emp).toBe("Eve");
+      expect(hrRows[1].first_emp).toBe("Charlie");
+      expect(hrRows[1].last_emp).toBe("Eve");
 
       // IT department: Alice (5000), David (5000), Bob (6000)
-      const itRows = rows.filter(r => r.department === 'IT');
-      expect(itRows[0].first_emp).toBe('Alice');
-      expect(itRows[0].last_emp).toBe('Bob');
-      expect(itRows[2].first_emp).toBe('Alice');
-      expect(itRows[2].last_emp).toBe('Bob');
+      const itRows = rows.filter((r) => r.department === "IT");
+      expect(itRows[0].first_emp).toBe("Alice");
+      expect(itRows[0].last_emp).toBe("Bob");
+      expect(itRows[2].first_emp).toBe("Alice");
+      expect(itRows[2].last_emp).toBe("Bob");
     });
   });
 
@@ -1643,7 +1667,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 34: Aggregate SUM, MIN, MAX and COUNT(DISTINCT)", () => {
     test("34.1 Advanced aggregations", async () => {
-      await db.exec(`CREATE TABLE orders_34 (id SERIAL PRIMARY KEY, user_id INTEGER, total_amount NUMBER, status TEXT)`);
+      await db.exec(
+        `CREATE TABLE orders_34 (id SERIAL PRIMARY KEY, user_id INTEGER, total_amount NUMBER, status TEXT)`,
+      );
       await db.exec(`INSERT INTO orders_34 (user_id, total_amount, status) VALUES 
         (1, 100, 'completed'),
         (1, 150, 'completed'),
@@ -1674,9 +1700,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("34.2 COUNT with nulls", async () => {
-      await db.exec(`CREATE TABLE null_counts (id SERIAL PRIMARY KEY, val TEXT)`);
-      await db.exec(`INSERT INTO null_counts (val) VALUES ('a'), (NULL), ('b'), ('a')`);
-      
+      await db.exec(
+        `CREATE TABLE null_counts (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
+      await db.exec(
+        `INSERT INTO null_counts (val) VALUES ('a'), (NULL), ('b'), ('a')`,
+      );
+
       const rows = await db.query(`
         SELECT 
           COUNT(*) AS total,
@@ -1732,9 +1762,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 18: Complex Introspection", () => {
     test("18.3 Advanced Table Introspection Query (DBeaver/TablePlus style)", async () => {
-      await db.exec(`CREATE TABLE public.intro_target (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'abc')`);
-      await db.exec(`COMMENT ON COLUMN public.intro_target.val IS 'Test comment'`);
-      
+      await db.exec(
+        `CREATE TABLE public.intro_target (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'abc')`,
+      );
+      await db.exec(
+        `COMMENT ON COLUMN public.intro_target.val IS 'Test comment'`,
+      );
+
       const sql = `
         SELECT 
           n.nspname AS schema_name,
@@ -1755,14 +1789,16 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           AND NOT a.attisdropped
         ORDER BY c.relname, a.attnum;
       `;
-      
+
       const rows = await db.query(sql, ["public"]);
       expect(rows.length).toBeGreaterThan(0);
-      
-      const col = rows.find(r => r.table_name === 'intro_target' && r.column_name === 'val');
+
+      const col = rows.find(
+        (r) => r.table_name === "intro_target" && r.column_name === "val",
+      );
       expect(col).toBeDefined();
-      expect(col.column_default).toContain('abc');
-      expect(col.comment).toBe('Test comment');
+      expect(col.column_default).toContain("abc");
+      expect(col.comment).toBe("Test comment");
     });
 
     test("18.1 Advanced pg_constraint join with LATERAL and FILTER", async () => {
@@ -1834,8 +1870,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("18.2 Query pg_attrdef system catalog", async () => {
-      await db.exec(`CREATE TABLE attr_test (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'hello')`);
-      
+      await db.exec(
+        `CREATE TABLE attr_test (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'hello')`,
+      );
+
       const sql = `
         SELECT adnum, adbin 
         FROM pg_attrdef 
@@ -1849,8 +1887,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("18.4 Composite Primary Key introspection via pg_constraint", async () => {
       // In this engine, marking multiple columns as PRIMARY KEY results in a composite PK
-      await db.exec(`CREATE TABLE composite_test (a INT PRIMARY KEY, b INT PRIMARY KEY)`);
-      
+      await db.exec(
+        `CREATE TABLE composite_test (a INT PRIMARY KEY, b INT PRIMARY KEY)`,
+      );
+
       const sql = `
         SELECT conname, conkey 
         FROM pg_constraint 
@@ -2022,7 +2062,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         WHERE c.relname = 'users' AND n.nspname = 'public'
       `);
       expect(rows.length).toBe(1);
-      expect(rows[0].relkind).toBe('r');
+      expect(rows[0].relkind).toBe("r");
     });
 
     test("19.2 Check pg_attribute.atttypmod and attisdropped", async () => {
@@ -2051,7 +2091,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `;
       const rows = await db.query(sql);
       expect(rows.length).toBe(1);
-      expect(rows[0].relname).toBe('posts');
+      expect(rows[0].relname).toBe("posts");
     });
   });
 
@@ -2069,7 +2109,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("20.2 pg_get_expr decodes default value expressions", async () => {
-      await db.exec(`CREATE TABLE expr_test (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'my_default_val')`);
+      await db.exec(
+        `CREATE TABLE expr_test (id SERIAL PRIMARY KEY, val TEXT DEFAULT 'my_default_val')`,
+      );
       const sql = `
         SELECT pg_get_expr(adbin, adrelid) as default_val
         FROM pg_attrdef
@@ -2082,8 +2124,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("20.3 pg_index introspection", async () => {
-      await db.exec(`CREATE TABLE idx_info_test (id SERIAL PRIMARY KEY, email TEXT UNIQUE)`);
-      
+      await db.exec(
+        `CREATE TABLE idx_info_test (id SERIAL PRIMARY KEY, email TEXT UNIQUE)`,
+      );
+
       const sql = `
         SELECT 
           idx.indisprimary, 
@@ -2096,13 +2140,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `;
       const rows = await db.query(sql);
       expect(rows.length).toBe(2);
-      
-      const pk = rows.find(r => r.indisprimary);
+
+      const pk = rows.find((r) => r.indisprimary);
       expect(pk).toBeDefined();
       expect(pk.indisunique).toBe(true);
       expect(pk.indkey).toEqual([1]);
 
-      const uniq = rows.find(r => !r.indisprimary && r.indisunique);
+      const uniq = rows.find((r) => !r.indisprimary && r.indisunique);
       expect(uniq).toBeDefined();
       expect(uniq.indkey).toEqual([2]);
     });
@@ -2138,7 +2182,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("22.2 Foreign Key Update Validation", async () => {
       await db.exec(`CREATE TABLE parent_update (id NUMBER PRIMARY KEY)`);
       await db.exec(`INSERT INTO parent_update (id) VALUES (1), (2)`);
-      await db.exec(`CREATE TABLE child_update (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_update(id))`);
+      await db.exec(
+        `CREATE TABLE child_update (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_update(id))`,
+      );
       await db.exec(`INSERT INTO child_update (p_id) VALUES (1)`);
 
       // Valid update
@@ -2154,50 +2200,58 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("22.3 ON DELETE CASCADE", async () => {
       await db.exec(`CREATE TABLE parent_cascade (id NUMBER PRIMARY KEY)`);
-      await db.exec(`CREATE TABLE child_cascade (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_cascade(id) ON DELETE CASCADE)`);
-      
+      await db.exec(
+        `CREATE TABLE child_cascade (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_cascade(id) ON DELETE CASCADE)`,
+      );
+
       await db.exec(`INSERT INTO parent_cascade (id) VALUES (10)`);
       await db.exec(`INSERT INTO child_cascade (p_id) VALUES (10), (10)`);
-      
+
       await db.exec(`DELETE FROM parent_cascade WHERE id = 10`);
-      
+
       const rows = await db.query(`SELECT * FROM child_cascade`);
       expect(rows.length).toBe(0);
     });
 
     test("22.4 ON DELETE SET NULL", async () => {
       await db.exec(`CREATE TABLE parent_setnull (id NUMBER PRIMARY KEY)`);
-      await db.exec(`CREATE TABLE child_setnull (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_setnull(id) ON DELETE SET NULL)`);
-      
+      await db.exec(
+        `CREATE TABLE child_setnull (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_setnull(id) ON DELETE SET NULL)`,
+      );
+
       await db.exec(`INSERT INTO parent_setnull (id) VALUES (20)`);
       await db.exec(`INSERT INTO child_setnull (p_id) VALUES (20)`);
-      
+
       await db.exec(`DELETE FROM parent_setnull WHERE id = 20`);
-      
+
       const rows = await db.query(`SELECT p_id FROM child_setnull`);
       expect(rows[0].p_id).toBeNull();
     });
 
     test("22.5 ON UPDATE CASCADE", async () => {
       await db.exec(`CREATE TABLE parent_upd_cascade (id NUMBER PRIMARY KEY)`);
-      await db.exec(`CREATE TABLE child_upd_cascade (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_upd_cascade(id) ON UPDATE CASCADE)`);
-      
+      await db.exec(
+        `CREATE TABLE child_upd_cascade (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_upd_cascade(id) ON UPDATE CASCADE)`,
+      );
+
       await db.exec(`INSERT INTO parent_upd_cascade (id) VALUES (30)`);
       await db.exec(`INSERT INTO child_upd_cascade (p_id) VALUES (30)`);
-      
+
       await db.exec(`UPDATE parent_upd_cascade SET id = 31 WHERE id = 30`);
-      
+
       const rows = await db.query(`SELECT p_id FROM child_upd_cascade`);
       expect(rows[0].p_id).toBe(31);
     });
 
     test("22.6 ON DELETE RESTRICT (Default)", async () => {
       await db.exec(`CREATE TABLE parent_restrict (id NUMBER PRIMARY KEY)`);
-      await db.exec(`CREATE TABLE child_restrict (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_restrict(id))`);
-      
+      await db.exec(
+        `CREATE TABLE child_restrict (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES parent_restrict(id))`,
+      );
+
       await db.exec(`INSERT INTO parent_restrict (id) VALUES (40)`);
       await db.exec(`INSERT INTO child_restrict (p_id) VALUES (40)`);
-      
+
       // Should throw error because child record exists
       expect(async () => {
         await db.exec(`DELETE FROM parent_restrict WHERE id = 40`);
@@ -2208,11 +2262,17 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   describe("LEVEL 23: Foreign Key Performance (Indexing)", () => {
     test("23.1 Validate index usage for FK checks", async () => {
       // Create a large table to simulate where scanning would be slow
-      await db.exec(`CREATE TABLE big_parent (id NUMBER PRIMARY KEY, info TEXT)`);
-      await db.exec(`CREATE TABLE big_child (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES big_parent(id))`);
+      await db.exec(
+        `CREATE TABLE big_parent (id NUMBER PRIMARY KEY, info TEXT)`,
+      );
+      await db.exec(
+        `CREATE TABLE big_child (id SERIAL PRIMARY KEY, p_id NUMBER REFERENCES big_parent(id))`,
+      );
 
       // Populate parent
-      await db.exec(`INSERT INTO big_parent (id, info) VALUES (1, 'p1'), (2, 'p2'), (3, 'p3')`);
+      await db.exec(
+        `INSERT INTO big_parent (id, info) VALUES (1, 'p1'), (2, 'p2'), (3, 'p3')`,
+      );
 
       // 1. Outgoing FK check (Insert into child) - Should pass using index
       const res = await db.exec(`INSERT INTO big_child (p_id) VALUES (2)`);
@@ -2268,9 +2328,15 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         )
       `);
 
-      await db.exec(`INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-01-01', 10000, 3000)`);
-      await db.exec(`INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-02-01', 15000, 5000)`);
-      await db.exec(`INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-03-01', 20000, 8000)`);
+      await db.exec(
+        `INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-01-01', 10000, 3000)`,
+      );
+      await db.exec(
+        `INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-02-01', 15000, 5000)`,
+      );
+      await db.exec(
+        `INSERT INTO revenue_monthly (month, revenue, expenses) VALUES ('2024-03-01', 20000, 8000)`,
+      );
 
       const rows = await db.query(`SELECT * FROM revenue_monthly ORDER BY id`);
       expect(rows.length).toBe(3);
@@ -2281,18 +2347,26 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("27.2 Generated column recalculates on UPDATE", async () => {
       await db.exec(`UPDATE revenue_monthly SET expenses = 1000 WHERE id = 1`);
-      const rows = await db.query(`SELECT profit FROM revenue_monthly WHERE id = 1`);
+      const rows = await db.query(
+        `SELECT profit FROM revenue_monthly WHERE id = 1`,
+      );
       expect(rows[0].profit).toBe(9000);
     });
 
     test("27.3 Generated column with default expenses", async () => {
-      await db.exec(`INSERT INTO revenue_monthly (month, revenue) VALUES ('2024-04-01', 25000)`);
-      const rows = await db.query(`SELECT profit FROM revenue_monthly WHERE id = 4`);
+      await db.exec(
+        `INSERT INTO revenue_monthly (month, revenue) VALUES ('2024-04-01', 25000)`,
+      );
+      const rows = await db.query(
+        `SELECT profit FROM revenue_monthly WHERE id = 4`,
+      );
       expect(rows[0].profit).toBe(25000); // revenue - 0 (default)
     });
 
     test("27.4 Query generated column with WHERE filter", async () => {
-      const rows = await db.query(`SELECT month, profit FROM revenue_monthly WHERE profit > 10000 ORDER BY profit DESC`);
+      const rows = await db.query(
+        `SELECT month, profit FROM revenue_monthly WHERE profit > 10000 ORDER BY profit DESC`,
+      );
       expect(rows.length).toBe(2);
       expect(rows[0].profit).toBe(25000);
       expect(rows[1].profit).toBe(12000);
@@ -2310,15 +2384,20 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 26: Overflow Pages (Data > 4KB)", () => {
     test("26.1 Insert and Read a row larger than 4KB", async () => {
-      await db.exec(`CREATE TABLE overflow_test (id SERIAL PRIMARY KEY, large_text TEXT)`);
-      
+      await db.exec(
+        `CREATE TABLE overflow_test (id SERIAL PRIMARY KEY, large_text TEXT)`,
+      );
+
       // Generate a string larger than 4KB (e.g., 10KB)
       let largeStr = "";
       for (let i = 0; i < 10000; i++) {
         largeStr += "A";
       }
 
-      const res = await db.exec(`INSERT INTO overflow_test (large_text) VALUES ($1)`, [largeStr]);
+      const res = await db.exec(
+        `INSERT INTO overflow_test (large_text) VALUES ($1)`,
+        [largeStr],
+      );
       expect(res.success).toBe(true);
 
       const rows = await db.query(`SELECT id, large_text FROM overflow_test`);
@@ -2329,9 +2408,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
       // Update the row to an even larger string
       let largerStr = largeStr + "B".repeat(5000); // 15KB
-      await db.exec(`UPDATE overflow_test SET large_text = $1 WHERE id = 1`, [largerStr]);
+      await db.exec(`UPDATE overflow_test SET large_text = $1 WHERE id = 1`, [
+        largerStr,
+      ]);
 
-      const updatedRows = await db.query(`SELECT large_text FROM overflow_test WHERE id = 1`);
+      const updatedRows = await db.query(
+        `SELECT large_text FROM overflow_test WHERE id = 1`,
+      );
       expect(updatedRows[0].large_text.length).toBe(15000);
       expect(updatedRows[0].large_text).toBe(largerStr);
 
@@ -2407,16 +2490,24 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("25.2 Update with quoted identifiers and string values", async () => {
-      await db.exec(`CREATE TABLE "users_update_test" ("id" TEXT PRIMARY KEY, "username" TEXT)`);
-      await db.exec(`INSERT INTO "users_update_test" ("id", "username") VALUES ('1', 'admin')`);
+      await db.exec(
+        `CREATE TABLE "users_update_test" ("id" TEXT PRIMARY KEY, "username" TEXT)`,
+      );
+      await db.exec(
+        `INSERT INTO "users_update_test" ("id", "username") VALUES ('1', 'admin')`,
+      );
 
-      const res = await db.exec(`UPDATE "users_update_test" SET "username" = 'admin123' WHERE "id" = '1'`);
+      const res = await db.exec(
+        `UPDATE "users_update_test" SET "username" = 'admin123' WHERE "id" = '1'`,
+      );
       expect(res.success).toBe(true);
       expect(res.updated).toBe(1);
 
-      const rows = await db.query(`SELECT "username" FROM "users_update_test" WHERE "id" = '1'`);
+      const rows = await db.query(
+        `SELECT "username" FROM "users_update_test" WHERE "id" = '1'`,
+      );
       expect(rows.length).toBe(1);
-      expect(rows[0].username).toBe('admin123');
+      expect(rows[0].username).toBe("admin123");
     });
   });
 
@@ -2443,10 +2534,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 30: DISTINCT and AS alias", () => {
     test("30.2 SELECT DISTINCT ON", async () => {
-      await db.exec(`CREATE TABLE distinct_on_test (id SERIAL PRIMARY KEY, group_id INT, val TEXT)`);
+      await db.exec(
+        `CREATE TABLE distinct_on_test (id SERIAL PRIMARY KEY, group_id INT, val TEXT)`,
+      );
       await db.exec(`INSERT INTO distinct_on_test (group_id, val) VALUES 
         (1, 'A'), (1, 'B'), (2, 'C'), (2, 'D')`);
-      
+
       // ORDER BY causes B to appear before A for group 1 and D before C for group 2.
       // DISTINCT ON removes duplicates based on group_id and picks the first encountered.
       const rows = await db.query(`
@@ -2456,29 +2549,33 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
       expect(rows.length).toBe(2);
       expect(rows[0].group_id).toBe(1);
-      expect(rows[0].val).toBe('B');
+      expect(rows[0].val).toBe("B");
       expect(rows[1].group_id).toBe(2);
-      expect(rows[1].val).toBe('D');
+      expect(rows[1].val).toBe("D");
     });
 
     test("30.1 SELECT DISTINCT with multiple AS aliases", async () => {
-      await db.exec(`CREATE TABLE products (id SERIAL PRIMARY KEY, category TEXT)`);
-      await db.exec(`INSERT INTO products (category) VALUES ('Electronics'), ('Clothing'), ('Electronics'), ('Home')`);
+      await db.exec(
+        `CREATE TABLE products (id SERIAL PRIMARY KEY, category TEXT)`,
+      );
+      await db.exec(
+        `INSERT INTO products (category) VALUES ('Electronics'), ('Clothing'), ('Electronics'), ('Home')`,
+      );
 
       const rows = await db.query(
         "SELECT DISTINCT category AS value, category AS label FROM products WHERE category ILIKE '%' || $1 || '%' LIMIT 1000",
-        ['e']
+        ["e"],
       );
 
       // 'Electronics', 'Home' contain 'e'
       // 'Clothing' does not
       expect(rows.length).toBe(2);
-      
-      const values = rows.map(r => r.value).sort();
-      expect(values).toEqual(['Electronics', 'Home']);
-      
-      const labels = rows.map(r => r.label).sort();
-      expect(labels).toEqual(['Electronics', 'Home']);
+
+      const values = rows.map((r) => r.value).sort();
+      expect(values).toEqual(["Electronics", "Home"]);
+
+      const labels = rows.map((r) => r.label).sort();
+      expect(labels).toEqual(["Electronics", "Home"]);
     });
   });
 
@@ -2486,7 +2583,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("32.1 Database destroys its files when destroyOnClose is true", async () => {
       const DESTROY_DB_FILE = "test_destroy.db";
       if (existsSync(DESTROY_DB_FILE)) unlinkSync(DESTROY_DB_FILE);
-      if (existsSync(DESTROY_DB_FILE + ".wal")) unlinkSync(DESTROY_DB_FILE + ".wal");
+      if (existsSync(DESTROY_DB_FILE + ".wal"))
+        unlinkSync(DESTROY_DB_FILE + ".wal");
 
       const dbDestroy = new LitePostgres(DESTROY_DB_FILE, {
         database: "testdb",
@@ -2497,7 +2595,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       // Insert some data
       await dbDestroy.exec(`CREATE TABLE test_destroy (id SERIAL PRIMARY KEY)`);
       await dbDestroy.exec(`INSERT INTO test_destroy (id) VALUES (1)`);
-      
+
       // Ensure file exists
       expect(existsSync(DESTROY_DB_FILE)).toBe(true);
 
@@ -2512,16 +2610,24 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 33: BETWEEN operator", () => {
     test("33.1 Basic BETWEEN and NOT BETWEEN", async () => {
-      await db.exec(`CREATE TABLE between_test (id SERIAL PRIMARY KEY, val NUMBER)`);
-      await db.exec(`INSERT INTO between_test (val) VALUES (10), (20), (30), (40), (50)`);
+      await db.exec(
+        `CREATE TABLE between_test (id SERIAL PRIMARY KEY, val NUMBER)`,
+      );
+      await db.exec(
+        `INSERT INTO between_test (val) VALUES (10), (20), (30), (40), (50)`,
+      );
 
-      const rows1 = await db.query(`SELECT val FROM between_test WHERE val BETWEEN 20 AND 40 ORDER BY val`);
+      const rows1 = await db.query(
+        `SELECT val FROM between_test WHERE val BETWEEN 20 AND 40 ORDER BY val`,
+      );
       expect(rows1.length).toBe(3);
       expect(rows1[0].val).toBe(20);
       expect(rows1[1].val).toBe(30);
       expect(rows1[2].val).toBe(40);
 
-      const rows2 = await db.query(`SELECT val FROM between_test WHERE val NOT BETWEEN 20 AND 40 ORDER BY val`);
+      const rows2 = await db.query(
+        `SELECT val FROM between_test WHERE val NOT BETWEEN 20 AND 40 ORDER BY val`,
+      );
       expect(rows2.length).toBe(2);
       expect(rows2[0].val).toBe(10);
       expect(rows2[1].val).toBe(50);
@@ -2530,17 +2636,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 58: Parameter Binding Validation & SUM on empty set", () => {
     test("58.1 Throw error when query has more parameters than provided", async () => {
-      await db.exec(`CREATE TABLE tx_params_test (id SERIAL PRIMARY KEY, type TEXT, amount NUMBER, created_at TIMESTAMP)`);
-      await db.exec(`INSERT INTO tx_params_test (type, amount, created_at) VALUES ('tuition_deduction', 100, '2026-04-04T18:00:00.000Z')`);
+      await db.exec(
+        `CREATE TABLE tx_params_test (id SERIAL PRIMARY KEY, type TEXT, amount NUMBER, created_at TIMESTAMP)`,
+      );
+      await db.exec(
+        `INSERT INTO tx_params_test (type, amount, created_at) VALUES ('tuition_deduction', 100, '2026-04-04T18:00:00.000Z')`,
+      );
 
       // The user provided 3 values but query has 4 parameters ($1, $2, $3, $4)
       const params = [
         "tuition_deduction",
         "2026-04-04T17:00:00.000Z",
-        "2026-04-05T17:00:00.000Z"
+        "2026-04-05T17:00:00.000Z",
       ];
       const sql = `select sum("amount") as "total" from "tx_params_test" where "type" in ($1, $2) and "created_at" >= $3 and "created_at" < $4`;
-      
+
       let error: any;
       try {
         await db.query(sql, params);
@@ -2548,14 +2658,17 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         error = err;
       }
       expect(error).toBeDefined();
-      expect(error.message).toContain("bind message supplies 3 parameters, but prepared statement requires at least 4");
+      expect(error.message).toContain(
+        "bind message supplies 3 parameters, but prepared statement requires at least 4",
+      );
     });
 
     test("58.2 IN with single array parameter unrolling", async () => {
       // If we provide 1 array param, IN ($1) should automatically unroll it to IN ('A', 'B')
-      const rows = await db.query(`select sum(amount) as total from tx_params_test where type in ($1)`, [
-        ["tuition_deduction", "other_type"]
-      ]);
+      const rows = await db.query(
+        `select sum(amount) as total from tx_params_test where type in ($1)`,
+        [["tuition_deduction", "other_type"]],
+      );
       expect(rows[0].total).toBe(100);
     });
 
@@ -2564,20 +2677,24 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const params = [
         "tuition_deduction",
         "2027-04-04T17:00:00.000Z",
-        "2027-04-05T17:00:00.000Z"
+        "2027-04-05T17:00:00.000Z",
       ];
       // Here we correctly supply 3 parameters for 3 placeholders
       const sql = `select sum("amount") as "total" from "tx_params_test" where "type" in ($1) and "created_at" >= $2 and "created_at" < $3`;
-      
+
       const rows = await db.query(sql, params);
       expect(rows[0].total).toBeNull();
     });
 
     test("58.4 SUM correctly adds numbers even if stored as strings", async () => {
-      await db.exec(`CREATE TABLE tx_str_test (id SERIAL PRIMARY KEY, amount TEXT)`);
+      await db.exec(
+        `CREATE TABLE tx_str_test (id SERIAL PRIMARY KEY, amount TEXT)`,
+      );
       await db.exec(`INSERT INTO tx_str_test (amount) VALUES ('150'), ('250')`);
-      
-      const rows = await db.query(`SELECT SUM(amount) as total FROM tx_str_test`);
+
+      const rows = await db.query(
+        `SELECT SUM(amount) as total FROM tx_str_test`,
+      );
       expect(rows[0].total).toBe(400); // Should be 400, not "0150250"
     });
   });
@@ -2597,7 +2714,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
       // Insert using Date objects as parameters
       const dateObj = new Date("2026-03-31T04:28:02.265Z");
-      await db.exec(`INSERT INTO dt_test_57 (created_at, updated_at, my_date, my_time) VALUES ($1, $2, $3, $4)`, [dateObj, dateObj, dateObj, dateObj]);
+      await db.exec(
+        `INSERT INTO dt_test_57 (created_at, updated_at, my_date, my_time) VALUES ($1, $2, $3, $4)`,
+        [dateObj, dateObj, dateObj, dateObj],
+      );
 
       const rows = await db.query(`SELECT * FROM dt_test_57 ORDER BY id ASC`);
       expect(rows.length).toBe(1);
@@ -2609,11 +2729,14 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].my_time).toBe("04:28:02.265");
 
       // Insert using string with extra quotes (simulating bad JSON stringify injection)
-      await db.exec(`INSERT INTO dt_test_57 (created_at, updated_at, my_date) VALUES ($1, $2, $3)`, [
-        '"2026-04-01T00:00:00.000Z"', 
-        '"2026-04-01T00:00:00.000Z"', 
-        '"2026-04-01"'
-      ]);
+      await db.exec(
+        `INSERT INTO dt_test_57 (created_at, updated_at, my_date) VALUES ($1, $2, $3)`,
+        [
+          '"2026-04-01T00:00:00.000Z"',
+          '"2026-04-01T00:00:00.000Z"',
+          '"2026-04-01"',
+        ],
+      );
 
       const rows2 = await db.query(`SELECT * FROM dt_test_57 WHERE id = 2`);
       expect(rows2[0].created_at).toBe("2026-04-01T00:00:00.000Z");
@@ -2636,7 +2759,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
       // Insert using Date objects as parameters
       const dateObj = new Date("2026-03-31T04:28:02.265Z");
-      await db.exec(`INSERT INTO dt_test (created_at, updated_at, my_date, my_time) VALUES ($1, $2, $3, $4)`, [dateObj, dateObj, dateObj, dateObj]);
+      await db.exec(
+        `INSERT INTO dt_test (created_at, updated_at, my_date, my_time) VALUES ($1, $2, $3, $4)`,
+        [dateObj, dateObj, dateObj, dateObj],
+      );
 
       const rows = await db.query(`SELECT * FROM dt_test`);
       expect(rows.length).toBe(1);
@@ -2648,11 +2774,14 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].my_time).toBe("04:28:02.265");
 
       // Insert using string with extra quotes (simulating bad JSON stringify injection)
-      await db.exec(`INSERT INTO dt_test (created_at, updated_at, my_date) VALUES ($1, $2, $3)`, [
-        '"2026-04-01T00:00:00.000Z"', 
-        '"2026-04-01T00:00:00.000Z"', 
-        '"2026-04-01"'
-      ]);
+      await db.exec(
+        `INSERT INTO dt_test (created_at, updated_at, my_date) VALUES ($1, $2, $3)`,
+        [
+          '"2026-04-01T00:00:00.000Z"',
+          '"2026-04-01T00:00:00.000Z"',
+          '"2026-04-01"',
+        ],
+      );
 
       const rows2 = await db.query(`SELECT * FROM dt_test WHERE id = 2`);
       expect(rows2[0].created_at).toBe("2026-04-01T00:00:00.000Z");
@@ -2665,14 +2794,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("56.1 Multiple instances sharing the same file do not lose data on page splits", async () => {
       const DB_FILE_CONCURRENT = "test_concurrent.db";
       if (existsSync(DB_FILE_CONCURRENT)) unlinkSync(DB_FILE_CONCURRENT);
-      if (existsSync(DB_FILE_CONCURRENT + ".wal")) unlinkSync(DB_FILE_CONCURRENT + ".wal");
+      if (existsSync(DB_FILE_CONCURRENT + ".wal"))
+        unlinkSync(DB_FILE_CONCURRENT + ".wal");
 
       // Giả lập 2 connections (như cơ chế connection pooling)
-      const conn1 = new LitePostgres(DB_FILE_CONCURRENT, { adapter: new NodeFSAdapter() });
-      const conn2 = new LitePostgres(DB_FILE_CONCURRENT, { adapter: new NodeFSAdapter() });
+      const conn1 = new LitePostgres(DB_FILE_CONCURRENT, {
+        adapter: new NodeFSAdapter(),
+      });
+      const conn2 = new LitePostgres(DB_FILE_CONCURRENT, {
+        adapter: new NodeFSAdapter(),
+      });
 
       // 1. Tạo table
-      await conn1.exec(`CREATE TABLE concurrent_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await conn1.exec(
+        `CREATE TABLE concurrent_test (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
 
       // 2. Ép cả 2 connection load bảng vào cache (khiến chúng nhớ lastPage hiện tại)
       await conn1.query(`SELECT * FROM concurrent_test`);
@@ -2680,15 +2816,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
       // 3. conn1 insert dữ liệu LỚN (> 4KB) để ép file cấp phát page mới, thay đổi lastPage
       const largeString1 = "A".repeat(5000);
-      await conn1.exec(`INSERT INTO concurrent_test (val) VALUES ($1)`, [largeString1]);
+      await conn1.exec(`INSERT INTO concurrent_test (val) VALUES ($1)`, [
+        largeString1,
+      ]);
 
-      // 4. conn2 insert dữ liệu. Nếu cache không được share (không dùng static), 
+      // 4. conn2 insert dữ liệu. Nếu cache không được share (không dùng static),
       // conn2 sẽ trỏ vào lastPage cũ, làm đứt gãy liên kết (linked-list) của page và mất dữ liệu của conn1.
       const largeString2 = "B".repeat(5000);
-      await conn2.exec(`INSERT INTO concurrent_test (val) VALUES ($1)`, [largeString2]);
+      await conn2.exec(`INSERT INTO concurrent_test (val) VALUES ($1)`, [
+        largeString2,
+      ]);
 
       // 5. Query để kiểm tra tính toàn vẹn của dữ liệu
-      const rows = await conn1.query(`SELECT id, SUBSTRING(val, 1, 1) as prefix FROM concurrent_test ORDER BY id`);
+      const rows = await conn1.query(
+        `SELECT id, SUBSTRING(val, 1, 1) as prefix FROM concurrent_test ORDER BY id`,
+      );
 
       // Phải tồn tại ĐẦY ĐỦ 2 rows, không có cái nào bị ghi đè hay biến mất
       expect(rows.length).toBe(2);
@@ -2698,18 +2840,27 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       await conn1.close();
       await conn2.close();
       if (existsSync(DB_FILE_CONCURRENT)) unlinkSync(DB_FILE_CONCURRENT);
-      if (existsSync(DB_FILE_CONCURRENT + ".wal")) unlinkSync(DB_FILE_CONCURRENT + ".wal");
+      if (existsSync(DB_FILE_CONCURRENT + ".wal"))
+        unlinkSync(DB_FILE_CONCURRENT + ".wal");
     });
   });
 
   describe("LEVEL 55: Specific Syntax Compatibility", () => {
     test("55.1 Table alias wildcard and named parameters", async () => {
-      await db.exec(`CREATE TABLE students (id SERIAL PRIMARY KEY, full_name TEXT, student_code TEXT, deleted_at TIMESTAMP)`);
-      await db.exec(`CREATE TABLE enrollments (id SERIAL PRIMARY KEY, student_id INT, class_id INT, deleted_at TIMESTAMP)`);
-      
-      await db.exec(`INSERT INTO students (full_name, student_code) VALUES ('Nguyen Van A', 'SV001'), ('Le Thi B', 'SV002')`);
-      await db.exec(`INSERT INTO enrollments (student_id, class_id) VALUES (1, 101)`);
-      
+      await db.exec(
+        `CREATE TABLE students (id SERIAL PRIMARY KEY, full_name TEXT, student_code TEXT, deleted_at TIMESTAMP)`,
+      );
+      await db.exec(
+        `CREATE TABLE enrollments (id SERIAL PRIMARY KEY, student_id INT, class_id INT, deleted_at TIMESTAMP)`,
+      );
+
+      await db.exec(
+        `INSERT INTO students (full_name, student_code) VALUES ('Nguyen Van A', 'SV001'), ('Le Thi B', 'SV002')`,
+      );
+      await db.exec(
+        `INSERT INTO enrollments (student_id, class_id) VALUES (1, 101)`,
+      );
+
       const sql = `
         SELECT 
             s.*,
@@ -2725,16 +2876,16 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         AND (s.full_name ILIKE :search OR s.student_code ILIKE :search);
       `;
 
-      const rows = await db.query(sql, { classId: 101, search: '%Nguyen%' });
-      
+      const rows = await db.query(sql, { classId: 101, search: "%Nguyen%" });
+
       expect(rows.length).toBe(1);
-      expect(rows[0].full_name).toBe('Nguyen Van A');
-      expect(rows[0].student_code).toBe('SV001');
+      expect(rows[0].full_name).toBe("Nguyen Van A");
+      expect(rows[0].student_code).toBe("SV001");
       expect(rows[0].is_enrolled).toBe(true);
 
-      const rows2 = await db.query(sql, { classId: 102, search: '%Le Thi%' });
+      const rows2 = await db.query(sql, { classId: 102, search: "%Le Thi%" });
       expect(rows2.length).toBe(1);
-      expect(rows2[0].full_name).toBe('Le Thi B');
+      expect(rows2[0].full_name).toBe("Le Thi B");
       expect(rows2[0].is_enrolled).toBe(false);
     });
   });
@@ -2742,8 +2893,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   describe("LEVEL 54: DROP ... CASCADE and RESTRICT", () => {
     test("54.1 DROP TABLE CASCADE drops table and referencing foreign keys", async () => {
       await db.exec(`CREATE TABLE parent_cascade_drop (id SERIAL PRIMARY KEY)`);
-      await db.exec(`CREATE TABLE child_cascade_drop (id SERIAL PRIMARY KEY, p_id INT REFERENCES parent_cascade_drop(id))`);
-      
+      await db.exec(
+        `CREATE TABLE child_cascade_drop (id SERIAL PRIMARY KEY, p_id INT REFERENCES parent_cascade_drop(id))`,
+      );
+
       // Attempting to drop parent without CASCADE should throw
       expect(async () => {
         await db.exec(`DROP TABLE parent_cascade_drop`);
@@ -2765,7 +2918,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("54.2 DROP INDEX CASCADE", async () => {
-      await db.exec(`CREATE TABLE index_drop_cascade (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(
+        `CREATE TABLE index_drop_cascade (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
       await db.exec(`CREATE INDEX idx_val ON index_drop_cascade(val)`);
       const res = await db.exec(`DROP INDEX idx_val CASCADE`);
       expect(res.success).toBe(true);
@@ -2785,11 +2940,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("54.4 Multiple tables drop", async () => {
       await db.exec(`CREATE TABLE multi_drop1 (id INT)`);
       await db.exec(`CREATE TABLE multi_drop2 (id INT)`);
-      
+
       const res = await db.exec(`DROP TABLE multi_drop1, multi_drop2 CASCADE`);
       expect(res.success).toBe(true);
-      
-      const rows = await db.query(`SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'multi_drop%'`);
+
+      const rows = await db.query(
+        `SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'multi_drop%'`,
+      );
       expect(rows.length).toBe(0);
     });
   });
@@ -2799,7 +2956,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       // 1. Create referenced table
       await db.exec(`CREATE TABLE users_53 (id SERIAL PRIMARY KEY)`);
       // 2. Create referencing table
-      await db.exec(`CREATE TABLE classes_53 (id SERIAL PRIMARY KEY, teacher_id INT REFERENCES users_53(id))`);
+      await db.exec(
+        `CREATE TABLE classes_53 (id SERIAL PRIMARY KEY, teacher_id INT REFERENCES users_53(id))`,
+      );
 
       // 3. Verify foreign key exists
       const beforeRows = await db.query(`
@@ -2837,8 +2996,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 52: DROP CONSTRAINT and DROP INDEX", () => {
     test("52.1 ALTER TABLE DROP CONSTRAINT and DROP INDEX", async () => {
-      await db.exec(`CREATE TABLE classes (id SERIAL PRIMARY KEY, teacher_id INT UNIQUE)`);
-      await db.exec(`CREATE UNIQUE INDEX idx_classes_teacher_id_unique ON classes(teacher_id)`);
+      await db.exec(
+        `CREATE TABLE classes (id SERIAL PRIMARY KEY, teacher_id INT UNIQUE)`,
+      );
+      await db.exec(
+        `CREATE UNIQUE INDEX idx_classes_teacher_id_unique ON classes(teacher_id)`,
+      );
 
       const sql = `
         DO $ 
@@ -2855,14 +3018,20 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const res = await db.exec(sql);
       expect(res.success).toBe(true);
 
-      const res2 = await db.exec(`DROP INDEX IF EXISTS idx_classes_teacher_id_unique`);
+      const res2 = await db.exec(
+        `DROP INDEX IF EXISTS idx_classes_teacher_id_unique`,
+      );
       expect(res2.success).toBe(true);
 
       // Actually execute the ALTER TABLE directly to test its logic
-      const res3 = await db.exec(`ALTER TABLE classes DROP CONSTRAINT IF EXISTS classes_teacher_id_key`);
+      const res3 = await db.exec(
+        `ALTER TABLE classes DROP CONSTRAINT IF EXISTS classes_teacher_id_key`,
+      );
       expect(res3.success).toBe(true);
 
-      const rows = await db.query(`SELECT indisunique FROM pg_index WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_classes_teacher_id_unique')`);
+      const rows = await db.query(
+        `SELECT indisunique FROM pg_index WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_classes_teacher_id_unique')`,
+      );
       expect(rows.length).toBe(0);
     });
   });
@@ -2911,19 +3080,22 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
-
   describe("LEVEL 36: CREATE TABLE IF NOT EXISTS in Transaction", () => {
     test("36.1 Create table if not exists in a transaction", async () => {
       // Create first table successfully
       await db.transaction(async (tx) => {
-        await tx.query(`CREATE TABLE IF NOT EXISTS tx_test_a (id SERIAL PRIMARY KEY, val TEXT)`);
+        await tx.query(
+          `CREATE TABLE IF NOT EXISTS tx_test_a (id SERIAL PRIMARY KEY, val TEXT)`,
+        );
         await tx.query(`INSERT INTO tx_test_a (val) VALUES ('A')`);
       });
 
       // Failed transaction
       try {
         await db.transaction(async (tx) => {
-          await tx.query(`CREATE TABLE IF NOT EXISTS tx_test_fail (id SERIAL PRIMARY KEY, val TEXT)`);
+          await tx.query(
+            `CREATE TABLE IF NOT EXISTS tx_test_fail (id SERIAL PRIMARY KEY, val TEXT)`,
+          );
           await tx.query(`INSERT INTO tx_test_fail (val) VALUES ('B')`);
           throw new Error("Simulate error");
         });
@@ -2931,8 +3103,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
       // Try creating table again in new transaction
       await db.transaction(async (tx) => {
-        await tx.exec(`CREATE TABLE IF NOT EXISTS tx_test_b (id SERIAL PRIMARY KEY, val TEXT)`);
-        await tx.exec(`CREATE TABLE IF NOT EXISTS tx_test_b (id SERIAL PRIMARY KEY, val TEXT)`);
+        await tx.exec(
+          `CREATE TABLE IF NOT EXISTS tx_test_b (id SERIAL PRIMARY KEY, val TEXT)`,
+        );
+        await tx.exec(
+          `CREATE TABLE IF NOT EXISTS tx_test_b (id SERIAL PRIMARY KEY, val TEXT)`,
+        );
         await tx.exec(`INSERT INTO tx_test_b (val) VALUES ('C')`);
       });
 
@@ -2945,19 +3121,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
       const rowsB = await db.query(`SELECT * FROM tx_test_b`);
       expect(rowsB.length).toBe(1);
-      expect(rowsB[0].val).toBe('C');
+      expect(rowsB[0].val).toBe("C");
     });
   });
 
   describe("LEVEL 35: Transaction Callback", () => {
     test("35.1 Successful transaction", async () => {
-      await db.exec(`CREATE TABLE tx_cb_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(
+        `CREATE TABLE tx_cb_test (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
       const res = await db.transaction(async (tx) => {
         await tx.exec(`INSERT INTO tx_cb_test (val) VALUES ('A')`);
         await tx.exec(`INSERT INTO tx_cb_test (val) VALUES ('B')`);
-        return 'success';
+        return "success";
       });
-      expect(res).toBe('success');
+      expect(res).toBe("success");
       const rows = await db.query(`SELECT * FROM tx_cb_test`);
       expect(rows.length).toBe(2);
     });
@@ -2989,28 +3167,32 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("38.1 Insert using SELECT without column names specified", async () => {
       await db.exec(`CREATE TABLE src_table (id SERIAL PRIMARY KEY, val TEXT)`);
       await db.exec(`INSERT INTO src_table (val) VALUES ('A'), ('B'), ('C')`);
-      
-      await db.exec(`CREATE TABLE dest_table (id SERIAL PRIMARY KEY, val TEXT)`);
+
+      await db.exec(
+        `CREATE TABLE dest_table (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
       // Insert all rows from src_table into dest_table
       await db.exec(`INSERT INTO dest_table SELECT * FROM src_table`);
-      
+
       const rows = await db.query(`SELECT * FROM dest_table ORDER BY id`);
       expect(rows.length).toBe(3);
-      expect(rows[0].val).toBe('A');
-      expect(rows[2].val).toBe('C');
+      expect(rows[0].val).toBe("A");
+      expect(rows[2].val).toBe("C");
     });
 
     test("38.2 Insert using SELECT with column names specified", async () => {
-      await db.exec(`CREATE TABLE dest_table2 (id SERIAL PRIMARY KEY, title TEXT, score NUMBER)`);
-      
+      await db.exec(
+        `CREATE TABLE dest_table2 (id SERIAL PRIMARY KEY, title TEXT, score NUMBER)`,
+      );
+
       await db.exec(`
         INSERT INTO dest_table2 (title, score)
         SELECT val, id * 10 FROM src_table
       `);
-      
+
       const rows = await db.query(`SELECT * FROM dest_table2 ORDER BY id`);
       expect(rows.length).toBe(3);
-      expect(rows[0].title).toBe('A');
+      expect(rows[0].title).toBe("A");
       expect(rows[0].score).toBe(10);
       expect(rows[2].score).toBe(30);
     });
@@ -3018,12 +3200,18 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 39: CREATE INDEX", () => {
     test("39.1 Create basic index", async () => {
-      await db.exec(`CREATE TABLE users_idx_test (id SERIAL PRIMARY KEY, email TEXT)`);
-      const res = await db.exec(`CREATE INDEX idx_users_email ON users_idx_test(email)`);
+      await db.exec(
+        `CREATE TABLE users_idx_test (id SERIAL PRIMARY KEY, email TEXT)`,
+      );
+      const res = await db.exec(
+        `CREATE INDEX idx_users_email ON users_idx_test(email)`,
+      );
       expect(res.success).toBe(true);
       expect(res.message).toContain("idx_users_email");
 
-      const res2 = await db.exec(`CREATE INDEX IF NOT EXISTS idx_users_email ON users_idx_test(email)`);
+      const res2 = await db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_users_email ON users_idx_test(email)`,
+      );
       expect(res2.success).toBe(true);
 
       const rows = await db.query(`
@@ -3033,9 +3221,11 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("39.2 Create unique index with USING btree and ASC/DESC", async () => {
-      const res = await db.exec(`CREATE UNIQUE INDEX idx_users_email_uniq ON users_idx_test USING btree (email DESC NULLS LAST)`);
+      const res = await db.exec(
+        `CREATE UNIQUE INDEX idx_users_email_uniq ON users_idx_test USING btree (email DESC NULLS LAST)`,
+      );
       expect(res.success).toBe(true);
-      
+
       const rows = await db.query(`
         SELECT indisunique FROM pg_index 
         WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_users_email_uniq')
@@ -3045,9 +3235,11 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("39.3 Column named index still works", async () => {
-      const res = await db.exec(`CREATE TABLE index_col_test (id SERIAL, index INT)`);
+      const res = await db.exec(
+        `CREATE TABLE index_col_test (id SERIAL, index INT)`,
+      );
       expect(res.success).toBe(true);
-      
+
       await db.exec(`INSERT INTO index_col_test (index) VALUES (42)`);
       const rows = await db.query(`SELECT index FROM index_col_test`);
       expect(rows[0].index).toBe(42);
@@ -3064,7 +3256,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       `);
-      const res = await db.exec(`CREATE INDEX idx_password_reset_tokens_token ON password_reset_tokens(token)`);
+      const res = await db.exec(
+        `CREATE INDEX idx_password_reset_tokens_token ON password_reset_tokens(token)`,
+      );
       expect(res.success).toBe(true);
     });
 
@@ -3083,34 +3277,48 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
             "deleted_at" TIMESTAMP WITHOUT TIME ZONE
         );
       `);
-      const res1 = await db.exec(`CREATE INDEX "idx_notifications_user_id" ON "notifications_39"("user_id");`);
+      const res1 = await db.exec(
+        `CREATE INDEX "idx_notifications_user_id" ON "notifications_39"("user_id");`,
+      );
       expect(res1.success).toBe(true);
-      const res2 = await db.exec(`CREATE INDEX "idx_notifications_type" ON "notifications_39"("type");`);
+      const res2 = await db.exec(
+        `CREATE INDEX "idx_notifications_type" ON "notifications_39"("type");`,
+      );
       expect(res2.success).toBe(true);
     });
   });
 
   describe("LEVEL 41: Foreign Key with Parameter Type Coercion", () => {
     test("41.1 Insert into child table with string param when FK is integer", async () => {
-      await db.exec(`CREATE TABLE parent_fk_coerce (id SERIAL PRIMARY KEY, name TEXT)`);
-      await db.exec(`CREATE TABLE child_fk_coerce (id SERIAL PRIMARY KEY, parent_id INTEGER REFERENCES parent_fk_coerce(id))`);
+      await db.exec(
+        `CREATE TABLE parent_fk_coerce (id SERIAL PRIMARY KEY, name TEXT)`,
+      );
+      await db.exec(
+        `CREATE TABLE child_fk_coerce (id SERIAL PRIMARY KEY, parent_id INTEGER REFERENCES parent_fk_coerce(id))`,
+      );
 
       await db.exec(`INSERT INTO parent_fk_coerce (name) VALUES ('Parent 1')`);
-      
+
       // Should correctly coerce '1' to 1 for the foreign key check and insertion
-      const res = await db.exec(`INSERT INTO child_fk_coerce (parent_id) VALUES ($1)`, ['1']);
+      const res = await db.exec(
+        `INSERT INTO child_fk_coerce (parent_id) VALUES ($1)`,
+        ["1"],
+      );
       expect(res.success).toBe(true);
 
       const rows = await db.query(`SELECT * FROM child_fk_coerce`);
       expect(rows.length).toBe(1);
       expect(rows[0].parent_id).toBe(1); // Should be number, not string
     });
-    
+
     test("41.2 Update child table with string param when FK is integer", async () => {
       await db.exec(`INSERT INTO parent_fk_coerce (name) VALUES ('Parent 2')`);
-      
+
       // Update with string parameter
-      const res = await db.exec(`UPDATE child_fk_coerce SET parent_id = $1 WHERE id = 1`, ['2']);
+      const res = await db.exec(
+        `UPDATE child_fk_coerce SET parent_id = $1 WHERE id = 1`,
+        ["2"],
+      );
       expect(res.updated).toBe(1);
 
       const rows = await db.query(`SELECT * FROM child_fk_coerce`);
@@ -3118,9 +3326,12 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("41.3 Index lookup pushdown with string param for integer PK", async () => {
-      const rows = await db.query(`SELECT name FROM parent_fk_coerce WHERE id = $1`, ['2']);
+      const rows = await db.query(
+        `SELECT name FROM parent_fk_coerce WHERE id = $1`,
+        ["2"],
+      );
       expect(rows.length).toBe(1);
-      expect(rows[0].name).toBe('Parent 2');
+      expect(rows[0].name).toBe("Parent 2");
     });
   });
 
@@ -3132,7 +3343,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           let cols = [];
           for (let i = 0; i < 100; i++) cols.push(`col_${i} TEXT`);
           await tx.exec(`CREATE TABLE wide_table_fail (${cols.join(", ")})`);
-          
+
           // Throw to trigger rollback
           throw new Error("Force rollback");
         });
@@ -3141,7 +3352,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       // Now create a normal table in a new transaction
       // Without the fix, this would fail during CREATE INDEX because 'token' would be written to an orphaned page
       await db.transaction(async (tx) => {
-        await tx.exec(`CREATE TABLE safe_table (id SERIAL PRIMARY KEY, token TEXT)`);
+        await tx.exec(
+          `CREATE TABLE safe_table (id SERIAL PRIMARY KEY, token TEXT)`,
+        );
         await tx.exec(`CREATE INDEX idx_safe_table_token ON safe_table(token)`);
       });
 
@@ -3155,7 +3368,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         WHERE table_name = 'safe_table'
       `);
       expect(tableInfo.length).toBe(2);
-      expect(tableInfo.map((r: any) => r.column_name)).toContain('token');
+      expect(tableInfo.map((r: any) => r.column_name)).toContain("token");
     });
   });
 
@@ -3165,18 +3378,23 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       if (existsSync(customDbFile)) unlinkSync(customDbFile);
       if (existsSync(customDbFile + ".wal")) unlinkSync(customDbFile + ".wal");
 
-      const pg = new LitePostgres(customDbFile, { adapter: new NodeFSAdapter() });
+      const pg = new LitePostgres(customDbFile, {
+        adapter: new NodeFSAdapter(),
+      });
 
       // Create a table in database "db1" by omitting params array
-      await pg.exec(`CREATE TABLE custom_test (id SERIAL PRIMARY KEY, val TEXT)`, "db1");
-      
+      await pg.exec(
+        `CREATE TABLE custom_test (id SERIAL PRIMARY KEY, val TEXT)`,
+        "db1",
+      );
+
       // Insert using the omitted params overload
       await pg.exec(`INSERT INTO custom_test (val) VALUES ('Hello')`, "db1");
 
       // Select using omitted params
       const rows = await pg.query(`SELECT * FROM custom_test`, "db1");
       expect(rows.length).toBe(1);
-      expect(rows[0].val).toBe('Hello');
+      expect(rows[0].val).toBe("Hello");
 
       // Attempt to read from default database ('postgres'), should fail because table isn't there
       expect(async () => {
@@ -3188,9 +3406,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         await tx.exec(`INSERT INTO custom_test (val) VALUES ('World')`);
       }, "db1");
 
-      const txRows = await pg.query(`SELECT * FROM custom_test`,[], "db1");
+      const txRows = await pg.query(`SELECT * FROM custom_test`, [], "db1");
       expect(txRows.length).toBe(2);
-      expect(txRows[1].val).toBe('World');
+      expect(txRows[1].val).toBe("World");
 
       // Test transaction cross-database failure
       expect(async () => {
@@ -3209,7 +3427,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("42.1 Basic cross join with comma syntax", async () => {
       await db.exec(`CREATE TABLE colors (id SERIAL PRIMARY KEY, name TEXT)`);
       await db.exec(`CREATE TABLE sizes (id SERIAL PRIMARY KEY, name TEXT)`);
-      
+
       await db.exec(`INSERT INTO colors (name) VALUES ('Red'), ('Blue')`);
       await db.exec(`INSERT INTO sizes (name) VALUES ('S'), ('M'), ('L')`);
 
@@ -3220,8 +3438,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
 
       expect(rows.length).toBe(6);
-      expect(rows[0].color).toBe('Blue');
-      expect(rows[0].size).toBe('L');
+      expect(rows[0].color).toBe("Blue");
+      expect(rows[0].size).toBe("L");
     });
 
     test("42.2 Comma FROM with WHERE clause (Implicit INNER JOIN)", async () => {
@@ -3232,8 +3450,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
 
       expect(rows.length).toBe(1);
-      expect(rows[0].color).toBe('Red');
-      expect(rows[0].size).toBe('M');
+      expect(rows[0].color).toBe("Red");
+      expect(rows[0].size).toBe("M");
     });
 
     test("42.3 Triple cross join", async () => {
@@ -3247,16 +3465,20 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 43: String Functions", () => {
     test("43.1 LOWER() and LENGTH()", async () => {
-      const rows = await db.query("SELECT LOWER('HeLLo') as l, LENGTH('world') as len, LENGTH(NULL) as ln");
-      expect(rows[0].l).toBe('hello');
+      const rows = await db.query(
+        "SELECT LOWER('HeLLo') as l, LENGTH('world') as len, LENGTH(NULL) as ln",
+      );
+      expect(rows[0].l).toBe("hello");
       expect(rows[0].len).toBe(5);
       expect(rows[0].ln).toBeNull();
     });
 
     test("43.2 TRIM() and REPLACE()", async () => {
-      const rows = await db.query("SELECT TRIM('  spaces  ') as t, REPLACE('banana', 'a', 'o') as r");
-      expect(rows[0].t).toBe('spaces');
-      expect(rows[0].r).toBe('bonono');
+      const rows = await db.query(
+        "SELECT TRIM('  spaces  ') as t, REPLACE('banana', 'a', 'o') as r",
+      );
+      expect(rows[0].t).toBe("spaces");
+      expect(rows[0].r).toBe("bonono");
     });
 
     test("43.3 SUBSTRING()", async () => {
@@ -3266,8 +3488,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           SUBSTRING('alphabet', 3) as s2,
           SUBSTRING(NULL, 1) as s3
       `);
-      expect(rows[0].s1).toBe('ph');
-      expect(rows[0].s2).toBe('phabet');
+      expect(rows[0].s1).toBe("ph");
+      expect(rows[0].s2).toBe("phabet");
       expect(rows[0].s3).toBeNull();
     });
 
@@ -3278,8 +3500,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           CONCAT_WS(',', 'a', NULL, 'b', 'c') as list,
           CONCAT_WS(NULL, 'a', 'b') as n
       `);
-      expect(rows[0].date).toBe('2024-05-20');
-      expect(rows[0].list).toBe('a,b,c');
+      expect(rows[0].date).toBe("2024-05-20");
+      expect(rows[0].list).toBe("a,b,c");
       expect(rows[0].n).toBeNull();
     });
   });
@@ -3292,9 +3514,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           LTRIM('   left') as l,
           RTRIM('right   ') as r
       `);
-      expect(rows[0].c).toBe('PostgresLite');
-      expect(rows[0].l).toBe('left');
-      expect(rows[0].r).toBe('right');
+      expect(rows[0].c).toBe("PostgresLite");
+      expect(rows[0].l).toBe("left");
+      expect(rows[0].r).toBe("right");
     });
 
     test("44.2 LEFT and RIGHT", async () => {
@@ -3305,10 +3527,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           RIGHT('abcde', 2) as r1,
           RIGHT('abcde', -2) as r2
       `);
-      expect(rows[0].l1).toBe('ab');
-      expect(rows[0].l2).toBe('abc');
-      expect(rows[0].r1).toBe('de');
-      expect(rows[0].r2).toBe('cde');
+      expect(rows[0].l1).toBe("ab");
+      expect(rows[0].l2).toBe("abc");
+      expect(rows[0].r1).toBe("de");
+      expect(rows[0].r2).toBe("cde");
     });
 
     test("44.3 LPAD and RPAD", async () => {
@@ -3318,9 +3540,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           RPAD('hi', 5, 'y') as r1,
           LPAD('longstring', 4) as l2
       `);
-      expect(rows[0].l1).toBe('xxxhi');
-      expect(rows[0].r1).toBe('hiyyy');
-      expect(rows[0].l2).toBe('long');
+      expect(rows[0].l1).toBe("xxxhi");
+      expect(rows[0].r1).toBe("hiyyy");
+      expect(rows[0].l2).toBe("long");
     });
 
     test("44.4 INITCAP and REVERSE", async () => {
@@ -3329,8 +3551,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           INITCAP('hELLO wORLD') as i,
           REVERSE('desserts') as r
       `);
-      expect(rows[0].i).toBe('Hello World');
-      expect(rows[0].r).toBe('stressed');
+      expect(rows[0].i).toBe("Hello World");
+      expect(rows[0].r).toBe("stressed");
     });
 
     test("44.5 STRPOS, REPEAT, SPLIT_PART", async () => {
@@ -3341,8 +3563,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
           SPLIT_PART('a,b,c', ',', 2) as sp
       `);
       expect(rows[0].s).toBe(2);
-      expect(rows[0].r).toBe('aaa');
-      expect(rows[0].sp).toBe('b');
+      expect(rows[0].r).toBe("aaa");
+      expect(rows[0].sp).toBe("b");
     });
   });
 
@@ -3431,14 +3653,16 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
   describe("LEVEL 46: Advanced Date Functions", () => {
     test("46.1 EXTRACT() function", async () => {
-      const sql = "SELECT EXTRACT(YEAR FROM '2024-05-20'::timestamp) as yr, EXTRACT(MONTH FROM '2024-05-20'::timestamp) as mon";
+      const sql =
+        "SELECT EXTRACT(YEAR FROM '2024-05-20'::timestamp) as yr, EXTRACT(MONTH FROM '2024-05-20'::timestamp) as mon";
       const rows = await db.query(sql);
       expect(rows[0].yr).toBe(2024);
       expect(rows[0].mon).toBe(5);
     });
 
     test("46.2 AGE() function", async () => {
-      const sql = "SELECT AGE('2024-05-20'::timestamp, '2023-01-01'::timestamp) as age_val";
+      const sql =
+        "SELECT AGE('2024-05-20'::timestamp, '2023-01-01'::timestamp) as age_val";
       const rows = await db.query(sql);
       expect(rows[0].age_val).toContain("1 year");
       expect(rows[0].age_val).toContain("4 months");
@@ -3446,7 +3670,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("46.3 TO_CHAR() function", async () => {
-      const sql = "SELECT TO_CHAR('2024-05-20'::timestamp, 'YYYY-MM-DD') as fmt";
+      const sql =
+        "SELECT TO_CHAR('2024-05-20'::timestamp, 'YYYY-MM-DD') as fmt";
       const rows = await db.query(sql);
       expect(rows[0].fmt).toBe("2024-05-20");
     });
@@ -3482,7 +3707,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows.length).toBe(3);
       expect(rows[0].val).toBe(1);
       expect(rows[1].val).toBe("foo");
-      expect(rows[2].val).toEqual({"x": 10});
+      expect(rows[2].val).toEqual({ x: 10 });
     });
 
     test("47.3 jsonb_each() with ordinality", async () => {
@@ -3495,8 +3720,10 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("47.4 LATERAL join with jsonb_each", async () => {
       await db.exec(`CREATE TABLE json_data (id INT, doc JSONB)`);
-      await db.exec(`INSERT INTO json_data VALUES (1, '{"tags": ["a", "b"], "meta": {"owner": "alice"}}')`);
-      
+      await db.exec(
+        `INSERT INTO json_data VALUES (1, '{"tags": ["a", "b"], "meta": {"owner": "alice"}}')`,
+      );
+
       const sql = `
         SELECT j.id, kv.key, kv.value
         FROM json_data j
@@ -3505,7 +3732,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `;
       const rows = await db.query(sql);
       expect(rows.length).toBe(2);
-      const tags = rows.find(r => r.key === 'tags');
+      const tags = rows.find((r) => r.key === "tags");
       expect(tags.value).toEqual(["a", "b"]);
     });
   });
@@ -3516,9 +3743,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const rows = await db.query(sql);
       expect(rows.length).toBe(2);
       expect(rows[0].id).toBe(1);
-      expect(rows[0].name).toBe('a');
+      expect(rows[0].name).toBe("a");
       expect(rows[1].id).toBe(2);
-      expect(rows[1].name).toBe('b');
+      expect(rows[1].name).toBe("b");
     });
 
     test("49.2 VALUES as a standalone statement", async () => {
@@ -3526,20 +3753,22 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const rows = await db.query(sql);
       expect(rows.length).toBe(2);
       expect(rows[0].column1).toBe(1);
-      expect(rows[0].column2).toBe('foo');
+      expect(rows[0].column2).toBe("foo");
     });
 
     test("49.3 VALUES with expressions", async () => {
       const sql = `SELECT * FROM (VALUES (1+1, UPPER('hello'))) AS t(num, str)`;
       const rows = await db.query(sql);
       expect(rows[0].num).toBe(2);
-      expect(rows[0].str).toBe('HELLO');
+      expect(rows[0].str).toBe("HELLO");
     });
 
     test("49.4 JOIN with VALUES subquery", async () => {
       await db.exec(`CREATE TABLE users_49 (id INT, email TEXT)`);
-      await db.exec(`INSERT INTO users_49 VALUES (1, 'a@b.com'), (2, 'c@d.com')`);
-      
+      await db.exec(
+        `INSERT INTO users_49 VALUES (1, 'a@b.com'), (2, 'c@d.com')`,
+      );
+
       const sql = `
         SELECT u.email, v.role
         FROM users_49 u
@@ -3549,31 +3778,35 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `;
       const rows = await db.query(sql);
       expect(rows.length).toBe(2);
-      expect(rows[0].email).toBe('a@b.com');
-      expect(rows[0].role).toBe('admin');
-      expect(rows[1].role).toBe('user');
+      expect(rows[0].email).toBe("a@b.com");
+      expect(rows[0].role).toBe("admin");
+      expect(rows[1].role).toBe("user");
     });
   });
 
   describe("LEVEL 60: Bulk Inserts with dynamic placeholders", () => {
     test("60.1 Insert multiple rows using dynamic params array", async () => {
-      await db.exec(`CREATE TABLE bulk_insert_test (id SERIAL PRIMARY KEY, username TEXT, age NUMBER, is_active BOOLEAN)`);
-      
-      const placeholders: string[] =[];
+      await db.exec(
+        `CREATE TABLE bulk_insert_test (id SERIAL PRIMARY KEY, username TEXT, age NUMBER, is_active BOOLEAN)`,
+      );
+
+      const placeholders: string[] = [];
       // Khai báo tường minh type any[] để TypeScript không báo lỗi khi push nhiều type khác nhau
-      const params: any[] =[];
-      
+      const params: any[] = [];
+
       for (let idx = 0; idx < 50; idx++) {
         const offset = idx * 3;
         placeholders.push(`(${offset + 1}, ${offset + 2}, ${offset + 3})`);
         params.push(`User_${idx}`, idx % 100, idx % 2 === 0);
       }
-      
+
       const sql = `INSERT INTO bulk_insert_test (username, age, is_active) VALUES ${placeholders.join(", ")}`;
       const res = await db.exec(sql, params);
-      
+
       expect(res.success).toBe(true);
-      const rows = await db.query(`SELECT COUNT(*) as total FROM bulk_insert_test`);
+      const rows = await db.query(
+        `SELECT COUNT(*) as total FROM bulk_insert_test`,
+      );
       expect(rows[0].total).toBe(50);
     });
   });
@@ -3581,17 +3814,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   describe("LEVEL 59: Truncated Queries and Unquoted UUIDs", () => {
     test("59.1 Parse unquoted UUIDs as identifiers instead of splitting them", async () => {
       await db.exec(`CREATE TABLE unquoted_uuid_test (db_key TEXT)`);
-      await db.exec(`INSERT INTO unquoted_uuid_test (db_key) VALUES ('1a5487d3-b2f1-4495')`);
-      
+      await db.exec(
+        `INSERT INTO unquoted_uuid_test (db_key) VALUES ('1a5487d3-b2f1-4495')`,
+      );
+
       // Query with unquoted UUID which starts with a number.
       // This should parse as a subtraction expression and not throw "Expected statement, got IDENTIFIER".
       const sql = `SELECT * FROM unquoted_uuid_test WHERE db_key = 1a5487d3-b2f1-4495`;
-      
+
       let parseError = false;
       try {
         await db.query(sql);
       } catch (e: any) {
-        if (e.message.includes("Parse Error: Expected statement, got IDENTIFIER")) {
+        if (
+          e.message.includes("Parse Error: Expected statement, got IDENTIFIER")
+        ) {
           parseError = true;
         }
       }
@@ -3599,31 +3836,94 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("59.2 Forgive truncated strings (implicitly close at EOF)", async () => {
-      await db.exec(`CREATE TABLE truncated_string_test (id SERIAL PRIMARY KEY, val TEXT)`);
-      await db.exec(`INSERT INTO truncated_string_test (val) VALUES ('1a5487d3-b2f1-4495')`);
+      await db.exec(
+        `CREATE TABLE truncated_string_test (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
+      await db.exec(
+        `INSERT INTO truncated_string_test (val) VALUES ('1a5487d3-b2f1-4495')`,
+      );
 
       // Missing closing quote
       const sql = `SELECT val FROM truncated_string_test WHERE val = '1a5487d3-b2f1-4495`;
       const rows = await db.query(sql);
       expect(rows.length).toBe(1);
-      expect(rows[0].val).toBe('1a5487d3-b2f1-4495');
+      expect(rows[0].val).toBe("1a5487d3-b2f1-4495");
+    });
+  });
+
+  describe("LEVEL 68: Foreign Key Insert with Casted Timestamp Parameter", () => {
+    test("68.1 Foreign key insert with parameter $5::timestamp", async () => {
+      const db = new LitePostgres("./test_fk_cast.db", {
+        adapter: new NodeFSAdapter(),
+        database: "DEMO",
+      });
+      // 1. Create the Teachers table
+      await db.exec(`
+        CREATE TABLE teachers (
+          id SERIAL PRIMARY KEY, 
+          username TEXT, 
+          full_name TEXT
+        )
+      `);
+
+      // 2. Create the Assignments table with referenced Foreign Keys
+      await db.exec(`
+        CREATE TABLE assignments (
+          id SERIAL PRIMARY KEY,
+          class_id INTEGER,
+          teacher_id INTEGER REFERENCES teachers(id),
+          title TEXT,
+          instructions TEXT,
+          deadline TIMESTAMP,
+          status TEXT
+        )
+      `);
+
+      // 3. Insert teacher with ID 9 to satisfy the Foreign Key constraint
+      await db.exec(
+        `INSERT INTO teachers (id, username, full_name) VALUES (9, 'teacher1', 'John Doe')`,
+      );
+
+      // 4. Execute the exact parameterized query
+      const params = [3, 9, "TEST", "TEST", "2026-04-21T10:49", "active"];
+      const sql = `insert into "assignments" ("class_id", "teacher_id", "title", "instructions", "deadline", "status") values ($1, $2, $3, $4, $5::timestamp, $6)`;
+
+      const res = await db.exec(sql, params);
+
+      // 5. Verify the insertion succeeded and data mapped correctly
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT * FROM assignments`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].teacher_id).toBe(9);
+      expect(rows[0].class_id).toBe(3);
+      expect(rows[0].status).toBe("active");
+      expect(rows[0].deadline).toContain("2026-04-21T10:49");
     });
   });
 
   describe("LEVEL 61: Partial Indexes (WHERE in CREATE INDEX)", () => {
     test("61.1 Parse WHERE, INCLUDE, WITH and TABLESPACE in CREATE INDEX without crashing", async () => {
-      await db.exec(`CREATE TABLE partial_index_test (id SERIAL PRIMARY KEY, email TEXT)`);
-      
+      await db.exec(
+        `CREATE TABLE partial_index_test (id SERIAL PRIMARY KEY, email TEXT)`,
+      );
+
       // Basic WHERE (Partial Index)
-      let res = await db.exec(`CREATE INDEX IF NOT EXISTS idx_partial_1 ON partial_index_test(email) WHERE email IS NOT NULL;`);
+      let res = await db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_partial_1 ON partial_index_test(email) WHERE email IS NOT NULL;`,
+      );
       expect(res.success).toBe(true);
 
       // WITH and WHERE
-      res = await db.exec(`CREATE INDEX idx_partial_2 ON partial_index_test(email) WITH (fillfactor = 70) WHERE email != '';`);
+      res = await db.exec(
+        `CREATE INDEX idx_partial_2 ON partial_index_test(email) WITH (fillfactor = 70) WHERE email != '';`,
+      );
       expect(res.success).toBe(true);
 
       // INCLUDE (Covering Index)
-      res = await db.exec(`CREATE INDEX idx_partial_3 ON partial_index_test(email) INCLUDE (id) WHERE email IS NOT NULL;`);
+      res = await db.exec(
+        `CREATE INDEX idx_partial_3 ON partial_index_test(email) INCLUDE (id) WHERE email IS NOT NULL;`,
+      );
       expect(res.success).toBe(true);
     });
   });
@@ -3631,22 +3931,24 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   describe("LEVEL 63: Circular Reference Bug Fix", () => {
     test("63.1 Selecting joined table fields does not cause [Circular]", async () => {
       await db.exec(`CREATE TABLE circ_a (id SERIAL PRIMARY KEY, name TEXT)`);
-      await db.exec(`CREATE TABLE circ_b (id SERIAL PRIMARY KEY, a_id INT REFERENCES circ_a(id), val TEXT)`);
-      
+      await db.exec(
+        `CREATE TABLE circ_b (id SERIAL PRIMARY KEY, a_id INT REFERENCES circ_a(id), val TEXT)`,
+      );
+
       await db.exec(`INSERT INTO circ_a (name) VALUES ('Alpha')`);
       await db.exec(`INSERT INTO circ_b (a_id, val) VALUES (1, 'Beta')`);
-      
+
       const rows = await db.query(`
         SELECT a.*, b.* 
         FROM circ_a a
         JOIN circ_b b ON a.id = b.a_id
       `);
-      
+
       expect(rows.length).toBe(1);
-      expect(rows[0].name).toBe('Alpha');
-      expect(rows[0].val).toBe('Beta');
+      expect(rows[0].name).toBe("Alpha");
+      expect(rows[0].val).toBe("Beta");
       expect(rows[0].a_id).toBe(1);
-      
+
       // Ensure JSON.stringify works without throwing "Converting circular structure to JSON"
       let jsonError = false;
       try {
@@ -3668,7 +3970,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         jsonError = true;
       }
       expect(jsonError).toBe(false);
-      expect(rows[0].name).toBe('Alpha');
+      expect(rows[0].name).toBe("Alpha");
     });
   });
 
@@ -3676,51 +3978,71 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     test("65.1 ALTER COLUMN TYPE works even if table is referenced by a foreign key", async () => {
       await db.exec(`CREATE TABLE _omni_contacts (id TEXT PRIMARY KEY)`);
       await db.exec(`INSERT INTO _omni_contacts (id) VALUES ('C001')`);
-      
-      await db.exec(`CREATE TABLE user_packages_65 (id SERIAL PRIMARY KEY, contact_id INT)`);
+
+      await db.exec(
+        `CREATE TABLE user_packages_65 (id SERIAL PRIMARY KEY, contact_id INT)`,
+      );
       await db.exec(`INSERT INTO user_packages_65 (contact_id) VALUES (10)`);
-      
-      await db.exec(`CREATE TABLE bookings_65 (id SERIAL PRIMARY KEY, package_id INT REFERENCES user_packages_65(id))`);
+
+      await db.exec(
+        `CREATE TABLE bookings_65 (id SERIAL PRIMARY KEY, package_id INT REFERENCES user_packages_65(id))`,
+      );
       await db.exec(`INSERT INTO bookings_65 (package_id) VALUES (1)`);
-      
+
       // Mặc dù user_packages_65 đang bị bookings_65 trỏ tới, nó vẫn cho phép rewrite type thành công
-      const res = await db.exec(`ALTER TABLE user_packages_65 ALTER COLUMN contact_id TYPE TEXT`);
+      const res = await db.exec(
+        `ALTER TABLE user_packages_65 ALTER COLUMN contact_id TYPE TEXT`,
+      );
       expect(res.success).toBe(true);
 
       const rows = await db.query(`SELECT contact_id FROM user_packages_65`);
       expect(rows[0].contact_id).toBe("10"); // Đã ép kiểu sang Text
-      
+
       // Cũng test luôn việc móc nối thêm Constraint sau khi đã sửa kiểu dữ liệu
-      const resFK = await db.exec(`ALTER TABLE user_packages_65 ADD CONSTRAINT fk_contact FOREIGN KEY (contact_id) REFERENCES _omni_contacts(id)`);
+      const resFK = await db.exec(
+        `ALTER TABLE user_packages_65 ADD CONSTRAINT fk_contact FOREIGN KEY (contact_id) REFERENCES _omni_contacts(id)`,
+      );
       expect(resFK.success).toBe(true);
     });
   });
 
   describe("LEVEL 64: Fast UPDATE/DELETE by Primary Key and NOW() function", () => {
     test("64.1 UPDATE ... SET deleted_at = NOW() WHERE id = $1 works and uses O(1) PK index", async () => {
-      await db.exec(`CREATE TABLE packages (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`);
-      await db.exec(`INSERT INTO packages (name) VALUES ('react'), ('vue'), ('svelte')`);
-      
-      const res = await db.exec(`UPDATE packages SET deleted_at = NOW() WHERE id = $1`, [2]);
+      await db.exec(
+        `CREATE TABLE packages (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`,
+      );
+      await db.exec(
+        `INSERT INTO packages (name) VALUES ('react'), ('vue'), ('svelte')`,
+      );
+
+      const res = await db.exec(
+        `UPDATE packages SET deleted_at = NOW() WHERE id = $1`,
+        [2],
+      );
       expect(res.success).toBe(true);
       expect(res.updated).toBe(1);
 
       const rows = await db.query(`SELECT * FROM packages ORDER BY id`);
       expect(rows.length).toBe(3);
-      expect(rows[1].name).toBe('vue');
+      expect(rows[1].name).toBe("vue");
       expect(rows[1].deleted_at).toBeDefined();
       expect(rows[1].deleted_at).not.toBeNull();
-      
+
       // row 1 and 3 should not have deleted_at
       expect(rows[0].deleted_at).toBeNull();
       expect(rows[2].deleted_at).toBeNull();
     });
 
     test("64.2 UPDATE ... SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1 works and uses O(1) PK index", async () => {
-      await db.exec(`CREATE TABLE packages_64_2 (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`);
+      await db.exec(
+        `CREATE TABLE packages_64_2 (id SERIAL PRIMARY KEY, name TEXT, deleted_at TIMESTAMP)`,
+      );
       await db.exec(`INSERT INTO packages_64_2 (name) VALUES ('pkg1')`);
-      
-      const res = await db.exec(`UPDATE packages_64_2 SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1`, [1]);
+
+      const res = await db.exec(
+        `UPDATE packages_64_2 SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [1],
+      );
       expect(res.success).toBe(true);
       expect(res.updated).toBe(1);
 
@@ -3728,29 +4050,37 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].deleted_at).toBeDefined();
       expect(rows[0].deleted_at).not.toBeNull();
       // Verify format is ISO string
-      expect(new Date(rows[0].deleted_at).getFullYear()).toBeGreaterThanOrEqual(2024);
+      expect(new Date(rows[0].deleted_at).getFullYear()).toBeGreaterThanOrEqual(
+        2024,
+      );
     });
   });
 
   describe("LEVEL 50: TRUNCATE TABLE", () => {
     test("50.1 TRUNCATE simple table", async () => {
-      await db.exec(`CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(
+        `CREATE TABLE trunc_test (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
       await db.exec(`INSERT INTO trunc_test (val) VALUES ('A'), ('B')`);
       const res = await db.exec(`TRUNCATE TABLE trunc_test`);
       expect(res.success).toBe(true);
 
       const rows = await db.query(`SELECT * FROM trunc_test`);
       expect(rows.length).toBe(0);
-      
+
       // Without RESTART IDENTITY, sequence should continue
-      const res2 = await db.query(`INSERT INTO trunc_test (val) VALUES ('C') RETURNING id`);
+      const res2 = await db.query(
+        `INSERT INTO trunc_test (val) VALUES ('C') RETURNING id`,
+      );
       expect(res2[0].id).toBe(3);
     });
 
     test("50.2 TRUNCATE with RESTART IDENTITY", async () => {
       await db.exec(`TRUNCATE TABLE trunc_test RESTART IDENTITY`);
-      
-      const res = await db.query(`INSERT INTO trunc_test (val) VALUES ('D') RETURNING id`);
+
+      const res = await db.query(
+        `INSERT INTO trunc_test (val) VALUES ('D') RETURNING id`,
+      );
       expect(res[0].id).toBe(1);
     });
 
@@ -3759,9 +4089,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       await db.exec(`CREATE TABLE trunc_multi_2 (id INT)`);
       await db.exec(`INSERT INTO trunc_multi_1 VALUES (1)`);
       await db.exec(`INSERT INTO trunc_multi_2 VALUES (2)`);
-      
+
       await db.exec(`TRUNCATE trunc_multi_1, trunc_multi_2`);
-      
+
       const r1 = await db.query(`SELECT * FROM trunc_multi_1`);
       const r2 = await db.query(`SELECT * FROM trunc_multi_2`);
       expect(r1.length).toBe(0);
@@ -3770,25 +4100,27 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
 
     test("50.4 TRUNCATE with foreign keys and CASCADE", async () => {
       await db.exec(`CREATE TABLE trunc_parent (id INT PRIMARY KEY)`);
-      await db.exec(`CREATE TABLE trunc_child (id INT REFERENCES trunc_parent(id))`);
-      
+      await db.exec(
+        `CREATE TABLE trunc_child (id INT REFERENCES trunc_parent(id))`,
+      );
+
       await db.exec(`INSERT INTO trunc_parent VALUES (1)`);
       await db.exec(`INSERT INTO trunc_child VALUES (1)`);
-      
+
       // Should fail without cascade
       expect(async () => {
         await db.exec(`TRUNCATE trunc_parent`);
       }).toThrow();
-      
+
       // Should succeed if both are in statement
       await db.exec(`TRUNCATE trunc_parent, trunc_child`);
-      
+
       await db.exec(`INSERT INTO trunc_parent VALUES (2)`);
       await db.exec(`INSERT INTO trunc_child VALUES (2)`);
-      
+
       // Should succeed with CASCADE
       await db.exec(`TRUNCATE trunc_parent CASCADE`);
-      
+
       const cRows = await db.query(`SELECT * FROM trunc_child`);
       expect(cRows.length).toBe(0);
     });
@@ -3811,7 +4143,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("51.2 RECURSIVE CTE for hierarchical data", async () => {
-      await db.exec(`CREATE TABLE categories_rec (id INT PRIMARY KEY, parent_id INT, name TEXT)`);
+      await db.exec(
+        `CREATE TABLE categories_rec (id INT PRIMARY KEY, parent_id INT, name TEXT)`,
+      );
       await db.exec(`INSERT INTO categories_rec VALUES 
         (1, NULL, 'Electronics'),
         (2, 1, 'Computers'),
@@ -3835,23 +4169,29 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `;
       const rows = await db.query(sql);
       expect(rows.length).toBe(6);
-      const laptops = rows.find((r: any) => r.name === 'Laptops');
+      const laptops = rows.find((r: any) => r.name === "Laptops");
       expect(laptops.level).toBe(3);
     });
   });
 
   describe("LEVEL 62: ORDER BY NULLS FIRST/LAST", () => {
     test("62.1 Parse and sort with NULLS LAST", async () => {
-      await db.exec(`CREATE TABLE order_nulls (id SERIAL PRIMARY KEY, val NUMBER)`);
+      await db.exec(
+        `CREATE TABLE order_nulls (id SERIAL PRIMARY KEY, val NUMBER)`,
+      );
       await db.exec(`INSERT INTO order_nulls (val) VALUES (10), (NULL), (20)`);
-      
-      const rows = await db.query(`SELECT val FROM order_nulls ORDER BY val DESC NULLS LAST`);
+
+      const rows = await db.query(
+        `SELECT val FROM order_nulls ORDER BY val DESC NULLS LAST`,
+      );
       expect(rows.length).toBe(3);
       expect(rows[0].val).toBe(20);
       expect(rows[1].val).toBe(10);
       expect(rows[2].val).toBeNull();
 
-      const rows2 = await db.query(`SELECT val FROM order_nulls ORDER BY val ASC NULLS FIRST`);
+      const rows2 = await db.query(
+        `SELECT val FROM order_nulls ORDER BY val ASC NULLS FIRST`,
+      );
       expect(rows2.length).toBe(3);
       expect(rows2[0].val).toBeNull();
       expect(rows2[1].val).toBe(10);
@@ -3871,19 +4211,19 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         FROM employees
         ORDER BY department, salary DESC
       `);
-      
-      const itRows = rows.filter(r => r.department === 'IT');
-      // IT salaries: Bob (6000), Alice (5000), David (5000)
-      expect(itRows[0].top_earner).toBe('Bob');
-      expect(itRows[0].lowest_earner).toBe('David');
-      expect(itRows[1].top_earner).toBe('Bob');
-      expect(itRows[2].lowest_earner).toBe('David');
 
-      const hrRows = rows.filter(r => r.department === 'HR');
+      const itRows = rows.filter((r) => r.department === "IT");
+      // IT salaries: Bob (6000), Alice (5000), David (5000)
+      expect(itRows[0].top_earner).toBe("Bob");
+      expect(itRows[0].lowest_earner).toBe("David");
+      expect(itRows[1].top_earner).toBe("Bob");
+      expect(itRows[2].lowest_earner).toBe("David");
+
+      const hrRows = rows.filter((r) => r.department === "HR");
       // HR salaries: Charlie (4500), Eve (4500)
-      expect(hrRows[0].top_earner).toBe('Charlie');
-      expect(hrRows[1].top_earner).toBe('Charlie');
-      expect(hrRows[1].lowest_earner).toBe('Eve');
+      expect(hrRows[0].top_earner).toBe("Charlie");
+      expect(hrRows[1].top_earner).toBe("Charlie");
+      expect(hrRows[1].lowest_earner).toBe("Eve");
     });
 
     test("48.2 FIRST_VALUE without partition", async () => {
@@ -3894,22 +4234,28 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `);
       // Names alphabetically: Alice, Bob, Charlie, David, Eve
       // Alice's salary is 5000
-      expect(rows.every(r => r.first_sal === 5000)).toBe(true);
+      expect(rows.every((r) => r.first_sal === 5000)).toBe(true);
     });
   });
 
   describe("LEVEL 66: Double Quoted String Fallback (SQLite Style)", () => {
     test("66.1 Double quoted string falls back to string literal if column not found", async () => {
-      await db.exec(`CREATE TABLE fallback_test (id SERIAL PRIMARY KEY, provider TEXT)`);
-      await db.exec(`INSERT INTO fallback_test (provider) VALUES ('zalo_oa'), ('facebook')`);
+      await db.exec(
+        `CREATE TABLE fallback_test (id SERIAL PRIMARY KEY, provider TEXT)`,
+      );
+      await db.exec(
+        `INSERT INTO fallback_test (provider) VALUES ('zalo_oa'), ('facebook')`,
+      );
 
-      const rows = await db.query(`SELECT * FROM fallback_test WHERE provider = "zalo_oa"`);
+      const rows = await db.query(
+        `SELECT * FROM fallback_test WHERE provider = "zalo_oa"`,
+      );
       expect(rows.length).toBe(1);
-      expect(rows[0].provider).toBe('zalo_oa');
+      expect(rows[0].provider).toBe("zalo_oa");
 
       // Also test function arguments
       const rows2 = await db.query(`SELECT UPPER("hello") as val`);
-      expect(rows2[0].val).toBe('HELLO');
+      expect(rows2[0].val).toBe("HELLO");
     });
   });
 });
