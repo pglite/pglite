@@ -2960,6 +2960,7 @@ export class StorageEngine {
       for await (const n of this.scanCatalog(this.pgNamespaceDef))
         nspMap.set(n.oid, n.nspname);
       for await (const r of this.scanCatalog(this.pgClassDef)) {
+        if (r.relkind !== "r") continue;
         const schema = nspMap.get(r.relnamespace);
         if (schema === "pg_catalog" || schema === "information_schema")
           continue;
@@ -3008,8 +3009,9 @@ export class StorageEngine {
       for await (const n of this.scanCatalog(this.pgNamespaceDef))
         nspMap.set(n.oid, n.nspname);
       const relMap = new Map();
-      for await (const r of this.scanCatalog(this.pgClassDef))
-        relMap.set(r.oid, r);
+      for await (const r of this.scanCatalog(this.pgClassDef)) {
+        if (r.relkind === "r") relMap.set(r.oid, r);
+      }
 
       for await (const attr of this.scanCatalog(this.pgAttributeDef)) {
         const rel = relMap.get(attr.attrelid);

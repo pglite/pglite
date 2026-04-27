@@ -725,6 +725,21 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(exceptVals).toEqual([3, 4]);
     });
 
+    test("5.16 information_schema.tables should not return index tables", async () => {
+      await db.exec(`CREATE TABLE tbl_for_idx_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`CREATE INDEX custom_idx_test ON tbl_for_idx_test(val)`);
+
+      const sql = `
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+      `;
+      const rows = await db.query(sql);
+      const tableNames = rows.map((r: any) => r.table_name);
+      expect(tableNames).toContain('tbl_for_idx_test');
+      expect(tableNames).not.toContain('custom_idx_test'); // Không được chứa tên của Index
+    });
+
     test("5.15 Set Operations - UNION, INTERSECT, EXCEPT and ALL variants", async () => {
       await db.exec(`CREATE TABLE set_ops_all (val INT)`);
       await db.exec(`INSERT INTO set_ops_all (val) VALUES (1), (1), (1), (2)`);
