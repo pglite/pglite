@@ -73,6 +73,14 @@ export class LitePostgres {
     });
   }
 
+  /**
+   * Used for statements that do not return rows (CREATE, INSERT, UPDATE, DELETE)
+   * returns standard PostgreSQL result format
+   */
+  public async exec2<T = any>(sql: string, params?: any[] | Record<string, any> | string, dbName?: string): Promise<QueryResult<T>> {
+    return this.query2(sql, params, dbName);
+  }
+
   private formatQueryResult<T>(sql: string, result: any): QueryResult<T> {
     let rows: any[] = [];
     let rowCount = 0;
@@ -172,6 +180,19 @@ export class LitePostgres {
                   txQueue = txQueue.then(async () => {
                     try { resolve(await target.run(sql, actualP, actualDb || txDb)); }
                     catch (e) { reject(e); }
+                  });
+                });
+              };
+              if (prop === 'exec2') return (sql: string, p?: any[] | Record<string, any> | string, db?: string) => {
+                let actualP: any = [];
+                let actualDb = db;
+                if (typeof p === 'string') { actualDb = p; } else if (p !== undefined && p !== null) { actualP = p; }
+                return new Promise((resolve, reject) => {
+                  txQueue = txQueue.then(async () => {
+                    try {
+                      const res = await target.run(sql, actualP, actualDb || txDb);
+                      resolve((target as any).formatQueryResult(sql, res));
+                    } catch (e) { reject(e); }
                   });
                 });
               };

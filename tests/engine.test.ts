@@ -4262,7 +4262,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
     
   });
-describe("LEVEL 69: query2 and transaction2 standard Postgres format", () => {
+describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () => {
     test("69.1 query2 returns standard fields", async () => {
       await db.exec(`CREATE TABLE std_format_test (id SERIAL PRIMARY KEY, name TEXT)`);
       const resInsert = await db.query2(`INSERT INTO std_format_test (name) VALUES ('Alpha'), ('Beta')`);
@@ -4287,15 +4287,38 @@ describe("LEVEL 69: query2 and transaction2 standard Postgres format", () => {
       expect(resDelete.rowCount).toBe(1);
     });
 
-    test("69.2 transaction2 provides query2 on tx object", async () => {
+    test("69.2 exec2 returns standard fields", async () => {
+      await db.exec(`CREATE TABLE exec2_test (id SERIAL PRIMARY KEY, val INT)`);
+      
+      const resInsert = await db.exec2(`INSERT INTO exec2_test (val) VALUES (100)`);
+      expect(resInsert.command).toBe("INSERT");
+      expect(resInsert.rowCount).toBe(1);
+
+      const resUpdate = await db.exec2(`UPDATE exec2_test SET val = 200 WHERE val = 100`);
+      expect(resUpdate.command).toBe("UPDATE");
+      expect(resUpdate.rowCount).toBe(1);
+
+      const resSelect = await db.exec2(`SELECT * FROM exec2_test`);
+      expect(resSelect.command).toBe("SELECT");
+      expect(resSelect.rowCount).toBe(1);
+      expect(resSelect.rows[0].val).toBe(200);
+    });
+
+    test("69.3 transaction2 provides query2 and exec2 on tx object", async () => {
       await db.exec(`CREATE TABLE std_tx_test (val INT)`);
       
       const res = await db.transaction2(async (tx) => {
+        // Test query2 in tx
         const insertRes = await tx.query2(`INSERT INTO std_tx_test (val) VALUES (10), (20) RETURNING val`);
         expect(insertRes.command).toBe("INSERT");
         expect(insertRes.rowCount).toBe(2);
         expect(insertRes.rows[0].val).toBe(10);
         expect(insertRes.fields).toEqual([{ name: "val" }]);
+
+        // Test exec2 in tx
+        const updateRes = await tx.exec2(`UPDATE std_tx_test SET val = val + 1`);
+        expect(updateRes.command).toBe("UPDATE");
+        expect(updateRes.rowCount).toBe(2);
 
         const selectRes = await tx.query2(`SELECT * FROM std_tx_test`);
         expect(selectRes.rowCount).toBe(2);
