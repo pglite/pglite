@@ -4260,5 +4260,51 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const rows2 = await db.query(`SELECT UPPER("hello") as val`);
       expect(rows2[0].val).toBe("HELLO");
     });
+    
+  });
+describe("LEVEL 69: query2 and transaction2 standard Postgres format", () => {
+    test("69.1 query2 returns standard fields", async () => {
+      await db.exec(`CREATE TABLE std_format_test (id SERIAL PRIMARY KEY, name TEXT)`);
+      const resInsert = await db.query2(`INSERT INTO std_format_test (name) VALUES ('Alpha'), ('Beta')`);
+      expect(resInsert.command).toBe("INSERT");
+      expect(resInsert.rowCount).toBe(2);
+      expect(resInsert.rows).toEqual([]);
+      expect(resInsert.fields).toEqual([]);
+
+      const resSelect = await db.query2(`SELECT * FROM std_format_test ORDER BY id`);
+      expect(resSelect.command).toBe("SELECT");
+      expect(resSelect.rowCount).toBe(2);
+      expect(resSelect.rows.length).toBe(2);
+      expect(resSelect.rows[0].name).toBe("Alpha");
+      expect(resSelect.fields).toEqual([{ name: "id" }, { name: "name" }]);
+
+      const resUpdate = await db.query2(`UPDATE std_format_test SET name = 'Gamma' WHERE id = 1`);
+      expect(resUpdate.command).toBe("UPDATE");
+      expect(resUpdate.rowCount).toBe(1);
+
+      const resDelete = await db.query2(`DELETE FROM std_format_test WHERE id = 2`);
+      expect(resDelete.command).toBe("DELETE");
+      expect(resDelete.rowCount).toBe(1);
+    });
+
+    test("69.2 transaction2 provides query2 on tx object", async () => {
+      await db.exec(`CREATE TABLE std_tx_test (val INT)`);
+      
+      const res = await db.transaction2(async (tx) => {
+        const insertRes = await tx.query2(`INSERT INTO std_tx_test (val) VALUES (10), (20) RETURNING val`);
+        expect(insertRes.command).toBe("INSERT");
+        expect(insertRes.rowCount).toBe(2);
+        expect(insertRes.rows[0].val).toBe(10);
+        expect(insertRes.fields).toEqual([{ name: "val" }]);
+
+        const selectRes = await tx.query2(`SELECT * FROM std_tx_test`);
+        expect(selectRes.rowCount).toBe(2);
+        return "tx_done";
+      });
+
+      expect(res).toBe("tx_done");
+      const finalSelect = await db.query2(`SELECT * FROM std_tx_test`);
+      expect(finalSelect.rowCount).toBe(2);
+    });
   });
 });

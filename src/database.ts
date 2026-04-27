@@ -4,6 +4,13 @@ import { Executor } from './execution/executor';
 import { StorageEngine, type VFS } from './storage/engine';
 import { Statement } from './ast';
 
+export interface QueryResult<R = any> {
+  rows: R[];
+  rowCount: number;
+  fields: { name: string }[];
+  command: string;
+}
+
 export class FileMutex {
   private static locks = new Map<string, Promise<void>>();
 
@@ -59,6 +66,58 @@ export class LitePostgres {
       this.queue = this.queue.then(async () => {
         try {
           resolve(await this.run(sql, actualParams, actualDbName || this.defaultDb));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  private formatQueryResult<T>(sql: string, result: any): QueryResult<T> {
+    let rows: any[] = [];
+    let rowCount = 0;
+    const match = sql.trim().match(/^[A-Za-z]+/);
+    let command = match ? match[0].toUpperCase() : '';
+    
+    if (Array.isArray(result)) {
+      rows = result;
+      rowCount = rows.length;
+    } else if (result && typeof result === 'object') {
+      if (result.inserted !== undefined) {
+        if (Array.isArray(result.inserted)) {
+          rowCount = result.inserted.length;
+        } else {
+          rowCount = 1;
+        }
+      } else if (result.updated !== undefined) {
+        rowCount = result.updated;
+      } else if (result.deleted !== undefined) {
+        rowCount = result.deleted;
+      } else if (result.conflict === 'nothing') {
+        rowCount = 0;
+      }
+    }
+    const fields = rows.length > 0 ? Object.keys(rows[0]).map(k => ({ name: k })) : [];
+    return { rows, rowCount, fields, command };
+  }
+
+  /**
+   * Used for statements that return rows (SELECT) in standard PostgreSQL format
+   */
+  public async query2<T = any>(sql: string, params?: any[] | Record<string, any> | string, dbName?: string): Promise<QueryResult<T>> {
+    let actualParams: any = [];
+    let actualDbName = dbName;
+    if (typeof params === 'string') {
+      actualDbName = params;
+    } else if (params !== undefined && params !== null) {
+      actualParams = params;
+    }
+
+    return new Promise((resolve, reject) => {
+      this.queue = this.queue.then(async () => {
+        try {
+          const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
+          resolve(this.formatQueryResult<T>(sql, result));
         } catch (e) {
           reject(e);
         }
@@ -129,7 +188,20 @@ export class LitePostgres {
                   });
                 });
               };
-              if (prop === 'transaction') return async () => { throw new Error("Nested transactions not supported"); };
+              if (prop === 'query2') return (sql: string, p?: any[] | Record<string, any> | string, db?: string) => {
+                let actualP: any = [];
+                let actualDb = db;
+                if (typeof p === 'string') { actualDb = p; } else if (p !== undefined && p !== null) { actualP = p; }
+                return new Promise((resolve, reject) => {
+                  txQueue = txQueue.then(async () => {
+                    try {
+                      const res = await target.run(sql, actualP, actualDb || txDb);
+                      resolve((target as any).formatQueryResult(sql, res));
+                    } catch (e) { reject(e); }
+                  });
+                });
+              };
+              if (prop === 'transaction' || prop === 'transaction2') return async () => { throw new Error("Nested transactions not supported"); };
               return (target as any)[prop];
             }
           });
@@ -153,6 +225,10 @@ export class LitePostgres {
         }
       });
     });
+  }
+
+  public async transaction2<T>(callback: (tx: LitePostgres) => Promise<T>, dbName?: string): Promise<T> {
+    return this.transaction(callback, dbName);
   }
 
   /**
