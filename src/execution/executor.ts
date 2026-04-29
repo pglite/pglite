@@ -429,7 +429,7 @@ export class Executor {
           startBenchmarks();
           let conflictRow = null;
           for (const col of table.columns) {
-            if (col.isUnique && record[col.name] !== undefined && record[col.name] !== null) {
+            if ((col.isUnique || col.isPrimaryKey) && record[col.name] !== undefined && record[col.name] !== null) {
               let existing = null;
               if (col.isPrimaryKey) {
                 existing = await storage.getRowByPK(stmt.tableName, record[col.name]);
@@ -648,6 +648,28 @@ export class Executor {
 
             row[colName] = newVal;
           }
+
+          // Check UNIQUE / PRIMARY KEY constraints after applying all updates
+          for (const col of table.columns) {
+            if ((col.isUnique || col.isPrimaryKey) && row[col.name] !== undefined && row[col.name] !== null) {
+              // Only check if the value actually changed to avoid false positive with itself
+              if (row[col.name] !== oldRow[col.name]) {
+                let existing = null;
+                if (col.isPrimaryKey) {
+                  existing = await storage.getRowByPK(stmt.tableName, row[col.name]);
+                }
+                if (!existing) {
+                  for await (const r of storage.scanRows(stmt.tableName)) {
+                    if (r[col.name] == row[col.name]) { existing = r; break; }
+                  }
+                }
+                if (existing) {
+                  throw new Error(`Constraint Error: ${col.name} must be unique`);
+                }
+              }
+            }
+          }
+
           // Re-evaluate generated columns after update
           for (const col of table.columns) {
             if ((col as any).generatedExpr) {

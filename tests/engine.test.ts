@@ -4335,14 +4335,77 @@ describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () 
         expect(updateRes.command).toBe("UPDATE");
         expect(updateRes.rowCount).toBe(2);
 
-        const selectRes = await tx.query2(`SELECT * FROM std_tx_test`);
-        expect(selectRes.rowCount).toBe(2);
-        return "tx_done";
-      });
+      const selectRes = await tx.query2(`SELECT * FROM std_tx_test`);
+      expect(selectRes.rowCount).toBe(2);
+      return "tx_done";
+    });
 
-      expect(res).toBe("tx_done");
-      const finalSelect = await db.query2(`SELECT * FROM std_tx_test`);
-      expect(finalSelect.rowCount).toBe(2);
+    expect(res).toBe("tx_done");
+    const finalSelect = await db.query2(`SELECT * FROM std_tx_test`);
+    expect(finalSelect.rowCount).toBe(2);
+  });
+
+  describe("LEVEL 70: PRIMARY KEY constraints", () => {
+    test("70.1 PRIMARY KEY must be unique on INSERT", async () => {
+      await db.exec(`CREATE TABLE pk_test (id INT PRIMARY KEY, name TEXT)`);
+      await db.exec(`INSERT INTO pk_test (id, name) VALUES (1, 'A')`);
+      
+      let error1;
+      try {
+        await db.exec(`INSERT INTO pk_test (id, name) VALUES (1, 'B')`);
+      } catch (e: any) {
+        error1 = e;
+      }
+      expect(error1).toBeDefined();
+      expect(error1.message).toContain("Constraint Error: id must be unique");
+      
+      let error2;
+      try {
+        await db.exec(`INSERT INTO pk_test (id, name) VALUES (2, 'C'), (2, 'D')`);
+      } catch (e: any) {
+        error2 = e;
+      }
+      expect(error2).toBeDefined();
+      expect(error2.message).toContain("Constraint Error: id must be unique");
+    });
+
+    test("70.2 PRIMARY KEY must be unique on UPDATE", async () => {
+      await db.exec(`CREATE TABLE pk_test_update (id INT PRIMARY KEY, name TEXT)`);
+      await db.exec(`INSERT INTO pk_test_update (id, name) VALUES (1, 'A'), (2, 'B')`);
+      
+      let error1;
+      try {
+        await db.exec(`UPDATE pk_test_update SET id = 1 WHERE id = 2`);
+      } catch (e: any) {
+        error1 = e;
+      }
+      expect(error1).toBeDefined();
+      expect(error1.message).toContain("Constraint Error: id must be unique");
+
+      // Valid update should work
+      const res = await db.exec(`UPDATE pk_test_update SET id = 3 WHERE id = 2`);
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(1);
+      
+      const rows = await db.query(`SELECT * FROM pk_test_update ORDER BY id`);
+      expect(rows.length).toBe(2);
+      expect(rows[0].id).toBe(1);
+      expect(rows[1].id).toBe(3);
+    });
+
+    test("70.3 UNIQUE constraint is checked on UPDATE", async () => {
+      await db.exec(`CREATE TABLE uniq_test_update (id SERIAL PRIMARY KEY, email TEXT UNIQUE)`);
+      await db.exec(`INSERT INTO uniq_test_update (email) VALUES ('test1@example.com'), ('test2@example.com')`);
+      
+      let error1;
+      try {
+        await db.exec(`UPDATE uniq_test_update SET email = 'test1@example.com' WHERE id = 2`);
+      } catch (e: any) {
+        error1 = e;
+      }
+      expect(error1).toBeDefined();
+      expect(error1.message).toContain("Constraint Error: email must be unique");
     });
   });
+});
 });
