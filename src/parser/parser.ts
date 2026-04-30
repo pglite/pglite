@@ -963,9 +963,17 @@ export class Parser {
     } else if (this.match('KEYWORD', 'ADD')) {
       this.consume();
       
+      let isConstraint = false;
+      let constraintName = '';
       if (this.match('KEYWORD', 'CONSTRAINT')) {
         this.consume(); // CONSTRAINT
-        const constraintName = this.consumeIdentifier();
+        constraintName = this.consumeIdentifier();
+        isConstraint = true;
+      } else if (this.match('KEYWORD', 'FOREIGN') || this.match('KEYWORD', 'UNIQUE') || this.match('KEYWORD', 'PRIMARY')) {
+        isConstraint = true;
+      }
+
+      if (isConstraint) {
         if (this.match('KEYWORD', 'FOREIGN')) {
           this.consume(); // FOREIGN
           this.consume('KEYWORD', 'KEY'); // KEY
@@ -1012,8 +1020,31 @@ export class Parser {
           }
           
           return { type: 'AlterTable', tableName, action: { type: 'AddForeignKey', columnName, references } };
+        } else if (this.match('KEYWORD', 'UNIQUE')) {
+          this.consume(); // UNIQUE
+          this.consume('SYMBOL', '(');
+          const columns: string[] =[];
+          columns.push(this.consumeIdentifier());
+          while (this.match('SYMBOL', ',')) {
+            this.consume();
+            columns.push(this.consumeIdentifier());
+          }
+          this.consume('SYMBOL', ')');
+          return { type: 'AlterTable', tableName, action: { type: 'AddUniqueConstraint', constraintName, columns } };
+        } else if (this.match('KEYWORD', 'PRIMARY')) {
+          this.consume(); // PRIMARY
+          this.consume('KEYWORD', 'KEY'); // KEY
+          this.consume('SYMBOL', '(');
+          const columns: string[] =[];
+          columns.push(this.consumeIdentifier());
+          while (this.match('SYMBOL', ',')) {
+            this.consume();
+            columns.push(this.consumeIdentifier());
+          }
+          this.consume('SYMBOL', ')');
+          return { type: 'AlterTable', tableName, action: { type: 'AddPrimaryKeyConstraint', constraintName, columns } };
         } else {
-           throw new Error("Parse Error: Only FOREIGN KEY constraints are supported in ALTER TABLE ADD CONSTRAINT currently");
+           throw new Error("Parse Error: Only FOREIGN KEY, UNIQUE, and PRIMARY KEY constraints are supported in ALTER TABLE ADD CONSTRAINT currently");
         }
       }
 

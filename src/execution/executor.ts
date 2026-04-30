@@ -256,6 +256,74 @@ export class Executor {
             async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
             async (r: any) => { r.attnotnull = false; }
           );
+        } else if (action.type === 'AddUniqueConstraint') {
+          // Verify no duplicate data exists
+          const rows =[];
+          for await (const row of storage.scanRows(stmt.tableName)) rows.push(row);
+
+          const keySet = new Set();
+          for (const row of rows) {
+            const vals = action.columns.map(c => row[c]);
+            if (vals.some(v => v === null || v === undefined)) continue;
+            const key = JSON.stringify(vals);
+            if (keySet.has(key)) {
+              throw new Error(`Constraint Error: data contains duplicate values for unique constraint ${action.constraintName || 'UNIQUE'}`);
+            }
+            keySet.add(key);
+          }
+
+          for (const c of action.columns) {
+             const col = table.columns.find((col: any) => col.name === c);
+             if (!col) throw new Error(`Column ${c} does not exist`);
+             col.isUnique = true;
+          }
+          await storage.updateTableSchema(stmt.tableName, table);
+
+          for (const c of action.columns) {
+            await storage.updateRows('pg_catalog.pg_attribute',
+              async (r: any) => r.attrelid === table.firstPage && r.attname === c,
+              async (r: any) => { r.attunique = true; }
+            );
+          }
+
+          const tableShortName = stmt.tableName.includes('.') ? stmt.tableName.split('.').pop()! : stmt.tableName;
+          const constraintName = action.constraintName || `${tableShortName}_${action.columns.join('_')}_key`;
+          await storage.createIndex(constraintName, stmt.tableName, action.columns, true, true);
+        } else if (action.type === 'AddPrimaryKeyConstraint') {
+          // Verify no null or duplicate
+          const rows =[];
+          for await (const row of storage.scanRows(stmt.tableName)) rows.push(row);
+
+          const keySet = new Set();
+          for (const row of rows) {
+            const vals = action.columns.map(c => row[c]);
+            if (vals.some(v => v === null || v === undefined)) {
+              throw new Error(`Constraint Error: Primary key columns cannot be null`);
+            }
+            const key = JSON.stringify(vals);
+            if (keySet.has(key)) {
+              throw new Error(`Constraint Error: data contains duplicate values for primary key constraint ${action.constraintName || 'PRIMARY KEY'}`);
+            }
+            keySet.add(key);
+          }
+
+          for (const c of action.columns) {
+             const col = table.columns.find((col: any) => col.name === c);
+             if (!col) throw new Error(`Column ${c} does not exist`);
+             col.isPrimaryKey = true;
+             col.isNotNull = true;
+          }
+          table.pkColumn = action.columns.length === 1 ? action.columns[0] : null; 
+          await storage.updateTableSchema(stmt.tableName, table);
+
+          for (const c of action.columns) {
+            await storage.updateRows('pg_catalog.pg_attribute',
+              async (r: any) => r.attrelid === table.firstPage && r.attname === c,
+              async (r: any) => { r.attprimary = true; r.attnotnull = true; }
+            );
+          }
+
+          await (storage as any).addPrimaryKeyIndex(stmt.tableName, action.columns);
         } else if (action.type === 'AddForeignKey') {
           const col = table.columns.find((c: any) => c.name === action.columnName);
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
@@ -718,6 +786,18 @@ export class Executor {
              async (row: any) => !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params)),
              updateFn
            );
+           // Fallback to full scan if the PK lookup didn't update anything 
+           // (in case there are duplicate PKs and the first match failed the extra WHERE conditions)
+           if (updatedCount === 0) {
+             updatedCount = await storage.updateRows(
+               stmt.tableName,
+               async (row: any) => {
+                 if (row[pkColName!] != pkVal) return false;
+                 return !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params));
+               },
+               updateFn
+             );
+           }
         } else {
            updatedCount = await storage.updateRows(
              stmt.tableName,
@@ -827,6 +907,15 @@ export class Executor {
         let deletedCount = 0;
         if (pkVal !== undefined && pkVal !== null) {
             deletedCount = await storage.deleteRowByPK(stmt.tableName, pkVal, filterFn);
+            if (deletedCount === 0) {
+              deletedCount = await storage.deleteRows(
+                stmt.tableName,
+                async (row: any) => {
+                  if (row[pkColName!] != pkVal) return false;
+                  return await filterFn(row);
+                }
+              );
+            }
         } else {
             deletedCount = await storage.deleteRows(stmt.tableName, filterFn);
         }

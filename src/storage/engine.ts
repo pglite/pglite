@@ -943,12 +943,9 @@ class BTree {
       }
     }
 
-    if (foundIdx !== -1) {
-      leaf.vals[foundIdx] = val;
-    } else {
-      leaf.keys.splice(insertIdx, 0, key);
-      leaf.vals.splice(insertIdx, 0, val);
-    }
+    let finalInsertIdx = foundIdx !== -1 ? foundIdx : insertIdx;
+    leaf.keys.splice(finalInsertIdx, 0, key);
+    leaf.vals.splice(finalInsertIdx, 0, val);
 
     if (
       this.getNodeSize({
@@ -1042,7 +1039,7 @@ class BTree {
     return this.rootPageId;
   }
 
-  async delete(key: any) {
+  async delete(key: any, expectedVal?: { pageId: number; slotIdx: number }) {
     if (this.rootPageId === 0 || this.rootPageId === 0xffffffff) return;
     const path = [];
     let currId = this.rootPageId;
@@ -1094,8 +1091,29 @@ class BTree {
       }
 
       if (foundIdx !== -1) {
-        leaf.keys.splice(foundIdx, 1);
-        leaf.vals.splice(foundIdx, 1);
+        let targetIdx = foundIdx;
+        if (expectedVal) {
+          let i = foundIdx;
+          while (i >= 0 && leaf.keys[i] === key) {
+            if (leaf.vals[i].pageId === expectedVal.pageId && leaf.vals[i].slotIdx === expectedVal.slotIdx) {
+              targetIdx = i;
+              break;
+            }
+            i--;
+          }
+          if (targetIdx === foundIdx && (leaf.vals[foundIdx].pageId !== expectedVal.pageId || leaf.vals[foundIdx].slotIdx !== expectedVal.slotIdx)) {
+            let j = foundIdx + 1;
+            while (j < leaf.keys.length && leaf.keys[j] === key) {
+              if (leaf.vals[j].pageId === expectedVal.pageId && leaf.vals[j].slotIdx === expectedVal.slotIdx) {
+                targetIdx = j;
+                break;
+              }
+              j++;
+            }
+          }
+        }
+        leaf.keys.splice(targetIdx, 1);
+        leaf.vals.splice(targetIdx, 1);
         const buf = await this.pager.readPage(leaf.pageId);
         this.serializeNode(leaf, buf);
         await this.pager.writePage(leaf.pageId, buf);
@@ -1608,6 +1626,44 @@ export class StorageEngine {
 
   public getFullTableName(name: string): string {
     return name.includes(".") ? name : `public.${name}`;
+  }
+
+  public async addPrimaryKeyIndex(tableName: string, columns: string[]): Promise<void> {
+    const fullName = this.getFullTableName(tableName);
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} does not exist`);
+
+    const pkAttNums = columns.map(c => table.columns.findIndex(col => col.name === c) + 1);
+
+    const rootPage = await this.pager.allocatePage();
+    const rootBuf = Buffer.alloc(PAGE_SIZE);
+    rootBuf.writeUInt8(1, 0);
+    rootBuf.writeUInt16LE(0, 1);
+    rootBuf.writeUInt32LE(0xffffffff, 3);
+    await this.pager.writePage(rootPage, rootBuf);
+
+    await this.insertRowIntoCatalog(this.pgIndexDef, {
+      indexrelid: rootPage,
+      indrelid: table.firstPage,
+      indkey: pkAttNums,
+      indisprimary: true,
+      indisunique: true,
+    });
+
+    await this.updateRowsInCatalog(
+      this.pgClassDef,
+      async (r) => r.oid === table.firstPage,
+      async (r) => {
+        r.relindexroot = rootPage;
+      },
+    );
+
+    table.indexRootPage = rootPage;
+    await this.updateTableSchema(fullName, table);
+
+    if (columns.length === 1) {
+      await this.buildIndexes(fullName);
+    }
   }
 
   public async createIndex(
@@ -3162,7 +3218,7 @@ export class StorageEngine {
             }
             page.deleteTuple(tuple.slotIdx);
             if (pkCol && StorageEngine.pkIndexes.has(`${this.filepath}:${this.currentDbName}:${fullName}`)) {
-              await StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!.delete(oldRow[pkCol.name]);
+              await StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!.delete(oldRow[pkCol.name], { pageId: pageId!, slotIdx: tuple.slotIdx });
             }
             await this.insertRow(name, row);
           } else {
@@ -3173,7 +3229,7 @@ export class StorageEngine {
               // PK value changed but row still fits in page, update index
               if (StorageEngine.pkIndexes.has(`${this.filepath}:${this.currentDbName}:${fullName}`)) {
                 const btree = StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!;
-                await btree.delete(oldRow[pkCol.name]);
+                await btree.delete(oldRow[pkCol.name], { pageId: pageId!, slotIdx: tuple.slotIdx });
                 const newRoot = await btree.insert(row[pkCol.name], {
                   pageId: pageId!,
                   slotIdx: tuple.slotIdx,
@@ -3243,14 +3299,14 @@ export class StorageEngine {
         await this.freeOverflowPages(oldTupleData);
       }
       page.deleteTuple(loc.slotIdx);
-      await index.delete(oldRow[pkCol.name]);
+      await index.delete(oldRow[pkCol.name], loc);
       await this.insertRow(name, row);
     } else {
       if (this.isOverflow(oldTupleData)) {
         await this.freeOverflowPages(oldTupleData);
       }
       if (oldRow[pkCol.name] !== row[pkCol.name]) {
-        await index.delete(oldRow[pkCol.name]);
+        await index.delete(oldRow[pkCol.name], loc);
         const newRoot = await index.insert(row[pkCol.name], {
           pageId,
           slotIdx: loc.slotIdx,
@@ -3301,7 +3357,7 @@ export class StorageEngine {
         await this.freeOverflowPages(tuple.data);
       }
       page.deleteTuple(loc.slotIdx);
-      await index.delete(pkValue);
+      await index.delete(pkValue, loc);
       await this.pager.writePage(pageId, page.buf);
       return 1;
     }
@@ -3335,7 +3391,7 @@ export class StorageEngine {
           }
           page.deleteTuple(tuple.slotIdx);
           if (pkCol && StorageEngine.pkIndexes.has(`${this.filepath}:${this.currentDbName}:${fullName}`))
-            await StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!.delete(row[pkCol.name]);
+            await StorageEngine.pkIndexes.get(`${this.filepath}:${this.currentDbName}:${fullName}`)!.delete(row[pkCol.name], { pageId: pageId!, slotIdx: tuple.slotIdx });
           pageModified = true;
           deleted++;
         }

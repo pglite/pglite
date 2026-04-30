@@ -83,6 +83,8 @@ export type AlterTableAction =
   | { type: 'AlterColumnSetNotNull'; columnName: string }
   | { type: 'AlterColumnDropNotNull'; columnName: string }
   | { type: 'AddForeignKey'; columnName: string; references: { table: string; column: string; onDelete?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION'; onUpdate?: 'CASCADE' | 'RESTRICT' | 'SET NULL' | 'SET DEFAULT' | 'NO ACTION' } }
+  | { type: 'AddUniqueConstraint'; constraintName: string; columns: string[] }
+  | { type: 'AddPrimaryKeyConstraint'; constraintName: string; columns: string[] }
   | { type: 'DropConstraint'; constraintName: string; ifExists?: boolean; cascade?: boolean };
 
 export type Statement =

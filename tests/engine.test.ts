@@ -4407,5 +4407,128 @@ describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () 
       expect(error1.message).toContain("Constraint Error: email must be unique");
     });
   });
+
+  describe("LEVEL 72: ALTER TABLE ADD UNIQUE / PRIMARY KEY CONSTRAINT", () => {
+    test("72.1 Add UNIQUE constraint to an existing column", async () => {
+      await db.exec(`CREATE TABLE brands (id SERIAL PRIMARY KEY, name TEXT)`);
+      await db.exec(`INSERT INTO brands (name) VALUES ('Apple'), ('Samsung')`);
+
+      // 1. Add column
+      await db.exec(`ALTER TABLE brands ADD COLUMN IF NOT EXISTS key VARCHAR(50)`);
+
+      // 2. Update data
+      await db.exec(`UPDATE brands SET key = LOWER(name) WHERE key IS NULL`);
+
+      // 3. Add NOT NULL constraint
+      await db.exec(`ALTER TABLE brands ALTER COLUMN key SET NOT NULL`);
+
+      // 4. Add UNIQUE constraint
+      const res = await db.exec(`ALTER TABLE brands ADD CONSTRAINT brands_key_unique UNIQUE (key)`);
+      expect(res.success).toBe(true);
+
+      // 5. Add comment
+      await db.exec(`COMMENT ON COLUMN brands.key IS '{ "label": "Mã nhận dạng", "type": "short_text", "required": true, "description": "Mã định danh duy nhất dùng để nhận diện thương hiệu (ví dụ: beso-cafe, red-junk)", "visible": true }'`);
+
+      const commentRows = await db.query(`
+        SELECT column_comment 
+        FROM information_schema.columns 
+        WHERE table_name = 'brands' AND column_name = 'key'
+      `);
+      expect(commentRows[0].column_comment).toContain("Mã nhận dạng");
+
+      // Verify that duplicate inserts now fail
+      let error;
+      try {
+        await db.exec(`INSERT INTO brands (name, key) VALUES ('Fake Apple', 'apple')`);
+      } catch (e: any) {
+        error = e;
+      }
+      expect(error).toBeDefined();
+      expect(error.message).toContain("Constraint Error: key must be unique");
+
+      // Verify adding a duplicate initially fails
+      // Note: We use 'dup1' and 'dup2' for key because key is already UNIQUE
+      await db.exec(`INSERT INTO brands (name, key) VALUES ('Duplicate', 'dup1'), ('Duplicate', 'dup2')`);
+      let addConstraintError;
+      try {
+        await db.exec(`ALTER TABLE brands ADD CONSTRAINT another_unique UNIQUE (name)`);
+      } catch (e: any) {
+        addConstraintError = e;
+      }
+      expect(addConstraintError).toBeDefined();
+      expect(addConstraintError.message).toContain("duplicate values for unique constraint another_unique");
+    });
+
+    test("72.2 Add PRIMARY KEY constraint to an existing column", async () => {
+      await db.exec(`CREATE TABLE pk_add_test (name TEXT, value TEXT)`);
+      await db.exec(`INSERT INTO pk_add_test (name, value) VALUES ('pk1', 'v1'), ('pk2', 'v2')`);
+
+      const res = await db.exec(`ALTER TABLE pk_add_test ADD CONSTRAINT pk_add_test_pkey PRIMARY KEY (name)`);
+      expect(res.success).toBe(true);
+
+      let error;
+      try {
+        await db.exec(`INSERT INTO pk_add_test (name, value) VALUES ('pk1', 'v3')`);
+      } catch (e: any) {
+        error = e;
+      }
+      expect(error).toBeDefined();
+      expect(error.message).toContain("Constraint Error: name must be unique");
+
+      // Verify primary key allows O(1) lookup
+      const rows = await db.query(`SELECT value FROM pk_add_test WHERE name = 'pk2'`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].value).toBe('v2');
+    });
+  });
+
+  describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
+    test("71.1 Update duplicated PKs using fallback mechanism", async () => {
+      await db.exec(`CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`);
+      
+      // Simulate the bug where duplicate PKs were inserted (bypassing Executor's unique check)
+      const storage = (db as any).storage;
+      await storage.insertRow('duplicate_pk_test', { id: 1, name: 'original' });
+      await storage.insertRow('duplicate_pk_test', { id: 1, name: 'duplicate' });
+
+      // Check that both rows exist
+      const rows = await db.query(`SELECT * FROM duplicate_pk_test`);
+      expect(rows.length).toBe(2);
+
+      // Try to fix the duplicate by updating the specific one
+      const res = await db.exec(`UPDATE duplicate_pk_test SET id = 2 WHERE id = 1 AND name = 'duplicate'`);
+      
+      // The update should succeed and fallback to full scan because the B-Tree's first match ('original') failed the WHERE clause
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(1);
+
+      // Verify the fix
+      const fixedRows = await db.query(`SELECT * FROM duplicate_pk_test ORDER BY id`);
+      expect(fixedRows.length).toBe(2);
+      expect(fixedRows[0].id).toBe(1);
+      expect(fixedRows[0].name).toBe('original');
+      expect(fixedRows[1].id).toBe(2);
+      expect(fixedRows[1].name).toBe('duplicate');
+    });
+
+    test("71.2 Delete duplicated PK using fallback mechanism", async () => {
+      await db.exec(`CREATE TABLE duplicate_pk_del_test (id INT PRIMARY KEY, name TEXT)`);
+      
+      // Simulate duplicates
+      const storage = (db as any).storage;
+      await storage.insertRow('duplicate_pk_del_test', { id: 1, name: 'keep' });
+      await storage.insertRow('duplicate_pk_del_test', { id: 1, name: 'remove' });
+
+      // Delete the specific duplicate
+      const res = await db.exec(`DELETE FROM duplicate_pk_del_test WHERE id = 1 AND name = 'remove'`);
+      
+      expect(res.success).toBe(true);
+      expect(res.deleted).toBe(1);
+
+      const remainingRows = await db.query(`SELECT * FROM duplicate_pk_del_test`);
+      expect(remainingRows.length).toBe(1);
+      expect(remainingRows[0].name).toBe('keep');
+    });
+  });
 });
 });
