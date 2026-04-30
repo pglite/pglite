@@ -94,7 +94,7 @@ export type Statement =
   | { type: 'DropTable'; tableNames: string[]; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropIndex'; indexNames: string[]; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropOther'; objectType: string; names: string[] }
-  | { type: 'CreateTable'; tableName: string; columns: ColumnDef[]; ifNotExists?: boolean }
+  | { type: 'CreateTable'; tableName: string; columns: ColumnDef[]; ifNotExists?: boolean; tableConstraints?: { type: string; columns: string[]; name?: string }[] }
   | { type: 'Insert'; tableName: string; columns: string[]; values?: Expr[][] | Expr[]; select?: Statement; returning?: Expr[]; onConflict?: OnConflict }
   | { 
       type: 'Select'; 
@@ -128,7 +128,7 @@ export type Statement =
   | { type: 'Delete'; tableName: string; where?: Expr; returning?: Expr[] }
   | { type: 'Truncate'; tableNames: string[]; cascade?: boolean; restartIdentity?: boolean }
   | { type: 'Values'; values: Expr[][]; ctes?: { name: string; columnAliases?: string[]; stmt: Statement; recursive?: boolean }[] }
-  | { type: 'AlterTable'; tableName: string; action: AlterTableAction }
+  | { type: 'AlterTable'; tableName: string; action: AlterTableAction; actions?: AlterTableAction[] }
   | { type: 'Do'; code: string; language?: string }
   | { type: 'Comment'; objectType: string; objectName: string; comment: string }
   | { type: 'Begin' }

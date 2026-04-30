@@ -1,4 +1,4 @@
-import { Token, TokenType, Statement, Expr, ColumnDef, JoinClause, OrderBy } from '../ast';
+import { Token, TokenType, Statement, Expr, ColumnDef, JoinClause, OrderBy, AlterTableAction } from '../ast';
 
 export class Parser {
   private pos = 0;
@@ -740,11 +740,15 @@ export class Parser {
     this.consume('SYMBOL', '(');
     
     const columns: ColumnDef[] =[];
+    const tableConstraints: any[] = [];
     while (!this.match('SYMBOL', ')')) {
       let isConstraint = false;
+      let constraintName: string | undefined;
       if (this.match('KEYWORD', 'CONSTRAINT')) {
         this.consume(); // CONSTRAINT
-        if (this.matchIdentifier()) this.consume(); // constraint name
+        if (this.matchIdentifier()) {
+          constraintName = this.consume().value;
+        }
         isConstraint = true;
       }
       
@@ -755,10 +759,18 @@ export class Parser {
       if (isConstraint) {
         if (this.match('KEYWORD', 'PRIMARY')) {
           this.consume(); this.consume('KEYWORD', 'KEY');
+          const pkCols: string[] = [];
           if (this.match('SYMBOL', '(')) {
             this.consume();
-            while (!this.match('SYMBOL', ')')) this.consume();
+            pkCols.push(this.consumeIdentifier());
+            while (this.match('SYMBOL', ',')) {
+              this.consume();
+              pkCols.push(this.consumeIdentifier());
+            }
             this.consume('SYMBOL', ')');
+          }
+          if (pkCols.length > 0) {
+            tableConstraints.push({ type: 'PRIMARY KEY', columns: pkCols, name: constraintName });
           }
         } else if (this.match('KEYWORD', 'FOREIGN')) {
           this.consume(); this.consume('KEYWORD', 'KEY');
@@ -776,12 +788,20 @@ export class Parser {
           }
         } else if (this.match('KEYWORD', 'UNIQUE')) {
           this.consume();
+          const uniqCols: string[] = [];
           if (this.match('SYMBOL', '(')) {
             this.consume();
-            while (!this.match('SYMBOL', ')')) this.consume();
+            uniqCols.push(this.consumeIdentifier());
+            while (this.match('SYMBOL', ',')) {
+              this.consume();
+              uniqCols.push(this.consumeIdentifier());
+            }
             this.consume('SYMBOL', ')');
           }
           if (this.match('KEYWORD', 'NULL') || this.match('IDENTIFIER', 'null')) this.consume();
+          if (uniqCols.length > 0) {
+            tableConstraints.push({ type: 'UNIQUE', columns: uniqCols, name: constraintName });
+          }
         } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
           this.consume(); // CHECK
           if (this.match('SYMBOL', '(')) {
@@ -902,7 +922,7 @@ export class Parser {
       if (this.match('SYMBOL', ',')) this.consume();
     }
     this.consume('SYMBOL', ')');
-    return { type: 'CreateTable', tableName, columns, ifNotExists };
+    return { type: 'CreateTable', tableName, columns, ifNotExists, tableConstraints };
   }
 
   private parseAlter(): Statement {
@@ -910,289 +930,300 @@ export class Parser {
     this.consume('KEYWORD', 'TABLE');
     const tableName = this.parseTableName();
 
-    if (this.match('KEYWORD', 'RENAME')) {
-      this.consume();
-      if (this.match('KEYWORD', 'COLUMN')) {
+    const parseAction = (): AlterTableAction => {
+      if (this.match('KEYWORD', 'RENAME')) {
         this.consume();
-        const oldColumnName = this.consumeIdentifier();
-        this.consume('KEYWORD', 'TO');
-        const newColumnName = this.consumeIdentifier();
-        return { type: 'AlterTable', tableName, action: { type: 'RenameColumn', oldColumnName, newColumnName } };
-      } else if (this.match('KEYWORD', 'TO')) {
+        if (this.match('KEYWORD', 'COLUMN')) {
+          this.consume();
+          const oldColumnName = this.consumeIdentifier();
+          this.consume('KEYWORD', 'TO');
+          const newColumnName = this.consumeIdentifier();
+          return { type: 'RenameColumn', oldColumnName, newColumnName };
+        } else if (this.match('KEYWORD', 'TO')) {
+          this.consume();
+          const newTableName = this.parseTableName();
+          return { type: 'RenameTable', newTableName };
+        } else {
+          const oldColumnName = this.consumeIdentifier();
+          this.consume('KEYWORD', 'TO');
+          const newColumnName = this.consumeIdentifier();
+          return { type: 'RenameColumn', oldColumnName, newColumnName };
+        }
+      } else if (this.match('KEYWORD', 'DROP')) {
         this.consume();
-        const newTableName = this.parseTableName();
-        return { type: 'AlterTable', tableName, action: { type: 'RenameTable', newTableName } };
-      } else {
-        const oldColumnName = this.consumeIdentifier();
-        this.consume('KEYWORD', 'TO');
-        const newColumnName = this.consumeIdentifier();
-        return { type: 'AlterTable', tableName, action: { type: 'RenameColumn', oldColumnName, newColumnName } };
-      }
-    } else if (this.match('KEYWORD', 'DROP')) {
-      this.consume();
-      if (this.match('KEYWORD', 'CONSTRAINT')) {
-        this.consume();
+        if (this.match('KEYWORD', 'CONSTRAINT')) {
+          this.consume();
+          let ifExists = false;
+          if (this.match('KEYWORD', 'IF')) {
+            this.consume(); this.consume('KEYWORD', 'EXISTS');
+            ifExists = true;
+          }
+          const constraintName = this.consumeIdentifier();
+          let cascade = false;
+          if (this.match('KEYWORD', 'CASCADE')) {
+            this.consume(); cascade = true;
+          } else if (this.match('KEYWORD', 'RESTRICT')) {
+            this.consume();
+          }
+          return { type: 'DropConstraint', constraintName, ifExists, cascade };
+        }
+        if (this.match('KEYWORD', 'COLUMN')) this.consume();
         let ifExists = false;
         if (this.match('KEYWORD', 'IF')) {
           this.consume(); this.consume('KEYWORD', 'EXISTS');
           ifExists = true;
         }
-        const constraintName = this.consumeIdentifier();
+        const columnName = this.consumeIdentifier();
         let cascade = false;
         if (this.match('KEYWORD', 'CASCADE')) {
           this.consume(); cascade = true;
         } else if (this.match('KEYWORD', 'RESTRICT')) {
           this.consume();
         }
-        return { type: 'AlterTable', tableName, action: { type: 'DropConstraint', constraintName, ifExists, cascade } };
-      }
-      if (this.match('KEYWORD', 'COLUMN')) this.consume();
-      let ifExists = false;
-      if (this.match('KEYWORD', 'IF')) {
-        this.consume(); this.consume('KEYWORD', 'EXISTS');
-        ifExists = true;
-      }
-      const columnName = this.consumeIdentifier();
-      let cascade = false;
-      if (this.match('KEYWORD', 'CASCADE')) {
-        this.consume(); cascade = true;
-      } else if (this.match('KEYWORD', 'RESTRICT')) {
+        return { type: 'DropColumn', columnName, ifExists, cascade };
+      } else if (this.match('KEYWORD', 'ADD')) {
         this.consume();
-      }
-      return { type: 'AlterTable', tableName, action: { type: 'DropColumn', columnName, ifExists, cascade } };
-    } else if (this.match('KEYWORD', 'ADD')) {
-      this.consume();
-      
-      let isConstraint = false;
-      let constraintName = '';
-      if (this.match('KEYWORD', 'CONSTRAINT')) {
-        this.consume(); // CONSTRAINT
-        constraintName = this.consumeIdentifier();
-        isConstraint = true;
-      } else if (this.match('KEYWORD', 'FOREIGN') || this.match('KEYWORD', 'UNIQUE') || this.match('KEYWORD', 'PRIMARY')) {
-        isConstraint = true;
-      }
-
-      if (isConstraint) {
-        if (this.match('KEYWORD', 'FOREIGN')) {
-          this.consume(); // FOREIGN
-          this.consume('KEYWORD', 'KEY'); // KEY
-          this.consume('SYMBOL', '(');
-          const columnName = this.consumeIdentifier();
-          this.consume('SYMBOL', ')');
-          
-          this.consume('KEYWORD', 'REFERENCES');
-          const refTable = this.parseTableName();
-          let refCol = "id";
-          if (this.match('SYMBOL', '(')) {
-            this.consume();
-            refCol = this.consumeIdentifier();
-            this.consume('SYMBOL', ')');
-          }
-          const references: any = { table: refTable, column: refCol };
-          
-          while (this.match('KEYWORD', 'ON')) {
-            this.consume(); // ON
-            const isDelete = this.match('KEYWORD', 'DELETE');
-            const isUpdate = this.match('KEYWORD', 'UPDATE');
-            if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
-
-            let action: any;
-            if (this.match('KEYWORD', 'SET')) {
-              this.consume();
-              if (this.match('KEYWORD', 'NULL')) {
-                this.consume(); action = 'SET NULL';
-              } else if (this.match('KEYWORD', 'DEFAULT')) {
-                this.consume(); action = 'SET DEFAULT';
-              }
-            } else if (this.match('KEYWORD', 'CASCADE')) {
-              this.consume(); action = 'CASCADE';
-            } else if (this.match('KEYWORD', 'RESTRICT')) {
-              this.consume(); action = 'RESTRICT';
-            } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'NO') {
-              this.consume();
-              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ACTION') {
-                this.consume(); action = 'NO ACTION';
-              }
-            }
-            if (isDelete) references.onDelete = action;
-            if (isUpdate) references.onUpdate = action;
-          }
-          
-          return { type: 'AlterTable', tableName, action: { type: 'AddForeignKey', columnName, references } };
-        } else if (this.match('KEYWORD', 'UNIQUE')) {
-          this.consume(); // UNIQUE
-          this.consume('SYMBOL', '(');
-          const columns: string[] =[];
-          columns.push(this.consumeIdentifier());
-          while (this.match('SYMBOL', ',')) {
-            this.consume();
-            columns.push(this.consumeIdentifier());
-          }
-          this.consume('SYMBOL', ')');
-          return { type: 'AlterTable', tableName, action: { type: 'AddUniqueConstraint', constraintName, columns } };
-        } else if (this.match('KEYWORD', 'PRIMARY')) {
-          this.consume(); // PRIMARY
-          this.consume('KEYWORD', 'KEY'); // KEY
-          this.consume('SYMBOL', '(');
-          const columns: string[] =[];
-          columns.push(this.consumeIdentifier());
-          while (this.match('SYMBOL', ',')) {
-            this.consume();
-            columns.push(this.consumeIdentifier());
-          }
-          this.consume('SYMBOL', ')');
-          return { type: 'AlterTable', tableName, action: { type: 'AddPrimaryKeyConstraint', constraintName, columns } };
-        } else {
-           throw new Error("Parse Error: Only FOREIGN KEY, UNIQUE, and PRIMARY KEY constraints are supported in ALTER TABLE ADD CONSTRAINT currently");
+        
+        let isConstraint = false;
+        let constraintName = '';
+        if (this.match('KEYWORD', 'CONSTRAINT')) {
+          this.consume(); // CONSTRAINT
+          constraintName = this.consumeIdentifier();
+          isConstraint = true;
+        } else if (this.match('KEYWORD', 'FOREIGN') || this.match('KEYWORD', 'UNIQUE') || this.match('KEYWORD', 'PRIMARY')) {
+          isConstraint = true;
         }
-      }
 
-      if (this.match('KEYWORD', 'COLUMN')) this.consume();
-      let ifNotExists = false;
-      if (this.match('KEYWORD', 'IF')) {
-        this.consume(); this.consume('KEYWORD', 'NOT'); this.consume('KEYWORD', 'EXISTS');
-        ifNotExists = true;
-      }
-      const name = this.consumeIdentifier();
-      let dataType = this.parseDataType();
-      let isPrimaryKey = false, isUnique = false, isNotNull = false;
-      let references: any, defaultVal;
-      let generatedExpr: Expr | undefined;
-
-      if (dataType.toUpperCase().includes('SERIAL')) isNotNull = true;
-      
-      while (true) {
-        if (this.match('KEYWORD', 'PRIMARY')) {
-          this.consume(); this.consume('KEYWORD', 'KEY'); isPrimaryKey = true; isNotNull = true;
-        } else if (this.match('KEYWORD', 'UNIQUE')) {
-          this.consume(); isUnique = true;
-        } else if (this.match('KEYWORD', 'NOT')) {
-          this.consume(); this.consume('KEYWORD', 'NULL'); isNotNull = true;
-        } else if (this.match('KEYWORD', 'NULL')) {
-          this.consume();
-        } else if (this.match('KEYWORD', 'REFERENCES')) {
-          this.consume(); 
-          const refTable = this.parseTableName();
-          let refCol = "id";
-          if (this.match('SYMBOL', '(')) {
-            this.consume();
-            refCol = this.consumeIdentifier();
+        if (isConstraint) {
+          if (this.match('KEYWORD', 'FOREIGN')) {
+            this.consume(); // FOREIGN
+            this.consume('KEYWORD', 'KEY'); // KEY
+            this.consume('SYMBOL', '(');
+            const columnName = this.consumeIdentifier();
             this.consume('SYMBOL', ')');
-          }
-          references = { table: refTable, column: refCol };
-
-          while (this.match('KEYWORD', 'ON')) {
-            this.consume(); // ON
-            const isDelete = this.match('KEYWORD', 'DELETE');
-            const isUpdate = this.match('KEYWORD', 'UPDATE');
-            if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
-
-            let action: any;
-            if (this.match('KEYWORD', 'SET')) {
-              this.consume();
-              if (this.match('KEYWORD', 'NULL')) {
-                this.consume(); action = 'SET NULL';
-              } else if (this.match('KEYWORD', 'DEFAULT')) {
-                this.consume(); action = 'SET DEFAULT';
-              }
-            } else if (this.match('KEYWORD', 'CASCADE')) {
-              this.consume(); action = 'CASCADE';
-            } else if (this.match('KEYWORD', 'RESTRICT')) {
-              this.consume(); action = 'RESTRICT';
-            } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'NO') {
-              this.consume();
-              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ACTION') {
-                this.consume(); action = 'NO ACTION';
-              }
-            }
-            if (isDelete) references.onDelete = action;
-            if (isUpdate) references.onUpdate = action;
-          }
-        } else if (this.match('KEYWORD', 'DEFAULT')) {
-          this.consume(); defaultVal = this.parseExpr();
-        } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'GENERATED') {
-          this.consume(); // GENERATED
-          if (this.matchIdentifier() && ['ALWAYS', 'BY'].includes(this.current()?.value.toUpperCase() || '')) {
-            this.consume();
-            if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DEFAULT') this.consume();
-          }
-          if (this.match('KEYWORD', 'AS')) {
-            this.consume();
+            
+            this.consume('KEYWORD', 'REFERENCES');
+            const refTable = this.parseTableName();
+            let refCol = "id";
             if (this.match('SYMBOL', '(')) {
               this.consume();
-              generatedExpr = this.parseExpr();
+              refCol = this.consumeIdentifier();
               this.consume('SYMBOL', ')');
-              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'STORED') {
+            }
+            const references: any = { table: refTable, column: refCol };
+            
+            while (this.match('KEYWORD', 'ON')) {
+              this.consume(); // ON
+              const isDelete = this.match('KEYWORD', 'DELETE');
+              const isUpdate = this.match('KEYWORD', 'UPDATE');
+              if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
+
+              let action: any;
+              if (this.match('KEYWORD', 'SET')) {
                 this.consume();
+                if (this.match('KEYWORD', 'NULL')) {
+                  this.consume(); action = 'SET NULL';
+                } else if (this.match('KEYWORD', 'DEFAULT')) {
+                  this.consume(); action = 'SET DEFAULT';
+                }
+              } else if (this.match('KEYWORD', 'CASCADE')) {
+                this.consume(); action = 'CASCADE';
+              } else if (this.match('KEYWORD', 'RESTRICT')) {
+                this.consume(); action = 'RESTRICT';
+              } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'NO') {
+                this.consume();
+                if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ACTION') {
+                  this.consume(); action = 'NO ACTION';
+                }
+              }
+              if (isDelete) references.onDelete = action;
+              if (isUpdate) references.onUpdate = action;
+            }
+            
+            return { type: 'AddForeignKey', columnName, references };
+          } else if (this.match('KEYWORD', 'UNIQUE')) {
+            this.consume(); // UNIQUE
+            this.consume('SYMBOL', '(');
+            const columns: string[] =[];
+            columns.push(this.consumeIdentifier());
+            while (this.match('SYMBOL', ',')) {
+              this.consume();
+              columns.push(this.consumeIdentifier());
+            }
+            this.consume('SYMBOL', ')');
+            return { type: 'AddUniqueConstraint', constraintName, columns };
+          } else if (this.match('KEYWORD', 'PRIMARY')) {
+            this.consume(); // PRIMARY
+            this.consume('KEYWORD', 'KEY'); // KEY
+            this.consume('SYMBOL', '(');
+            const columns: string[] =[];
+            columns.push(this.consumeIdentifier());
+            while (this.match('SYMBOL', ',')) {
+              this.consume();
+              columns.push(this.consumeIdentifier());
+            }
+            this.consume('SYMBOL', ')');
+            return { type: 'AddPrimaryKeyConstraint', constraintName, columns };
+          } else {
+             throw new Error("Parse Error: Only FOREIGN KEY, UNIQUE, and PRIMARY KEY constraints are supported in ALTER TABLE ADD CONSTRAINT currently");
+          }
+        }
+
+        if (this.match('KEYWORD', 'COLUMN')) this.consume();
+        let ifNotExists = false;
+        if (this.match('KEYWORD', 'IF')) {
+          this.consume(); this.consume('KEYWORD', 'NOT'); this.consume('KEYWORD', 'EXISTS');
+          ifNotExists = true;
+        }
+        const name = this.consumeIdentifier();
+        let dataType = this.parseDataType();
+        let isPrimaryKey = false, isUnique = false, isNotNull = false;
+        let references: any, defaultVal;
+        let generatedExpr: Expr | undefined;
+
+        if (dataType.toUpperCase().includes('SERIAL')) isNotNull = true;
+        
+        while (true) {
+          if (this.match('KEYWORD', 'PRIMARY')) {
+            this.consume(); this.consume('KEYWORD', 'KEY'); isPrimaryKey = true; isNotNull = true;
+          } else if (this.match('KEYWORD', 'UNIQUE')) {
+            this.consume(); isUnique = true;
+          } else if (this.match('KEYWORD', 'NOT')) {
+            this.consume(); this.consume('KEYWORD', 'NULL'); isNotNull = true;
+          } else if (this.match('KEYWORD', 'NULL')) {
+            this.consume();
+          } else if (this.match('KEYWORD', 'REFERENCES')) {
+            this.consume(); 
+            const refTable = this.parseTableName();
+            let refCol = "id";
+            if (this.match('SYMBOL', '(')) {
+              this.consume();
+              refCol = this.consumeIdentifier();
+              this.consume('SYMBOL', ')');
+            }
+            references = { table: refTable, column: refCol };
+
+            while (this.match('KEYWORD', 'ON')) {
+              this.consume(); // ON
+              const isDelete = this.match('KEYWORD', 'DELETE');
+              const isUpdate = this.match('KEYWORD', 'UPDATE');
+              if (isDelete || isUpdate) this.consume(); // DELETE or UPDATE
+
+              let action: any;
+              if (this.match('KEYWORD', 'SET')) {
+                this.consume();
+                if (this.match('KEYWORD', 'NULL')) {
+                  this.consume(); action = 'SET NULL';
+                } else if (this.match('KEYWORD', 'DEFAULT')) {
+                  this.consume(); action = 'SET DEFAULT';
+                }
+              } else if (this.match('KEYWORD', 'CASCADE')) {
+                this.consume(); action = 'CASCADE';
+              } else if (this.match('KEYWORD', 'RESTRICT')) {
+                this.consume(); action = 'RESTRICT';
+              } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'NO') {
+                this.consume();
+                if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ACTION') {
+                  this.consume(); action = 'NO ACTION';
+                }
+              }
+              if (isDelete) references.onDelete = action;
+              if (isUpdate) references.onUpdate = action;
+            }
+          } else if (this.match('KEYWORD', 'DEFAULT')) {
+            this.consume(); defaultVal = this.parseExpr();
+          } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'GENERATED') {
+            this.consume(); // GENERATED
+            if (this.matchIdentifier() && ['ALWAYS', 'BY'].includes(this.current()?.value.toUpperCase() || '')) {
+              this.consume();
+              if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DEFAULT') this.consume();
+            }
+            if (this.match('KEYWORD', 'AS')) {
+              this.consume();
+              if (this.match('SYMBOL', '(')) {
+                this.consume();
+                generatedExpr = this.parseExpr();
+                this.consume('SYMBOL', ')');
+                if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'STORED') {
+                  this.consume();
+                }
+              } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
+                this.consume();
+                isNotNull = true;
+                dataType = 'SERIAL';
               }
             } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
               this.consume();
               isNotNull = true;
               dataType = 'SERIAL';
+            } else {
+              isNotNull = true;
+              dataType = 'SERIAL';
             }
-          } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'IDENTITY') {
-            this.consume();
-            isNotNull = true;
-            dataType = 'SERIAL';
+          } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
+            this.consume(); // CHECK
+            if (this.match('SYMBOL', '(')) {
+              this.consume();
+              let depth = 1;
+              while (depth > 0 && this.current() && this.current()?.type !== 'EOF') {
+                const token = this.consume();
+                if (token.value === '(') depth++;
+                else if (token.value === ')') depth--;
+              }
+            }
           } else {
-            isNotNull = true;
-            dataType = 'SERIAL';
+            break;
           }
-        } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'CHECK') {
-          this.consume(); // CHECK
-          if (this.match('SYMBOL', '(')) {
+        }
+        return { type: 'AddColumn', column: { name, dataType, isPrimaryKey, isUnique, isNotNull, references, defaultVal, generatedExpr }, ifNotExists };
+      } else if (this.match('KEYWORD', 'ALTER')) {
+        this.consume();
+        if (this.match('KEYWORD', 'COLUMN')) this.consume();
+        const columnName = this.consumeIdentifier();
+        
+        if (this.match('KEYWORD', 'TYPE')) {
+          this.consume();
+          const dataType = this.parseDataType();
+          if (this.match('KEYWORD', 'USING')) {
+             this.consume(); this.parseExpr(); // skip USING expression for now
+          }
+          if (this.match('KEYWORD', 'CASCADE') || this.match('KEYWORD', 'RESTRICT')) {
             this.consume();
-            let depth = 1;
-            while (depth > 0 && this.current() && this.current()?.type !== 'EOF') {
-              const token = this.consume();
-              if (token.value === '(') depth++;
-              else if (token.value === ')') depth--;
-            }
           }
-        } else {
-          break;
+          return { type: 'AlterColumnType', columnName, dataType };
+        } else if (this.match('KEYWORD', 'SET')) {
+          this.consume();
+          if (this.match('KEYWORD', 'NOT')) {
+            this.consume(); this.consume('KEYWORD', 'NULL');
+            return { type: 'AlterColumnSetNotNull', columnName };
+          } else if (this.match('KEYWORD', 'DEFAULT')) {
+            this.consume();
+            const defaultVal = this.parseExpr();
+            return { type: 'AlterColumnSetDefault', columnName, defaultVal };
+          }
+        } else if (this.match('KEYWORD', 'DROP')) {
+          this.consume();
+          if (this.match('KEYWORD', 'NOT')) {
+            this.consume(); this.consume('KEYWORD', 'NULL');
+            return { type: 'AlterColumnDropNotNull', columnName };
+          } else if (this.match('KEYWORD', 'DEFAULT')) {
+            this.consume();
+            return { type: 'AlterColumnDropDefault', columnName };
+          }
         }
       }
-      return { type: 'AlterTable', tableName, action: { type: 'AddColumn', column: { name, dataType, isPrimaryKey, isUnique, isNotNull, references, defaultVal, generatedExpr }, ifNotExists } };
-    } else if (this.match('KEYWORD', 'ALTER')) {
+
+      throw new Error(`Parse Error: Unsupported ALTER TABLE action`);
+    };
+
+    const actions: AlterTableAction[] = [];
+    actions.push(parseAction());
+    while (this.match('SYMBOL', ',')) {
       this.consume();
-      if (this.match('KEYWORD', 'COLUMN')) this.consume();
-      const columnName = this.consumeIdentifier();
-      
-      if (this.match('KEYWORD', 'TYPE')) {
-        this.consume();
-        const dataType = this.parseDataType();
-        if (this.match('KEYWORD', 'USING')) {
-           this.consume(); this.parseExpr(); // skip USING expression for now
-        }
-        if (this.match('KEYWORD', 'CASCADE') || this.match('KEYWORD', 'RESTRICT')) {
-          this.consume();
-        }
-        return { type: 'AlterTable', tableName, action: { type: 'AlterColumnType', columnName, dataType } };
-      } else if (this.match('KEYWORD', 'SET')) {
-        this.consume();
-        if (this.match('KEYWORD', 'NOT')) {
-          this.consume(); this.consume('KEYWORD', 'NULL');
-          return { type: 'AlterTable', tableName, action: { type: 'AlterColumnSetNotNull', columnName } };
-        } else if (this.match('KEYWORD', 'DEFAULT')) {
-          this.consume();
-          const defaultVal = this.parseExpr();
-          return { type: 'AlterTable', tableName, action: { type: 'AlterColumnSetDefault', columnName, defaultVal } };
-        }
-      } else if (this.match('KEYWORD', 'DROP')) {
-        this.consume();
-        if (this.match('KEYWORD', 'NOT')) {
-          this.consume(); this.consume('KEYWORD', 'NULL');
-          return { type: 'AlterTable', tableName, action: { type: 'AlterColumnDropNotNull', columnName } };
-        } else if (this.match('KEYWORD', 'DEFAULT')) {
-          this.consume();
-          return { type: 'AlterTable', tableName, action: { type: 'AlterColumnDropDefault', columnName } };
-        }
-      }
+      actions.push(parseAction());
     }
 
-    throw new Error(`Parse Error: Unsupported ALTER TABLE action`);
+    return { type: 'AlterTable', tableName, action: actions[0] as AlterTableAction, actions };
   }
 
   private parseSelect(): Statement {

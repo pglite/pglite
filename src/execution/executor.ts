@@ -103,11 +103,13 @@ export class Executor {
       case "AlterTable": {
         const table = await (storage as any).getTableAsync(stmt.tableName);
         if (!table) throw new Error(`Table ${stmt.tableName} not found`);
-        const action = stmt.action;
+        
+        const actionsToRun = stmt.actions || [stmt.action];
 
+        for (const action of actionsToRun) {
         if (action.type === 'AddColumn') {
           if (action.ifNotExists && table.columns.some((c: any) => c.name === action.column.name)) {
-            return { success: true };
+            continue;
           }
           if (action.column.references) {
             storage.invalidateTableCache(action.column.references.table);
@@ -157,7 +159,7 @@ export class Executor {
         } else if (action.type === 'DropColumn') {
           const colIndex = table.columns.findIndex((c: any) => c.name === action.columnName);
           if (colIndex === -1) {
-            if (action.ifExists) return { success: true };
+            if (action.ifExists) continue;
             throw new Error(`Column ${action.columnName} does not exist`);
           }
           const colNum = colIndex + 1;
@@ -387,12 +389,13 @@ export class Executor {
              );
           }
         }
+        }
 
         return { success: true };
       }
 
       case "CreateTable":
-        await storage.createTable(stmt.tableName, stmt.columns, stmt.ifNotExists);
+        await storage.createTable(stmt.tableName, stmt.columns, stmt.ifNotExists, stmt.tableConstraints);
         return { success: true, message: `Table ${stmt.tableName} created.` };
 
       case "Insert": {

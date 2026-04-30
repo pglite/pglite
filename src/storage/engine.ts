@@ -2163,6 +2163,7 @@ export class StorageEngine {
     name: string,
     columns: ColumnDef[],
     ifNotExists: boolean = false,
+    tableConstraints?: any[],
   ): Promise<void> {
     const fullName = this.getFullTableName(name);
     const existing = await this.getTableAsync(fullName);
@@ -2192,12 +2193,34 @@ export class StorageEngine {
     const pkAttNums: number[] = [];
     const uniqueAttNums: Map<string, number[]> = new Map();
 
+    if (tableConstraints) {
+      for (const tc of tableConstraints) {
+        if (tc.type === 'UNIQUE') {
+          const cNames = tc.columns;
+          const attNums = cNames.map((c: string) => {
+            const idx = columns.findIndex(col => col.name === c);
+            if (idx === -1) throw new Error(`Column ${c} not found for unique constraint`);
+            return idx + 1;
+          });
+          uniqueAttNums.set(tc.name || `${tableName}_${cNames.join('_')}_key`, attNums);
+        } else if (tc.type === 'PRIMARY KEY') {
+          const cNames = tc.columns;
+          for (const c of cNames) {
+            const col = columns.find(col => col.name === c);
+            if (!col) throw new Error(`Column ${c} not found for primary key`);
+            col.isPrimaryKey = true;
+            col.isNotNull = true;
+          }
+        }
+      }
+    }
+
     for (let i = 0; i < columns.length; i++) {
       const col = columns[i]!;
       if (col.references) {
         this.invalidateTableCache(col.references.table);
       }
-      if (col.isPrimaryKey) pkAttNums.push(i + 1);
+      if (col.isPrimaryKey && !pkAttNums.includes(i + 1)) pkAttNums.push(i + 1);
       if (col.isUnique && !col.isPrimaryKey) {
         uniqueAttNums.set(`${tableName}_${col.name}_key`, [i + 1]);
       }
