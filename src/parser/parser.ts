@@ -1556,6 +1556,15 @@ export class Parser {
   private parseUpdate(): Statement {
     this.consume('KEYWORD', 'UPDATE');
     const tableName = this.parseTableName();
+    
+    let alias: string | undefined;
+    if (this.match('KEYWORD', 'AS')) {
+      this.consume();
+      alias = this.consumeIdentifier();
+    } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() !== 'SET') {
+      alias = this.consumeIdentifier();
+    }
+
     this.consume('KEYWORD', 'SET');
     
     const assignments: Record<string, Expr> = {};
@@ -1565,6 +1574,155 @@ export class Parser {
       assignments[colName] = this.parseExpr();
     } while (this.match('SYMBOL', ',') && this.consume());
     
+    let from: any = undefined;
+    const joins: JoinClause[] = [];
+
+    const parseFromSource = () => {
+      let source: any = {};
+      if (this.match('SYMBOL', '(')) {
+        this.consume();
+        const stmt = this.parseQuery();
+        this.consume('SYMBOL', ')');
+        source.stmt = stmt;
+      } else {
+        const next = this.tokens[this.pos + 1];
+        if (this.matchIdentifier() && next?.type === 'SYMBOL' && next.value === '(') {
+          source.fn = this.parseExpr();
+        } else {
+          source.tableName = this.parseTableName();
+        }
+      }
+
+      if (this.match('KEYWORD', 'WITH')) {
+        this.consume();
+        this.consume('KEYWORD', 'ORDINALITY');
+        source.withOrdinality = true;
+      }
+
+      if (this.match('KEYWORD', 'AS')) {
+        this.consume();
+        source.alias = this.consumeIdentifier();
+        if (this.match('SYMBOL', '(')) {
+          this.consume();
+          const columnAliases = [];
+          columnAliases.push(this.consumeIdentifier());
+          while (this.match('SYMBOL', ',')) {
+            this.consume();
+            columnAliases.push(this.consumeIdentifier());
+          }
+          this.consume('SYMBOL', ')');
+          source.columnAliases = columnAliases;
+        }
+      } else if (this.matchIdentifier() && !['INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'WHERE', 'RETURNING'].includes(this.current()?.value.toUpperCase() || '')) {
+        source.alias = this.consumeIdentifier();
+      }
+      return source;
+    };
+
+    if (this.match('KEYWORD', 'FROM')) {
+      this.consume();
+      from = parseFromSource();
+      while (this.match('SYMBOL', ',')) {
+        this.consume();
+        const nextSource = parseFromSource();
+        joins.push({
+          type: 'CROSS',
+          tableName: nextSource.tableName,
+          stmt: nextSource.stmt,
+          fn: nextSource.fn,
+          withOrdinality: nextSource.withOrdinality,
+          columnAliases: nextSource.columnAliases,
+          alias: nextSource.alias,
+          on: { type: 'Literal', value: true }
+        });
+      }
+    }
+    
+    // Allow joins in UPDATE statements (Postgres extension)
+    while (this.match('KEYWORD', 'INNER') || this.match('KEYWORD', 'LEFT') || this.match('KEYWORD', 'RIGHT') || this.match('KEYWORD', 'FULL') || this.match('KEYWORD', 'CROSS') || this.match('KEYWORD', 'JOIN')) {
+      let type: 'INNER' | 'LEFT' | 'RIGHT' | 'FULL' | 'CROSS' = 'INNER';
+      if (this.match('KEYWORD', 'LEFT')) {
+        this.consume(); 
+        if (this.match('KEYWORD', 'OUTER')) this.consume();
+        type = 'LEFT'; this.consume('KEYWORD', 'JOIN');
+      } else if (this.match('KEYWORD', 'RIGHT')) {
+        this.consume(); 
+        if (this.match('KEYWORD', 'OUTER')) this.consume();
+        type = 'RIGHT'; this.consume('KEYWORD', 'JOIN');
+      } else if (this.match('KEYWORD', 'FULL')) {
+        this.consume(); 
+        if (this.match('KEYWORD', 'OUTER')) this.consume();
+        type = 'FULL'; this.consume('KEYWORD', 'JOIN');
+      } else if (this.match('KEYWORD', 'CROSS')) {
+        this.consume(); this.consume('KEYWORD', 'JOIN');
+        type = 'CROSS';
+      } else if (this.match('KEYWORD', 'INNER')) {
+        this.consume(); this.consume('KEYWORD', 'JOIN');
+      } else {
+        this.consume('KEYWORD', 'JOIN');
+      }
+      
+      let lateral = false;
+      if (this.match('KEYWORD', 'LATERAL')) {
+        this.consume();
+        lateral = true;
+      }
+      
+      let stmt_join: Statement | undefined;
+      let fn_join: Expr | undefined;
+      let joinTableName: string | undefined;
+      let withOrdinality = false;
+      let columnAliases: string[] | undefined;
+
+      if (this.match('SYMBOL', '(')) {
+        this.consume();
+        stmt_join = this.parseQuery();
+        this.consume('SYMBOL', ')');
+      } else {
+        const next = this.tokens[this.pos + 1];
+        if (this.matchIdentifier() && next?.type === 'SYMBOL' && next.value === '(') {
+          fn_join = this.parseExpr();
+        } else {
+          joinTableName = this.parseTableName();
+        }
+      }
+
+      if (this.match('KEYWORD', 'WITH')) {
+        this.consume();
+        this.consume('KEYWORD', 'ORDINALITY');
+        withOrdinality = true;
+      }
+
+      let joinAlias;
+      if (this.match('KEYWORD', 'AS')) {
+        this.consume();
+        joinAlias = this.consumeIdentifier();
+        if (this.match('SYMBOL', '(')) {
+          this.consume();
+          const aliases = [];
+          aliases.push(this.consumeIdentifier());
+          while (this.match('SYMBOL', ',')) {
+            this.consume();
+            aliases.push(this.consumeIdentifier());
+          }
+          this.consume('SYMBOL', ')');
+          columnAliases = aliases;
+        }
+      } else if (this.matchIdentifier() && !['ON', 'WHERE', 'RETURNING', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'LATERAL', 'WITH'].includes(this.current()?.value.toUpperCase() || '')) {
+        joinAlias = this.consumeIdentifier();
+      }
+      
+      let on: Expr;
+      if (this.match('KEYWORD', 'ON')) {
+        this.consume();
+        on = this.parseExpr();
+      } else {
+        on = { type: 'Literal', value: true };
+      }
+      
+      joins.push({ type, lateral, tableName: joinTableName, stmt: stmt_join, fn: fn_join, withOrdinality, columnAliases, alias: joinAlias, on });
+    }
+
     let where: Expr | undefined;
     if (this.match('KEYWORD', 'WHERE')) {
       this.consume(); where = this.parseExpr();
@@ -1575,7 +1733,7 @@ export class Parser {
       returning = this.parseReturning();
     }
     
-    return { type: 'Update', tableName, assignments, where, returning };
+    return { type: 'Update', tableName, alias, assignments, from, joins, where, returning };
   }
 
   private parseDelete(): Statement {

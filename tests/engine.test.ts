@@ -4531,6 +4531,52 @@ describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () 
     });
   });
 
+  describe("LEVEL 74: UPDATE ... FROM syntax", () => {
+    test("74.1 UPDATE ... FROM standard use case", async () => {
+      await db.exec(`CREATE TABLE branches (id SERIAL PRIMARY KEY, name TEXT)`);
+      await db.exec(`INSERT INTO branches (name) VALUES ('Branch 1'), ('Branch 2')`);
+
+      await db.exec(`CREATE TABLE tables (id SERIAL PRIMARY KEY, branch_id INT, table_no TEXT)`);
+      await db.exec(`INSERT INTO tables (branch_id, table_no) VALUES (1, 'T1'), (2, 'T2')`);
+
+      await db.exec(`CREATE TABLE bookings (id SERIAL PRIMARY KEY, table_id INT, branch_id INT)`);
+      await db.exec(`INSERT INTO bookings (table_id) VALUES (1), (2)`);
+
+      const sql = `
+        UPDATE bookings b
+        SET branch_id = t.branch_id
+        FROM tables t
+        WHERE b.table_id = t.id AND b.branch_id IS NULL
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(2);
+
+      const rows = await db.query(`SELECT branch_id FROM bookings ORDER BY id`);
+      expect(rows[0].branch_id).toBe(1);
+      expect(rows[1].branch_id).toBe(2);
+    });
+
+    test("74.2 UPDATE ... FROM with function/alias fallback", async () => {
+      await db.exec(`CREATE TABLE stock (id INT PRIMARY KEY, qty INT)`);
+      await db.exec(`INSERT INTO stock (id, qty) VALUES (1, 10), (2, 20)`);
+      
+      const sql = `
+        UPDATE stock
+        SET qty = qty + v.add_qty
+        FROM (VALUES (1, 5), (2, 10)) AS v(id, add_qty)
+        WHERE stock.id = v.id
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+      expect(res.updated).toBe(2);
+
+      const rows = await db.query(`SELECT * FROM stock ORDER BY id`);
+      expect(rows[0].qty).toBe(15);
+      expect(rows[1].qty).toBe(30);
+    });
+  });
+
   describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
     test("71.1 Update duplicated PKs using fallback mechanism", async () => {
       await db.exec(`CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`);

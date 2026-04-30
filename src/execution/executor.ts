@@ -634,178 +634,346 @@ export class Executor {
         
         const referencingCols = await storage.getReferencingColumns(stmt.tableName);
         const updatedRows: any[] =[];
+
+        let sourceStream: AsyncIterableIterator<any> | null = null;
         
-        const updateFn = async (row: any) => {
-          const oldRow = { ...row };
-          for (const [colName, expr] of Object.entries(stmt.assignments)) {
-            let newVal = await this.evaluateExpr(storage, expr, row, params);
-
-            const colDef = table.columns.find((c: any) => c.name === colName);
-            if (colDef && newVal !== undefined && newVal !== null) {
-              newVal = await this.castValue(storage, newVal, colDef.dataType);
-            }
-
-            // 1. Validate outgoing Foreign Key constraints (Child side)
-            if (colDef?.references && newVal !== undefined && newVal !== null) {
-              let exists = false;
-              // Optimization: Use O(log N) index lookup if referenced column is the Primary Key
-              const refPK = await storage.getPKColumn(colDef.references.table);
-              if (refPK === colDef.references.column) {
-                const refRow = await storage.getRowByPK(colDef.references.table, newVal);
-                if (refRow) exists = true;
-              }
-              if (!exists) {
-                for await (const r of storage.scanRows(colDef.references.table)) {
-                  if (r[colDef.references.column] == newVal) { exists = true; break; }
-                }
-              }
-              if (!exists) {
-                const errorDetails = [
-                  `Foreign Key Violation (Update): update on table "${stmt.tableName}" violates foreign key constraint.`,
-                  `- Source Column: "${colDef.name}"`,
-                  `- New Source Value: ${JSON.stringify(newVal)}`,
-                  `- Target Table: "${colDef.references.table}"`,
-                  `- Target Column: "${colDef.references.column}"`,
-                  `Reason: The updated value ${JSON.stringify(newVal)} was not found in the referenced column "${colDef.references.column}" of table "${colDef.references.table}".`
-                ].join('\n');
-                throw new Error(errorDetails);
-              }
-            }
-
-            // 2. Handle Referential Integrity for incoming references (Parent side)
-            const oldVal = oldRow[colName];
-            if (newVal !== oldVal) {
-              for (const ref of referencingCols) {
-                if (ref.parentColumn === colName) {
-                  const action = ref.onUpdate;
-                  
-                  // Check if any child records exist
-                  const childrenExist = async () => {
-                    // Optimization: Use O(log N) index lookup if child column is the Primary Key
-                    const childPK = await storage.getPKColumn(ref.childTable);
-                    if (childPK === ref.childColumn) {
-                      const r = await storage.getRowByPK(ref.childTable, oldVal);
-                      if (r) return true;
-                    }
-                    for await (const r of storage.scanRows(ref.childTable)) {
-                      if (r[ref.childColumn] == oldVal) return true;
-                    }
-                    return false;
-                  };
-
-                  if (await childrenExist()) {
-                    if (action === 'RESTRICT' || action === 'NO ACTION') {
-                      const errorDetails = [
-                        `Foreign Key Violation (Update RESTRICT): update on table "${stmt.tableName}" violates foreign key constraint.`,
-                        `- Target Table: "${stmt.tableName}" (Parent)`,
-                        `- Target Column: "${ref.parentColumn}"`,
-                        `- Old Value: ${JSON.stringify(oldVal)}`,
-                        `- New Value: ${JSON.stringify(newVal)}`,
-                        `- Dependent Table: "${ref.childTable}" (Child)`,
-                        `- Dependent Column: "${ref.childColumn}"`,
-                        `Reason: Cannot update value from ${JSON.stringify(oldVal)} to ${JSON.stringify(newVal)} because child records exist in table "${ref.childTable}" and the ON UPDATE action is ${action}.`
-                      ].join('\n');
-                      throw new Error(errorDetails);
-                    } else if (action === 'CASCADE') {
-                      await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = newVal; });
-                    } else if (action === 'SET NULL') {
-                      await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = null; });
-                    }
-                  }
-                }
-              }
-            }
-
-            row[colName] = newVal;
-          }
-
-          // Check UNIQUE / PRIMARY KEY constraints after applying all updates
-          for (const col of table.columns) {
-            if ((col.isUnique || col.isPrimaryKey) && row[col.name] !== undefined && row[col.name] !== null) {
-              // Only check if the value actually changed to avoid false positive with itself
-              if (row[col.name] !== oldRow[col.name]) {
-                let existing = null;
-                if (col.isPrimaryKey) {
-                  existing = await storage.getRowByPK(stmt.tableName, row[col.name]);
-                }
-                if (!existing) {
-                  for await (const r of storage.scanRows(stmt.tableName)) {
-                    if (r[col.name] == row[col.name]) { existing = r; break; }
-                  }
-                }
-                if (existing) {
-                  throw new Error(`Constraint Error: ${col.name} must be unique`);
-                }
-              }
-            }
-          }
-
-          // Re-evaluate generated columns after update
-          for (const col of table.columns) {
-            if ((col as any).generatedExpr) {
-              row[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, row, params);
-            }
-          }
-
-          if (stmt.returning) {
-            updatedRows.push(await this.projectRow(storage, row, stmt.returning, params));
-          }
-        };
-
-        const pkColName = await storage.getPKColumn(stmt.tableName);
-        let pkExpr: Expr | null = null;
-        let pkVal: any = undefined;
-
-        if (pkColName && stmt.where) {
-          const findPkCondition = (expr: Expr): Expr | null => {
-            if (expr.type === "Binary" && expr.operator === "=") {
-              if (expr.left.type === "Identifier" && expr.left.name === pkColName &&
-                  (expr.right.type === "Literal" || expr.right.type === "Parameter" || expr.right.type === "Identifier")) {
-                return expr;
-              }
-            } else if (expr.type === "Logical" && expr.operator === "AND") {
-              return findPkCondition(expr.left) || findPkCondition(expr.right);
-            }
-            return null;
-          };
-
-          pkExpr = findPkCondition(stmt.where);
-          if (pkExpr && pkExpr.type === "Binary") {
-             pkVal = await this.evaluateExpr(storage, pkExpr.right, {}, params);
-             const tableInfo = await (storage as any).getTableAsync(stmt.tableName);
-             const pkCol = tableInfo?.columns.find((c: any) => c.name === pkColName);
-             if (pkCol) {
-               pkVal = await this.castValue(storage, pkVal, pkCol.dataType);
+        // If we have FROM or JOINs in UPDATE, we must evaluate them
+        if (stmt.from || (stmt.joins && stmt.joins.length > 0)) {
+           // We will map the base table into a stream
+           sourceStream = this.mapStream(
+             storage.scanRows(stmt.tableName),
+             (r) => {
+               const tblCopy = this.getTableCopy(r);
+               r['__lpg_tbl_' + stmt.tableName] = tblCopy;
+               if (stmt.alias) r['__lpg_tbl_' + stmt.alias] = tblCopy;
+               return r;
              }
-          }
+           );
+
+           if (stmt.from) {
+             // Treat FROM as a CROSS JOIN
+             const fromJoin: JoinClause = {
+               type: 'CROSS',
+               tableName: stmt.from.tableName,
+               stmt: stmt.from.stmt,
+               fn: stmt.from.fn,
+               withOrdinality: stmt.from.withOrdinality,
+               columnAliases: stmt.from.columnAliases,
+               alias: stmt.from.alias,
+               on: { type: 'Literal', value: true }
+             };
+             if (fromJoin.lateral || fromJoin.fn || fromJoin.stmt) {
+               sourceStream = this.nestedLoopJoinStream(storage, sourceStream, fromJoin, params);
+             } else {
+               const rightRows = [];
+               for await (const r of storage.scanRows(fromJoin.tableName!)) {
+                 const tblCopy = this.getTableCopy(r);
+                 r['__lpg_tbl_' + fromJoin.tableName!] = tblCopy;
+                 if (fromJoin.alias) r['__lpg_tbl_' + fromJoin.alias] = tblCopy;
+                 rightRows.push(r);
+               }
+               sourceStream = this.hashJoinStream(storage, sourceStream, rightRows, fromJoin, params);
+             }
+           }
+
+           if (stmt.joins) {
+             for (const join of stmt.joins) {
+               if (join.lateral || join.fn || join.stmt) {
+                 sourceStream = this.nestedLoopJoinStream(storage, sourceStream, join, params);
+               } else {
+                 const rightRows = [];
+                 for await (const r of storage.scanRows(join.tableName!)) {
+                   const tblCopy = this.getTableCopy(r);
+                   r['__lpg_tbl_' + join.tableName!] = tblCopy;
+                   if (join.alias) r['__lpg_tbl_' + join.alias] = tblCopy;
+                   rightRows.push(r);
+                 }
+                 sourceStream = this.hashJoinStream(storage, sourceStream, rightRows, join, params);
+               }
+             }
+           }
         }
 
         let updatedCount = 0;
-        if (pkVal !== undefined && pkVal !== null) {
-           updatedCount = await storage.updateRowByPK(
-             stmt.tableName,
-             pkVal,
-             async (row: any) => !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params)),
-             updateFn
-           );
-           // Fallback to full scan if the PK lookup didn't update anything 
-           // (in case there are duplicate PKs and the first match failed the extra WHERE conditions)
-           if (updatedCount === 0) {
-             updatedCount = await storage.updateRows(
-               stmt.tableName,
-               async (row: any) => {
-                 if (row[pkColName!] != pkVal) return false;
-                 return !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params));
-               },
-               updateFn
-             );
+        
+        if (sourceStream) {
+           // We have a complex stream of joined rows.
+           // However, storage.updateRows only iterates the base table.
+           // To apply the matched joined contexts to the base table:
+           // 1. Gather all matched rows in memory.
+           const matchedRows = [];
+           for await (const r of sourceStream) {
+              if (!stmt.where || (await this.evaluateExpr(storage, stmt.where, r, params))) {
+                 matchedRows.push(r);
+              }
            }
-        } else {
+           
+           // We need to identify rows in the base table by their primary key if possible,
+           // or we have to match them completely. 
+           // Since we don't have CTID, we'll try to find the row by PK.
+           const pkColName = await storage.getPKColumn(stmt.tableName);
+           if (!pkColName) {
+             throw new Error("UPDATE ... FROM requires a PRIMARY KEY on the target table for row identification");
+           }
+           
+           const pkValuesToUpdate = new Map<any, any>();
+           for (const r of matchedRows) {
+              const baseTblObj = r['__lpg_tbl_' + (stmt.alias || stmt.tableName)];
+              const pkVal = baseTblObj[pkColName];
+              if (!pkValuesToUpdate.has(pkVal)) {
+                 pkValuesToUpdate.set(pkVal, r);
+              }
+           }
+
            updatedCount = await storage.updateRows(
-             stmt.tableName,
-             async (row: any) => !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params)),
-             updateFn
+              stmt.tableName,
+              async (baseRow) => pkValuesToUpdate.has(baseRow[pkColName]),
+              async (baseRow) => {
+                 const pkVal = baseRow[pkColName];
+                 const joinContext = pkValuesToUpdate.get(pkVal);
+                 // We pass the joinContext (which has __lpg_tbl_* and flat fields) to evaluateExpr
+                 // But wait, the assignments evaluate on `row`. 
+                 // So we need to evaluate the assignments using `joinContext`, 
+                 // and apply them to `baseRow`.
+                 
+                 const oldRow = { ...baseRow };
+                 for (const [colName, expr] of Object.entries(stmt.assignments)) {
+                   let newVal = await this.evaluateExpr(storage, expr, joinContext, params);
+
+                   const colDef = table.columns.find((c: any) => c.name === colName);
+                   if (colDef && newVal !== undefined && newVal !== null) {
+                     newVal = await this.castValue(storage, newVal, colDef.dataType);
+                   }
+
+                   if (colDef?.references && newVal !== undefined && newVal !== null) {
+                     let exists = false;
+                     const refPK = await storage.getPKColumn(colDef.references.table);
+                     if (refPK === colDef.references.column) {
+                       const refRow = await storage.getRowByPK(colDef.references.table, newVal);
+                       if (refRow) exists = true;
+                     }
+                     if (!exists) {
+                       for await (const r of storage.scanRows(colDef.references.table)) {
+                         if (r[colDef.references.column] == newVal) { exists = true; break; }
+                       }
+                     }
+                     if (!exists) {
+                        const errorDetails = [
+                          `Foreign Key Violation (Update): update on table "${stmt.tableName}" violates foreign key constraint.`,
+                          `- Source Column: "${colDef.name}"`,
+                          `- New Source Value: ${JSON.stringify(newVal)}`,
+                          `- Target Table: "${colDef.references.table}"`,
+                          `- Target Column: "${colDef.references.column}"`
+                        ].join('\n');
+                        throw new Error(errorDetails);
+                     }
+                   }
+
+                   const oldVal = oldRow[colName];
+                   if (newVal !== oldVal) {
+                     for (const ref of referencingCols) {
+                       if (ref.parentColumn === colName) {
+                         const action = ref.onUpdate;
+                         const childrenExist = async () => {
+                           const childPK = await storage.getPKColumn(ref.childTable);
+                           if (childPK === ref.childColumn) {
+                             const r = await storage.getRowByPK(ref.childTable, oldVal);
+                             if (r) return true;
+                           }
+                           for await (const r of storage.scanRows(ref.childTable)) {
+                             if (r[ref.childColumn] == oldVal) return true;
+                           }
+                           return false;
+                         };
+
+                         if (await childrenExist()) {
+                           if (action === 'RESTRICT' || action === 'NO ACTION') {
+                             throw new Error(`Foreign Key Violation (Update RESTRICT)`);
+                           } else if (action === 'CASCADE') {
+                             await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = newVal; });
+                           } else if (action === 'SET NULL') {
+                             await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = null; });
+                           }
+                         }
+                       }
+                     }
+                   }
+                   baseRow[colName] = newVal;
+                 }
+                 
+                 for (const col of table.columns) {
+                   if ((col.isUnique || col.isPrimaryKey) && baseRow[col.name] !== undefined && baseRow[col.name] !== null) {
+                     if (baseRow[col.name] !== oldRow[col.name]) {
+                       let existing = null;
+                       if (col.isPrimaryKey) existing = await storage.getRowByPK(stmt.tableName, baseRow[col.name]);
+                       if (!existing) {
+                         for await (const r of storage.scanRows(stmt.tableName)) {
+                           if (r[col.name] == baseRow[col.name]) { existing = r; break; }
+                         }
+                       }
+                       if (existing) throw new Error(`Constraint Error: ${col.name} must be unique`);
+                     }
+                   }
+                 }
+
+                 for (const col of table.columns) {
+                   if ((col as any).generatedExpr) {
+                     baseRow[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, baseRow, params);
+                   }
+                 }
+
+                 if (stmt.returning) {
+                   updatedRows.push(await this.projectRow(storage, baseRow, stmt.returning, params));
+                 }
+              }
            );
+        } else {
+           // Normal update (no FROM)
+           const pkColName = await storage.getPKColumn(stmt.tableName);
+           let pkExpr: Expr | null = null;
+           let pkVal: any = undefined;
+
+           if (pkColName && stmt.where) {
+             const findPkCondition = (expr: Expr): Expr | null => {
+               if (expr.type === "Binary" && expr.operator === "=") {
+                 if (expr.left.type === "Identifier" && expr.left.name === pkColName &&
+                     (expr.right.type === "Literal" || expr.right.type === "Parameter" || expr.right.type === "Identifier")) {
+                   return expr;
+                 }
+               } else if (expr.type === "Logical" && expr.operator === "AND") {
+                 return findPkCondition(expr.left) || findPkCondition(expr.right);
+               }
+               return null;
+             };
+
+             pkExpr = findPkCondition(stmt.where);
+             if (pkExpr && pkExpr.type === "Binary") {
+                pkVal = await this.evaluateExpr(storage, pkExpr.right, {}, params);
+                const tableInfo = await (storage as any).getTableAsync(stmt.tableName);
+                const pkCol = tableInfo?.columns.find((c: any) => c.name === pkColName);
+                if (pkCol) {
+                  pkVal = await this.castValue(storage, pkVal, pkCol.dataType);
+                }
+             }
+           }
+
+           const localUpdateFn = async (row: any) => {
+              const oldRow = { ...row };
+              for (const [colName, expr] of Object.entries(stmt.assignments)) {
+                let newVal = await this.evaluateExpr(storage, expr, row, params);
+
+                const colDef = table.columns.find((c: any) => c.name === colName);
+                if (colDef && newVal !== undefined && newVal !== null) {
+                  newVal = await this.castValue(storage, newVal, colDef.dataType);
+                }
+
+                if (colDef?.references && newVal !== undefined && newVal !== null) {
+                  let exists = false;
+                  const refPK = await storage.getPKColumn(colDef.references.table);
+                  if (refPK === colDef.references.column) {
+                    const refRow = await storage.getRowByPK(colDef.references.table, newVal);
+                    if (refRow) exists = true;
+                  }
+                  if (!exists) {
+                    for await (const r of storage.scanRows(colDef.references.table)) {
+                      if (r[colDef.references.column] == newVal) { exists = true; break; }
+                    }
+                  }
+                  if (!exists) {
+                    const errorDetails = [
+                      `Foreign Key Violation (Update): update on table "${stmt.tableName}" violates foreign key constraint.`,
+                      `- Source Column: "${colDef.name}"`,
+                      `- New Source Value: ${JSON.stringify(newVal)}`,
+                      `- Target Table: "${colDef.references.table}"`,
+                      `- Target Column: "${colDef.references.column}"`
+                    ].join('\n');
+                    throw new Error(errorDetails);
+                  }
+                }
+
+                const oldVal = oldRow[colName];
+                if (newVal !== oldVal) {
+                  for (const ref of referencingCols) {
+                    if (ref.parentColumn === colName) {
+                      const action = ref.onUpdate;
+                      const childrenExist = async () => {
+                        const childPK = await storage.getPKColumn(ref.childTable);
+                        if (childPK === ref.childColumn) {
+                          const r = await storage.getRowByPK(ref.childTable, oldVal);
+                          if (r) return true;
+                        }
+                        for await (const r of storage.scanRows(ref.childTable)) {
+                          if (r[ref.childColumn] == oldVal) return true;
+                        }
+                        return false;
+                      };
+
+                      if (await childrenExist()) {
+                        if (action === 'RESTRICT' || action === 'NO ACTION') {
+                          throw new Error(`Foreign Key Violation (Update RESTRICT)`);
+                        } else if (action === 'CASCADE') {
+                          await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = newVal; });
+                        } else if (action === 'SET NULL') {
+                          await storage.updateRows(ref.childTable, async (r) => r[ref.childColumn] == oldVal, async (r) => { r[ref.childColumn] = null; });
+                        }
+                      }
+                    }
+                  }
+                }
+
+                row[colName] = newVal;
+              }
+
+              for (const col of table.columns) {
+                if ((col.isUnique || col.isPrimaryKey) && row[col.name] !== undefined && row[col.name] !== null) {
+                  if (row[col.name] !== oldRow[col.name]) {
+                    let existing = null;
+                    if (col.isPrimaryKey) existing = await storage.getRowByPK(stmt.tableName, row[col.name]);
+                    if (!existing) {
+                      for await (const r of storage.scanRows(stmt.tableName)) {
+                        if (r[col.name] == row[col.name]) { existing = r; break; }
+                      }
+                    }
+                    if (existing) throw new Error(`Constraint Error: ${col.name} must be unique`);
+                  }
+                }
+              }
+
+              for (const col of table.columns) {
+                if ((col as any).generatedExpr) {
+                  row[col.name] = await this.evaluateExpr(storage, (col as any).generatedExpr, row, params);
+                }
+              }
+
+              if (stmt.returning) {
+                updatedRows.push(await this.projectRow(storage, row, stmt.returning, params));
+              }
+           };
+
+           if (pkVal !== undefined && pkVal !== null) {
+              updatedCount = await storage.updateRowByPK(
+                stmt.tableName,
+                pkVal,
+                async (row: any) => !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params)),
+                localUpdateFn
+              );
+              if (updatedCount === 0) {
+                updatedCount = await storage.updateRows(
+                  stmt.tableName,
+                  async (row: any) => {
+                    if (row[pkColName!] != pkVal) return false;
+                    return !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params));
+                  },
+                  localUpdateFn
+                );
+              }
+           } else {
+              updatedCount = await storage.updateRows(
+                stmt.tableName,
+                async (row: any) => !stmt.where || (await this.evaluateExpr(storage, stmt.where, row, params)),
+                localUpdateFn
+              );
+           }
         }
 
         if (stmt.returning) return updatedRows;

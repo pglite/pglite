@@ -124,7 +124,7 @@ export type Statement =
       except?: Statement;
       exceptAll?: Statement;
     }
-  | { type: 'Update'; tableName: string; assignments: Record<string, Expr>; where?: Expr; returning?: Expr[] }
+  | { type: 'Update'; tableName: string; alias?: string; assignments: Record<string, Expr>; from?: any; joins?: JoinClause[]; where?: Expr; returning?: Expr[] }
   | { type: 'Delete'; tableName: string; where?: Expr; returning?: Expr[] }
   | { type: 'Truncate'; tableNames: string[]; cascade?: boolean; restartIdentity?: boolean }
   | { type: 'Values'; values: Expr[][]; ctes?: { name: string; columnAliases?: string[]; stmt: Statement; recursive?: boolean }[] }
