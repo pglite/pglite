@@ -4482,6 +4482,55 @@ describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () 
     });
   });
 
+  describe("LEVEL 73: DO block IF EXISTS evaluation", () => {
+    test("73.1 DO block IF EXISTS RENAME COLUMN", async () => {
+      await db.exec(`CREATE TABLE do_tables (id SERIAL PRIMARY KEY, brand_id INT)`);
+      
+      const sql = `
+        DO $ 
+        BEGIN 
+            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='do_tables' AND column_name='brand_id') THEN
+                ALTER TABLE do_tables RENAME COLUMN brand_id TO branch_id;
+            END IF;
+        END $;
+      `;
+      
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'do_tables'`);
+      const colNames = rows.map((r: any) => r.column_name);
+      expect(colNames).toContain('branch_id');
+      expect(colNames).not.toContain('brand_id');
+    });
+
+    test("73.2 DO block IF NOT EXISTS ADD COLUMN with multiple conditions", async () => {
+      const sql = `
+        DO $ 
+        BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='do_tables' AND column_name='pos_x') THEN
+                ALTER TABLE do_tables ADD COLUMN pos_x INTEGER DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='do_tables' AND column_name='pos_y') THEN
+                ALTER TABLE do_tables ADD COLUMN pos_y INTEGER DEFAULT 0;
+            END IF;
+        END $;
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'do_tables'`);
+      const colNames = rows.map((r: any) => r.column_name);
+      expect(colNames).toContain('pos_x');
+      expect(colNames).toContain('pos_y');
+      
+      // Test COMMENT ON to confirm integration
+      await db.exec(`COMMENT ON COLUMN do_tables.branch_id IS 'test_comment'`);
+      const commentRows = await db.query(`SELECT column_comment FROM information_schema.columns WHERE table_name = 'do_tables' AND column_name = 'branch_id'`);
+      expect(commentRows[0].column_comment).toBe('test_comment');
+    });
+  });
+
   describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
     test("71.1 Update duplicated PKs using fallback mechanism", async () => {
       await db.exec(`CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`);

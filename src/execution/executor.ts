@@ -1,6 +1,8 @@
 import { Statement, Expr, JoinClause, OrderBy } from "../ast";
 import { endBenchmarks, startBenchmarks } from "../benchmarks";
 import { StorageEngine } from "../storage/engine";
+import { Lexer } from "../parser/lexer";
+import { Parser } from "../parser/parser";
 
 export class Executor {
   private exprKeyMap = new WeakMap<Expr, string>();
@@ -963,9 +965,48 @@ export class Executor {
         // Handle anonymous block execution
         // For standard "Lite" implementation, we return success and metadata
 
-        // --- HACK: Support TypeORM / Prisma dynamic constraint dropping ---
         const code = stmt.code;
-        if (/ALTER\s+TABLE\s+.*?\s+DROP\s+CONSTRAINT/i.test(code) && /pg_constraint/i.test(code)) {
+        const cleanCode = code.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+
+        // --- HACK: Support conditional execution blocks (IF EXISTS) ---
+        const ifRegex = /IF\s+(NOT\s+)?EXISTS\s*\(([\s\S]+?)\)\s*THEN\s*([\s\S]+?)\s*END IF;/ig;
+        let match;
+        let executedIf = false;
+        while ((match = ifRegex.exec(cleanCode)) !== null) {
+          executedIf = true;
+          const isNot = !!match[1];
+          const query = match[2];
+          const innerSql = match[3];
+
+          const lexer = new Lexer(query);
+          const parser = new Parser(lexer.tokenize());
+          const selectStmt = parser.parse();
+
+          let exists = false;
+          for await (const row of this.executeSelect(storage, selectStmt, params)) {
+             exists = true;
+             break;
+          }
+
+          const conditionMet = isNot ? !exists : exists;
+
+          if (conditionMet) {
+             const innerLexer = new Lexer(innerSql);
+             const innerParser = new Parser(innerLexer.tokenize());
+             while (innerParser.hasMore()) {
+                const innerStmt = innerParser.parse();
+                if (innerStmt) {
+                   await this.execute(storage, innerStmt, params);
+                }
+                if (innerParser.match('SYMBOL', ';')) {
+                   innerParser.consume();
+                }
+             }
+          }
+        }
+
+        // --- HACK: Support TypeORM / Prisma dynamic constraint dropping ---
+        if (!executedIf && /ALTER\s+TABLE\s+.*?\s+DROP\s+CONSTRAINT/i.test(code) && /pg_constraint/i.test(code)) {
             const relMatch = code.match(/conrelid\s*=\s*'([^']+)'::regclass/i);
             const targetMatch = code.match(/confrelid\s*=\s*'([^']+)'::regclass/i);
             
