@@ -1635,12 +1635,35 @@ export class StorageEngine {
 
     const pkAttNums = columns.map(c => table.columns.findIndex(col => col.name === c) + 1);
 
-    const rootPage = await this.pager.allocatePage();
+    let rootPage = await this.pager.allocatePage();
     const rootBuf = Buffer.alloc(PAGE_SIZE);
     rootBuf.writeUInt8(1, 0);
     rootBuf.writeUInt16LE(0, 1);
     rootBuf.writeUInt32LE(0xffffffff, 3);
     await this.pager.writePage(rootPage, rootBuf);
+
+    const btree = new BTree(this.pager, rootPage);
+
+    if (columns.length === 1) {
+      const pkColName = columns[0];
+      let pageId = table.firstPage;
+      while (pageId !== 0xffffffff && pageId !== 0) {
+        const buf = await this.pager.readPage(pageId);
+        const page = new SlottedPage(buf);
+        for (const tuple of page.getTuples()) {
+          const resolved = this.isOverflow(tuple.data)
+            ? await this.resolveOverflow(tuple.data)
+            : tuple.data;
+          const row = this.deserializeRow(table.columns, resolved);
+          rootPage = await btree.insert(row[pkColName], {
+            pageId,
+            slotIdx: tuple.slotIdx,
+          });
+        }
+        pageId = page.nextPageId;
+      }
+      StorageEngine.pkIndexes.set(`${this.filepath}:${this.currentDbName}:${fullName}`, btree);
+    }
 
     await this.insertRowIntoCatalog(this.pgIndexDef, {
       indexrelid: rootPage,
@@ -1660,10 +1683,6 @@ export class StorageEngine {
 
     table.indexRootPage = rootPage;
     await this.updateTableSchema(fullName, table);
-
-    if (columns.length === 1) {
-      await this.buildIndexes(fullName);
-    }
   }
 
   public async createIndex(

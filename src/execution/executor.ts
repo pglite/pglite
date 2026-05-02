@@ -1450,7 +1450,7 @@ export class Executor {
           await (storage as any).getTableAsync(stmt.from.tableName);
           let useIndex = false;
           // Predicate Pushdown + O(1) Index Lookup
-          if (!stmt.joins && stmt.where) {
+          if ((!stmt.joins || stmt.joins.length === 0) && stmt.where) {
             const pkColName = await storage.getPKColumn(stmt.from.tableName);
             if (pkColName) {
               let pkExpr: Expr | null = null;
@@ -1513,7 +1513,7 @@ export class Executor {
               return r;
             }
           );
-            if (!stmt.joins && stmt.where)
+            if ((!stmt.joins || stmt.joins.length === 0) && stmt.where)
               source = this.filterStream(
                 source,
                 async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
@@ -1544,12 +1544,12 @@ export class Executor {
         }
       }
 
-      if (stmt.where && stmt.joins)
+      if (stmt.where && stmt.joins && stmt.joins.length > 0)
         source = this.filterStream(
           source,
           async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
         );
-      else if (stmt.where && (stmt.from?.stmt || stmt.from?.fn))
+      else if (stmt.where && (stmt.from?.stmt || stmt.from?.fn || !stmt.from))
         source = this.filterStream(
           source,
           async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
@@ -2293,17 +2293,32 @@ export class Executor {
         }
       } else if (col.type === "Alias") {
         const key = this.getExprKey(col.expr);
-        if (row[key] !== undefined) outRow[col.alias] = row[key];
-        else outRow[col.alias] = await this.evaluateExpr(storage, col.expr, row, params);
+        let outKey = col.alias;
+        if (outRow[outKey] !== undefined) {
+           let suffix = 1;
+           while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+           outKey = `${outKey}${suffix}`;
+        }
+        if (row[key] !== undefined) outRow[outKey] = row[key];
+        else outRow[outKey] = await this.evaluateExpr(storage, col.expr, row, params);
       } else {
         const key = this.getExprKey(col);
+        let outKey = "col";
+        if ((col as any).name) {
+          outKey = (col as any).name.includes(".") ? (col as any).name.split(".")[1] : (col as any).name;
+        } else if (col.type === "Call") {
+          outKey = col.fnName.toLowerCase();
+        }
+        
+        if (outRow[outKey] !== undefined) {
+           let suffix = 1;
+           while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+           outKey = `${outKey}${suffix}`;
+        }
+
         if (row[key] !== undefined) {
-           const name = (col as any).name;
-           const outKey = name && name.includes(".") ? name.split(".")[1] : name || "col";
            outRow[outKey] = row[key];
         } else {
-           const name = (col as any).name;
-           const outKey = name && name.includes(".") ? name.split(".")[1] : name || "col";
            outRow[outKey] = await this.evaluateExpr(storage, col, row, params);
         }
       }
@@ -2557,19 +2572,38 @@ export class Executor {
           if (target.type === "Call") {
              const colName = this.getExprKey(target);
              const fn = target.fnName;
+             
+             let outKey = alias;
+             if (!outKey) {
+               if (fn === "COUNT") outKey = "count";
+               else if (fn === "SUM" || fn === "MIN" || fn === "MAX") outKey = fn.toLowerCase();
+               else if (fn === "AVG") outKey = "avg";
+               else if (fn === "ARRAY_AGG") outKey = "array_agg";
+               else if (fn === "JSON_AGG") outKey = "json_agg";
+               else if (fn === "JSONB_AGG") outKey = "jsonb_agg";
+               else if (fn === "JSON_OBJECT_AGG") outKey = "json_object_agg";
+               else if (fn === "JSONB_OBJECT_AGG") outKey = "jsonb_object_agg";
+               else outKey = fn.toLowerCase();
+             }
+             if (outRow[outKey] !== undefined) {
+               let suffix = 1;
+               while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+               outKey = `${outKey}${suffix}`;
+             }
+
              if (fn === "COUNT") {
                 const count = target.distinct ? (state.__DISTINCTS__[colName]?.size || 0) : (state.__COUNTS__[colName] || 0);
-                outRow[alias || "count"] = count;
+                outRow[outKey] = count;
                 outRow[colName] = count;
              } else if (fn === "SUM" || fn === "MIN" || fn === "MAX") {
                 const val = state.__SUMS__[colName] === undefined ? null : state.__SUMS__[colName];
-                outRow[alias || fn.toLowerCase()] = val;
+                outRow[outKey] = val;
                 outRow[colName] = val;
              } else if (fn === "AVG") {
                 const sum = state.__SUMS__[colName] || 0;
                 const count = state.__COUNTS__[colName] || 0;
                 const avg = count ? sum / count : null;
-                outRow[alias || "avg"] = avg;
+                outRow[outKey] = avg;
                 outRow["__AVG__"] = avg;
                 outRow[colName] = avg;
              } else if (fn === "ARRAY_AGG" || fn === "JSON_AGG" || fn === "JSONB_AGG") {
@@ -2590,19 +2624,28 @@ export class Executor {
                   });
                   arr = arr.map((x: any) => x.val);
                 }
-                const outKey = alias || (fn === "ARRAY_AGG" ? "array_agg" : (fn === "JSON_AGG" ? "json_agg" : "jsonb_agg"));
                 outRow[outKey] = arr;
                 outRow[colName] = arr;
              } else if (fn === "JSON_OBJECT_AGG" || fn === "JSONB_OBJECT_AGG") {
                 const obj = state.__JSON_OBJ_AGGS__[colName] || {};
-                const outKey = alias || (fn === "JSON_OBJECT_AGG" ? "json_object_agg" : "jsonb_object_agg");
                 outRow[outKey] = obj;
                 outRow[colName] = obj;
              }
           } else {
-             const name = (target as any).name;
-             const outKey = name && name.includes(".") ? name.split(".")[1] : name || "col";
-             outRow[alias || outKey] = await this.evaluateExpr(storage, target, state.baseRow, params);
+             let outKey = alias;
+             if (!outKey) {
+               if ((target as any).name) {
+                 outKey = (target as any).name.includes(".") ? (target as any).name.split(".")[1] : (target as any).name;
+               } else {
+                 outKey = "col";
+               }
+             }
+             if (outRow[outKey] !== undefined) {
+               let suffix = 1;
+               while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+               outKey = `${outKey}${suffix}`;
+             }
+             outRow[outKey] = await this.evaluateExpr(storage, target, state.baseRow, params);
           }
        }
        if (stmt.having) {

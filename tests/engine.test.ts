@@ -4577,6 +4577,30 @@ describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () 
     });
   });
 
+  describe("LEVEL 76: INSERT INTO SELECT with WHERE NOT EXISTS", () => {
+    test("76.1 Multiple un-aliased literal columns project uniquely", async () => {
+      await db.exec(`CREATE TABLE vouchers (id SERIAL PRIMARY KEY, code TEXT, description TEXT, discount_type TEXT, discount_value NUMBER NOT NULL, min_order_amount NUMBER, is_active BOOLEAN)`);
+      
+      const sql = `
+        INSERT INTO vouchers (code, description, discount_type, discount_value, min_order_amount, is_active)
+        SELECT 'WELCOME_BESO', 'Quà tặng', 'fixed_amount', 20000, 50000, true
+        WHERE NOT EXISTS (SELECT 1 FROM vouchers WHERE code = 'WELCOME_BESO');
+      `;
+      
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`SELECT * FROM vouchers WHERE code = 'WELCOME_BESO'`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].discount_value).toBe(20000);
+      expect(rows[0].is_active).toBe(true);
+
+      // Running the same insert again should result in 0 rows inserted because WHERE NOT EXISTS is false.
+      const res2 = await db.query2(sql); 
+      expect(res2.rowCount).toBe(0);
+    });
+  });
+
   describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
     test("71.1 Update duplicated PKs using fallback mechanism", async () => {
       await db.exec(`CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`);
