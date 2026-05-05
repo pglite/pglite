@@ -4277,7 +4277,30 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
     
   });
-describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () => {
+describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () => {
+    test("77.1 Query matches expected output and resolves Date params correctly", async () => {
+      await db.exec(`CREATE TABLE bookings_77 (id SERIAL PRIMARY KEY, user_id INT, program_id INT, check_in_date DATE, check_out_date DATE, check_in_status TEXT, deleted_at TIMESTAMP)`);
+      await db.exec(`CREATE TABLE retreat_programs_77 (id SERIAL PRIMARY KEY, name TEXT, location_name TEXT, thumbnail_url TEXT, duration_days INT)`);
+      
+      await db.exec(`INSERT INTO retreat_programs_77 (id, name, location_name, thumbnail_url, duration_days) VALUES (10, 'Yoga Retreat', 'Bali', 'url', 5)`);
+      
+      await db.exec(`INSERT INTO bookings_77 (id, user_id, program_id, check_in_date, check_out_date, check_in_status) VALUES (100, 1, 10, '2026-05-10', '2026-05-15', 'confirmed')`);
+
+      // Using Date object for param $2 which used to fail the >= comparison
+      const params =[1, new Date('2026-05-01T00:00:00.000Z'), 'confirmed', 'pending'];
+      
+      const sql = `select "b"."id" as "booking_id", "rp"."id" as "program_id", "rp"."name", "rp"."location_name", "rp"."thumbnail_url", "rp"."duration_days", "b"."check_in_date", "b"."check_out_date", "b"."check_in_status" from "bookings_77" as "b" inner join "retreat_programs_77" as "rp" on "rp"."id" = "b"."program_id" where "b"."user_id" = $1 and "b"."check_out_date" >= $2 and "b"."check_in_status" in ($3, $4) and "b"."deleted_at" is null order by "b"."check_in_date" asc`;
+
+      const rows = await db.query(sql, params);
+      
+      expect(rows.length).toBe(1);
+      expect(rows[0].booking_id).toBe(100);
+      expect(rows[0].program_id).toBe(10);
+      expect(rows[0].name).toBe('Yoga Retreat');
+    });
+  });
+
+  describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () => {
     test("69.1 query2 returns standard fields", async () => {
       await db.exec(`CREATE TABLE std_format_test (id SERIAL PRIMARY KEY, name TEXT)`);
       const resInsert = await db.query2(`INSERT INTO std_format_test (name) VALUES ('Alpha'), ('Beta')`);

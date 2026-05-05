@@ -2928,16 +2928,20 @@ export class Executor {
     switch (expr.type) {
       case "Literal":
         return expr.value;
-      case "Parameter":
+      case "Parameter": {
         if (!Array.isArray(params) || expr.index > params.length) {
           throw new Error(`bind message supplies ${Array.isArray(params) ? params.length : 0} parameters, but prepared statement requires at least ${expr.index}`);
         }
-        return params[expr.index - 1];
-      case "NamedParameter":
+        const pVal = params[expr.index - 1];
+        return pVal instanceof Date ? pVal.toISOString() : pVal;
+      }
+      case "NamedParameter": {
         if (!params || (params[expr.name] === undefined && !(expr.name in params))) {
           throw new Error(`bind message does not supply named parameter '${expr.name}'`);
         }
-        return params[expr.name];
+        const npVal = params[expr.name];
+        return npVal instanceof Date ? npVal.toISOString() : npVal;
+      }
       case "Identifier": {
         if ((expr as any)._nameUpper === undefined) {
            (expr as any)._nameUpper = expr.name.toUpperCase();
