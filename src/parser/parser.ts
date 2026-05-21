@@ -261,8 +261,11 @@ export class Parser {
 
     let not = false;
     if (this.match('KEYWORD', 'NOT')) {
-      this.consume();
-      not = true;
+      const next = this.tokens[this.pos + 1];
+      if (next && ['LIKE', 'ILIKE', 'BETWEEN', 'IN'].includes(next.value.toUpperCase())) {
+        this.consume();
+        not = true;
+      }
     }
 
     if (this.match('KEYWORD', 'LIKE') || this.match('KEYWORD', 'ILIKE')) {
@@ -307,8 +310,6 @@ export class Parser {
         return { type: 'In', left, right, not };
       }
     }
-
-    if (not) throw new Error("Parse Error: Unexpected NOT");
 
     if (this.match('KEYWORD', 'IS')) {
       this.consume();
@@ -728,6 +729,11 @@ export class Parser {
       }
       const schemaName = this.consumeIdentifier();
       return { type: 'CreateSchema', schemaName, ifNotExists };
+    }
+
+    if (this.match('KEYWORD', 'TYPE')) {
+      while (this.current() && !this.match('SYMBOL', ';') && this.current()?.type !== 'EOF') this.consume();
+      return { type: 'DropOther', objectType: 'TYPE', names: [] };
     }
 
     this.consume('KEYWORD', 'TABLE');

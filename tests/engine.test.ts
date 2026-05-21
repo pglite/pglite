@@ -4624,6 +4624,23 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
     });
   });
 
+  describe("LEVEL 75: DEFAULT with NOT NULL bug", () => {
+    test("75.1 DEFAULT with NOT NULL parses correctly", async () => {
+      const sql = `CREATE TABLE IF NOT EXISTS default_not_null_test (
+        id SERIAL PRIMARY KEY,
+        status TEXT DEFAULT 'draft' NOT NULL,
+        count INTEGER DEFAULT 0 NOT NULL
+      )`;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      await db.exec(`INSERT INTO default_not_null_test (id) VALUES (1)`);
+      const rows = await db.query(`SELECT status, count FROM default_not_null_test`);
+      expect(rows[0].status).toBe('draft');
+      expect(rows[0].count).toBe(0);
+    });
+  });
+
   describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
     test("71.1 Update duplicated PKs using fallback mechanism", async () => {
       await db.exec(`CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`);
@@ -4670,6 +4687,57 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
       const remainingRows = await db.query(`SELECT * FROM duplicate_pk_del_test`);
       expect(remainingRows.length).toBe(1);
       expect(remainingRows[0].name).toBe('keep');
+    });
+  });
+
+  describe("LEVEL 78: Complex Schema with ENUM and NOT NULL defaults", () => {
+    test("78.1 Graceful degradation for CREATE TYPE and pg_type", async () => {
+      // Kiểm tra việc LitePostgres có thể chạy mượt mà đoạn script chứa pg_type
+      // và bỏ qua CREATE TYPE một cách êm ái mà không bị gián đoạn hay throw lỗi.
+      const sql = `
+        DO $
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'campaign_status') THEN
+            CREATE TYPE campaign_status AS ENUM ('draft', 'active', 'paused', 'ended');
+          END IF;
+        END $;
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+    });
+
+    test("78.2 End-to-end user schema execution (DEFAULT 'draft' NOT NULL)", async () => {
+      // Khởi tạo bảng giống cấu trúc bị lỗi của user
+      const sql = `
+        CREATE TABLE IF NOT EXISTS e2e_campaigns (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          status campaign_status DEFAULT 'draft' NOT NULL
+        );
+        
+        COMMENT ON TABLE e2e_campaigns IS '{ "label": "Chiến dịch" }';
+        COMMENT ON COLUMN e2e_campaigns.status IS '{ "label": "Trạng thái" }';
+      `;
+      
+      const res = await db.exec(sql) as any[];
+      expect(res[0].success).toBe(true);
+
+      // Chèn thử dữ liệu, không cung cấp trường status để test DEFAULT
+      await db.exec(`INSERT INTO e2e_campaigns (name) VALUES ('Black Friday')`);
+      
+      // Query ra xem giá trị 'draft' có được áp dụng đúng không
+      const rows = await db.query(`SELECT name, status FROM e2e_campaigns`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe('Black Friday');
+      expect(rows[0].status).toBe('draft');
+      
+      // Đảm bảo phần lưu trữ COMMENT (JSON string) hoạt động đúng
+      const comments = await db.query(`
+        SELECT column_comment 
+        FROM information_schema.columns 
+        WHERE table_name = 'e2e_campaigns' AND column_name = 'status'
+      `);
+      expect(comments[0].column_comment).toContain('Trạng thái');
     });
   });
 });

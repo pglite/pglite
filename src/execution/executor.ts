@@ -1154,9 +1154,14 @@ export class Executor {
           const selectStmt = parser.parse();
 
           let exists = false;
-          for await (const row of this.executeSelect(storage, selectStmt, params)) {
-             exists = true;
-             break;
+          try {
+            for await (const row of this.executeSelect(storage, selectStmt, params)) {
+               exists = true;
+               break;
+            }
+          } catch (e) {
+            // Ignore missing table errors for system catalogs like pg_type
+            exists = false;
           }
 
           const conditionMet = isNot ? !exists : exists;
