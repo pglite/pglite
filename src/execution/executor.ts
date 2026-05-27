@@ -108,8 +108,9 @@ export class Executor {
 
         for (const action of actionsToRun) {
         if (action.type === 'AddColumn') {
-          if (action.ifNotExists && table.columns.some((c: any) => c.name === action.column.name)) {
-            continue;
+          if (table.columns.some((c: any) => c.name === action.column.name)) {
+            if (action.ifNotExists) continue;
+            throw new Error(`Column "${action.column.name}" of relation "${stmt.tableName}" already exists`);
           }
           if (action.column.references) {
             storage.invalidateTableCache(action.column.references.table);
@@ -175,6 +176,9 @@ export class Executor {
         } else if (action.type === 'RenameColumn') {
           const col = table.columns.find((c: any) => c.name === action.oldColumnName);
           if (!col) throw new Error(`Column ${action.oldColumnName} does not exist`);
+          if (table.columns.some((c: any) => c.name === action.newColumnName)) {
+            throw new Error(`Column "${action.newColumnName}" of relation "${stmt.tableName}" already exists`);
+          }
           
           col.name = action.newColumnName;
           await storage.updateTableSchema(stmt.tableName, table);

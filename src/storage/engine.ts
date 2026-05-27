@@ -1851,6 +1851,9 @@ export class StorageEngine {
     const oldTable = await this.getTableAsync(fullOldName);
     if (!oldTable) throw new Error(`Table ${fullOldName} does not exist`);
 
+    const existingNewTable = await this.getTableAsync(fullNewName);
+    if (existingNewTable) throw new Error(`Table ${fullNewName} already exists`);
+
     const partsOld = fullOldName.split(".");
     const oldSchema = partsOld[0]!;
     const oldRelName = partsOld[1]!;

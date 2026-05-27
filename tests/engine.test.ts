@@ -4690,6 +4690,64 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
     });
   });
 
+  describe("LEVEL 79: Duplicate Schema Definition Protections (Bug Fix)", () => {
+    test("79.1 ALTER TABLE ADD COLUMN throws if column already exists", async () => {
+      await db.exec(`CREATE TABLE dup_col_test (id SERIAL PRIMARY KEY, type TEXT)`);
+      
+      // Attempting to add existing column without IF NOT EXISTS should throw
+      let error;
+      try {
+        await db.exec(`ALTER TABLE dup_col_test ADD COLUMN type VARCHAR(50)`);
+      } catch (e: any) {
+        error = e;
+      }
+      expect(error).toBeDefined();
+      expect(error.message).toContain('already exists');
+      
+      // Ensure catalog only has ONE 'type' column
+      const cols = await db.query(`
+        SELECT * FROM information_schema.columns 
+        WHERE table_name = 'dup_col_test' AND column_name = 'type'
+      `);
+      expect(cols.length).toBe(1);
+    });
+
+    test("79.2 ALTER TABLE ADD COLUMN IF NOT EXISTS ignores silently without duplicate", async () => {
+      const res = await db.exec(`ALTER TABLE dup_col_test ADD COLUMN IF NOT EXISTS type VARCHAR(50)`);
+      expect(res.success).toBe(true);
+
+      const cols = await db.query(`
+        SELECT * FROM information_schema.columns 
+        WHERE table_name = 'dup_col_test' AND column_name = 'type'
+      `);
+      expect(cols.length).toBe(1); // Vẫn chỉ có 1 cột duy nhất
+    });
+
+    test("79.3 ALTER TABLE RENAME COLUMN throws if target name exists", async () => {
+      await db.exec(`ALTER TABLE dup_col_test ADD COLUMN status TEXT`);
+      let error;
+      try {
+        await db.exec(`ALTER TABLE dup_col_test RENAME COLUMN status TO type`);
+      } catch (e: any) {
+        error = e;
+      }
+      expect(error).toBeDefined();
+      expect(error.message).toContain('already exists');
+    });
+
+    test("79.4 ALTER TABLE RENAME TO throws if target table exists", async () => {
+      await db.exec(`CREATE TABLE existing_target (id INT)`);
+      let error;
+      try {
+        await db.exec(`ALTER TABLE dup_col_test RENAME TO existing_target`);
+      } catch (e: any) {
+        error = e;
+      }
+      expect(error).toBeDefined();
+      expect(error.message).toContain('already exists');
+    });
+  });
+
   describe("LEVEL 78: Complex Schema with ENUM and NOT NULL defaults", () => {
     test("78.1 Graceful degradation for CREATE TYPE and pg_type", async () => {
       // Kiểm tra việc LitePostgres có thể chạy mượt mà đoạn script chứa pg_type
