@@ -4748,6 +4748,45 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
     });
   });
 
+  describe("LEVEL 80: CREATE TYPE ENUM and pg_type / pg_enum support", () => {
+    test("80.1 Execute DO block with CREATE TYPE and verify pg_type", async () => {
+      const sql = `
+        DO $ BEGIN 
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'workflow_status') THEN 
+                CREATE TYPE workflow_status AS ENUM ('active', 'inactive', 'draft'); 
+            END IF; 
+        END $;
+
+        CREATE TABLE IF NOT EXISTS workflows (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            status workflow_status DEFAULT 'draft'
+        );
+
+        INSERT INTO workflows (name, description, status) VALUES 
+        ('Quy trình Tuyển dụng', 'Quy trình các bước từ lọc hồ sơ đến thử việc', 'active');
+      `;
+      const res = await db.exec(sql);
+      expect(Array.isArray(res)).toBe(true);
+
+      const rows = await db.query(`SELECT status FROM workflows`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].status).toBe('active');
+
+      const typeRows = await db.query(`SELECT * FROM pg_type WHERE typname = 'workflow_status'`);
+      expect(typeRows.length).toBe(1);
+      
+      const enumRows = await db.query(`SELECT enumlabel FROM pg_enum WHERE enumtypid = $1 ORDER BY enumsortorder`, [typeRows[0].oid]);
+      expect(enumRows.length).toBe(3);
+      expect(enumRows.map((r: any) => r.enumlabel)).toEqual(['active', 'inactive', 'draft']);
+
+      // Test REGTYPE casting
+      const regtypeRows = await db.query(`SELECT 'workflow_status'::regtype as oid`);
+      expect(regtypeRows[0].oid).toBe(typeRows[0].oid);
+    });
+  });
+
   describe("LEVEL 78: Complex Schema with ENUM and NOT NULL defaults", () => {
     test("78.1 Graceful degradation for CREATE TYPE and pg_type", async () => {
       // Kiểm tra việc LitePostgres có thể chạy mượt mà đoạn script chứa pg_type

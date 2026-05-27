@@ -94,6 +94,7 @@ export type Statement =
   | { type: 'DropTable'; tableNames: string[]; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropIndex'; indexNames: string[]; ifExists?: boolean; cascade?: boolean }
   | { type: 'DropOther'; objectType: string; names: string[] }
+  | { type: 'CreateType'; typeName: string; enumValues: string[] }
   | { type: 'CreateTable'; tableName: string; columns: ColumnDef[]; ifNotExists?: boolean; tableConstraints?: { type: string; columns: string[]; name?: string }[] }
   | { type: 'Insert'; tableName: string; columns: string[]; values?: Expr[][] | Expr[]; select?: Statement; returning?: Expr[]; onConflict?: OnConflict }
   | { 

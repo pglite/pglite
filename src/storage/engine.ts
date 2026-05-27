@@ -1175,6 +1175,8 @@ export class StorageEngine {
   private pgDescriptionDef!: TableData;
   private pgAttrdefDef!: TableData;
   private pgIndexDef!: TableData;
+  private pgTypeDef!: TableData;
+  private pgEnumDef!: TableData;
 
   // Static Column Definitions for catalogs
   private static readonly CLUSTER_CATALOG_COLS: ColumnDef[] = [
@@ -1248,6 +1250,20 @@ export class StorageEngine {
     { name: "indkey", dataType: "JSON", isPrimaryKey: false },
     { name: "indisprimary", dataType: "BOOLEAN", isPrimaryKey: false },
     { name: "indisunique", dataType: "BOOLEAN", isPrimaryKey: false },
+  ];
+
+  private static readonly PG_TYPE_COLS: ColumnDef[] = [
+    { name: "oid", dataType: "NUMBER", isPrimaryKey: true },
+    { name: "typname", dataType: "TEXT", isPrimaryKey: false },
+    { name: "typnamespace", dataType: "NUMBER", isPrimaryKey: false },
+    { name: "typtype", dataType: "TEXT", isPrimaryKey: false },
+  ];
+
+  private static readonly PG_ENUM_COLS: ColumnDef[] = [
+    { name: "oid", dataType: "NUMBER", isPrimaryKey: true },
+    { name: "enumtypid", dataType: "NUMBER", isPrimaryKey: false },
+    { name: "enumsortorder", dataType: "NUMBER", isPrimaryKey: false },
+    { name: "enumlabel", dataType: "TEXT", isPrimaryKey: false },
   ];
 
   constructor(
@@ -1457,7 +1473,18 @@ export class StorageEngine {
       this.dbMeta = meta;
       this.refreshCatalogDefs();
     }
+
     this.currentDbName = dbName;
+
+    // Ensure pg_type and pg_enum exist as normal tables (backward compatibility for older db files)
+    const pgTypeExists = await this.getTableAsync("pg_catalog.pg_type");
+    if (!pgTypeExists) {
+      await this.createTable("pg_catalog.pg_type", StorageEngine.PG_TYPE_COLS, true);
+    }
+    const pgEnumExists = await this.getTableAsync("pg_catalog.pg_enum");
+    if (!pgEnumExists) {
+      await this.createTable("pg_catalog.pg_enum", StorageEngine.PG_ENUM_COLS, true);
+    }
   }
 
   private refreshCatalogDefs() {

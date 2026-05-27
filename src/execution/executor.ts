@@ -100,6 +100,38 @@ export class Executor {
         return { success: true, message: `Ignored DROP ${stmt.objectType} ${stmt.names.join(', ')}.` };
       }
 
+      case "CreateType": {
+        let maxOid = 0;
+        for await (const r of storage.scanRows("pg_catalog.pg_type")) {
+          if (r.oid > maxOid) maxOid = r.oid;
+        }
+        const typeOid = maxOid + 1;
+        let cleanTypeName = stmt.typeName.includes('.') ? stmt.typeName.split('.')[1] : stmt.typeName;
+        cleanTypeName = cleanTypeName.replace(/^"|"$/g, '');
+        
+        await storage.insertRow("pg_catalog.pg_type", {
+          oid: typeOid,
+          typname: cleanTypeName,
+          typnamespace: 2200, // public
+          typtype: "e"
+        });
+
+        let enumMaxOid = 0;
+        for await (const r of storage.scanRows("pg_catalog.pg_enum")) {
+          if (r.oid > enumMaxOid) enumMaxOid = r.oid;
+        }
+
+        for (let i = 0; i < stmt.enumValues.length; i++) {
+          await storage.insertRow("pg_catalog.pg_enum", {
+            oid: enumMaxOid + 1 + i,
+            enumtypid: typeOid,
+            enumsortorder: i + 1,
+            enumlabel: stmt.enumValues[i]
+          });
+        }
+        return { success: true, message: `Type ${stmt.typeName} created.` };
+      }
+
       case "AlterTable": {
         const table = await (storage as any).getTableAsync(stmt.tableName);
         if (!table) throw new Error(`Table ${stmt.tableName} not found`);
@@ -2678,6 +2710,12 @@ export class Executor {
               const name = val.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
               for await (const row of storage.scanRows('pg_namespace')) {
                 if (row.nspname === name) return row.oid;
+              }
+              return null;
+            } else if (dt === "REGTYPE") {
+              const typeName = val.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
+              for await (const row of storage.scanRows('pg_catalog.pg_type')) {
+                if (row.typname === typeName) return row.oid;
               }
               return null;
             } else {

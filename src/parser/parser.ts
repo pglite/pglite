@@ -732,6 +732,24 @@ export class Parser {
     }
 
     if (this.match('KEYWORD', 'TYPE')) {
+      this.consume();
+      const typeName = this.parseTableName();
+      if (this.match('KEYWORD', 'AS')) {
+        this.consume();
+        if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ENUM') {
+          this.consume();
+          this.consume('SYMBOL', '(');
+          const enumValues: string[] = [];
+          enumValues.push(this.consume('STRING').value);
+          while (this.match('SYMBOL', ',')) {
+            this.consume();
+            enumValues.push(this.consume('STRING').value);
+          }
+          this.consume('SYMBOL', ')');
+          return { type: 'CreateType', typeName, enumValues };
+        }
+      }
+      // Ignore other types
       while (this.current() && !this.match('SYMBOL', ';') && this.current()?.type !== 'EOF') this.consume();
       return { type: 'DropOther', objectType: 'TYPE', names: [] };
     }
