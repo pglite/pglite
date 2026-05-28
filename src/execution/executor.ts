@@ -674,11 +674,11 @@ export class Executor {
                     }
                  } else if (col.name.endsWith('.*')) {
                     const prefix = col.name.substring(0, col.name.length - 2);
-                    let targetTable = prefix;
-                    if (stmt.from && stmt.from.alias === prefix) targetTable = stmt.from.tableName;
+                    let targetTable = prefix
+                    if (stmt.from && stmt.from.alias === prefix && stmt.from.tableName) targetTable = stmt.from.tableName;
                     if (stmt.joins) {
                        for (const j of stmt.joins) {
-                          if (j.alias === prefix) targetTable = j.tableName;
+                          if (j.alias === prefix && j.tableName) targetTable = j.tableName;
                        }
                     }
                     if (targetTable) {
