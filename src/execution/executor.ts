@@ -656,7 +656,64 @@ export class Executor {
         for await (const row of this.executeSelect(storage, stmt, params)) {
           rows.push(row);
         }
-        return rows;
+        
+        let fields: { name: string }[] = [];
+        if (rows.length > 0) {
+           fields = Object.keys(rows[0]).map(k => ({ name: k }));
+        } else {
+           for (const col of stmt.columns) {
+              if (col.type === 'Alias') {
+                 fields.push({ name: col.alias });
+              } else if (col.type === 'Identifier') {
+                 if (col.name === '*') {
+                    if (stmt.from && stmt.from.tableName) {
+                       const tableInfo = await (storage as any).getTableAsync(stmt.from.tableName);
+                       if (tableInfo) {
+                          for (const c of tableInfo.columns) fields.push({ name: c.name });
+                       }
+                    }
+                 } else if (col.name.endsWith('.*')) {
+                    const prefix = col.name.substring(0, col.name.length - 2);
+                    let targetTable = prefix;
+                    if (stmt.from && stmt.from.alias === prefix) targetTable = stmt.from.tableName;
+                    if (stmt.joins) {
+                       for (const j of stmt.joins) {
+                          if (j.alias === prefix) targetTable = j.tableName;
+                       }
+                    }
+                    if (targetTable) {
+                       const tableInfo = await (storage as any).getTableAsync(targetTable);
+                       if (tableInfo) {
+                          for (const c of tableInfo.columns) fields.push({ name: c.name });
+                       }
+                    }
+                 } else {
+                    const name = col.name.includes('.') ? col.name.split('.')[1] : col.name;
+                    fields.push({ name });
+                 }
+              } else if (col.type === 'Call') {
+                 fields.push({ name: col.fnName.toLowerCase() });
+              } else {
+                 fields.push({ name: 'col' });
+              }
+           }
+           
+           const finalFields: { name: string }[] = [];
+           const seen = new Set<string>();
+           for (const f of fields) {
+              let outKey = f.name;
+              if (seen.has(outKey)) {
+                 let suffix = 1;
+                 while (seen.has(`${outKey}${suffix}`)) suffix++;
+                 outKey = `${outKey}${suffix}`;
+              }
+              seen.add(outKey);
+              finalFields.push({ name: outKey });
+           }
+           fields = finalFields;
+        }
+
+        return { rows, fields };
       }
 
       case "Values": {
@@ -664,7 +721,8 @@ export class Executor {
         for await (const row of this.executeSelect(storage, stmt, params)) {
           rows.push(row);
         }
-        return rows;
+        const fields = rows.length > 0 ? Object.keys(rows[0]).map(k => ({ name: k })) : [];
+        return { rows, fields };
       }
 
       case "Update": {

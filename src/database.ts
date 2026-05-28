@@ -84,12 +84,18 @@ export class LitePostgres {
   private formatQueryResult<T>(sql: string, result: any): QueryResult<T> {
     let rows: any[] = [];
     let rowCount = 0;
+    let fields: { name: string }[] = [];
     const match = sql.trim().match(/^[A-Za-z]+/);
     let command = match ? match[0].toUpperCase() : '';
     
-    if (Array.isArray(result)) {
+    if (result && Array.isArray(result.rows) && result.fields) {
+      rows = result.rows;
+      rowCount = rows.length;
+      fields = result.fields;
+    } else if (Array.isArray(result)) {
       rows = result;
       rowCount = rows.length;
+      fields = rows.length > 0 ? Object.keys(rows[0]).map(k => ({ name: k })) : [];
     } else if (result && typeof result === 'object') {
       if (result.inserted !== undefined) {
         if (Array.isArray(result.inserted)) {
@@ -105,7 +111,6 @@ export class LitePostgres {
         rowCount = 0;
       }
     }
-    const fields = rows.length > 0 ? Object.keys(rows[0]).map(k => ({ name: k })) : [];
     return { rows, rowCount, fields, command };
   }
 
@@ -149,7 +154,11 @@ export class LitePostgres {
       this.queue = this.queue.then(async () => {
         try {
           const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
-          resolve(Array.isArray(result) ? result :[]);
+          if (result && Array.isArray(result.rows) && result.fields) {
+             resolve(result.rows);
+          } else {
+             resolve(Array.isArray(result) ? result :[]);
+          }
         } catch (e) {
           reject(e);
         }
@@ -204,7 +213,11 @@ export class LitePostgres {
                   txQueue = txQueue.then(async () => {
                     try {
                       const res = await target.run(sql, actualP, actualDb || txDb);
-                      resolve(Array.isArray(res) ? res : []);
+                      if (res && Array.isArray(res.rows) && res.fields) {
+                         resolve(res.rows);
+                      } else {
+                         resolve(Array.isArray(res) ? res : []);
+                      }
                     } catch (e) { reject(e); }
                   });
                 });

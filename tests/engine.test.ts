@@ -4787,6 +4787,53 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
     });
   });
 
+  describe("LEVEL 81: 0 columns table bug fix (Empty table field inference)", () => {
+    test("81.1 SELECT * FROM empty table returns fields", async () => {
+      await db.exec(`CREATE TABLE empty_products (id BIGSERIAL PRIMARY KEY, name VARCHAR(255), price DECIMAL(12,2))`);
+      const res = await db.query2(`SELECT * FROM empty_products`);
+      expect(res.rows.length).toBe(0);
+      expect(res.fields.length).toBe(3);
+      expect(res.fields.map(f => f.name)).toEqual(['id', 'name', 'price']);
+    });
+    
+    test("81.2 End-to-end execution of user provided script", async () => {
+      const sql = `
+        DO $ BEGIN 
+          IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'product_status') THEN 
+            CREATE TYPE product_status AS ENUM ('active', 'inactive', 'discontinued'); 
+          END IF; 
+        END $;
+
+        CREATE TABLE IF NOT EXISTS script_products (id BIGSERIAL PRIMARY KEY);
+        ALTER TABLE script_products ADD COLUMN IF NOT EXISTS name VARCHAR(255);
+        ALTER TABLE script_products ADD COLUMN IF NOT EXISTS description TEXT;
+        ALTER TABLE script_products ADD COLUMN IF NOT EXISTS price DECIMAL(12,2);
+        ALTER TABLE script_products ADD COLUMN IF NOT EXISTS stock INTEGER DEFAULT 0;
+        ALTER TABLE script_products ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active';
+
+        COMMENT ON TABLE script_products IS '{ "label": "Sản phẩm" }';
+      `;
+      const res = await db.exec(sql);
+      expect(Array.isArray(res)).toBe(true);
+
+      const q = await db.query2(`SELECT * FROM script_products`);
+      expect(q.rows.length).toBe(0);
+      expect(q.fields.length).toBe(6);
+      expect(q.fields.map(f => f.name)).toEqual(['id', 'name', 'description', 'price', 'stock', 'status']);
+      
+      const insertSql = `
+        INSERT INTO script_products (name, description, price, stock, status)
+        SELECT 'Áo Thun Cotton Basic', 'Áo thun cotton cao cấp', 250000, 150, 'active'
+        WHERE NOT EXISTS (SELECT 1 FROM script_products LIMIT 1);
+      `;
+      await db.exec(insertSql);
+      
+      const rows = await db.query(`SELECT * FROM script_products`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].name).toBe('Áo Thun Cotton Basic');
+    });
+  });
+
   describe("LEVEL 78: Complex Schema with ENUM and NOT NULL defaults", () => {
     test("78.1 Graceful degradation for CREATE TYPE and pg_type", async () => {
       // Kiểm tra việc LitePostgres có thể chạy mượt mà đoạn script chứa pg_type
