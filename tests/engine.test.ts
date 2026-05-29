@@ -228,7 +228,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         WHERE users.name = 'Eve'
       `);
       expect(rows.length).toBe(1);
-      expect(rows[0].title).toBeUndefined();
+      expect(rows[0].title).toBeNull();
     });
 
     test("3.2.1 RIGHT JOIN", async () => {
@@ -246,7 +246,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows.length).toBe(4);
       const orphan = rows.find((r) => r.title === "Orphan Post");
       expect(orphan).toBeDefined();
-      expect(orphan.name).toBeUndefined();
+      expect(orphan.name).toBeNull();
 
       const pglite = rows.find((r) => r.title === "Postgres Lite");
       expect(pglite).toBeDefined();
@@ -271,7 +271,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       // 1 (only in A)
       expect(rows[0].a_id).toBe(1);
       expect(rows[0].val_a).toBe("A1");
-      expect(rows[0].b_id).toBeUndefined();
+      expect(rows[0].b_id).toBeNull();
 
       // 2 (in both)
       expect(rows[1].a_id).toBe(2);
@@ -280,7 +280,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[1].val_b).toBe("B2");
 
       // 3 (only in B)
-      expect(rows[2].a_id).toBeUndefined();
+      expect(rows[2].a_id).toBeNull();
       expect(rows[2].b_id).toBe(3);
       expect(rows[2].val_b).toBe("B3");
     });
@@ -306,7 +306,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       // 1 (only in A)
       expect(rows[0].a_id).toBe(1);
       expect(rows[0].val_a).toBe("A1");
-      expect(rows[0].b_id).toBeUndefined();
+      expect(rows[0].b_id).toBeNull();
 
       // 2 (in both)
       expect(rows[1].a_id).toBe(2);
@@ -315,7 +315,7 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[1].val_b).toBe("B2");
 
       // 3 (only in B)
-      expect(rows[2].a_id).toBeUndefined();
+      expect(rows[2].a_id).toBeNull();
       expect(rows[2].b_id).toBe(3);
       expect(rows[2].val_b).toBe("B3");
     });
@@ -4126,9 +4126,13 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       await db.exec(`INSERT INTO trunc_child VALUES (1)`);
 
       // Should fail without cascade
-      expect(async () => {
+      let err;
+      try {
         await db.exec(`TRUNCATE trunc_parent`);
-      }).toThrow();
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeDefined();
 
       // Should succeed if both are in statement
       await db.exec(`TRUNCATE trunc_parent, trunc_child`);
@@ -4831,6 +4835,75 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
       const rows = await db.query(`SELECT * FROM script_products`);
       expect(rows.length).toBe(1);
       expect(rows[0].name).toBe('Áo Thun Cotton Basic');
+    });
+  });
+
+  describe("LEVEL 82: Parameterized Identifiers (TypeORM hack)", () => {
+    test("82.1 Resolves parameter as identifier if it matches a table.column pattern", async () => {
+      await db.exec(`DROP TABLE IF EXISTS aftercare_contents`);
+      await db.exec(`DROP TABLE IF EXISTS user_aftercare_progress`);
+      await db.exec(`CREATE TABLE aftercare_contents (id SERIAL PRIMARY KEY, status TEXT, deleted_at TIMESTAMP, category TEXT, created_at TIMESTAMP)`);
+      await db.exec(`CREATE TABLE user_aftercare_progress (id SERIAL PRIMARY KEY, aftercare_id INT, user_id INT, is_favorite BOOLEAN, is_completed BOOLEAN)`);
+      
+      await db.exec(`INSERT INTO aftercare_contents (status, category, created_at) VALUES ('published', 'Tâm lý học', '2024-01-01T00:00:00Z')`);
+      await db.exec(`INSERT INTO user_aftercare_progress (aftercare_id, user_id, is_favorite, is_completed) VALUES (1, 3, true, false)`);
+      
+      const sql = `
+        select "ac".*, "uap"."is_favorite" as "is_favorite", "uap"."is_completed" as "is_completed" 
+        from "aftercare_contents" as "ac" 
+        left join "user_aftercare_progress" as "uap" on "uap"."aftercare_id" = $1 and "uap"."user_id" = $2 
+        where "id" != $3 and "status" = $4 and "deleted_at" is null and "ac"."category" ilike $5 
+        order by "created_at" desc limit $6
+      `;
+      const params = ["ac.id", 3, 5, "published", "%Tâm lý%", 3];
+      
+      const rows = await db.query(sql, params);
+      
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBe(1);
+      expect(rows[0].is_favorite).toBe(true);
+      expect(rows[0].is_completed).toBe(false);
+    });
+  });
+
+  describe("LEVEL 82: Parameterized Identifiers (TypeORM hack)", () => {
+    test("82.1 Resolves parameter as identifier if it matches a table.column pattern", async () => {
+      await db.exec(`DROP TABLE IF EXISTS aftercare_contents`);
+      await db.exec(`DROP TABLE IF EXISTS user_aftercare_progress`);
+      await db.exec(`CREATE TABLE aftercare_contents (id SERIAL PRIMARY KEY, status TEXT, deleted_at TIMESTAMP, category TEXT, created_at TIMESTAMP)`);
+      await db.exec(`CREATE TABLE user_aftercare_progress (id SERIAL PRIMARY KEY, aftercare_id INT, user_id INT, is_favorite BOOLEAN, is_completed BOOLEAN)`);
+      
+      await db.exec(`INSERT INTO aftercare_contents (id, status, category, created_at) VALUES (1, 'published', 'Tâm lý học', '2024-01-01T00:00:00Z')`);
+      await db.exec(`INSERT INTO user_aftercare_progress (aftercare_id, user_id, is_favorite, is_completed) VALUES (1, 3, true, false)`);
+      
+      const sql = `
+        select "ac".*, "uap"."is_favorite" as "is_favorite", "uap"."is_completed" as "is_completed" 
+        from "aftercare_contents" as "ac" 
+        left join "user_aftercare_progress" as "uap" on "uap"."aftercare_id" = $1 and "uap"."user_id" = $2 
+        where "id" != $3 and "status" = $4 and "deleted_at" is null and "ac"."category" ilike $5 
+        order by "created_at" desc limit $6
+      `;
+      const params = ["ac.id", 3, 5, "published", "%Tâm lý%", 3];
+      
+      const rows = await db.query(sql, params);
+      
+      // Expected to match because $1 dynamically bounds to ac.id value (1) and $2 is 3
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBe(1);
+      expect(rows[0].is_favorite).toBe(true);
+      expect(rows[0].is_completed).toBe(false);
+    });
+
+    test("82.2 Missed columns in SELECT fallback to NULL instead of string literal", async () => {
+      // Missing fields from failed JOIN should return null to allow ORM mapping
+      const sql = `
+        select "ac".*, "uap"."is_favorite" as "is_favorite"
+        from "aftercare_contents" as "ac" 
+        left join "user_aftercare_progress" as "uap" on "uap"."aftercare_id" = 999 
+      `;
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows[0].is_favorite).toBeNull();
     });
   });
 

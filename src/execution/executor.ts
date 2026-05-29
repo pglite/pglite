@@ -3038,6 +3038,20 @@ export class Executor {
           throw new Error(`bind message supplies ${Array.isArray(params) ? params.length : 0} parameters, but prepared statement requires at least ${expr.index}`);
         }
         const pVal = params[expr.index - 1];
+
+        // Hack for ORMs like TypeORM/Knex mistakenly parameterizing identifiers in Joins
+        if (typeof pVal === 'string' && pVal.includes('.') && !pVal.includes(' ') && !pVal.includes('%')) {
+           const parts = pVal.split('.');
+           if (parts.length === 2) {
+             const tbl = parts[0]!;
+             const col = parts[1]!;
+             const tblObj = row['__lpg_tbl_' + tbl] || row[tbl];
+             if (tblObj && tblObj[col] !== undefined) {
+                 return tblObj[col];
+             }
+           }
+        }
+
         return pVal instanceof Date ? pVal.toISOString() : pVal;
       }
       case "NamedParameter": {
@@ -3078,13 +3092,15 @@ export class Executor {
              return tblObj[(expr as any)._col];
           }
           if (row[expr.name] !== undefined) return row[expr.name];
-          if ((expr as any).isDoubleQuoted) return expr.name;
-          return undefined;
+          // For nested identifiers like "tbl"."col", we should return null if not found,
+          // never fall back to string literal.
+          return null;
         }
 
         if (row[expr.name] !== undefined) return row[expr.name];
+        // Only simple double-quoted identifiers fall back to string literals (SQLite style)
         if ((expr as any).isDoubleQuoted) return expr.name;
-        return undefined;
+        return null;
       }
       case "Binary": {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
