@@ -4957,5 +4957,54 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
       expect(comments[0].column_comment).toContain('Trạng thái');
     });
   });
+
+  describe("LEVEL 83: ALTER TYPE ADD VALUE", () => {
+    test("83.1 ALTER TYPE ADD VALUE and COMMENT ON COLUMN", async () => {
+      // 1. Create type
+      await db.exec(`CREATE TYPE user_role AS ENUM ('admin', 'user');`);
+      
+      // 2. Create table using the type
+      await db.exec(`CREATE TABLE users_83 (id SERIAL PRIMARY KEY, role user_role);`);
+
+      // 3. ALTER TYPE
+      const resAlter = await db.exec(`ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'staff';`);
+      expect(resAlter.success).toBe(true);
+
+      // Verify pg_enum has the new value
+      const enumRows = await db.query(`
+        SELECT enumlabel 
+        FROM pg_enum 
+        WHERE enumtypid = (SELECT oid FROM pg_type WHERE typname = 'user_role')
+        ORDER BY enumsortorder
+      `);
+      expect(enumRows.map((r: any) => r.enumlabel)).toEqual(['admin', 'user', 'staff']);
+
+      // 4. Update comment on column
+      const commentSql = `
+        COMMENT ON COLUMN users_83.role IS '{
+          "label": "Vai trò",
+          "type": "select",
+          "required": true,
+          "description": "Vai trò của người dùng trong hệ thống (Admin, Nhân viên, hoặc Người dùng thông thường)",
+          "enums": [
+            {"label": "Admin", "value": "admin"},
+            {"label": "Nhân viên", "value": "staff"},
+            {"label": "User", "value": "user"}
+          ]
+        }';
+      `;
+      const resComment = await db.exec(commentSql);
+      expect(resComment.success).toBe(true);
+
+      // Verify comment
+      const commentRows = await db.query(`
+        SELECT column_comment 
+        FROM information_schema.columns 
+        WHERE table_name = 'users_83' AND column_name = 'role'
+      `);
+      expect(commentRows[0].column_comment).toContain('Nhân viên');
+      expect(commentRows[0].column_comment).toContain('staff');
+    });
+  });
 });
 });

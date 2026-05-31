@@ -951,6 +951,24 @@ export class Parser {
 
   private parseAlter(): Statement {
     this.consume('KEYWORD', 'ALTER');
+
+    if (this.match('KEYWORD', 'TYPE')) {
+      this.consume();
+      const typeName = this.parseTableName();
+      if (this.match('KEYWORD', 'ADD')) {
+        this.consume();
+        this.consume('KEYWORD', 'VALUE');
+        let ifNotExists = false;
+        if (this.match('KEYWORD', 'IF')) {
+          this.consume(); this.consume('KEYWORD', 'NOT'); this.consume('KEYWORD', 'EXISTS');
+          ifNotExists = true;
+        }
+        const valToken = this.consume('STRING');
+        return { type: 'AlterType', typeName, action: { type: 'AddValue', value: valToken.value, ifNotExists } };
+      }
+      throw new Error(`Parse Error: Unsupported ALTER TYPE action`);
+    }
+
     this.consume('KEYWORD', 'TABLE');
     const tableName = this.parseTableName();
 

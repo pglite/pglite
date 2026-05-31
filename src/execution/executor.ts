@@ -132,6 +132,50 @@ export class Executor {
         return { success: true, message: `Type ${stmt.typeName} created.` };
       }
 
+      case "AlterType": {
+        if (stmt.action.type === 'AddValue') {
+          let cleanTypeName = stmt.typeName.includes('.') ? stmt.typeName.split('.')[1] : stmt.typeName;
+          cleanTypeName = cleanTypeName.replace(/^"|"$/g, '');
+          
+          let typeOid = -1;
+          for await (const r of storage.scanRows("pg_catalog.pg_type")) {
+             if (r.typname === cleanTypeName) {
+                 typeOid = r.oid;
+                 break;
+             }
+          }
+          if (typeOid === -1) throw new Error(`Type ${stmt.typeName} does not exist`);
+
+          let maxSortOrder = 0;
+          let exists = false;
+          let enumMaxOid = 0;
+          for await (const r of storage.scanRows("pg_catalog.pg_enum")) {
+             if (r.oid > enumMaxOid) enumMaxOid = r.oid;
+             if (r.enumtypid === typeOid) {
+                 if (r.enumlabel === stmt.action.value) {
+                     exists = true;
+                 }
+                 if (r.enumsortorder > maxSortOrder) {
+                     maxSortOrder = r.enumsortorder;
+                 }
+             }
+          }
+          if (exists) {
+             if (stmt.action.ifNotExists) return { success: true, message: `Enum value already exists` };
+             throw new Error(`enum label "${stmt.action.value}" already exists, in type "${stmt.typeName}"`);
+          }
+
+          await storage.insertRow("pg_catalog.pg_enum", {
+             oid: enumMaxOid + 1,
+             enumtypid: typeOid,
+             enumsortorder: maxSortOrder + 1,
+             enumlabel: stmt.action.value
+          });
+          return { success: true, message: `Type ${stmt.typeName} altered.` };
+        }
+        return { success: true };
+      }
+
       case "AlterTable": {
         const table = await (storage as any).getTableAsync(stmt.tableName);
         if (!table) throw new Error(`Table ${stmt.tableName} not found`);

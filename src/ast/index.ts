@@ -72,6 +72,9 @@ export interface OrderBy {
   nullsLast?: boolean;
 }
 
+export type AlterTypeAction =
+  | { type: 'AddValue'; value: string; ifNotExists?: boolean };
+
 export type AlterTableAction =
   | { type: 'AddColumn'; column: ColumnDef; ifNotExists?: boolean }
   | { type: 'DropColumn'; columnName: string; ifExists?: boolean; cascade?: boolean }
@@ -130,6 +133,7 @@ export type Statement =
   | { type: 'Truncate'; tableNames: string[]; cascade?: boolean; restartIdentity?: boolean }
   | { type: 'Values'; values: Expr[][]; ctes?: { name: string; columnAliases?: string[]; stmt: Statement; recursive?: boolean }[] }
   | { type: 'AlterTable'; tableName: string; action: AlterTableAction; actions?: AlterTableAction[] }
+  | { type: 'AlterType'; typeName: string; action: AlterTypeAction }
   | { type: 'Do'; code: string; language?: string }
   | { type: 'Comment'; objectType: string; objectName: string; comment: string }
   | { type: 'Begin' }
