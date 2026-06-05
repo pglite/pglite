@@ -1660,7 +1660,10 @@ export class StorageEngine {
     const table = await this.getTableAsync(fullName);
     if (!table) throw new Error(`Table ${fullName} does not exist`);
 
-    const pkAttNums = columns.map(c => table.columns.findIndex(col => col.name === c) + 1);
+    const pkAttNums = columns.map(c => {
+      const idx = table.columns.findIndex(col => col.name === c);
+      return (table.columns[idx] as any)._attnum;
+    });
 
     let rootPage = await this.pager.allocatePage();
     const rootBuf = Buffer.alloc(PAGE_SIZE);
@@ -1759,7 +1762,7 @@ export class StorageEngine {
           `Column '${col}' does not exist in table ${fullName}. Available columns: [${available}]`,
         );
       }
-      attNums.push(attrIdx + 1);
+      attNums.push((table.columns[attrIdx] as any)._attnum);
     }
 
     const rootPage = await this.pager.allocatePage();
@@ -2125,6 +2128,7 @@ export class StorageEngine {
           isPrimaryKey: !!attr.attprimary,
           isUnique: !!attr.attunique,
           isNotNull: !!attr.attnotnull,
+          _attnum: attr.attnum,
           references: attr.attref_table
             ? {
                 table: attr.attref_table,
@@ -2266,6 +2270,7 @@ export class StorageEngine {
 
     for (let i = 0; i < columns.length; i++) {
       const col = columns[i]!;
+      (col as any)._attnum = i + 1;
       if (col.references) {
         this.invalidateTableCache(col.references.table);
       }
@@ -3066,7 +3071,7 @@ export class StorageEngine {
               const refAttrIdx = refTable.columns.findIndex(
                 (c) => c.name === attr.attref_col,
               );
-              if (refAttrIdx !== -1) confkey = [refAttrIdx + 1];
+              if (refAttrIdx !== -1) confkey = [(refTable.columns[refAttrIdx] as any)._attnum];
             }
             yield {
               conname: rel.relname + "_" + attr.attname + "_fkey",

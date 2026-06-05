@@ -191,6 +191,14 @@ export class Executor {
           if (action.column.references) {
             storage.invalidateTableCache(action.column.references.table);
           }
+
+          let maxAttnum = 0;
+          for (const c of table.columns) {
+            if ((c as any)._attnum > maxAttnum) maxAttnum = (c as any)._attnum;
+          }
+          const nextAttnum = maxAttnum + 1;
+          (action.column as any)._attnum = nextAttnum;
+
           table.columns.push(action.column);
           await storage.updateTableSchema(stmt.tableName, table);
 
@@ -198,7 +206,7 @@ export class Executor {
             attrelid: table.firstPage,
             attname: action.column.name,
             atttypid: action.column.dataType,
-            attnum: table.columns.length,
+            attnum: nextAttnum,
             attnotnull: !!action.column.isNotNull,
             attprimary: !!action.column.isPrimaryKey,
             attunique: !!action.column.isUnique,
@@ -214,7 +222,7 @@ export class Executor {
           if (action.column.defaultVal || action.column.generatedExpr) {
             await storage.insertRow('pg_catalog.pg_attrdef', {
               adrelid: table.firstPage,
-              adnum: table.columns.length,
+              adnum: nextAttnum,
               adbin: action.column.generatedExpr ? JSON.stringify({ __generated__: true, expr: action.column.generatedExpr }) : JSON.stringify(action.column.defaultVal),
             });
           }
@@ -239,13 +247,13 @@ export class Executor {
             if (action.ifExists) continue;
             throw new Error(`Column ${action.columnName} does not exist`);
           }
-          const colNum = colIndex + 1;
+          const actualAttnum = (table.columns[colIndex] as any)._attnum;
           
           await this.rewriteTableData(storage, stmt.tableName, async () => {
             table.columns.splice(colIndex, 1);
             await storage.updateTableSchema(stmt.tableName, table);
             await storage.deleteRows('pg_catalog.pg_attribute', async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName);
-            await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === colNum);
+            await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === actualAttnum);
           }, (row) => {
             delete row[action.columnName];
           });
@@ -289,6 +297,7 @@ export class Executor {
           const colIndex = table.columns.findIndex((c: any) => c.name === action.columnName);
           const col = table.columns[colIndex];
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
+          const actualAttnum = (col as any)._attnum;
           col.defaultVal = action.defaultVal;
           await storage.updateTableSchema(stmt.tableName, table);
           
@@ -300,13 +309,13 @@ export class Executor {
           
           let updatedAd = false;
           await storage.updateRows('pg_catalog.pg_attrdef',
-            async (r: any) => r.adrelid === table.firstPage && r.adnum === colIndex + 1,
+            async (r: any) => r.adrelid === table.firstPage && r.adnum === actualAttnum,
             async (r: any) => { r.adbin = strDef; updatedAd = true; }
           );
           if (!updatedAd) {
             await storage.insertRow('pg_catalog.pg_attrdef', {
               adrelid: table.firstPage,
-              adnum: colIndex + 1,
+              adnum: actualAttnum,
               adbin: strDef
             });
           }
@@ -314,6 +323,7 @@ export class Executor {
           const colIndex = table.columns.findIndex((c: any) => c.name === action.columnName);
           const col = table.columns[colIndex];
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
+          const actualAttnum = (col as any)._attnum;
           delete col.defaultVal;
           await storage.updateTableSchema(stmt.tableName, table);
 
@@ -321,7 +331,7 @@ export class Executor {
             async (r: any) => r.attrelid === table.firstPage && r.attname === action.columnName,
             async (r: any) => { r.attdef = null; }
           );
-          await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === colIndex + 1);
+          await storage.deleteRows('pg_catalog.pg_attrdef', async (r: any) => r.adrelid === table.firstPage && r.adnum === actualAttnum);
         } else if (action.type === 'AlterColumnSetNotNull') {
           const col = table.columns.find((c: any) => c.name === action.columnName);
           if (!col) throw new Error(`Column ${action.columnName} does not exist`);
@@ -1248,7 +1258,7 @@ export class Executor {
         if (isColumn && colName) {
           const colIdx = table.columns.findIndex((c: any) => c.name === colName);
           if (colIdx === -1) throw new Error(`Column ${colName} does not exist in table ${tableName}`);
-          objsubid = colIdx + 1;
+          objsubid = (table.columns[colIdx] as any)._attnum;
         }
 
         const objoid = table.firstPage;
