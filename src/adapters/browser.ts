@@ -51,13 +51,15 @@ export class BrowserFSAdapter implements VFS {
       },
       write: async (buf, offset, len, pos) => {
         const writeData = buf.subarray(offset, offset + len);
-        if (pos === -1 || pos >= data.length) {
-          const newData = new Uint8Array(Math.max(pos === -1 ? 0 : pos, data.length) + len);
+        const actualPos = pos === -1 ? data.length : pos;
+        
+        if (actualPos + writeData.length > data.length) {
+          const newData = new Uint8Array(actualPos + writeData.length);
           newData.set(data);
-          newData.set(writeData, pos === -1 ? data.length : pos);
+          newData.set(writeData, actualPos);
           data = newData;
         } else {
-          data.set(writeData, pos);
+          data.set(writeData, actualPos);
         }
         await this.saveFile(path, data);
         return len;

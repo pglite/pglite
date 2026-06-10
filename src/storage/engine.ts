@@ -653,6 +653,7 @@ class SlottedPage {
     data.copy(this.buf, this.freeSpacePointer);
     const slotIdx = this.numSlots;
     const slotOffset = 8 + slotIdx * 4;
+    if (slotOffset + 4 > this.buf.length) return -1;
     this.buf.writeUInt16LE(this.freeSpacePointer, slotOffset);
     this.buf.writeUInt16LE(data.length, slotOffset + 2);
     this.numSlots++;
@@ -662,9 +663,11 @@ class SlottedPage {
   getTuple(targetSlotIdx: number): { offset: number; len: number; data: Buffer; slotIdx: number } | null {
     if (targetSlotIdx >= this.numSlots) return null;
     const slotOffset = 8 + targetSlotIdx * 4;
+    if (slotOffset + 4 > this.buf.length) return null;
     const dataOffset = this.buf.readUInt16LE(slotOffset);
     if (dataOffset === 0) return null;
     const dataLen = this.buf.readUInt16LE(slotOffset + 2);
+    if (dataOffset + dataLen > this.buf.length) return null;
     return {
       offset: dataOffset,
       len: dataLen,
@@ -684,10 +687,13 @@ class SlottedPage {
     const result = [];
     for (let i = 0; i < num; i++) {
       const slotOffset = 8 + i * 4;
+      if (slotOffset + 4 > buffer.length) break;
       const dataOffset = buffer.readUInt16LE(slotOffset);
       if (dataOffset === 0) continue;
 
       const dataLen = buffer.readUInt16LE(slotOffset + 2);
+      if (dataOffset + dataLen > buffer.length) continue;
+      
       result.push({
         offset: dataOffset,
         len: dataLen,
@@ -699,11 +705,15 @@ class SlottedPage {
   }
 
   deleteTuple(slotIdx: number) {
-    this.buf.writeUInt16LE(0, 8 + slotIdx * 4);
+    const slotOffset = 8 + slotIdx * 4;
+    if (slotOffset + 2 <= this.buf.length) {
+      this.buf.writeUInt16LE(0, slotOffset);
+    }
   }
 
   updateTuple(slotIdx: number, data: Buffer): boolean {
     const slotOffset = 8 + slotIdx * 4;
+    if (slotOffset + 4 > this.buf.length) return false;
     const oldLen = this.buf.readUInt16LE(slotOffset + 2);
     if (data.length <= oldLen) {
       const dataOffset = this.buf.readUInt16LE(slotOffset);
@@ -800,44 +810,62 @@ class BTree {
       };
 
     const isLeaf = buf.readUInt8(0) === 1;
-    const numKeys = buf.readUInt16LE(1);
+    let numKeys = buf.readUInt16LE(1);
     const nextLeaf = buf.readUInt32LE(3);
     let offset = 7;
     const keys = [];
     const vals = [];
     const children = [];
-    for (let i = 0; i < numKeys; i++) {
-      const kLen = buf.readUInt16LE(offset);
-      const kStr = buf.toString("utf-8", offset + 2, offset + 2 + kLen);
-      offset += 2 + kLen;
-      const typeInd = kStr[0];
-      const valStr = kStr.substring(1);
-      // Legacy fallback if type indicator is missing (for older files if any)
-      if (typeInd !== "N" && typeInd !== "S") {
-        keys.push(isNaN(Number(kStr)) ? kStr : Number(kStr));
-      } else {
-        keys.push(typeInd === "N" ? Number(valStr) : valStr);
+    
+    try {
+      for (let i = 0; i < numKeys; i++) {
+        if (offset + 2 > buf.length) break;
+        const kLen = buf.readUInt16LE(offset);
+        if (offset + 2 + kLen > buf.length) break;
+        
+        const kStr = buf.toString("utf-8", offset + 2, offset + 2 + kLen);
+        offset += 2 + kLen;
+        const typeInd = kStr[0];
+        const valStr = kStr.substring(1);
+        // Legacy fallback if type indicator is missing (for older files if any)
+        if (typeInd !== "N" && typeInd !== "S") {
+          keys.push(isNaN(Number(kStr)) ? kStr : Number(kStr));
+        } else {
+          keys.push(typeInd === "N" ? Number(valStr) : valStr);
+        }
+        
+        if (isLeaf) {
+          if (offset + 6 > buf.length) break;
+          vals.push({
+            pageId: buf.readUInt32LE(offset),
+            slotIdx: buf.readUInt16LE(offset + 4),
+          });
+          offset += 6;
+        } else {
+          if (offset + 4 > buf.length) break;
+          children.push(buf.readUInt32LE(offset));
+          offset += 4;
+        }
       }
-      if (isLeaf) {
-        vals.push({
-          pageId: buf.readUInt32LE(offset),
-          slotIdx: buf.readUInt16LE(offset + 4),
-        });
-        offset += 6;
-      } else {
-        children.push(buf.readUInt32LE(offset));
-        offset += 4;
-      }
+      if (!isLeaf && offset + 4 <= buf.length) children.push(buf.readUInt32LE(offset));
+    } catch (e) {
+      console.warn("BTree node deserialization recovered from out-of-bounds read", e);
     }
-    if (!isLeaf) children.push(buf.readUInt32LE(offset));
+    
     return { pageId, isLeaf, keys, vals, children, nextLeaf };
   }
 
   async get(key: any): Promise<{ pageId: number; slotIdx: number } | null> {
     if (this.rootPageId === 0 || this.rootPageId === 0xffffffff) return null;
     let currId = this.rootPageId;
+    const visited = new Set<number>();
 
     while (currId !== 0xffffffff && currId !== 0) {
+      if (visited.has(currId)) {
+         console.warn("[LitePostgres] BTree cycle detected during GET");
+         break;
+      }
+      visited.add(currId);
       const node = await this.fetchNode(currId);
       
       let left = 0;
@@ -895,7 +923,26 @@ class BTree {
 
     const path = [];
     let currId = this.rootPageId;
+    const visited = new Set<number>();
     while (true) {
+      if (visited.has(currId)) {
+        console.warn("[LitePostgres] BTree cycle detected during INSERT. Auto-recovering by resetting the corrupted index.");
+        // Tự động phục hồi bằng cách cấp phát page mới làm root và bỏ qua index bị hỏng
+        this.rootPageId = await this.pager.allocatePage();
+        const buf = await this.pager.readPage(this.rootPageId);
+        const node = {
+          isLeaf: true,
+          keys: [key],
+          vals: [val],
+          children: [],
+          nextLeaf: 0xffffffff,
+        };
+        this.serializeNode(node, buf);
+        await this.pager.writePage(this.rootPageId, buf);
+        BTree.nodeCache.set(buf, node);
+        return this.rootPageId;
+      }
+      visited.add(currId);
       const node = await this.fetchNode(currId);
       path.push(node);
       if (node.isLeaf) break;
@@ -1043,7 +1090,10 @@ class BTree {
     if (this.rootPageId === 0 || this.rootPageId === 0xffffffff) return;
     const path = [];
     let currId = this.rootPageId;
+    const visited = new Set<number>();
     while (currId !== 0xffffffff && currId !== 0) {
+      if (visited.has(currId)) break;
+      visited.add(currId);
       const node = await this.fetchNode(currId);
       path.push(node);
       if (node.isLeaf) break;
@@ -1677,7 +1727,10 @@ export class StorageEngine {
     if (columns.length === 1) {
       const pkColName = columns[0];
       let pageId = table.firstPage;
+      const visited = new Set<number>();
       while (pageId !== 0xffffffff && pageId !== 0) {
+        if (visited.has(pageId)) break;
+        visited.add(pageId);
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
         for (const tuple of page.getTuples()) {
@@ -2388,7 +2441,13 @@ export class StorageEngine {
 
   private async *scanCatalog(def: TableData): AsyncIterableIterator<any> {
     let pageId = def.firstPage;
+    const visited = new Set<number>();
     while (pageId !== 0xffffffff && pageId !== 0) {
+      if (visited.has(pageId)) {
+         console.warn(`[LitePostgres] Cycle detected in catalog at page ${pageId}`);
+         break;
+      }
+      visited.add(pageId);
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
@@ -2406,7 +2465,10 @@ export class StorageEngine {
     filter: (r: any) => Promise<boolean>,
   ) {
     let pageId = def.firstPage;
+    const visited = new Set<number>();
     while (pageId !== 0xffffffff && pageId !== 0) {
+      if (visited.has(pageId)) break;
+      visited.add(pageId);
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       let mod = false;
@@ -2437,7 +2499,10 @@ export class StorageEngine {
   ) {
     const pagesToVisit = [];
     let pId = def.firstPage;
+    const visited = new Set<number>();
     while (pId !== 0xffffffff && pId !== 0) {
+      if (visited.has(pId)) break;
+      visited.add(pId);
       pagesToVisit.push(pId);
       const buf = await this.pager.readPage(pId);
       pId = new SlottedPage(buf).nextPageId;
@@ -2576,7 +2641,10 @@ export class StorageEngine {
     if (!this.isOverflow(data)) return;
     const firstPageId = data.readUInt32LE(2);
     let currPageId = firstPageId;
+    const visited = new Set<number>();
     while (currPageId !== 0xffffffff && currPageId !== 0) {
+      if (visited.has(currPageId)) break;
+      visited.add(currPageId);
       const buf = await this.pager.readPage(currPageId);
       const nextId = buf.readUInt32LE(0);
       await this.pager.freePage(currPageId);
@@ -2590,7 +2658,13 @@ export class StorageEngine {
     const fullData = Buffer.allocUnsafe(totalLen);
     let currPageId = firstPageId;
     let offset = 0;
+    const visited = new Set<number>();
     while (currPageId !== 0xffffffff && currPageId !== 0) {
+      if (visited.has(currPageId)) {
+        console.warn("[LitePostgres] Overflow pages cycle detected");
+        break;
+      }
+      visited.add(currPageId);
       const buf = await this.pager.readPage(currPageId);
       const nextId = buf.readUInt32LE(0);
       const chunkLen = Math.min(totalLen - offset, PAGE_SIZE - 4);
@@ -2714,14 +2788,18 @@ export class StorageEngine {
       }
 
       if (isNum) {
+        if (offset + 8 > buf.length) break;
         row[col!.name] = buf.readDoubleLE(offset);
         offset += 8;
       } else if (isBool) {
+        if (offset + 1 > buf.length) break;
         row[col!.name] = buf[offset] === 1;
         offset += 1;
       } else {
+        if (offset + 4 > buf.length) break;
         const len = buf.readUInt32LE(offset);
         offset += 4;
+        if (offset + len > buf.length) break;
         const str = buf.toString("utf-8", offset, offset + len);
         offset += len;
 
@@ -2794,7 +2872,10 @@ export class StorageEngine {
     // Free old data pages and overflow pages
     let pId = table.firstPage;
     const pagesToFree: number[] = [];
+    const visitedPages = new Set<number>();
     while (pId !== 0xffffffff && pId !== 0) {
+      if (visitedPages.has(pId)) break;
+      visitedPages.add(pId);
       const buf = await this.pager.readPage(pId);
       const page = new SlottedPage(buf);
       for (const t of page.getTuples()) {
@@ -2912,7 +2993,10 @@ export class StorageEngine {
       const btree = new BTree(this.pager, table.indexRootPage);
 
       let pageId = table.firstPage;
+      const visited = new Set<number>();
       while (pageId !== 0xffffffff && pageId !== 0) {
+        if (visited.has(pageId)) break;
+        visited.add(pageId);
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
         for (const tuple of page.getTuples()) {
@@ -3183,7 +3267,13 @@ export class StorageEngine {
 
     let pageId = table.firstPage;
     const columns = table.columns;
+    const visited = new Set<number>();
     while (pageId !== 0xffffffff && pageId !== 0) {
+      if (visited.has(pageId)) {
+         console.warn(`[LitePostgres] Cycle detected in table ${fullName} at page ${pageId}`);
+         break;
+      }
+      visited.add(pageId);
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
       for (const tuple of page.getTuples()) {
@@ -3263,7 +3353,10 @@ export class StorageEngine {
     // khi một Row bị phình to và relocate xuống lastPage.
     const pagesToVisit = [];
     let pId = table.firstPage;
+    const visited = new Set<number>();
     while (pId !== 0xffffffff && pId !== 0) {
+      if (visited.has(pId)) break;
+      visited.add(pId);
       pagesToVisit.push(pId);
       const buf = await this.pager.readPage(pId);
       pId = new SlottedPage(buf).nextPageId;
@@ -3451,8 +3544,11 @@ export class StorageEngine {
     const pkCol = table.columns.find((c) => c.isPrimaryKey);
     let pageId = table.firstPage;
     let deleted = 0;
+    const visited = new Set<number>();
 
     while (pageId !== 0xffffffff && pageId !== 0) {
+      if (visited.has(pageId)) break;
+      visited.add(pageId);
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
       let pageModified = false;

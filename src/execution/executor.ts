@@ -3552,6 +3552,12 @@ export class Executor {
         }
         if (fnName === "PI") return Math.PI;
         if (fnName === "RANDOM") return Math.random();
+        if (fnName === "GEN_RANDOM_UUID" || fnName === "UUID_GENERATE_V4") {
+          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+        }
         if (fnName === "DEGREES") return args[0] != null ? Number(args[0]) * (180 / Math.PI) : null;
         if (fnName === "RADIANS") return args[0] != null ? Number(args[0]) * (Math.PI / 180) : null;
 
