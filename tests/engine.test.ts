@@ -1029,6 +1029,29 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
   });
 
+  describe("LEVEL 84: Bug Fix - Table pg_catalog.pg_description not found after rollback / on COMMENT", () => {
+    test("84.1 COMMENT ON after failed query (rollbackStatement) succeeds without catalog not found error", async () => {
+      await db.exec(`CREATE TABLE comment_rollback_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      
+      // 1. Force an error to trigger rollbackStatement
+      try {
+        await db.exec(`INSERT INTO comment_rollback_test INVALID SYNTAX`);
+      } catch (e) {}
+
+      // 2. Add comment directly afterwards
+      const res = await db.exec(`COMMENT ON COLUMN comment_rollback_test.val IS 'Successfully recovered'`);
+      expect(res.success).toBe(true);
+
+      const rows = await db.query(`
+        SELECT column_comment 
+        FROM information_schema.columns 
+        WHERE table_name = 'comment_rollback_test' AND column_name = 'val'
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].column_comment).toBe('Successfully recovered');
+    });
+  });
+
   describe("LEVEL 7: Schema Operations", () => {
     test("7.1 CREATE SCHEMA", async () => {
       const res = await db.exec(`CREATE SCHEMA analytics`);

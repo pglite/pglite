@@ -359,6 +359,7 @@ export class LitePostgres {
       } else {
         await this.storage.rollbackStatement();
       }
+      this.currentDb = undefined;
       if (this.txRelease) {
         this.txRelease();
         this.txRelease = undefined;

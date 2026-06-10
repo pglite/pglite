@@ -2138,6 +2138,17 @@ export class StorageEngine {
     if (cached) return cached;
 
     const loadTable = async (schema: string, table: string) => {
+      if (schema === "pg_catalog") {
+        let sysDef: TableData | null = null;
+        if (table === "pg_namespace") sysDef = this.pgNamespaceDef;
+        else if (table === "pg_class") sysDef = this.pgClassDef;
+        else if (table === "pg_attribute") sysDef = this.pgAttributeDef;
+        else if (table === "pg_description") sysDef = this.pgDescriptionDef;
+        else if (table === "pg_attrdef") sysDef = this.pgAttrdefDef;
+        else if (table === "pg_index") sysDef = this.pgIndexDef;
+        if (sysDef) return sysDef;
+      }
+
       const nspOid = await this.getSchemaOid(schema);
       if (!nspOid) return null;
 
