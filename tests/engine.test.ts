@@ -2111,6 +2111,11 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   });
 
   describe("LEVEL 20: System Functions (format_type, pg_get_expr)", () => {
+    test("20.0 gen_random_uuid()", async () => {
+      const rows = await db.query("SELECT gen_random_uuid() as uuid");
+      expect(rows[0].uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    });
+
     test("20.1 format_type returns type name", async () => {
       const sql = `
         SELECT format_type(atttypid, atttypmod) as type_name
