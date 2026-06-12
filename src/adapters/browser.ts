@@ -109,4 +109,32 @@ export class BrowserFSAdapter implements VFS {
     const lines = text.split("\n");
     for (const line of lines) yield line;
   }
+
+  static async destroyDatabase(filepath: string): Promise<void> {
+    if (typeof indexedDB === "undefined") {
+      throw new Error("indexedDB is not supported in this environment.");
+    }
+    return new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open("pglite_vfs", 1);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("files");
+      };
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction("files", "readwrite");
+        const store = tx.objectStore("files");
+        store.delete(filepath);
+        store.delete(filepath + ".wal");
+        tx.oncomplete = () => {
+          db.close();
+          resolve();
+        };
+        tx.onerror = () => {
+          db.close();
+          reject(tx.error);
+        };
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
 }
