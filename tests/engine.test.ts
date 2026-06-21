@@ -726,7 +726,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("5.16 information_schema.tables should not return index tables", async () => {
-      await db.exec(`CREATE TABLE tbl_for_idx_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(
+        `CREATE TABLE tbl_for_idx_test (id SERIAL PRIMARY KEY, val TEXT)`,
+      );
       await db.exec(`CREATE INDEX custom_idx_test ON tbl_for_idx_test(val)`);
 
       const sql = `
@@ -736,8 +738,8 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       `;
       const rows = await db.query(sql);
       const tableNames = rows.map((r: any) => r.table_name);
-      expect(tableNames).toContain('tbl_for_idx_test');
-      expect(tableNames).not.toContain('custom_idx_test'); // Không được chứa tên của Index
+      expect(tableNames).toContain("tbl_for_idx_test");
+      expect(tableNames).not.toContain("custom_idx_test"); // Không được chứa tên của Index
     });
 
     test("5.15 Set Operations - UNION, INTERSECT, EXCEPT and ALL variants", async () => {
@@ -2113,7 +2115,9 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
   describe("LEVEL 20: System Functions (format_type, pg_get_expr)", () => {
     test("20.0 gen_random_uuid()", async () => {
       const rows = await db.query("SELECT gen_random_uuid() as uuid");
-      expect(rows[0].uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      expect(rows[0].uuid).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
     });
 
     test("20.1 format_type returns type name", async () => {
@@ -4284,64 +4288,90 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       const rows2 = await db.query(`SELECT UPPER("hello") as val`);
       expect(rows2[0].val).toBe("HELLO");
     });
-    
   });
-describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () => {
+  describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () => {
     test("77.1 Query matches expected output and resolves Date params correctly", async () => {
-      await db.exec(`CREATE TABLE bookings_77 (id SERIAL PRIMARY KEY, user_id INT, program_id INT, check_in_date DATE, check_out_date DATE, check_in_status TEXT, deleted_at TIMESTAMP)`);
-      await db.exec(`CREATE TABLE retreat_programs_77 (id SERIAL PRIMARY KEY, name TEXT, location_name TEXT, thumbnail_url TEXT, duration_days INT)`);
-      
-      await db.exec(`INSERT INTO retreat_programs_77 (id, name, location_name, thumbnail_url, duration_days) VALUES (10, 'Yoga Retreat', 'Bali', 'url', 5)`);
-      
-      await db.exec(`INSERT INTO bookings_77 (id, user_id, program_id, check_in_date, check_out_date, check_in_status) VALUES (100, 1, 10, '2026-05-10', '2026-05-15', 'confirmed')`);
+      await db.exec(
+        `CREATE TABLE bookings_77 (id SERIAL PRIMARY KEY, user_id INT, program_id INT, check_in_date DATE, check_out_date DATE, check_in_status TEXT, deleted_at TIMESTAMP)`,
+      );
+      await db.exec(
+        `CREATE TABLE retreat_programs_77 (id SERIAL PRIMARY KEY, name TEXT, location_name TEXT, thumbnail_url TEXT, duration_days INT)`,
+      );
+
+      await db.exec(
+        `INSERT INTO retreat_programs_77 (id, name, location_name, thumbnail_url, duration_days) VALUES (10, 'Yoga Retreat', 'Bali', 'url', 5)`,
+      );
+
+      await db.exec(
+        `INSERT INTO bookings_77 (id, user_id, program_id, check_in_date, check_out_date, check_in_status) VALUES (100, 1, 10, '2026-05-10', '2026-05-15', 'confirmed')`,
+      );
 
       // Using Date object for param $2 which used to fail the >= comparison
-      const params =[1, new Date('2026-05-01T00:00:00.000Z'), 'confirmed', 'pending'];
-      
+      const params = [
+        1,
+        new Date("2026-05-01T00:00:00.000Z"),
+        "confirmed",
+        "pending",
+      ];
+
       const sql = `select "b"."id" as "booking_id", "rp"."id" as "program_id", "rp"."name", "rp"."location_name", "rp"."thumbnail_url", "rp"."duration_days", "b"."check_in_date", "b"."check_out_date", "b"."check_in_status" from "bookings_77" as "b" inner join "retreat_programs_77" as "rp" on "rp"."id" = "b"."program_id" where "b"."user_id" = $1 and "b"."check_out_date" >= $2 and "b"."check_in_status" in ($3, $4) and "b"."deleted_at" is null order by "b"."check_in_date" asc`;
 
       const rows = await db.query(sql, params);
-      
+
       expect(rows.length).toBe(1);
       expect(rows[0].booking_id).toBe(100);
       expect(rows[0].program_id).toBe(10);
-      expect(rows[0].name).toBe('Yoga Retreat');
+      expect(rows[0].name).toBe("Yoga Retreat");
     });
   });
 
   describe("LEVEL 69: query2/exec2 and transaction2 standard Postgres format", () => {
     test("69.1 query2 returns standard fields", async () => {
-      await db.exec(`CREATE TABLE std_format_test (id SERIAL PRIMARY KEY, name TEXT)`);
-      const resInsert = await db.query2(`INSERT INTO std_format_test (name) VALUES ('Alpha'), ('Beta')`);
+      await db.exec(
+        `CREATE TABLE std_format_test (id SERIAL PRIMARY KEY, name TEXT)`,
+      );
+      const resInsert = await db.query2(
+        `INSERT INTO std_format_test (name) VALUES ('Alpha'), ('Beta')`,
+      );
       expect(resInsert.command).toBe("INSERT");
       expect(resInsert.rowCount).toBe(2);
       expect(resInsert.rows).toEqual([]);
       expect(resInsert.fields).toEqual([]);
 
-      const resSelect = await db.query2(`SELECT * FROM std_format_test ORDER BY id`);
+      const resSelect = await db.query2(
+        `SELECT * FROM std_format_test ORDER BY id`,
+      );
       expect(resSelect.command).toBe("SELECT");
       expect(resSelect.rowCount).toBe(2);
       expect(resSelect.rows.length).toBe(2);
       expect(resSelect.rows[0].name).toBe("Alpha");
       expect(resSelect.fields).toEqual([{ name: "id" }, { name: "name" }]);
 
-      const resUpdate = await db.query2(`UPDATE std_format_test SET name = 'Gamma' WHERE id = 1`);
+      const resUpdate = await db.query2(
+        `UPDATE std_format_test SET name = 'Gamma' WHERE id = 1`,
+      );
       expect(resUpdate.command).toBe("UPDATE");
       expect(resUpdate.rowCount).toBe(1);
 
-      const resDelete = await db.query2(`DELETE FROM std_format_test WHERE id = 2`);
+      const resDelete = await db.query2(
+        `DELETE FROM std_format_test WHERE id = 2`,
+      );
       expect(resDelete.command).toBe("DELETE");
       expect(resDelete.rowCount).toBe(1);
     });
 
     test("69.2 exec2 returns standard fields", async () => {
       await db.exec(`CREATE TABLE exec2_test (id SERIAL PRIMARY KEY, val INT)`);
-      
-      const resInsert = await db.exec2(`INSERT INTO exec2_test (val) VALUES (100)`);
+
+      const resInsert = await db.exec2(
+        `INSERT INTO exec2_test (val) VALUES (100)`,
+      );
       expect(resInsert.command).toBe("INSERT");
       expect(resInsert.rowCount).toBe(1);
 
-      const resUpdate = await db.exec2(`UPDATE exec2_test SET val = 200 WHERE val = 100`);
+      const resUpdate = await db.exec2(
+        `UPDATE exec2_test SET val = 200 WHERE val = 100`,
+      );
       expect(resUpdate.command).toBe("UPDATE");
       expect(resUpdate.rowCount).toBe(1);
 
@@ -4353,172 +4383,220 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
 
     test("69.3 transaction2 provides query2 and exec2 on tx object", async () => {
       await db.exec(`CREATE TABLE std_tx_test (val INT)`);
-      
+
       const res = await db.transaction2(async (tx) => {
         // Test query2 in tx
-        const insertRes = await tx.query2(`INSERT INTO std_tx_test (val) VALUES (10), (20) RETURNING val`);
+        const insertRes = await tx.query2(
+          `INSERT INTO std_tx_test (val) VALUES (10), (20) RETURNING val`,
+        );
         expect(insertRes.command).toBe("INSERT");
         expect(insertRes.rowCount).toBe(2);
         expect(insertRes.rows[0].val).toBe(10);
         expect(insertRes.fields).toEqual([{ name: "val" }]);
 
         // Test exec2 in tx
-        const updateRes = await tx.exec2(`UPDATE std_tx_test SET val = val + 1`);
+        const updateRes = await tx.exec2(
+          `UPDATE std_tx_test SET val = val + 1`,
+        );
         expect(updateRes.command).toBe("UPDATE");
         expect(updateRes.rowCount).toBe(2);
 
-      const selectRes = await tx.query2(`SELECT * FROM std_tx_test`);
-      expect(selectRes.rowCount).toBe(2);
-      return "tx_done";
+        const selectRes = await tx.query2(`SELECT * FROM std_tx_test`);
+        expect(selectRes.rowCount).toBe(2);
+        return "tx_done";
+      });
+
+      expect(res).toBe("tx_done");
+      const finalSelect = await db.query2(`SELECT * FROM std_tx_test`);
+      expect(finalSelect.rowCount).toBe(2);
     });
 
-    expect(res).toBe("tx_done");
-    const finalSelect = await db.query2(`SELECT * FROM std_tx_test`);
-    expect(finalSelect.rowCount).toBe(2);
-  });
+    describe("LEVEL 70: PRIMARY KEY constraints", () => {
+      test("70.1 PRIMARY KEY must be unique on INSERT", async () => {
+        await db.exec(`CREATE TABLE pk_test (id INT PRIMARY KEY, name TEXT)`);
+        await db.exec(`INSERT INTO pk_test (id, name) VALUES (1, 'A')`);
 
-  describe("LEVEL 70: PRIMARY KEY constraints", () => {
-    test("70.1 PRIMARY KEY must be unique on INSERT", async () => {
-      await db.exec(`CREATE TABLE pk_test (id INT PRIMARY KEY, name TEXT)`);
-      await db.exec(`INSERT INTO pk_test (id, name) VALUES (1, 'A')`);
-      
-      let error1;
-      try {
-        await db.exec(`INSERT INTO pk_test (id, name) VALUES (1, 'B')`);
-      } catch (e: any) {
-        error1 = e;
-      }
-      expect(error1).toBeDefined();
-      expect(error1.message).toContain("Constraint Error: id must be unique");
-      
-      let error2;
-      try {
-        await db.exec(`INSERT INTO pk_test (id, name) VALUES (2, 'C'), (2, 'D')`);
-      } catch (e: any) {
-        error2 = e;
-      }
-      expect(error2).toBeDefined();
-      expect(error2.message).toContain("Constraint Error: id must be unique");
+        let error1;
+        try {
+          await db.exec(`INSERT INTO pk_test (id, name) VALUES (1, 'B')`);
+        } catch (e: any) {
+          error1 = e;
+        }
+        expect(error1).toBeDefined();
+        expect(error1.message).toContain("Constraint Error: id must be unique");
+
+        let error2;
+        try {
+          await db.exec(
+            `INSERT INTO pk_test (id, name) VALUES (2, 'C'), (2, 'D')`,
+          );
+        } catch (e: any) {
+          error2 = e;
+        }
+        expect(error2).toBeDefined();
+        expect(error2.message).toContain("Constraint Error: id must be unique");
+      });
+
+      test("70.2 PRIMARY KEY must be unique on UPDATE", async () => {
+        await db.exec(
+          `CREATE TABLE pk_test_update (id INT PRIMARY KEY, name TEXT)`,
+        );
+        await db.exec(
+          `INSERT INTO pk_test_update (id, name) VALUES (1, 'A'), (2, 'B')`,
+        );
+
+        let error1;
+        try {
+          await db.exec(`UPDATE pk_test_update SET id = 1 WHERE id = 2`);
+        } catch (e: any) {
+          error1 = e;
+        }
+        expect(error1).toBeDefined();
+        expect(error1.message).toContain("Constraint Error: id must be unique");
+
+        // Valid update should work
+        const res = await db.exec(
+          `UPDATE pk_test_update SET id = 3 WHERE id = 2`,
+        );
+        expect(res.success).toBe(true);
+        expect(res.updated).toBe(1);
+
+        const rows = await db.query(`SELECT * FROM pk_test_update ORDER BY id`);
+        expect(rows.length).toBe(2);
+        expect(rows[0].id).toBe(1);
+        expect(rows[1].id).toBe(3);
+      });
+
+      test("70.3 UNIQUE constraint is checked on UPDATE", async () => {
+        await db.exec(
+          `CREATE TABLE uniq_test_update (id SERIAL PRIMARY KEY, email TEXT UNIQUE)`,
+        );
+        await db.exec(
+          `INSERT INTO uniq_test_update (email) VALUES ('test1@example.com'), ('test2@example.com')`,
+        );
+
+        let error1;
+        try {
+          await db.exec(
+            `UPDATE uniq_test_update SET email = 'test1@example.com' WHERE id = 2`,
+          );
+        } catch (e: any) {
+          error1 = e;
+        }
+        expect(error1).toBeDefined();
+        expect(error1.message).toContain(
+          "Constraint Error: email must be unique",
+        );
+      });
     });
 
-    test("70.2 PRIMARY KEY must be unique on UPDATE", async () => {
-      await db.exec(`CREATE TABLE pk_test_update (id INT PRIMARY KEY, name TEXT)`);
-      await db.exec(`INSERT INTO pk_test_update (id, name) VALUES (1, 'A'), (2, 'B')`);
-      
-      let error1;
-      try {
-        await db.exec(`UPDATE pk_test_update SET id = 1 WHERE id = 2`);
-      } catch (e: any) {
-        error1 = e;
-      }
-      expect(error1).toBeDefined();
-      expect(error1.message).toContain("Constraint Error: id must be unique");
+    describe("LEVEL 72: ALTER TABLE ADD UNIQUE / PRIMARY KEY CONSTRAINT", () => {
+      test("72.1 Add UNIQUE constraint to an existing column", async () => {
+        await db.exec(`CREATE TABLE brands (id SERIAL PRIMARY KEY, name TEXT)`);
+        await db.exec(
+          `INSERT INTO brands (name) VALUES ('Apple'), ('Samsung')`,
+        );
 
-      // Valid update should work
-      const res = await db.exec(`UPDATE pk_test_update SET id = 3 WHERE id = 2`);
-      expect(res.success).toBe(true);
-      expect(res.updated).toBe(1);
-      
-      const rows = await db.query(`SELECT * FROM pk_test_update ORDER BY id`);
-      expect(rows.length).toBe(2);
-      expect(rows[0].id).toBe(1);
-      expect(rows[1].id).toBe(3);
-    });
+        // 1. Add column
+        await db.exec(
+          `ALTER TABLE brands ADD COLUMN IF NOT EXISTS key VARCHAR(50)`,
+        );
 
-    test("70.3 UNIQUE constraint is checked on UPDATE", async () => {
-      await db.exec(`CREATE TABLE uniq_test_update (id SERIAL PRIMARY KEY, email TEXT UNIQUE)`);
-      await db.exec(`INSERT INTO uniq_test_update (email) VALUES ('test1@example.com'), ('test2@example.com')`);
-      
-      let error1;
-      try {
-        await db.exec(`UPDATE uniq_test_update SET email = 'test1@example.com' WHERE id = 2`);
-      } catch (e: any) {
-        error1 = e;
-      }
-      expect(error1).toBeDefined();
-      expect(error1.message).toContain("Constraint Error: email must be unique");
-    });
-  });
+        // 2. Update data
+        await db.exec(`UPDATE brands SET key = LOWER(name) WHERE key IS NULL`);
 
-  describe("LEVEL 72: ALTER TABLE ADD UNIQUE / PRIMARY KEY CONSTRAINT", () => {
-    test("72.1 Add UNIQUE constraint to an existing column", async () => {
-      await db.exec(`CREATE TABLE brands (id SERIAL PRIMARY KEY, name TEXT)`);
-      await db.exec(`INSERT INTO brands (name) VALUES ('Apple'), ('Samsung')`);
+        // 3. Add NOT NULL constraint
+        await db.exec(`ALTER TABLE brands ALTER COLUMN key SET NOT NULL`);
 
-      // 1. Add column
-      await db.exec(`ALTER TABLE brands ADD COLUMN IF NOT EXISTS key VARCHAR(50)`);
+        // 4. Add UNIQUE constraint
+        const res = await db.exec(
+          `ALTER TABLE brands ADD CONSTRAINT brands_key_unique UNIQUE (key)`,
+        );
+        expect(res.success).toBe(true);
 
-      // 2. Update data
-      await db.exec(`UPDATE brands SET key = LOWER(name) WHERE key IS NULL`);
+        // 5. Add comment
+        await db.exec(
+          `COMMENT ON COLUMN brands.key IS '{ "label": "Mã nhận dạng", "type": "short_text", "required": true, "description": "Mã định danh duy nhất dùng để nhận diện thương hiệu (ví dụ: beso-cafe, red-junk)", "visible": true }'`,
+        );
 
-      // 3. Add NOT NULL constraint
-      await db.exec(`ALTER TABLE brands ALTER COLUMN key SET NOT NULL`);
-
-      // 4. Add UNIQUE constraint
-      const res = await db.exec(`ALTER TABLE brands ADD CONSTRAINT brands_key_unique UNIQUE (key)`);
-      expect(res.success).toBe(true);
-
-      // 5. Add comment
-      await db.exec(`COMMENT ON COLUMN brands.key IS '{ "label": "Mã nhận dạng", "type": "short_text", "required": true, "description": "Mã định danh duy nhất dùng để nhận diện thương hiệu (ví dụ: beso-cafe, red-junk)", "visible": true }'`);
-
-      const commentRows = await db.query(`
+        const commentRows = await db.query(`
         SELECT column_comment 
         FROM information_schema.columns 
         WHERE table_name = 'brands' AND column_name = 'key'
       `);
-      expect(commentRows[0].column_comment).toContain("Mã nhận dạng");
+        expect(commentRows[0].column_comment).toContain("Mã nhận dạng");
 
-      // Verify that duplicate inserts now fail
-      let error;
-      try {
-        await db.exec(`INSERT INTO brands (name, key) VALUES ('Fake Apple', 'apple')`);
-      } catch (e: any) {
-        error = e;
-      }
-      expect(error).toBeDefined();
-      expect(error.message).toContain("Constraint Error: key must be unique");
+        // Verify that duplicate inserts now fail
+        let error;
+        try {
+          await db.exec(
+            `INSERT INTO brands (name, key) VALUES ('Fake Apple', 'apple')`,
+          );
+        } catch (e: any) {
+          error = e;
+        }
+        expect(error).toBeDefined();
+        expect(error.message).toContain("Constraint Error: key must be unique");
 
-      // Verify adding a duplicate initially fails
-      // Note: We use 'dup1' and 'dup2' for key because key is already UNIQUE
-      await db.exec(`INSERT INTO brands (name, key) VALUES ('Duplicate', 'dup1'), ('Duplicate', 'dup2')`);
-      let addConstraintError;
-      try {
-        await db.exec(`ALTER TABLE brands ADD CONSTRAINT another_unique UNIQUE (name)`);
-      } catch (e: any) {
-        addConstraintError = e;
-      }
-      expect(addConstraintError).toBeDefined();
-      expect(addConstraintError.message).toContain("duplicate values for unique constraint another_unique");
+        // Verify adding a duplicate initially fails
+        // Note: We use 'dup1' and 'dup2' for key because key is already UNIQUE
+        await db.exec(
+          `INSERT INTO brands (name, key) VALUES ('Duplicate', 'dup1'), ('Duplicate', 'dup2')`,
+        );
+        let addConstraintError;
+        try {
+          await db.exec(
+            `ALTER TABLE brands ADD CONSTRAINT another_unique UNIQUE (name)`,
+          );
+        } catch (e: any) {
+          addConstraintError = e;
+        }
+        expect(addConstraintError).toBeDefined();
+        expect(addConstraintError.message).toContain(
+          "duplicate values for unique constraint another_unique",
+        );
+      });
+
+      test("72.2 Add PRIMARY KEY constraint to an existing column", async () => {
+        await db.exec(`CREATE TABLE pk_add_test (name TEXT, value TEXT)`);
+        await db.exec(
+          `INSERT INTO pk_add_test (name, value) VALUES ('pk1', 'v1'), ('pk2', 'v2')`,
+        );
+
+        const res = await db.exec(
+          `ALTER TABLE pk_add_test ADD CONSTRAINT pk_add_test_pkey PRIMARY KEY (name)`,
+        );
+        expect(res.success).toBe(true);
+
+        let error;
+        try {
+          await db.exec(
+            `INSERT INTO pk_add_test (name, value) VALUES ('pk1', 'v3')`,
+          );
+        } catch (e: any) {
+          error = e;
+        }
+        expect(error).toBeDefined();
+        expect(error.message).toContain(
+          "Constraint Error: name must be unique",
+        );
+
+        // Verify primary key allows O(1) lookup
+        const rows = await db.query(
+          `SELECT value FROM pk_add_test WHERE name = 'pk2'`,
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].value).toBe("v2");
+      });
     });
 
-    test("72.2 Add PRIMARY KEY constraint to an existing column", async () => {
-      await db.exec(`CREATE TABLE pk_add_test (name TEXT, value TEXT)`);
-      await db.exec(`INSERT INTO pk_add_test (name, value) VALUES ('pk1', 'v1'), ('pk2', 'v2')`);
+    describe("LEVEL 73: DO block IF EXISTS evaluation", () => {
+      test("73.1 DO block IF EXISTS RENAME COLUMN", async () => {
+        await db.exec(
+          `CREATE TABLE do_tables (id SERIAL PRIMARY KEY, brand_id INT)`,
+        );
 
-      const res = await db.exec(`ALTER TABLE pk_add_test ADD CONSTRAINT pk_add_test_pkey PRIMARY KEY (name)`);
-      expect(res.success).toBe(true);
-
-      let error;
-      try {
-        await db.exec(`INSERT INTO pk_add_test (name, value) VALUES ('pk1', 'v3')`);
-      } catch (e: any) {
-        error = e;
-      }
-      expect(error).toBeDefined();
-      expect(error.message).toContain("Constraint Error: name must be unique");
-
-      // Verify primary key allows O(1) lookup
-      const rows = await db.query(`SELECT value FROM pk_add_test WHERE name = 'pk2'`);
-      expect(rows.length).toBe(1);
-      expect(rows[0].value).toBe('v2');
-    });
-  });
-
-  describe("LEVEL 73: DO block IF EXISTS evaluation", () => {
-    test("73.1 DO block IF EXISTS RENAME COLUMN", async () => {
-      await db.exec(`CREATE TABLE do_tables (id SERIAL PRIMARY KEY, brand_id INT)`);
-      
-      const sql = `
+        const sql = `
         DO $ 
         BEGIN 
             IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='do_tables' AND column_name='brand_id') THEN
@@ -4526,18 +4604,20 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
             END IF;
         END $;
       `;
-      
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
 
-      const rows = await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'do_tables'`);
-      const colNames = rows.map((r: any) => r.column_name);
-      expect(colNames).toContain('branch_id');
-      expect(colNames).not.toContain('brand_id');
-    });
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
 
-    test("73.2 DO block IF NOT EXISTS ADD COLUMN with multiple conditions", async () => {
-      const sql = `
+        const rows = await db.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_name = 'do_tables'`,
+        );
+        const colNames = rows.map((r: any) => r.column_name);
+        expect(colNames).toContain("branch_id");
+        expect(colNames).not.toContain("brand_id");
+      });
+
+      test("73.2 DO block IF NOT EXISTS ADD COLUMN with multiple conditions", async () => {
+        const sql = `
         DO $ 
         BEGIN 
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='do_tables' AND column_name='pos_x') THEN
@@ -4548,218 +4628,272 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
             END IF;
         END $;
       `;
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
 
-      const rows = await db.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'do_tables'`);
-      const colNames = rows.map((r: any) => r.column_name);
-      expect(colNames).toContain('pos_x');
-      expect(colNames).toContain('pos_y');
-      
-      // Test COMMENT ON to confirm integration
-      await db.exec(`COMMENT ON COLUMN do_tables.branch_id IS 'test_comment'`);
-      const commentRows = await db.query(`SELECT column_comment FROM information_schema.columns WHERE table_name = 'do_tables' AND column_name = 'branch_id'`);
-      expect(commentRows[0].column_comment).toBe('test_comment');
+        const rows = await db.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_name = 'do_tables'`,
+        );
+        const colNames = rows.map((r: any) => r.column_name);
+        expect(colNames).toContain("pos_x");
+        expect(colNames).toContain("pos_y");
+
+        // Test COMMENT ON to confirm integration
+        await db.exec(
+          `COMMENT ON COLUMN do_tables.branch_id IS 'test_comment'`,
+        );
+        const commentRows = await db.query(
+          `SELECT column_comment FROM information_schema.columns WHERE table_name = 'do_tables' AND column_name = 'branch_id'`,
+        );
+        expect(commentRows[0].column_comment).toBe("test_comment");
+      });
     });
-  });
 
-  describe("LEVEL 74: UPDATE ... FROM syntax", () => {
-    test("74.1 UPDATE ... FROM standard use case", async () => {
-      await db.exec(`CREATE TABLE branches (id SERIAL PRIMARY KEY, name TEXT)`);
-      await db.exec(`INSERT INTO branches (name) VALUES ('Branch 1'), ('Branch 2')`);
+    describe("LEVEL 74: UPDATE ... FROM syntax", () => {
+      test("74.1 UPDATE ... FROM standard use case", async () => {
+        await db.exec(
+          `CREATE TABLE branches (id SERIAL PRIMARY KEY, name TEXT)`,
+        );
+        await db.exec(
+          `INSERT INTO branches (name) VALUES ('Branch 1'), ('Branch 2')`,
+        );
 
-      await db.exec(`CREATE TABLE tables (id SERIAL PRIMARY KEY, branch_id INT, table_no TEXT)`);
-      await db.exec(`INSERT INTO tables (branch_id, table_no) VALUES (1, 'T1'), (2, 'T2')`);
+        await db.exec(
+          `CREATE TABLE tables (id SERIAL PRIMARY KEY, branch_id INT, table_no TEXT)`,
+        );
+        await db.exec(
+          `INSERT INTO tables (branch_id, table_no) VALUES (1, 'T1'), (2, 'T2')`,
+        );
 
-      await db.exec(`CREATE TABLE bookings (id SERIAL PRIMARY KEY, table_id INT, branch_id INT)`);
-      await db.exec(`INSERT INTO bookings (table_id) VALUES (1), (2)`);
+        await db.exec(
+          `CREATE TABLE bookings (id SERIAL PRIMARY KEY, table_id INT, branch_id INT)`,
+        );
+        await db.exec(`INSERT INTO bookings (table_id) VALUES (1), (2)`);
 
-      const sql = `
+        const sql = `
         UPDATE bookings b
         SET branch_id = t.branch_id
         FROM tables t
         WHERE b.table_id = t.id AND b.branch_id IS NULL
       `;
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
-      expect(res.updated).toBe(2);
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
+        expect(res.updated).toBe(2);
 
-      const rows = await db.query(`SELECT branch_id FROM bookings ORDER BY id`);
-      expect(rows[0].branch_id).toBe(1);
-      expect(rows[1].branch_id).toBe(2);
-    });
+        const rows = await db.query(
+          `SELECT branch_id FROM bookings ORDER BY id`,
+        );
+        expect(rows[0].branch_id).toBe(1);
+        expect(rows[1].branch_id).toBe(2);
+      });
 
-    test("74.2 UPDATE ... FROM with function/alias fallback", async () => {
-      await db.exec(`CREATE TABLE stock (id INT PRIMARY KEY, qty INT)`);
-      await db.exec(`INSERT INTO stock (id, qty) VALUES (1, 10), (2, 20)`);
-      
-      const sql = `
+      test("74.2 UPDATE ... FROM with function/alias fallback", async () => {
+        await db.exec(`CREATE TABLE stock (id INT PRIMARY KEY, qty INT)`);
+        await db.exec(`INSERT INTO stock (id, qty) VALUES (1, 10), (2, 20)`);
+
+        const sql = `
         UPDATE stock
         SET qty = qty + v.add_qty
         FROM (VALUES (1, 5), (2, 10)) AS v(id, add_qty)
         WHERE stock.id = v.id
       `;
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
-      expect(res.updated).toBe(2);
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
+        expect(res.updated).toBe(2);
 
-      const rows = await db.query(`SELECT * FROM stock ORDER BY id`);
-      expect(rows[0].qty).toBe(15);
-      expect(rows[1].qty).toBe(30);
+        const rows = await db.query(`SELECT * FROM stock ORDER BY id`);
+        expect(rows[0].qty).toBe(15);
+        expect(rows[1].qty).toBe(30);
+      });
     });
-  });
 
-  describe("LEVEL 76: INSERT INTO SELECT with WHERE NOT EXISTS", () => {
-    test("76.1 Multiple un-aliased literal columns project uniquely", async () => {
-      await db.exec(`CREATE TABLE vouchers (id SERIAL PRIMARY KEY, code TEXT, description TEXT, discount_type TEXT, discount_value NUMBER NOT NULL, min_order_amount NUMBER, is_active BOOLEAN)`);
-      
-      const sql = `
+    describe("LEVEL 76: INSERT INTO SELECT with WHERE NOT EXISTS", () => {
+      test("76.1 Multiple un-aliased literal columns project uniquely", async () => {
+        await db.exec(
+          `CREATE TABLE vouchers (id SERIAL PRIMARY KEY, code TEXT, description TEXT, discount_type TEXT, discount_value NUMBER NOT NULL, min_order_amount NUMBER, is_active BOOLEAN)`,
+        );
+
+        const sql = `
         INSERT INTO vouchers (code, description, discount_type, discount_value, min_order_amount, is_active)
         SELECT 'WELCOME_BESO', 'Quà tặng', 'fixed_amount', 20000, 50000, true
         WHERE NOT EXISTS (SELECT 1 FROM vouchers WHERE code = 'WELCOME_BESO');
       `;
-      
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
 
-      const rows = await db.query(`SELECT * FROM vouchers WHERE code = 'WELCOME_BESO'`);
-      expect(rows.length).toBe(1);
-      expect(rows[0].discount_value).toBe(20000);
-      expect(rows[0].is_active).toBe(true);
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
 
-      // Running the same insert again should result in 0 rows inserted because WHERE NOT EXISTS is false.
-      const res2 = await db.query2(sql); 
-      expect(res2.rowCount).toBe(0);
+        const rows = await db.query(
+          `SELECT * FROM vouchers WHERE code = 'WELCOME_BESO'`,
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].discount_value).toBe(20000);
+        expect(rows[0].is_active).toBe(true);
+
+        // Running the same insert again should result in 0 rows inserted because WHERE NOT EXISTS is false.
+        const res2 = await db.query2(sql);
+        expect(res2.rowCount).toBe(0);
+      });
     });
-  });
 
-  describe("LEVEL 75: DEFAULT with NOT NULL bug", () => {
-    test("75.1 DEFAULT with NOT NULL parses correctly", async () => {
-      const sql = `CREATE TABLE IF NOT EXISTS default_not_null_test (
+    describe("LEVEL 75: DEFAULT with NOT NULL bug", () => {
+      test("75.1 DEFAULT with NOT NULL parses correctly", async () => {
+        const sql = `CREATE TABLE IF NOT EXISTS default_not_null_test (
         id SERIAL PRIMARY KEY,
         status TEXT DEFAULT 'draft' NOT NULL,
         count INTEGER DEFAULT 0 NOT NULL
       )`;
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
 
-      await db.exec(`INSERT INTO default_not_null_test (id) VALUES (1)`);
-      const rows = await db.query(`SELECT status, count FROM default_not_null_test`);
-      expect(rows[0].status).toBe('draft');
-      expect(rows[0].count).toBe(0);
-    });
-  });
-
-  describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
-    test("71.1 Update duplicated PKs using fallback mechanism", async () => {
-      await db.exec(`CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`);
-      
-      // Simulate the bug where duplicate PKs were inserted (bypassing Executor's unique check)
-      const storage = (db as any).storage;
-      await storage.insertRow('duplicate_pk_test', { id: 1, name: 'original' });
-      await storage.insertRow('duplicate_pk_test', { id: 1, name: 'duplicate' });
-
-      // Check that both rows exist
-      const rows = await db.query(`SELECT * FROM duplicate_pk_test`);
-      expect(rows.length).toBe(2);
-
-      // Try to fix the duplicate by updating the specific one
-      const res = await db.exec(`UPDATE duplicate_pk_test SET id = 2 WHERE id = 1 AND name = 'duplicate'`);
-      
-      // The update should succeed and fallback to full scan because the B-Tree's first match ('original') failed the WHERE clause
-      expect(res.success).toBe(true);
-      expect(res.updated).toBe(1);
-
-      // Verify the fix
-      const fixedRows = await db.query(`SELECT * FROM duplicate_pk_test ORDER BY id`);
-      expect(fixedRows.length).toBe(2);
-      expect(fixedRows[0].id).toBe(1);
-      expect(fixedRows[0].name).toBe('original');
-      expect(fixedRows[1].id).toBe(2);
-      expect(fixedRows[1].name).toBe('duplicate');
+        await db.exec(`INSERT INTO default_not_null_test (id) VALUES (1)`);
+        const rows = await db.query(
+          `SELECT status, count FROM default_not_null_test`,
+        );
+        expect(rows[0].status).toBe("draft");
+        expect(rows[0].count).toBe(0);
+      });
     });
 
-    test("71.2 Delete duplicated PK using fallback mechanism", async () => {
-      await db.exec(`CREATE TABLE duplicate_pk_del_test (id INT PRIMARY KEY, name TEXT)`);
-      
-      // Simulate duplicates
-      const storage = (db as any).storage;
-      await storage.insertRow('duplicate_pk_del_test', { id: 1, name: 'keep' });
-      await storage.insertRow('duplicate_pk_del_test', { id: 1, name: 'remove' });
+    describe("LEVEL 71: Fixing Corrupted Duplicate Primary Keys", () => {
+      test("71.1 Update duplicated PKs using fallback mechanism", async () => {
+        await db.exec(
+          `CREATE TABLE duplicate_pk_test (id INT PRIMARY KEY, name TEXT)`,
+        );
 
-      // Delete the specific duplicate
-      const res = await db.exec(`DELETE FROM duplicate_pk_del_test WHERE id = 1 AND name = 'remove'`);
-      
-      expect(res.success).toBe(true);
-      expect(res.deleted).toBe(1);
+        // Simulate the bug where duplicate PKs were inserted (bypassing Executor's unique check)
+        const storage = (db as any).storage;
+        await storage.insertRow("duplicate_pk_test", {
+          id: 1,
+          name: "original",
+        });
+        await storage.insertRow("duplicate_pk_test", {
+          id: 1,
+          name: "duplicate",
+        });
 
-      const remainingRows = await db.query(`SELECT * FROM duplicate_pk_del_test`);
-      expect(remainingRows.length).toBe(1);
-      expect(remainingRows[0].name).toBe('keep');
+        // Check that both rows exist
+        const rows = await db.query(`SELECT * FROM duplicate_pk_test`);
+        expect(rows.length).toBe(2);
+
+        // Try to fix the duplicate by updating the specific one
+        const res = await db.exec(
+          `UPDATE duplicate_pk_test SET id = 2 WHERE id = 1 AND name = 'duplicate'`,
+        );
+
+        // The update should succeed and fallback to full scan because the B-Tree's first match ('original') failed the WHERE clause
+        expect(res.success).toBe(true);
+        expect(res.updated).toBe(1);
+
+        // Verify the fix
+        const fixedRows = await db.query(
+          `SELECT * FROM duplicate_pk_test ORDER BY id`,
+        );
+        expect(fixedRows.length).toBe(2);
+        expect(fixedRows[0].id).toBe(1);
+        expect(fixedRows[0].name).toBe("original");
+        expect(fixedRows[1].id).toBe(2);
+        expect(fixedRows[1].name).toBe("duplicate");
+      });
+
+      test("71.2 Delete duplicated PK using fallback mechanism", async () => {
+        await db.exec(
+          `CREATE TABLE duplicate_pk_del_test (id INT PRIMARY KEY, name TEXT)`,
+        );
+
+        // Simulate duplicates
+        const storage = (db as any).storage;
+        await storage.insertRow("duplicate_pk_del_test", {
+          id: 1,
+          name: "keep",
+        });
+        await storage.insertRow("duplicate_pk_del_test", {
+          id: 1,
+          name: "remove",
+        });
+
+        // Delete the specific duplicate
+        const res = await db.exec(
+          `DELETE FROM duplicate_pk_del_test WHERE id = 1 AND name = 'remove'`,
+        );
+
+        expect(res.success).toBe(true);
+        expect(res.deleted).toBe(1);
+
+        const remainingRows = await db.query(
+          `SELECT * FROM duplicate_pk_del_test`,
+        );
+        expect(remainingRows.length).toBe(1);
+        expect(remainingRows[0].name).toBe("keep");
+      });
     });
-  });
 
-  describe("LEVEL 79: Duplicate Schema Definition Protections (Bug Fix)", () => {
-    test("79.1 ALTER TABLE ADD COLUMN throws if column already exists", async () => {
-      await db.exec(`CREATE TABLE dup_col_test (id SERIAL PRIMARY KEY, type TEXT)`);
-      
-      // Attempting to add existing column without IF NOT EXISTS should throw
-      let error;
-      try {
-        await db.exec(`ALTER TABLE dup_col_test ADD COLUMN type VARCHAR(50)`);
-      } catch (e: any) {
-        error = e;
-      }
-      expect(error).toBeDefined();
-      expect(error.message).toContain('already exists');
-      
-      // Ensure catalog only has ONE 'type' column
-      const cols = await db.query(`
+    describe("LEVEL 79: Duplicate Schema Definition Protections (Bug Fix)", () => {
+      test("79.1 ALTER TABLE ADD COLUMN throws if column already exists", async () => {
+        await db.exec(
+          `CREATE TABLE dup_col_test (id SERIAL PRIMARY KEY, type TEXT)`,
+        );
+
+        // Attempting to add existing column without IF NOT EXISTS should throw
+        let error;
+        try {
+          await db.exec(`ALTER TABLE dup_col_test ADD COLUMN type VARCHAR(50)`);
+        } catch (e: any) {
+          error = e;
+        }
+        expect(error).toBeDefined();
+        expect(error.message).toContain("already exists");
+
+        // Ensure catalog only has ONE 'type' column
+        const cols = await db.query(`
         SELECT * FROM information_schema.columns 
         WHERE table_name = 'dup_col_test' AND column_name = 'type'
       `);
-      expect(cols.length).toBe(1);
-    });
+        expect(cols.length).toBe(1);
+      });
 
-    test("79.2 ALTER TABLE ADD COLUMN IF NOT EXISTS ignores silently without duplicate", async () => {
-      const res = await db.exec(`ALTER TABLE dup_col_test ADD COLUMN IF NOT EXISTS type VARCHAR(50)`);
-      expect(res.success).toBe(true);
+      test("79.2 ALTER TABLE ADD COLUMN IF NOT EXISTS ignores silently without duplicate", async () => {
+        const res = await db.exec(
+          `ALTER TABLE dup_col_test ADD COLUMN IF NOT EXISTS type VARCHAR(50)`,
+        );
+        expect(res.success).toBe(true);
 
-      const cols = await db.query(`
+        const cols = await db.query(`
         SELECT * FROM information_schema.columns 
         WHERE table_name = 'dup_col_test' AND column_name = 'type'
       `);
-      expect(cols.length).toBe(1); // Vẫn chỉ có 1 cột duy nhất
+        expect(cols.length).toBe(1); // Vẫn chỉ có 1 cột duy nhất
+      });
+
+      test("79.3 ALTER TABLE RENAME COLUMN throws if target name exists", async () => {
+        await db.exec(`ALTER TABLE dup_col_test ADD COLUMN status TEXT`);
+        let error;
+        try {
+          await db.exec(
+            `ALTER TABLE dup_col_test RENAME COLUMN status TO type`,
+          );
+        } catch (e: any) {
+          error = e;
+        }
+        expect(error).toBeDefined();
+        expect(error.message).toContain("already exists");
+      });
+
+      test("79.4 ALTER TABLE RENAME TO throws if target table exists", async () => {
+        await db.exec(`CREATE TABLE existing_target (id INT)`);
+        let error;
+        try {
+          await db.exec(`ALTER TABLE dup_col_test RENAME TO existing_target`);
+        } catch (e: any) {
+          error = e;
+        }
+        expect(error).toBeDefined();
+        expect(error.message).toContain("already exists");
+      });
     });
 
-    test("79.3 ALTER TABLE RENAME COLUMN throws if target name exists", async () => {
-      await db.exec(`ALTER TABLE dup_col_test ADD COLUMN status TEXT`);
-      let error;
-      try {
-        await db.exec(`ALTER TABLE dup_col_test RENAME COLUMN status TO type`);
-      } catch (e: any) {
-        error = e;
-      }
-      expect(error).toBeDefined();
-      expect(error.message).toContain('already exists');
-    });
-
-    test("79.4 ALTER TABLE RENAME TO throws if target table exists", async () => {
-      await db.exec(`CREATE TABLE existing_target (id INT)`);
-      let error;
-      try {
-        await db.exec(`ALTER TABLE dup_col_test RENAME TO existing_target`);
-      } catch (e: any) {
-        error = e;
-      }
-      expect(error).toBeDefined();
-      expect(error.message).toContain('already exists');
-    });
-  });
-
-  describe("LEVEL 80: CREATE TYPE ENUM and pg_type / pg_enum support", () => {
-    test("80.1 Execute DO block with CREATE TYPE and verify pg_type", async () => {
-      const sql = `
+    describe("LEVEL 80: CREATE TYPE ENUM and pg_type / pg_enum support", () => {
+      test("80.1 Execute DO block with CREATE TYPE and verify pg_type", async () => {
+        const sql = `
         DO $ BEGIN 
             IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'workflow_status') THEN 
                 CREATE TYPE workflow_status AS ENUM ('active', 'inactive', 'draft'); 
@@ -4776,37 +4910,50 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
         INSERT INTO workflows (name, description, status) VALUES 
         ('Quy trình Tuyển dụng', 'Quy trình các bước từ lọc hồ sơ đến thử việc', 'active');
       `;
-      const res = await db.exec(sql);
-      expect(Array.isArray(res)).toBe(true);
+        const res = await db.exec(sql);
+        expect(Array.isArray(res)).toBe(true);
 
-      const rows = await db.query(`SELECT status FROM workflows`);
-      expect(rows.length).toBe(1);
-      expect(rows[0].status).toBe('active');
+        const rows = await db.query(`SELECT status FROM workflows`);
+        expect(rows.length).toBe(1);
+        expect(rows[0].status).toBe("active");
 
-      const typeRows = await db.query(`SELECT * FROM pg_type WHERE typname = 'workflow_status'`);
-      expect(typeRows.length).toBe(1);
-      
-      const enumRows = await db.query(`SELECT enumlabel FROM pg_enum WHERE enumtypid = $1 ORDER BY enumsortorder`, [typeRows[0].oid]);
-      expect(enumRows.length).toBe(3);
-      expect(enumRows.map((r: any) => r.enumlabel)).toEqual(['active', 'inactive', 'draft']);
+        const typeRows = await db.query(
+          `SELECT * FROM pg_type WHERE typname = 'workflow_status'`,
+        );
+        expect(typeRows.length).toBe(1);
 
-      // Test REGTYPE casting
-      const regtypeRows = await db.query(`SELECT 'workflow_status'::regtype as oid`);
-      expect(regtypeRows[0].oid).toBe(typeRows[0].oid);
+        const enumRows = await db.query(
+          `SELECT enumlabel FROM pg_enum WHERE enumtypid = $1 ORDER BY enumsortorder`,
+          [typeRows[0].oid],
+        );
+        expect(enumRows.length).toBe(3);
+        expect(enumRows.map((r: any) => r.enumlabel)).toEqual([
+          "active",
+          "inactive",
+          "draft",
+        ]);
+
+        // Test REGTYPE casting
+        const regtypeRows = await db.query(
+          `SELECT 'workflow_status'::regtype as oid`,
+        );
+        expect(regtypeRows[0].oid).toBe(typeRows[0].oid);
+      });
     });
-  });
 
-  describe("LEVEL 81: 0 columns table bug fix (Empty table field inference)", () => {
-    test("81.1 SELECT * FROM empty table returns fields", async () => {
-      await db.exec(`CREATE TABLE empty_products (id BIGSERIAL PRIMARY KEY, name VARCHAR(255), price DECIMAL(12,2))`);
-      const res = await db.query2(`SELECT * FROM empty_products`);
-      expect(res.rows.length).toBe(0);
-      expect(res.fields.length).toBe(3);
-      expect(res.fields.map(f => f.name)).toEqual(['id', 'name', 'price']);
-    });
-    
-    test("81.2 End-to-end execution of user provided script", async () => {
-      const sql = `
+    describe("LEVEL 81: 0 columns table bug fix (Empty table field inference)", () => {
+      test("81.1 SELECT * FROM empty table returns fields", async () => {
+        await db.exec(
+          `CREATE TABLE empty_products (id BIGSERIAL PRIMARY KEY, name VARCHAR(255), price DECIMAL(12,2))`,
+        );
+        const res = await db.query2(`SELECT * FROM empty_products`);
+        expect(res.rows.length).toBe(0);
+        expect(res.fields.length).toBe(3);
+        expect(res.fields.map((f) => f.name)).toEqual(["id", "name", "price"]);
+      });
+
+      test("81.2 End-to-end execution of user provided script", async () => {
+        const sql = `
         DO $ BEGIN 
           IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'product_status') THEN 
             CREATE TYPE product_status AS ENUM ('active', 'inactive', 'discontinued'); 
@@ -4822,101 +4969,124 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
 
         COMMENT ON TABLE script_products IS '{ "label": "Sản phẩm" }';
       `;
-      const res = await db.exec(sql);
-      expect(Array.isArray(res)).toBe(true);
+        const res = await db.exec(sql);
+        expect(Array.isArray(res)).toBe(true);
 
-      const q = await db.query2(`SELECT * FROM script_products`);
-      expect(q.rows.length).toBe(0);
-      expect(q.fields.length).toBe(6);
-      expect(q.fields.map(f => f.name)).toEqual(['id', 'name', 'description', 'price', 'stock', 'status']);
-      
-      const insertSql = `
+        const q = await db.query2(`SELECT * FROM script_products`);
+        expect(q.rows.length).toBe(0);
+        expect(q.fields.length).toBe(6);
+        expect(q.fields.map((f) => f.name)).toEqual([
+          "id",
+          "name",
+          "description",
+          "price",
+          "stock",
+          "status",
+        ]);
+
+        const insertSql = `
         INSERT INTO script_products (name, description, price, stock, status)
         SELECT 'Áo Thun Cotton Basic', 'Áo thun cotton cao cấp', 250000, 150, 'active'
         WHERE NOT EXISTS (SELECT 1 FROM script_products LIMIT 1);
       `;
-      await db.exec(insertSql);
-      
-      const rows = await db.query(`SELECT * FROM script_products`);
-      expect(rows.length).toBe(1);
-      expect(rows[0].name).toBe('Áo Thun Cotton Basic');
-    });
-  });
+        await db.exec(insertSql);
 
-  describe("LEVEL 82: Parameterized Identifiers (TypeORM hack)", () => {
-    test("82.1 Resolves parameter as identifier if it matches a table.column pattern", async () => {
-      await db.exec(`DROP TABLE IF EXISTS aftercare_contents`);
-      await db.exec(`DROP TABLE IF EXISTS user_aftercare_progress`);
-      await db.exec(`CREATE TABLE aftercare_contents (id SERIAL PRIMARY KEY, status TEXT, deleted_at TIMESTAMP, category TEXT, created_at TIMESTAMP)`);
-      await db.exec(`CREATE TABLE user_aftercare_progress (id SERIAL PRIMARY KEY, aftercare_id INT, user_id INT, is_favorite BOOLEAN, is_completed BOOLEAN)`);
-      
-      await db.exec(`INSERT INTO aftercare_contents (status, category, created_at) VALUES ('published', 'Tâm lý học', '2024-01-01T00:00:00Z')`);
-      await db.exec(`INSERT INTO user_aftercare_progress (aftercare_id, user_id, is_favorite, is_completed) VALUES (1, 3, true, false)`);
-      
-      const sql = `
+        const rows = await db.query(`SELECT * FROM script_products`);
+        expect(rows.length).toBe(1);
+        expect(rows[0].name).toBe("Áo Thun Cotton Basic");
+      });
+    });
+
+    describe("LEVEL 82: Parameterized Identifiers (TypeORM hack)", () => {
+      test("82.1 Resolves parameter as identifier if it matches a table.column pattern", async () => {
+        await db.exec(`DROP TABLE IF EXISTS aftercare_contents`);
+        await db.exec(`DROP TABLE IF EXISTS user_aftercare_progress`);
+        await db.exec(
+          `CREATE TABLE aftercare_contents (id SERIAL PRIMARY KEY, status TEXT, deleted_at TIMESTAMP, category TEXT, created_at TIMESTAMP)`,
+        );
+        await db.exec(
+          `CREATE TABLE user_aftercare_progress (id SERIAL PRIMARY KEY, aftercare_id INT, user_id INT, is_favorite BOOLEAN, is_completed BOOLEAN)`,
+        );
+
+        await db.exec(
+          `INSERT INTO aftercare_contents (status, category, created_at) VALUES ('published', 'Tâm lý học', '2024-01-01T00:00:00Z')`,
+        );
+        await db.exec(
+          `INSERT INTO user_aftercare_progress (aftercare_id, user_id, is_favorite, is_completed) VALUES (1, 3, true, false)`,
+        );
+
+        const sql = `
         select "ac".*, "uap"."is_favorite" as "is_favorite", "uap"."is_completed" as "is_completed" 
         from "aftercare_contents" as "ac" 
         left join "user_aftercare_progress" as "uap" on "uap"."aftercare_id" = $1 and "uap"."user_id" = $2 
         where "id" != $3 and "status" = $4 and "deleted_at" is null and "ac"."category" ilike $5 
         order by "created_at" desc limit $6
       `;
-      const params = ["ac.id", 3, 5, "published", "%Tâm lý%", 3];
-      
-      const rows = await db.query(sql, params);
-      
-      expect(rows.length).toBe(1);
-      expect(rows[0].id).toBe(1);
-      expect(rows[0].is_favorite).toBe(true);
-      expect(rows[0].is_completed).toBe(false);
-    });
-  });
+        const params = ["ac.id", 3, 5, "published", "%Tâm lý%", 3];
 
-  describe("LEVEL 82: Parameterized Identifiers (TypeORM hack)", () => {
-    test("82.1 Resolves parameter as identifier if it matches a table.column pattern", async () => {
-      await db.exec(`DROP TABLE IF EXISTS aftercare_contents`);
-      await db.exec(`DROP TABLE IF EXISTS user_aftercare_progress`);
-      await db.exec(`CREATE TABLE aftercare_contents (id SERIAL PRIMARY KEY, status TEXT, deleted_at TIMESTAMP, category TEXT, created_at TIMESTAMP)`);
-      await db.exec(`CREATE TABLE user_aftercare_progress (id SERIAL PRIMARY KEY, aftercare_id INT, user_id INT, is_favorite BOOLEAN, is_completed BOOLEAN)`);
-      
-      await db.exec(`INSERT INTO aftercare_contents (id, status, category, created_at) VALUES (1, 'published', 'Tâm lý học', '2024-01-01T00:00:00Z')`);
-      await db.exec(`INSERT INTO user_aftercare_progress (aftercare_id, user_id, is_favorite, is_completed) VALUES (1, 3, true, false)`);
-      
-      const sql = `
+        const rows = await db.query(sql, params);
+
+        expect(rows.length).toBe(1);
+        expect(rows[0].id).toBe(1);
+        expect(rows[0].is_favorite).toBe(true);
+        expect(rows[0].is_completed).toBe(false);
+      });
+    });
+
+    describe("LEVEL 82: Parameterized Identifiers (TypeORM hack)", () => {
+      test("82.1 Resolves parameter as identifier if it matches a table.column pattern", async () => {
+        await db.exec(`DROP TABLE IF EXISTS aftercare_contents`);
+        await db.exec(`DROP TABLE IF EXISTS user_aftercare_progress`);
+        await db.exec(
+          `CREATE TABLE aftercare_contents (id SERIAL PRIMARY KEY, status TEXT, deleted_at TIMESTAMP, category TEXT, created_at TIMESTAMP)`,
+        );
+        await db.exec(
+          `CREATE TABLE user_aftercare_progress (id SERIAL PRIMARY KEY, aftercare_id INT, user_id INT, is_favorite BOOLEAN, is_completed BOOLEAN)`,
+        );
+
+        await db.exec(
+          `INSERT INTO aftercare_contents (id, status, category, created_at) VALUES (1, 'published', 'Tâm lý học', '2024-01-01T00:00:00Z')`,
+        );
+        await db.exec(
+          `INSERT INTO user_aftercare_progress (aftercare_id, user_id, is_favorite, is_completed) VALUES (1, 3, true, false)`,
+        );
+
+        const sql = `
         select "ac".*, "uap"."is_favorite" as "is_favorite", "uap"."is_completed" as "is_completed" 
         from "aftercare_contents" as "ac" 
         left join "user_aftercare_progress" as "uap" on "uap"."aftercare_id" = $1 and "uap"."user_id" = $2 
         where "id" != $3 and "status" = $4 and "deleted_at" is null and "ac"."category" ilike $5 
         order by "created_at" desc limit $6
       `;
-      const params = ["ac.id", 3, 5, "published", "%Tâm lý%", 3];
-      
-      const rows = await db.query(sql, params);
-      
-      // Expected to match because $1 dynamically bounds to ac.id value (1) and $2 is 3
-      expect(rows.length).toBe(1);
-      expect(rows[0].id).toBe(1);
-      expect(rows[0].is_favorite).toBe(true);
-      expect(rows[0].is_completed).toBe(false);
-    });
+        const params = ["ac.id", 3, 5, "published", "%Tâm lý%", 3];
 
-    test("82.2 Missed columns in SELECT fallback to NULL instead of string literal", async () => {
-      // Missing fields from failed JOIN should return null to allow ORM mapping
-      const sql = `
+        const rows = await db.query(sql, params);
+
+        // Expected to match because $1 dynamically bounds to ac.id value (1) and $2 is 3
+        expect(rows.length).toBe(1);
+        expect(rows[0].id).toBe(1);
+        expect(rows[0].is_favorite).toBe(true);
+        expect(rows[0].is_completed).toBe(false);
+      });
+
+      test("82.2 Missed columns in SELECT fallback to NULL instead of string literal", async () => {
+        // Missing fields from failed JOIN should return null to allow ORM mapping
+        const sql = `
         select "ac".*, "uap"."is_favorite" as "is_favorite"
         from "aftercare_contents" as "ac" 
         left join "user_aftercare_progress" as "uap" on "uap"."aftercare_id" = 999 
       `;
-      const rows = await db.query(sql);
-      expect(rows.length).toBeGreaterThan(0);
-      expect(rows[0].is_favorite).toBeNull();
+        const rows = await db.query(sql);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows[0].is_favorite).toBeNull();
+      });
     });
-  });
 
-  describe("LEVEL 78: Complex Schema with ENUM and NOT NULL defaults", () => {
-    test("78.1 Graceful degradation for CREATE TYPE and pg_type", async () => {
-      // Kiểm tra việc LitePostgres có thể chạy mượt mà đoạn script chứa pg_type
-      // và bỏ qua CREATE TYPE một cách êm ái mà không bị gián đoạn hay throw lỗi.
-      const sql = `
+    describe("LEVEL 78: Complex Schema with ENUM and NOT NULL defaults", () => {
+      test("78.1 Graceful degradation for CREATE TYPE and pg_type", async () => {
+        // Kiểm tra việc LitePostgres có thể chạy mượt mà đoạn script chứa pg_type
+        // và bỏ qua CREATE TYPE một cách êm ái mà không bị gián đoạn hay throw lỗi.
+        const sql = `
         DO $
         BEGIN
           IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'campaign_status') THEN
@@ -4924,13 +5094,13 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
           END IF;
         END $;
       `;
-      const res = await db.exec(sql);
-      expect(res.success).toBe(true);
-    });
+        const res = await db.exec(sql);
+        expect(res.success).toBe(true);
+      });
 
-    test("78.2 End-to-end user schema execution (DEFAULT 'draft' NOT NULL)", async () => {
-      // Khởi tạo bảng giống cấu trúc bị lỗi của user
-      const sql = `
+      test("78.2 End-to-end user schema execution (DEFAULT 'draft' NOT NULL)", async () => {
+        // Khởi tạo bảng giống cấu trúc bị lỗi của user
+        const sql = `
         CREATE TABLE IF NOT EXISTS e2e_campaigns (
           id SERIAL PRIMARY KEY,
           name VARCHAR(255) NOT NULL,
@@ -4940,52 +5110,62 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
         COMMENT ON TABLE e2e_campaigns IS '{ "label": "Chiến dịch" }';
         COMMENT ON COLUMN e2e_campaigns.status IS '{ "label": "Trạng thái" }';
       `;
-      
-      const res = await db.exec(sql) as any[];
-      expect(res[0].success).toBe(true);
 
-      // Chèn thử dữ liệu, không cung cấp trường status để test DEFAULT
-      await db.exec(`INSERT INTO e2e_campaigns (name) VALUES ('Black Friday')`);
-      
-      // Query ra xem giá trị 'draft' có được áp dụng đúng không
-      const rows = await db.query(`SELECT name, status FROM e2e_campaigns`);
-      expect(rows.length).toBe(1);
-      expect(rows[0].name).toBe('Black Friday');
-      expect(rows[0].status).toBe('draft');
-      
-      // Đảm bảo phần lưu trữ COMMENT (JSON string) hoạt động đúng
-      const comments = await db.query(`
+        const res = (await db.exec(sql)) as any[];
+        expect(res[0].success).toBe(true);
+
+        // Chèn thử dữ liệu, không cung cấp trường status để test DEFAULT
+        await db.exec(
+          `INSERT INTO e2e_campaigns (name) VALUES ('Black Friday')`,
+        );
+
+        // Query ra xem giá trị 'draft' có được áp dụng đúng không
+        const rows = await db.query(`SELECT name, status FROM e2e_campaigns`);
+        expect(rows.length).toBe(1);
+        expect(rows[0].name).toBe("Black Friday");
+        expect(rows[0].status).toBe("draft");
+
+        // Đảm bảo phần lưu trữ COMMENT (JSON string) hoạt động đúng
+        const comments = await db.query(`
         SELECT column_comment 
         FROM information_schema.columns 
         WHERE table_name = 'e2e_campaigns' AND column_name = 'status'
       `);
-      expect(comments[0].column_comment).toContain('Trạng thái');
+        expect(comments[0].column_comment).toContain("Trạng thái");
+      });
     });
-  });
 
-  describe("LEVEL 83: ALTER TYPE ADD VALUE", () => {
-    test("83.1 ALTER TYPE ADD VALUE and COMMENT ON COLUMN", async () => {
-      // 1. Create type
-      await db.exec(`CREATE TYPE user_role AS ENUM ('admin', 'user');`);
-      
-      // 2. Create table using the type
-      await db.exec(`CREATE TABLE users_83 (id SERIAL PRIMARY KEY, role user_role);`);
+    describe("LEVEL 83: ALTER TYPE ADD VALUE", () => {
+      test("83.1 ALTER TYPE ADD VALUE and COMMENT ON COLUMN", async () => {
+        // 1. Create type
+        await db.exec(`CREATE TYPE user_role AS ENUM ('admin', 'user');`);
 
-      // 3. ALTER TYPE
-      const resAlter = await db.exec(`ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'staff';`);
-      expect(resAlter.success).toBe(true);
+        // 2. Create table using the type
+        await db.exec(
+          `CREATE TABLE users_83 (id SERIAL PRIMARY KEY, role user_role);`,
+        );
 
-      // Verify pg_enum has the new value
-      const enumRows = await db.query(`
+        // 3. ALTER TYPE
+        const resAlter = await db.exec(
+          `ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'staff';`,
+        );
+        expect(resAlter.success).toBe(true);
+
+        // Verify pg_enum has the new value
+        const enumRows = await db.query(`
         SELECT enumlabel 
         FROM pg_enum 
         WHERE enumtypid = (SELECT oid FROM pg_type WHERE typname = 'user_role')
         ORDER BY enumsortorder
       `);
-      expect(enumRows.map((r: any) => r.enumlabel)).toEqual(['admin', 'user', 'staff']);
+        expect(enumRows.map((r: any) => r.enumlabel)).toEqual([
+          "admin",
+          "user",
+          "staff",
+        ]);
 
-      // 4. Update comment on column
-      const commentSql = `
+        // 4. Update comment on column
+        const commentSql = `
         COMMENT ON COLUMN users_83.role IS '{
           "label": "Vai trò",
           "type": "select",
@@ -4998,18 +5178,48 @@ describe("LEVEL 77: Complex Join and Aliased Projection with Date Params", () =>
           ]
         }';
       `;
-      const resComment = await db.exec(commentSql);
-      expect(resComment.success).toBe(true);
+        const resComment = await db.exec(commentSql);
+        expect(resComment.success).toBe(true);
 
-      // Verify comment
-      const commentRows = await db.query(`
+        // Verify comment
+        const commentRows = await db.query(`
         SELECT column_comment 
         FROM information_schema.columns 
         WHERE table_name = 'users_83' AND column_name = 'role'
       `);
-      expect(commentRows[0].column_comment).toContain('Nhân viên');
-      expect(commentRows[0].column_comment).toContain('staff');
+        expect(commentRows[0].column_comment).toContain("Nhân viên");
+        expect(commentRows[0].column_comment).toContain("staff");
+      });
+    });
+
+    describe("LEVEL 84: jsonb_set and complex jsonb updates", () => {
+      test("84.1 UPDATE with jsonb_set and COALESCE", async () => {
+        await db.exec(
+          `CREATE TABLE omni_messages (id SERIAL PRIMARY KEY, metadata JSONB)`,
+        );
+        await db.exec(`INSERT INTO omni_messages (metadata) VALUES (NULL)`);
+        await db.exec(
+          `INSERT INTO omni_messages (metadata) VALUES ('{"existing": "data"}')`,
+        );
+
+        const sql = `UPDATE omni_messages SET metadata = jsonb_set(COALESCE(metadata::jsonb, '{}'), '{reaction}', $1::jsonb) WHERE id = $2`;
+
+        const res1 = await db.exec(sql, ['{"like": 1}', 1]);
+        expect(res1.success).toBe(true);
+
+        const res2 = await db.exec(sql, ['{"heart": 2}', 2]);
+        expect(res2.success).toBe(true);
+
+        const rows = await db.query(
+          `SELECT id, metadata FROM omni_messages ORDER BY id`,
+        );
+        expect(rows.length).toBe(2);
+        expect(rows[0].metadata).toEqual({ reaction: { like: 1 } });
+        expect(rows[1].metadata).toEqual({
+          existing: "data",
+          reaction: { heart: 2 },
+        });
+      });
     });
   });
-});
 });

@@ -3237,13 +3237,29 @@ export class Executor {
           case "->>":
             return (left != null && typeof left === "object") ? (left[right] != null ? String(left[right]) : null) : null;
           case "#>": {
-            if (left == null || !Array.isArray(right)) return null;
+            let path = right;
+            if (typeof path === 'string') {
+              const trimmed = path.trim();
+              if (trimmed === '{}') path = [];
+              else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                path = trimmed.slice(1, -1).split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+              } else path = [path];
+            }
+            if (left == null || !Array.isArray(path)) return null;
             let curr = left;
-            for (const p of right) curr = curr?.[p];
+            for (const p of path) curr = curr?.[p];
             return curr;
           }
           case "#-": {
-            if (left == null || !Array.isArray(right)) return left;
+            let path = right;
+            if (typeof path === 'string') {
+              const trimmed = path.trim();
+              if (trimmed === '{}') path = [];
+              else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                path = trimmed.slice(1, -1).split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+              } else path = [path];
+            }
+            if (left == null || !Array.isArray(path)) return left;
             
             const deletePath = (obj: any, path: any[]): any => {
               if (path.length === 0) return obj;
@@ -3283,7 +3299,7 @@ export class Executor {
               }
             };
             
-            return deletePath(left, right);
+            return deletePath(left, path);
           }
           case "@>":
             if (Array.isArray(left) && Array.isArray(right)) return right.every(v => left.includes(v));
@@ -3588,19 +3604,39 @@ export class Executor {
         }
 
         if (fnName === "JSONB_SET") {
-          const target = args[0];
-          const path = args[1];
+          let target = args[0];
+          if (typeof target === 'string') {
+            try { target = JSON.parse(target); } catch(e) {}
+          }
+          let path = args[1];
           const newValue = args[2];
           const createMissing = args[3] !== false;
+          if (typeof path === 'string') {
+            const trimmed = path.trim();
+            if (trimmed === '{}') path = [];
+            else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+              path = trimmed.slice(1, -1).split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+            } else path = [path];
+          }
           if (!Array.isArray(path)) return target;
           return this.deepSet(target, path, newValue, createMissing);
         }
 
         if (fnName === "JSONB_INSERT") {
-          const target = args[0];
-          const path = args[1];
+          let target = args[0];
+          if (typeof target === 'string') {
+            try { target = JSON.parse(target); } catch(e) {}
+          }
+          let path = args[1];
           const newValue = args[2];
           const insertAfter = args[3] === true;
+          if (typeof path === 'string') {
+            const trimmed = path.trim();
+            if (trimmed === '{}') path = [];
+            else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+              path = trimmed.slice(1, -1).split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+            } else path = [path];
+          }
           if (!Array.isArray(path)) return target;
           return this.deepInsert(target, path, newValue, insertAfter);
         }
