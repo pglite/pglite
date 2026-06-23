@@ -6,24 +6,79 @@ export class BrowserFSAdapter implements VFS {
   private db: IDBDatabase | null = null;
 
   private async getDB(): Promise<IDBDatabase> {
-    if (this.db) return this.db;
+    if (this.db) {
+      try {
+        if (!this.db.objectStoreNames.contains(this.storeName)) {
+          this.db.close();
+          this.db = null;
+        } else {
+          return this.db;
+        }
+      } catch (e) {
+        this.db = null;
+      }
+    }
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, 1);
+      const request = indexedDB.open(this.dbName);
       request.onupgradeneeded = () => {
-        request.result.createObjectStore(this.storeName);
+        const db = request.result;
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          db.createObjectStore(this.storeName);
+        }
       };
       request.onsuccess = () => {
-        this.db = request.result;
-        resolve(this.db);
+        const db = request.result;
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          const currentVersion = db.version;
+          db.close();
+          const req2 = indexedDB.open(this.dbName, currentVersion + 1);
+          req2.onupgradeneeded = () => {
+            if (!req2.result.objectStoreNames.contains(this.storeName)) {
+              req2.result.createObjectStore(this.storeName);
+            }
+          };
+          req2.onsuccess = () => {
+            this.db = req2.result;
+            this.db.onversionchange = () => {
+              this.db?.close();
+              this.db = null;
+            };
+            resolve(this.db);
+          };
+          req2.onerror = () => reject(req2.error);
+        } else {
+          this.db = db;
+          this.db.onversionchange = () => {
+            this.db?.close();
+            this.db = null;
+          };
+          resolve(this.db);
+        }
       };
       request.onerror = () => reject(request.error);
     });
   }
 
+  private async getTransaction(mode: IDBTransactionMode): Promise<IDBTransaction> {
+    let db = await this.getDB();
+    try {
+      return db.transaction(this.storeName, mode);
+    } catch (e: any) {
+      if (e.name === "NotFoundError" || e.name === "InvalidStateError") {
+        if (this.db) {
+          try { this.db.close(); } catch (err) {}
+        }
+        this.db = null;
+        db = await this.getDB();
+        return db.transaction(this.storeName, mode);
+      }
+      throw e;
+    }
+  }
+
   private async getFile(path: string): Promise<Uint8Array | null> {
-    const db = await this.getDB();
+    const tx = await this.getTransaction("readonly");
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, "readonly");
       const request = tx.objectStore(this.storeName).get(path);
       request.onsuccess = () => resolve(request.result || null);
       request.onerror = () => reject(request.error);
@@ -31,9 +86,8 @@ export class BrowserFSAdapter implements VFS {
   }
 
   private async saveFile(path: string, data: Uint8Array): Promise<void> {
-    const db = await this.getDB();
+    const tx = await this.getTransaction("readwrite");
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, "readwrite");
       const request = tx.objectStore(this.storeName).put(data, path);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
@@ -80,9 +134,8 @@ export class BrowserFSAdapter implements VFS {
   }
 
   async unlink(path: string) {
-    const db = await this.getDB();
+    const tx = await this.getTransaction("readwrite");
     return new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(this.storeName, "readwrite");
       const request = tx.objectStore(this.storeName).delete(path);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
@@ -115,24 +168,36 @@ export class BrowserFSAdapter implements VFS {
       throw new Error("indexedDB is not supported in this environment.");
     }
     return new Promise<void>((resolve, reject) => {
-      const request = indexedDB.open("pglite_vfs", 1);
+      const request = indexedDB.open("pglite_vfs");
       request.onupgradeneeded = () => {
-        request.result.createObjectStore("files");
+        if (!request.result.objectStoreNames.contains("files")) {
+          request.result.createObjectStore("files");
+        }
       };
       request.onsuccess = () => {
         const db = request.result;
-        const tx = db.transaction("files", "readwrite");
-        const store = tx.objectStore("files");
-        store.delete(filepath);
-        store.delete(filepath + ".wal");
-        tx.oncomplete = () => {
+        if (!db.objectStoreNames.contains("files")) {
           db.close();
           resolve();
-        };
-        tx.onerror = () => {
+          return;
+        }
+        try {
+          const tx = db.transaction("files", "readwrite");
+          const store = tx.objectStore("files");
+          store.delete(filepath);
+          store.delete(filepath + ".wal");
+          tx.oncomplete = () => {
+            db.close();
+            resolve();
+          };
+          tx.onerror = () => {
+            db.close();
+            reject(tx.error);
+          };
+        } catch (e) {
           db.close();
-          reject(tx.error);
-        };
+          reject(e);
+        }
       };
       request.onerror = () => reject(request.error);
     });
