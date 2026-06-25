@@ -1531,13 +1531,19 @@ export class StorageEngine {
     this.currentDbName = dbName;
 
     // Ensure pg_type and pg_enum exist as normal tables (backward compatibility for older db files)
+    let systemTablesUpdated = false;
     const pgTypeExists = await this.getTableAsync("pg_catalog.pg_type");
     if (!pgTypeExists) {
       await this.createTable("pg_catalog.pg_type", StorageEngine.PG_TYPE_COLS, true);
+      systemTablesUpdated = true;
     }
     const pgEnumExists = await this.getTableAsync("pg_catalog.pg_enum");
     if (!pgEnumExists) {
       await this.createTable("pg_catalog.pg_enum", StorageEngine.PG_ENUM_COLS, true);
+      systemTablesUpdated = true;
+    }
+    if (systemTablesUpdated) {
+      await this.flush();
     }
   }
 
