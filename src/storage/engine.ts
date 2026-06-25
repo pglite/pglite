@@ -650,6 +650,7 @@ class SlottedPage {
   compact() {
     const num = this.numSlots;
     const tuples = [];
+    // 1. Quét thu thập tất cả tuples CÒN HỢP LỆ (dataOffset !== 0)
     for (let i = 0; i < num; i++) {
       const slotOffset = 8 + i * 4;
       if (slotOffset + 4 > this.buf.length) break;
@@ -662,15 +663,20 @@ class SlottedPage {
       }
     }
     
+    // 2. Sort tuple theo dataOffset giảm dần để dồn dữ liệu dần về phía cuối Page (PAGE_SIZE)
     tuples.sort((a, b) => b.dataOffset - a.dataOffset);
     
     let currentFree = PAGE_SIZE;
     for (const t of tuples) {
-      currentFree -= t.len;
-      if (currentFree !== t.dataOffset) {
-        this.buf.copy(this.buf, currentFree, t.dataOffset, t.dataOffset + t.len);
-        this.buf.writeUInt16LE(currentFree, 8 + t.i * 4);
+      // Đảm bảo không bị thất thoát byte hoặc ghi đè sai pointer do overlap
+      const targetStart = currentFree - t.len;
+      if (targetStart !== t.dataOffset) {
+        // Copy dữ liệu an toàn sang offset mới
+        this.buf.copy(this.buf, targetStart, t.dataOffset, t.dataOffset + t.len);
+        // Cập nhật lại offset mới vào vùng Slot Array (đúng index t.i ban đầu)
+        this.buf.writeUInt16LE(targetStart, 8 + t.i * 4);
       }
+      currentFree = targetStart;
     }
     this.freeSpacePointer = currentFree;
   }
@@ -719,10 +725,11 @@ class SlottedPage {
       const slotOffset = 8 + i * 4;
       if (slotOffset + 4 > buffer.length) break;
       const dataOffset = buffer.readUInt16LE(slotOffset);
-      if (dataOffset === 0) continue;
+      // dataOffset == 0 nghĩa là Slot này đã bị xóa (deleted), bỏ qua không đọc
+      if (dataOffset === 0 || dataOffset >= PAGE_SIZE) continue;
 
       const dataLen = buffer.readUInt16LE(slotOffset + 2);
-      if (dataOffset + dataLen > buffer.length) continue;
+      if (dataLen === 0 || dataOffset + dataLen > buffer.length) continue;
       
       result.push({
         offset: dataOffset,
@@ -748,7 +755,10 @@ class SlottedPage {
       return true;
     } else {
       // Allocate new space but retain the same slot index to prevent index corruption
-      if (data.length > this.getFreeSpace()) {
+      // Chú ý: Cần xóa dataOffset cũ thành 0 để khi compact() nó không tính phần cũ vào freeSpace nữa!
+      this.buf.writeUInt16LE(0, slotOffset);
+      
+      if (data.length > this.getFreeSpace()) { 
         this.compact();
         if (data.length > this.getFreeSpace()) return false;
       }
@@ -1626,21 +1636,33 @@ export class StorageEngine {
         if (table.firstPage === this.dbMeta.nsp_f) {
           this.dbMeta.nsp_l = newPageId;
           this.pgNamespaceDef.lastPage = newPageId;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_namespace`);
+          if (cached) cached.lastPage = newPageId;
         } else if (table.firstPage === this.dbMeta.cls_f) {
           this.dbMeta.cls_l = newPageId;
           this.pgClassDef.lastPage = newPageId;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_class`);
+          if (cached) cached.lastPage = newPageId;
         } else if (table.firstPage === this.dbMeta.att_f) {
           this.dbMeta.att_l = newPageId;
           this.pgAttributeDef.lastPage = newPageId;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_attribute`);
+          if (cached) cached.lastPage = newPageId;
         } else if (table.firstPage === this.dbMeta.dsc_f) {
           this.dbMeta.dsc_l = newPageId;
           this.pgDescriptionDef.lastPage = newPageId;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_description`);
+          if (cached) cached.lastPage = newPageId;
         } else if (table.firstPage === this.dbMeta.ad_f) {
           this.dbMeta.ad_l = newPageId;
           this.pgAttrdefDef.lastPage = newPageId;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_attrdef`);
+          if (cached) cached.lastPage = newPageId;
         } else if (table.firstPage === this.dbMeta.idx_f) {
           this.dbMeta.idx_l = newPageId;
           this.pgIndexDef.lastPage = newPageId;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_index`);
+          if (cached) cached.lastPage = newPageId;
         }
 
         await this.updateRowsInCatalog(
@@ -1683,6 +1705,8 @@ export class StorageEngine {
         if (newRoot !== this.dbMeta.nspIdx) {
           this.dbMeta.nspIdx = newRoot;
           table.indexRootPage = newRoot;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_namespace`);
+          if (cached) cached.indexRootPage = newRoot;
           await this.updateRowsInCatalog(
             this.clusterCatalogDef,
             async (r) => r.name === this.dbMeta.name,
@@ -1698,6 +1722,8 @@ export class StorageEngine {
         if (newRoot !== this.dbMeta.clsIdx) {
           this.dbMeta.clsIdx = newRoot;
           table.indexRootPage = newRoot;
+          const cached = StorageEngine.tableCache.get(`${this.filepath}:${this.currentDbName}:pg_catalog.pg_class`);
+          if (cached) cached.indexRootPage = newRoot;
           await this.updateRowsInCatalog(
             this.clusterCatalogDef,
             async (r) => r.name === this.dbMeta.name,
@@ -1743,7 +1769,10 @@ export class StorageEngine {
         visitedPages.add(pageId);
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
-        for (const tuple of page.getTuples()) {
+        const numSlots = page.numSlots;
+        for (let i = 0; i < numSlots; i++) {
+          const tuple = page.getTuple(i);
+          if (!tuple) continue;
           const resolved = this.isOverflow(tuple.data)
             ? await this.resolveOverflow(tuple.data)
             : tuple.data;
@@ -2100,7 +2129,10 @@ export class StorageEngine {
       visitedPages.add(pId);
       const buf = await this.pager.readPage(pId);
       const page = new SlottedPage(buf);
-      for (const t of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const t = page.getTuple(i);
+        if (!t) continue;
         if (this.isOverflow(t.data)) {
           await this.freeOverflowPages(t.data);
         }
@@ -2460,7 +2492,10 @@ export class StorageEngine {
       visited.add(pageId);
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
-      for (const tuple of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
         const resolved = this.isOverflow(tuple.data)
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;
@@ -2482,7 +2517,10 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       let mod = false;
-      for (const tuple of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
         const resolved = this.isOverflow(tuple.data)
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;
@@ -2522,7 +2560,10 @@ export class StorageEngine {
       const buf = await this.pager.readPage(pageId);
       const page = new SlottedPage(buf);
       let mod = false;
-      for (const tuple of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
         const resolved = this.isOverflow(tuple.data)
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;
@@ -2778,7 +2819,7 @@ export class StorageEngine {
 
     // Return a subarray (view) of the scratch buffer.
     // This is safe because SlottedPage.insertTuple/updateTuple performs a Buffer.copy immediately.
-    return target.subarray(0, totalSize);
+    return target.subarray(0, offset);
   }
 
   private deserializeRow(columns: ColumnDef[], buf: Buffer): any {
@@ -2786,6 +2827,7 @@ export class StorageEngine {
 
     const storedColCount = buf.readUInt16LE(0);
     const nullBitmapLen = (storedColCount + 7) >> 3;
+    if (buf.length < 2 + nullBitmapLen) return {};
     const row: any = {};
 
     let offset = 2 + nullBitmapLen;
@@ -2810,14 +2852,30 @@ export class StorageEngine {
       }
 
       if (isNum) {
+        if (offset + 8 > buf.length) {
+          row[col!.name] = null;
+          break;
+        }
         row[col!.name] = buf.readDoubleLE(offset);
         offset += 8;
       } else if (isBool) {
+        if (offset + 1 > buf.length) {
+          row[col!.name] = null;
+          break;
+        }
         row[col!.name] = buf[offset] === 1;
         offset += 1;
       } else {
+        if (offset + 4 > buf.length) {
+          row[col!.name] = null;
+          break;
+        }
         const len = buf.readUInt32LE(offset);
         offset += 4;
+        if (offset + len > buf.length) {
+          row[col!.name] = null;
+          break;
+        }
         const str = buf.toString("utf-8", offset, offset + len);
         offset += len;
 
@@ -2896,7 +2954,10 @@ export class StorageEngine {
       visitedPages.add(pId);
       const buf = await this.pager.readPage(pId);
       const page = new SlottedPage(buf);
-      for (const t of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const t = page.getTuple(i);
+        if (!t) continue;
         if (this.isOverflow(t.data)) {
           await this.freeOverflowPages(t.data);
         }
@@ -3017,7 +3078,10 @@ export class StorageEngine {
         visitedPages.add(pageId);
         const buf = await this.pager.readPage(pageId);
         const page = new SlottedPage(buf);
-        for (const tuple of page.getTuples()) {
+        const numSlots = page.numSlots;
+        for (let i = 0; i < numSlots; i++) {
+          const tuple = page.getTuple(i);
+          if (!tuple) continue;
           const resolved = this.isOverflow(tuple.data)
             ? await this.resolveOverflow(tuple.data)
             : tuple.data;
@@ -3291,7 +3355,10 @@ export class StorageEngine {
       visited.add(pageId);
       const buf = await this.pager.readPage(pageId!);
       const page = new SlottedPage(buf);
-      for (const tuple of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
         const resolved = this.isOverflow(tuple.data)
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;
@@ -3383,7 +3450,10 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let pageModified = false;
 
-      for (const tuple of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
         const resolved = this.isOverflow(tuple.data)
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;
@@ -3568,7 +3638,10 @@ export class StorageEngine {
       const page = new SlottedPage(buf);
       let pageModified = false;
 
-      for (const tuple of page.getTuples()) {
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
         const resolved = this.isOverflow(tuple.data)
           ? await this.resolveOverflow(tuple.data)
           : tuple.data;

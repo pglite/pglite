@@ -5221,5 +5221,40 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
         });
       });
     });
+
+    describe("LEVEL 85: Catalog Page Split Synchronization (0 columns bug)", () => {
+      test("85.1 Table columns are not lost after pg_attribute page split", async () => {
+        // 1. Tạo một bảng mồi để nhồi nhét cột
+        await db.exec(`CREATE TABLE force_split (id SERIAL PRIMARY KEY)`);
+
+        // 2. Thêm 150 cột để ép bảng hệ thống pg_attribute vượt quá 4KB và phải cấp phát Page mới
+        let alters1 = [];
+        for (let i = 0; i < 150; i++) {
+          alters1.push(`ALTER TABLE force_split ADD COLUMN col_${i} TEXT;`);
+        }
+        await db.exec(alters1.join('\n'));
+
+        // 3. Tạo các bảng bình thường (lúc này thông tin cột của chúng sẽ được ghi vào Page mới của pg_attribute)
+        await db.exec(`CREATE TABLE games_85 (id SERIAL PRIMARY KEY, name TEXT, type TEXT)`);
+        await db.exec(`CREATE TABLE leads_85 (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)`);
+
+        // 4. Tiếp tục thêm cột vào bảng mồi. 
+        // Nếu TableCache không được đồng bộ hóa lastPage, thao tác này sẽ sử dụng lại con trỏ cũ và ghi đè làm mất cột của games_85, leads_85!
+        let alters2 = [];
+        for (let i = 150; i < 200; i++) {
+          alters2.push(`ALTER TABLE force_split ADD COLUMN col_${i} TEXT;`);
+        }
+        await db.exec(alters2.join('\n'));
+
+        // 5. Kiểm tra xem các bảng bình thường có bị mất cột hay không
+        const resGames = await db.query2(`SELECT * FROM games_85`);
+        expect(resGames.fields.length).toBe(3);
+        expect(resGames.fields.map(f => f.name)).toEqual(['id', 'name', 'type']);
+
+        const resLeads = await db.query2(`SELECT * FROM leads_85`);
+        expect(resLeads.fields.length).toBe(3);
+        expect(resLeads.fields.map(f => f.name)).toEqual(['id', 'name', 'phone']);
+      });
+    });
   });
 });
