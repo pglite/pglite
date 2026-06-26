@@ -5257,4 +5257,22 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       });
     });
   });
+
+  describe("LEVEL 86: Nested Aggregate functions", () => {
+    test("86.1 Nested aggregates like COALESCE(SUM(...), 0) should group all rows and compute correctly", async () => {
+      await db.exec(`CREATE TABLE point_transactions (id SERIAL PRIMARY KEY, user_id INT, amount INT, deleted_at TIMESTAMP)`);
+      await db.exec(`INSERT INTO point_transactions (user_id, amount) VALUES (1, 10), (1, 20), (1, 30), (1, 40)`);
+      
+      const sql = `select COALESCE(SUM(CAST("amount" AS NUMERIC)), 0) as "total" from "point_transactions" where "user_id" = $1 and "deleted_at" is null`;
+      const rows = await db.query(sql, [1]);
+      
+      expect(rows.length).toBe(1);
+      expect(rows[0].total).toBe(100);
+
+      // Test with 0 rows
+      const rowsEmpty = await db.query(sql, [999]);
+      expect(rowsEmpty.length).toBe(1);
+      expect(rowsEmpty[0].total).toBe(0);
+    });
+  });
 });

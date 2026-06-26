@@ -33,6 +33,52 @@ export class Executor {
     return copy;
   }
 
+  private extractAggregates(expr: any, aggs: Expr[]) {
+    if (!expr) return;
+    if (expr.type === "Call" && !expr.over && ["COUNT", "AVG", "SUM", "MIN", "MAX", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG"].includes(expr.fnName.toUpperCase())) {
+      aggs.push(expr);
+      return;
+    }
+    switch (expr.type) {
+      case "Alias": this.extractAggregates(expr.expr, aggs); break;
+      case "Binary":
+      case "Logical":
+        this.extractAggregates(expr.left, aggs);
+        this.extractAggregates(expr.right, aggs);
+        break;
+      case "Not":
+      case "IsNull":
+      case "Cast":
+      case "Extract":
+        this.extractAggregates(expr.expr || expr.source, aggs);
+        break;
+      case "Call":
+        for (const arg of expr.args) this.extractAggregates(arg, aggs);
+        if (expr.filter) this.extractAggregates(expr.filter, aggs);
+        break;
+      case "Case":
+        for (const c of expr.cases) {
+          this.extractAggregates(c.when, aggs);
+          this.extractAggregates(c.then, aggs);
+        }
+        if (expr.elseExpr) this.extractAggregates(expr.elseExpr, aggs);
+        break;
+      case "Array":
+        for (const e of expr.elements) this.extractAggregates(e, aggs);
+        break;
+      case "In":
+        this.extractAggregates(expr.left, aggs);
+        if (Array.isArray(expr.right)) {
+          for (const e of expr.right) this.extractAggregates(e, aggs);
+        }
+        break;
+      case "Like":
+        this.extractAggregates(expr.left, aggs);
+        this.extractAggregates(expr.right, aggs);
+        break;
+    }
+  }
+
   constructor() {}
 
   private async rewriteTableData(storage: StorageEngine, tableName: string, schemaModifier: () => Promise<void>, rowModifier: (row: any) => Promise<void> | void) {
@@ -1708,18 +1754,18 @@ export class Executor {
           async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
         );
 
-      const isAgg = stmt.columns.some(
-        (c: Expr) => {
-          let target = c;
-          if (c.type === "Alias") target = c.expr;
-          return target.type === "Call" && !target.over && ["COUNT", "AVG", "SUM", "MIN", "MAX", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG"].includes(target.fnName);
-        }
-      );
+      const allAggs: Expr[] = [];
+      for (const c of stmt.columns) this.extractAggregates(c, allAggs);
+      if (stmt.having) this.extractAggregates(stmt.having, allAggs);
+      if (stmt.orderBy) {
+        for (const ob of stmt.orderBy) this.extractAggregates(ob.expr, allAggs);
+      }
+      const isAgg = allAggs.length > 0;
 
       let sourceStream = source;
 
       if (stmt.groupBy || isAgg) {
-         sourceStream = this.streamingAggregate(storage, sourceStream, stmt, params);
+         sourceStream = this.streamingAggregate(storage, sourceStream, stmt, params, allAggs);
       }
 
       const hasWindow = stmt.columns.some((c: any) => {
@@ -2603,8 +2649,17 @@ export class Executor {
     for (const row of rows) yield row;
   }
 
-  private async *streamingAggregate(storage: StorageEngine, source: AsyncIterableIterator<any>, stmt: any, params: any = []) {
+  private async *streamingAggregate(storage: StorageEngine, source: AsyncIterableIterator<any>, stmt: any, params: any = [], allAggs: Expr[] = []) {
     const groups = new Map<string, any>();
+
+    if (!allAggs || allAggs.length === 0) {
+       allAggs = [];
+       for (const col of stmt.columns) this.extractAggregates(col, allAggs);
+       if (stmt.having) this.extractAggregates(stmt.having, allAggs);
+       if (stmt.orderBy) {
+         for (const ob of stmt.orderBy) this.extractAggregates(ob.expr, allAggs);
+       }
+    }
     
     for await (const row of source) {
       let key = "all";
@@ -2620,94 +2675,90 @@ export class Executor {
       const state = groups.get(key);
       state.__COUNT__++;
       
-      for (const col of stmt.columns) {
-        let target = col;
-        if (col.type === "Alias") target = col.expr;
-        if (target.type === "Call") {
-          const colName = this.getExprKey(target);
-          if (target.filter) {
-             if (!(await this.evaluateExpr(storage, target.filter, row, params))) continue;
-          }
+      for (const target of allAggs) {
+         const colName = this.getExprKey(target);
+         if ((target as any).filter) {
+            if (!(await this.evaluateExpr(storage, (target as any).filter, row, params))) continue;
+         }
 
-          if (target.fnName === "COUNT") {
-            if (target.distinct && target.args && target.args[0]) {
-               const val = await this.evaluateExpr(storage, target.args[0], row, params);
-               if (val !== null && val !== undefined) {
-                 if (!state.__DISTINCTS__[colName]) state.__DISTINCTS__[colName] = new Set();
-                 const valKey = typeof val === 'object' ? JSON.stringify(val) : val;
-                 state.__DISTINCTS__[colName].add(valKey);
-               }
-            } else {
-               let isNotNull = true;
-               if (target.args && target.args[0] && !(target.args[0].type === "Identifier" && target.args[0].name === "*")) {
-                  const val = await this.evaluateExpr(storage, target.args[0], row, params);
-                  if (val === null || val === undefined) isNotNull = false;
-               }
-               if (isNotNull) state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
-            }
-          } else if (target.fnName === "SUM") {
-            if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = null;
-            if (target.args && target.args[0]) {
-               const val = await this.evaluateExpr(storage, target.args[0], row, params);
-               if (val !== null && val !== undefined) {
-                 const num = Number(val);
-                 if (!isNaN(num)) {
-                   if (state.__SUMS__[colName] === null) state.__SUMS__[colName] = 0;
-                   state.__SUMS__[colName] += num;
-                 }
-               }
-            }
-          } else if (target.fnName === "MIN") {
-            if (target.args && target.args[0]) {
-               const val = await this.evaluateExpr(storage, target.args[0], row, params);
-               if (val !== null && val !== undefined) {
-                 if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = val;
-                 else if (val < state.__SUMS__[colName]) state.__SUMS__[colName] = val;
-               }
-            }
-          } else if (target.fnName === "MAX") {
-            if (target.args && target.args[0]) {
-               const val = await this.evaluateExpr(storage, target.args[0], row, params);
-               if (val !== null && val !== undefined) {
-                 if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = val;
-                 else if (val > state.__SUMS__[colName]) state.__SUMS__[colName] = val;
-               }
-            }
-          } else if (target.fnName === "AVG") {
-            if (!state.__SUMS__[colName]) state.__SUMS__[colName] = 0;
-            if (target.args && target.args[0]) {
-               const val = await this.evaluateExpr(storage, target.args[0], row, params);
-               if (val !== null && val !== undefined) {
-                 const num = Number(val);
-                 if (!isNaN(num)) {
-                   state.__SUMS__[colName] += num;
-                   state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
-                 }
-               }
-            }
-          } else if (target.fnName === "ARRAY_AGG" || target.fnName === "JSON_AGG" || target.fnName === "JSONB_AGG") {
-            if (!state.__ARRAYS__[colName]) state.__ARRAYS__[colName] = [];
-            if (target.args && target.args[0]) {
-               const val = await this.evaluateExpr(storage, target.args[0], row, params);
-               if (target.argsOrderBy) {
-                 const orderVals = [];
-                 for (const ob of target.argsOrderBy) orderVals.push(await this.evaluateExpr(storage, ob.expr, row, params));
-                 state.__ARRAYS__[colName].push({ val, orderVals });
-               } else {
-                 state.__ARRAYS__[colName].push(val);
-               }
-            }
-          } else if (target.fnName === "JSON_OBJECT_AGG" || target.fnName === "JSONB_OBJECT_AGG") {
-            if (!state.__JSON_OBJ_AGGS__[colName]) state.__JSON_OBJ_AGGS__[colName] = {};
-            if (target.args && target.args.length >= 2) {
-               const k = await this.evaluateExpr(storage, target.args[0], row, params);
-               const v = await this.evaluateExpr(storage, target.args[1], row, params);
-               if (k !== null) {
-                  state.__JSON_OBJ_AGGS__[colName][String(k)] = v;
-               }
-            }
-          }
-        }
+         if ((target as any).fnName === "COUNT") {
+           if ((target as any).distinct && (target as any).args && (target as any).args[0]) {
+              const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              if (val !== null && val !== undefined) {
+                if (!state.__DISTINCTS__[colName]) state.__DISTINCTS__[colName] = new Set();
+                const valKey = typeof val === 'object' ? JSON.stringify(val) : val;
+                state.__DISTINCTS__[colName].add(valKey);
+              }
+           } else {
+              let isNotNull = true;
+              if ((target as any).args && (target as any).args[0] && !((target as any).args[0].type === "Identifier" && (target as any).args[0].name === "*")) {
+                 const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+                 if (val === null || val === undefined) isNotNull = false;
+              }
+              if (isNotNull) state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
+           }
+         } else if ((target as any).fnName === "SUM") {
+           if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = null;
+           if ((target as any).args && (target as any).args[0]) {
+              const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              if (val !== null && val !== undefined) {
+                const num = Number(val);
+                if (!isNaN(num)) {
+                  if (state.__SUMS__[colName] === null) state.__SUMS__[colName] = 0;
+                  state.__SUMS__[colName] += num;
+                }
+              }
+           }
+         } else if ((target as any).fnName === "MIN") {
+           if ((target as any).args && (target as any).args[0]) {
+              const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              if (val !== null && val !== undefined) {
+                if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = val;
+                else if (val < state.__SUMS__[colName]) state.__SUMS__[colName] = val;
+              }
+           }
+         } else if ((target as any).fnName === "MAX") {
+           if ((target as any).args && (target as any).args[0]) {
+              const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              if (val !== null && val !== undefined) {
+                if (state.__SUMS__[colName] === undefined) state.__SUMS__[colName] = val;
+                else if (val > state.__SUMS__[colName]) state.__SUMS__[colName] = val;
+              }
+           }
+         } else if ((target as any).fnName === "AVG") {
+           if (!state.__SUMS__[colName]) state.__SUMS__[colName] = 0;
+           if ((target as any).args && (target as any).args[0]) {
+              const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              if (val !== null && val !== undefined) {
+                const num = Number(val);
+                if (!isNaN(num)) {
+                  state.__SUMS__[colName] += num;
+                  state.__COUNTS__[colName] = (state.__COUNTS__[colName] || 0) + 1;
+                }
+              }
+           }
+         } else if ((target as any).fnName === "ARRAY_AGG" || (target as any).fnName === "JSON_AGG" || (target as any).fnName === "JSONB_AGG") {
+           if (!state.__ARRAYS__[colName]) state.__ARRAYS__[colName] = [];
+           if ((target as any).args && (target as any).args[0]) {
+              const val = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              if ((target as any).argsOrderBy) {
+                const orderVals = [];
+                for (const ob of (target as any).argsOrderBy) orderVals.push(await this.evaluateExpr(storage, ob.expr, row, params));
+                state.__ARRAYS__[colName].push({ val, orderVals });
+              } else {
+                state.__ARRAYS__[colName].push(val);
+              }
+           }
+         } else if ((target as any).fnName === "JSON_OBJECT_AGG" || (target as any).fnName === "JSONB_OBJECT_AGG") {
+           if (!state.__JSON_OBJ_AGGS__[colName]) state.__JSON_OBJ_AGGS__[colName] = {};
+           if ((target as any).args && (target as any).args.length >= 2) {
+              const k = await this.evaluateExpr(storage, (target as any).args[0], row, params);
+              const v = await this.evaluateExpr(storage, (target as any).args[1], row, params);
+              if (k !== null) {
+                 state.__JSON_OBJ_AGGS__[colName][String(k)] = v;
+              }
+           }
+         }
       }
     }
     
@@ -2717,89 +2768,62 @@ export class Executor {
 
     for (const state of groups.values()) {
        const outRow: any = { ...state.baseRow, __COUNT__: state.__COUNT__ };
+       
+       for (const target of allAggs) {
+           const colName = this.getExprKey(target);
+           const fn = (target as any).fnName;
+           if (fn === "COUNT") {
+              const count = (target as any).distinct ? (state.__DISTINCTS__[colName]?.size || 0) : (state.__COUNTS__[colName] || 0);
+              outRow[colName] = count;
+           } else if (fn === "SUM" || fn === "MIN" || fn === "MAX") {
+              const val = state.__SUMS__[colName] === undefined ? null : state.__SUMS__[colName];
+              outRow[colName] = val;
+           } else if (fn === "AVG") {
+              const sum = state.__SUMS__[colName] || 0;
+              const count = state.__COUNTS__[colName] || 0;
+              const avg = count ? sum / count : null;
+              outRow[colName] = avg;
+           } else if (fn === "ARRAY_AGG" || fn === "JSON_AGG" || fn === "JSONB_AGG") {
+              let arr = state.__ARRAYS__[colName] || [];
+              const obList = (target as any).argsOrderBy;
+              if (obList && arr.length > 0) {
+                arr.sort((a: any, b: any) => {
+                  for (let i = 0; i < obList.length; i++) {
+                    const ob = obList[i];
+                    const vA = a.orderVals[i];
+                    const vB = b.orderVals[i];
+                    if ((vA === null || vA === undefined) && (vB !== null && vB !== undefined)) return ob.nullsFirst ? -1 : (ob.nullsLast ? 1 : (ob.desc ? -1 : 1));
+                    if ((vA !== null && vA !== undefined) && (vB === null || vB === undefined)) return ob.nullsFirst ? 1 : (ob.nullsLast ? -1 : (ob.desc ? 1 : -1));
+                    if (vA < vB) return ob.desc ? 1 : -1;
+                    if (vA > vB) return ob.desc ? -1 : 1;
+                  }
+                  return 0;
+                });
+                arr = arr.map((x: any) => x.val);
+              }
+              outRow[colName] = arr;
+           } else if (fn === "JSON_OBJECT_AGG" || fn === "JSONB_OBJECT_AGG") {
+              const obj = state.__JSON_OBJ_AGGS__[colName] || {};
+              outRow[colName] = obj;
+           }
+       }
+
        for (const col of stmt.columns) {
           let target = col;
           let alias = null;
           if (col.type === "Alias") { alias = col.alias; target = col.expr; }
-          
-          if (target.type === "Call") {
-             const colName = this.getExprKey(target);
-             const fn = target.fnName;
-             
-             let outKey = alias;
-             if (!outKey) {
-               if (fn === "COUNT") outKey = "count";
-               else if (fn === "SUM" || fn === "MIN" || fn === "MAX") outKey = fn.toLowerCase();
-               else if (fn === "AVG") outKey = "avg";
-               else if (fn === "ARRAY_AGG") outKey = "array_agg";
-               else if (fn === "JSON_AGG") outKey = "json_agg";
-               else if (fn === "JSONB_AGG") outKey = "jsonb_agg";
-               else if (fn === "JSON_OBJECT_AGG") outKey = "json_object_agg";
-               else if (fn === "JSONB_OBJECT_AGG") outKey = "jsonb_object_agg";
-               else outKey = fn.toLowerCase();
-             }
-             if (outRow[outKey] !== undefined) {
-               let suffix = 1;
-               while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
-               outKey = `${outKey}${suffix}`;
-             }
-
-             if (fn === "COUNT") {
-                const count = target.distinct ? (state.__DISTINCTS__[colName]?.size || 0) : (state.__COUNTS__[colName] || 0);
-                outRow[outKey] = count;
-                outRow[colName] = count;
-             } else if (fn === "SUM" || fn === "MIN" || fn === "MAX") {
-                const val = state.__SUMS__[colName] === undefined ? null : state.__SUMS__[colName];
-                outRow[outKey] = val;
-                outRow[colName] = val;
-             } else if (fn === "AVG") {
-                const sum = state.__SUMS__[colName] || 0;
-                const count = state.__COUNTS__[colName] || 0;
-                const avg = count ? sum / count : null;
-                outRow[outKey] = avg;
-                outRow["__AVG__"] = avg;
-                outRow[colName] = avg;
-             } else if (fn === "ARRAY_AGG" || fn === "JSON_AGG" || fn === "JSONB_AGG") {
-                let arr = state.__ARRAYS__[colName] || [];
-                const obList = target.argsOrderBy;
-                if (obList && arr.length > 0) {
-                  arr.sort((a: any, b: any) => {
-                    for (let i = 0; i < obList.length; i++) {
-                      const ob = obList[i];
-                      const vA = a.orderVals[i];
-                      const vB = b.orderVals[i];
-                      if ((vA === null || vA === undefined) && (vB !== null && vB !== undefined)) return ob.nullsFirst ? -1 : (ob.nullsLast ? 1 : (ob.desc ? -1 : 1));
-                      if ((vA !== null && vA !== undefined) && (vB === null || vB === undefined)) return ob.nullsFirst ? 1 : (ob.nullsLast ? -1 : (ob.desc ? 1 : -1));
-                      if (vA < vB) return ob.desc ? 1 : -1;
-                      if (vA > vB) return ob.desc ? -1 : 1;
-                    }
-                    return 0;
-                  });
-                  arr = arr.map((x: any) => x.val);
-                }
-                outRow[outKey] = arr;
-                outRow[colName] = arr;
-             } else if (fn === "JSON_OBJECT_AGG" || fn === "JSONB_OBJECT_AGG") {
-                const obj = state.__JSON_OBJ_AGGS__[colName] || {};
-                outRow[outKey] = obj;
-                outRow[colName] = obj;
-             }
-          } else {
-             let outKey = alias;
-             if (!outKey) {
-               if ((target as any).name) {
-                 outKey = (target as any).name.includes(".") ? (target as any).name.split(".")[1] : (target as any).name;
-               } else {
-                 outKey = "col";
-               }
-             }
-             if (outRow[outKey] !== undefined) {
-               let suffix = 1;
-               while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
-               outKey = `${outKey}${suffix}`;
-             }
-             outRow[outKey] = await this.evaluateExpr(storage, target, state.baseRow, params);
+          let outKey = alias;
+          if (!outKey) {
+             if (target.type === "Call") outKey = target.fnName.toLowerCase();
+             else if ((target as any).name) outKey = (target as any).name.includes(".") ? (target as any).name.split(".")[1] : (target as any).name;
+             else outKey = "col";
           }
+          if (outRow[outKey] !== undefined) {
+             let suffix = 1;
+             while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+             outKey = `${outKey}${suffix}`;
+          }
+          outRow[outKey] = await this.evaluateExpr(storage, target, outRow, params);
        }
        if (stmt.having) {
           if (await this.evaluateExpr(storage, stmt.having, outRow, params)) yield outRow;
