@@ -150,6 +150,85 @@ export interface VFS {
   readLines(path: string): AsyncIterable<string>;
 }
 
+export class MemoryFSAdapter implements VFS {
+  private files = new Map<string, { buffer: Uint8Array; size: number }>();
+
+  async open(path: string, flags: string): Promise<VFSHandle> {
+    if (!this.files.has(path)) {
+      this.files.set(path, { buffer: new Uint8Array(4096), size: 0 });
+    }
+    return {
+      read: async (buf, offset, len, pos) => {
+        const file = this.files.get(path)!;
+        if (pos >= file.size) return 0;
+        const readLen = Math.min(len, file.size - pos);
+        const slice = file.buffer.subarray(pos, pos + readLen);
+        buf.set(slice, offset);
+        return readLen;
+      },
+      write: async (buf, offset, len, pos) => {
+        let file = this.files.get(path)!;
+        const writeData = buf.subarray(offset, offset + len);
+        const writePos = pos === -1 ? file.size : pos;
+        const newSize = writePos + len;
+        
+        if (newSize > file.buffer.length) {
+          const newCapacity = Math.max(file.buffer.length * 2, newSize + 65536);
+          const newData = new Uint8Array(newCapacity);
+          newData.set(file.buffer.subarray(0, file.size));
+          newData.set(writeData, writePos);
+          this.files.set(path, { buffer: newData, size: newSize });
+        } else {
+          file.buffer.set(writeData, writePos);
+          if (newSize > file.size) {
+            file.size = newSize;
+          }
+        }
+        return len;
+      },
+      stat: async () => ({ size: this.files.get(path)!.size }),
+      truncate: async (len) => {
+        const file = this.files.get(path)!;
+        if (len < file.size) {
+          file.size = len;
+        }
+      },
+      close: async () => {},
+    };
+  }
+
+  async exists(path: string) {
+    return this.files.has(path);
+  }
+
+  async unlink(path: string) {
+    this.files.delete(path);
+  }
+
+  async writeFile(path: string, data: string | Uint8Array) {
+    const uint8 = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const copy = new Uint8Array(uint8.length);
+    copy.set(uint8);
+    this.files.set(path, { buffer: copy, size: copy.length });
+  }
+
+  tempDir() {
+    return "/tmp";
+  }
+
+  join(...parts: string[]) {
+    return parts.join("/").replace(/\/+/g, "/");
+  }
+
+  async *readLines(path: string) {
+    const file = this.files.get(path);
+    if (!file) return;
+    const text = new TextDecoder().decode(file.buffer.subarray(0, file.size));
+    const lines = text.split("\n");
+    for (const line of lines) yield line;
+  }
+}
+
 class FileHandlePool {
   private static pool = new Map<string, VFSHandle>();
   private static refs = new Map<string, number>();

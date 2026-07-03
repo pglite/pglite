@@ -1,7 +1,7 @@
 import { Lexer } from './parser/lexer';
 import { Parser } from './parser/parser';
 import { Executor } from './execution/executor';
-import { StorageEngine, type VFS } from './storage/engine';
+import { StorageEngine, MemoryFSAdapter, type VFS } from './storage/engine';
 import { Statement } from './ast';
 
 export interface QueryResult<R = any> {
@@ -41,13 +41,22 @@ export class LitePostgres {
   private txRelease?: () => void;
   private queue = Promise.resolve();
 
-  constructor(filepath: string, options: { database?: string, adapter: VFS, destroyOnClose?: boolean }) {
+  constructor(filepath: string, options: { database?: string, adapter?: VFS, destroyOnClose?: boolean } = {}) {
     this.defaultDb = options.database || 'postgres';
     this.destroyOnClose = !!options.destroyOnClose;
-    if (!options.adapter) {
-      throw new Error("A VFS adapter must be provided. For Node.js, use NodeFSAdapter from '@pglite/core/node-fs'.");
+    
+    let adapter = options?.adapter;
+    let actualFilepath = filepath;
+    if (!adapter) {
+      if (filepath === ':memory:') {
+        adapter = new MemoryFSAdapter();
+        // Cấp phát filepath duy nhất để tránh xung đột cache (DB cách ly hoàn toàn)
+        actualFilepath = `:memory:${Date.now()}_${Math.random()}`;
+      } else {
+        throw new Error("A VFS adapter must be provided. For Node.js, use NodeFSAdapter from '@pglite/core/node-fs'.");
+      }
     }
-    this.storage = new StorageEngine(options.adapter, filepath);
+    this.storage = new StorageEngine(adapter, actualFilepath);
   }
 
   /**

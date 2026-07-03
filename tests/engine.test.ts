@@ -5275,4 +5275,45 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rowsEmpty[0].total).toBe(0);
     });
   });
+
+  describe("LEVEL 87: In-Memory Adapter", () => {
+    test("87.1 Should work seamlessly with :memory: fast mode", async () => {
+      // Provide ':memory:' without passing an explicit adapter
+      const memDb = new LitePostgres(":memory:");
+
+      await memDb.exec(`CREATE TABLE in_memory_users (id SERIAL PRIMARY KEY, name TEXT)`);
+      await memDb.exec(`INSERT INTO in_memory_users (name) VALUES ('Mem 1'), ('Mem 2')`);
+      
+      const rows = await memDb.query(`SELECT * FROM in_memory_users ORDER BY id`);
+      expect(rows.length).toBe(2);
+      expect(rows[0].name).toBe('Mem 1');
+      expect(rows[1].name).toBe('Mem 2');
+
+      // Update test
+      await memDb.exec(`UPDATE in_memory_users SET name = 'Mem Updated' WHERE id = 1`);
+      const updatedRows = await memDb.query(`SELECT name FROM in_memory_users WHERE id = 1`);
+      expect(updatedRows[0].name).toBe('Mem Updated');
+
+      await memDb.close();
+    });
+    
+    test("87.2 Speed test for in-memory mode vs disk mode", async () => {
+      const memDb = new LitePostgres(":memory:");
+      await memDb.exec(`CREATE TABLE perf_test (id SERIAL PRIMARY KEY, val INT)`);
+      
+      const start = performance.now();
+      await memDb.transaction(async (tx) => {
+        for (let i = 0; i < 1000; i++) {
+          await tx.exec(`INSERT INTO perf_test (val) VALUES ($1)`, [i]);
+        }
+      });
+      const end = performance.now();
+      
+      const count = await memDb.query(`SELECT COUNT(*) as c FROM perf_test`);
+      expect(count[0].c).toBe(1000);
+      console.log(`[In-Memory Performance] Inserted 1000 rows in ${end - start}ms`);
+      
+      await memDb.close();
+    });
+  });
 });

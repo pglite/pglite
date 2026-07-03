@@ -76,64 +76,144 @@ export class BrowserFSAdapter implements VFS {
     }
   }
 
+  private cache = new Map<string, { data: Uint8Array; size: number; dirty: boolean }>();
+  private flushTimer: any = null;
+
+  private scheduleFlush() {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush();
+    }, 100);
+  }
+
+  public async flush(): Promise<void> {
+    const dirtyFiles: any = [];
+    for (const [path, file] of this.cache.entries()) {
+      if (file.dirty) {
+        const saveBuf = new Uint8Array(file.size);
+        saveBuf.set(file.data.subarray(0, file.size));
+        dirtyFiles.push({ path, data: saveBuf });
+        file.dirty = false;
+      }
+    }
+    
+    if (dirtyFiles.length === 0) return;
+
+    try {
+      const tx = await this.getTransaction("readwrite");
+      await new Promise<void>((resolve, reject) => {
+        const store = tx.objectStore(this.storeName);
+        let completed = 0;
+        let hasError = false;
+        
+        for (const file of dirtyFiles) {
+          const request = store.put(file.data, file.path);
+          request.onsuccess = () => {
+            completed++;
+            if (completed === dirtyFiles.length && !hasError) resolve();
+          };
+          request.onerror = () => {
+            hasError = true;
+            reject(request.error);
+          };
+        }
+      });
+    } catch (e) {
+      for (const file of dirtyFiles) {
+        const cached = this.cache.get(file.path);
+        if (cached) cached.dirty = true;
+      }
+      console.error("BrowserFSAdapter flush error:", e);
+    }
+  }
+
   private async getFile(path: string): Promise<Uint8Array | null> {
+    if (this.cache.has(path)) {
+      const cached = this.cache.get(path)!;
+      return cached.data.subarray(0, cached.size);
+    }
     const tx = await this.getTransaction("readonly");
     return new Promise((resolve, reject) => {
       const request = tx.objectStore(this.storeName).get(path);
-      request.onsuccess = () => resolve(request.result || null);
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  private async saveFile(path: string, data: Uint8Array): Promise<void> {
-    const tx = await this.getTransaction("readwrite");
-    return new Promise((resolve, reject) => {
-      const request = tx.objectStore(this.storeName).put(data, path);
-      request.onsuccess = () => resolve();
+      request.onsuccess = () => {
+        if (request.result) {
+          const data = request.result as Uint8Array;
+          const copy = new Uint8Array(data.length);
+          copy.set(data);
+          this.cache.set(path, { data: copy, size: copy.length, dirty: false });
+          resolve(copy);
+        } else {
+          resolve(null);
+        }
+      };
       request.onerror = () => reject(request.error);
     });
   }
 
   async open(path: string, flags: string): Promise<VFSHandle> {
-    let data = (await this.getFile(path)) || new Uint8Array(0);
+    if (!this.cache.has(path)) {
+      const existing = await this.getFile(path);
+      if (!existing) {
+        this.cache.set(path, { data: new Uint8Array(0), size: 0, dirty: false });
+      }
+    }
 
     return {
       read: async (buf, offset, len, pos) => {
-        const slice = data.subarray(pos, pos + len);
+        const file = this.cache.get(path)!;
+        if (pos >= file.size) return 0;
+        const readLen = Math.min(len, file.size - pos);
+        const slice = file.data.subarray(pos, pos + readLen);
         buf.set(slice, offset);
-        return slice.length;
+        return readLen;
       },
       write: async (buf, offset, len, pos) => {
+        const file = this.cache.get(path)!;
         const writeData = buf.subarray(offset, offset + len);
-        const writePos = pos === -1 ? data.length : pos;
-        if (writePos + len > data.length) {
-          const newData = new Uint8Array(writePos + len);
-          newData.set(data);
+        const writePos = pos === -1 ? file.size : pos;
+        const newSize = writePos + len;
+        
+        if (newSize > file.data.length) {
+          let newCap = Math.max(file.data.length * 2, newSize + 65536);
+          const newData = new Uint8Array(newCap);
+          newData.set(file.data.subarray(0, file.size));
           newData.set(writeData, writePos);
-          data = newData;
+          this.cache.set(path, { data: newData, size: newSize, dirty: true });
         } else {
-          data.set(writeData, writePos);
+          file.data.set(writeData, writePos);
+          if (newSize > file.size) {
+            file.size = newSize;
+          }
+          file.dirty = true;
         }
-        await this.saveFile(path, data);
+        
+        this.scheduleFlush();
         return len;
       },
-      stat: async () => ({ size: data.length }),
+      stat: async () => ({ size: this.cache.get(path)!.size }),
       truncate: async (len) => {
-        data = data.slice(0, len);
-        await this.saveFile(path, data);
+        const file = this.cache.get(path)!;
+        if (len < file.size) {
+          file.size = len;
+          file.dirty = true;
+          this.scheduleFlush();
+        }
       },
       close: async () => {
-        await this.saveFile(path, data);
+        await this.flush();
       },
     };
   }
 
   async exists(path: string) {
+    if (this.cache.has(path)) return true;
     const data = await this.getFile(path);
     return data !== null;
   }
 
   async unlink(path: string) {
+    this.cache.delete(path);
     const tx = await this.getTransaction("readwrite");
     return new Promise<void>((resolve, reject) => {
       const request = tx.objectStore(this.storeName).delete(path);
@@ -144,7 +224,10 @@ export class BrowserFSAdapter implements VFS {
 
   async writeFile(path: string, data: string | Uint8Array) {
     const uint8 = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    await this.saveFile(path, uint8);
+    const copy = new Uint8Array(uint8.length);
+    copy.set(uint8);
+    this.cache.set(path, { data: copy, size: copy.length, dirty: true });
+    this.scheduleFlush();
   }
 
   tempDir() {
