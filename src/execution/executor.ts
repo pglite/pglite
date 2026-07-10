@@ -637,7 +637,31 @@ export class Executor {
           // 3. Unique/Conflict Checking
           startBenchmarks();
           let conflictRow = null;
+          const pkColumnsForCheck = table.columns.filter((c: any) => c.isPrimaryKey);
+
+          if (pkColumnsForCheck.length > 1) {
+            // Composite primary key: must be checked as a combined tuple,
+            // not column-by-column (matching Postgres semantics).
+            const hasAllPkValues = pkColumnsForCheck.every(
+              (c: any) => record[c.name] !== undefined && record[c.name] !== null,
+            );
+            if (hasAllPkValues) {
+              for await (const r of storage.scanRows(stmt.tableName)) {
+                if (pkColumnsForCheck.every((c: any) => r[c.name] == record[c.name])) {
+                  conflictRow = r;
+                  break;
+                }
+              }
+              if (conflictRow && !stmt.onConflict) {
+                const pkNames = pkColumnsForCheck.map((c: any) => c.name).join(', ');
+                throw new Error(`Constraint Error: (${pkNames}) must be unique`);
+              }
+            }
+          }
+
           for (const col of table.columns) {
+            if (conflictRow) break;
+            if (col.isPrimaryKey && pkColumnsForCheck.length > 1) continue; // handled above as a group
             if ((col.isUnique || col.isPrimaryKey) && record[col.name] !== undefined && record[col.name] !== null) {
               let existing = null;
               if (col.isPrimaryKey) {

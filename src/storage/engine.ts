@@ -2294,9 +2294,10 @@ export class StorageEngine {
 
       let pkColumn: string | null = null;
       const uniqueColumns: string[] = [];
+      const pkAttrCount = attrs.filter((a) => a.attprimary).length;
 
       const columns: ColumnDef[] = attrs.map((attr) => {
-        if (attr.attprimary) pkColumn = attr.attname;
+        if (attr.attprimary && pkAttrCount === 1) pkColumn = attr.attname;
         if (attr.attunique) uniqueColumns.push(attr.attname);
 
         return {
