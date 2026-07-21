@@ -115,6 +115,17 @@ export class Executor {
         const fixRes = await (storage as any).autoFix();
         return fixRes;
 
+      case "Reindex": {
+        if (stmt.targetType === 'DATABASE') {
+          await (storage as any).reindexDatabase();
+          return { success: true, message: `Reindex of database completed.` };
+        } else if (stmt.targetType === 'TABLE' && stmt.targetName) {
+          await (storage as any).reindexTable(stmt.targetName);
+          return { success: true, message: `Reindex of table ${stmt.targetName} completed.` };
+        }
+        return { success: true, message: `Reindex for ${stmt.targetType} ${stmt.targetName || ''} completed.` };
+      }
+
       case "CreateSchema": {
         await storage.createSchema(stmt.schemaName, stmt.ifNotExists);
         return { success: true, message: `Schema ${stmt.schemaName} created.` };

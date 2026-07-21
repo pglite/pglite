@@ -2993,6 +2993,40 @@ export class StorageEngine {
     return { success: true, message: "Database is already healthy. No fixes needed." };
   }
 
+  public async reindexTable(name: string) {
+    const fullName = this.getFullTableName(name);
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} not found`);
+
+    if (table.indexRootPage && table.indexRootPage !== 0 && table.indexRootPage !== 0xffffffff) {
+      await this.pager.freePage(table.indexRootPage);
+      table.indexRootPage = 0;
+      await this.updateTableSchema(fullName, table);
+      StorageEngine.pkIndexes.delete(`${this.filepath}:${this.currentDbName}:${fullName}`);
+    }
+    // Quét lại toàn bộ dữ liệu vật lý và dệt lại cây B-Tree
+    await this.buildIndexes(fullName);
+  }
+
+  public async reindexDatabase() {
+    const tables = [];
+    for await (const row of this.scanCatalog(this.pgClassDef)) {
+      if (row.relkind === 'r') {
+        let nspname = 'public';
+        for await (const nsp of this.scanCatalog(this.pgNamespaceDef)) {
+          if (nsp.oid === row.relnamespace) {
+            nspname = nsp.nspname;
+            break;
+          }
+        }
+        tables.push(`${nspname}.${row.relname}`);
+      }
+    }
+    for (const t of tables) {
+      await this.reindexTable(t);
+    }
+  }
+
   private deserializeRow(columns: ColumnDef[], buf: Buffer): any {
     if (!buf || buf.length < 2) return {};
 

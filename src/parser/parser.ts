@@ -120,6 +120,9 @@ export class Parser {
           if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DATABASE') this.consume();
           stmt = { type: 'AutoFix' };
           break;
+        case 'REINDEX':
+          stmt = this.parseReindex();
+          break;
         default: throw new Error(`Parse Error: Unsupported statement starting with '${token.value}'`);
       }
     } else {
@@ -128,6 +131,32 @@ export class Parser {
 
     if (ctes.length > 0 && (stmt.type === 'Select' || stmt.type === 'Values')) (stmt as any).ctes = ctes;
     return stmt;
+  }
+
+  private parseReindex(): Statement {
+    this.consume('KEYWORD', 'REINDEX');
+    let targetType: 'DATABASE' | 'TABLE' | 'INDEX' = 'DATABASE';
+    let targetName: string | undefined;
+
+    if (this.match('KEYWORD', 'DATABASE')) {
+      this.consume();
+      targetType = 'DATABASE';
+      if (this.current() && this.current()!.type !== 'EOF' && this.current()!.value !== ';') {
+        targetName = this.consumeIdentifier();
+      }
+    } else if (this.match('KEYWORD', 'TABLE')) {
+      this.consume();
+      targetType = 'TABLE';
+      targetName = this.parseTableName();
+    } else if (this.match('KEYWORD', 'INDEX')) {
+      this.consume();
+      targetType = 'INDEX';
+      targetName = this.parseTableName();
+    } else if (this.matchIdentifier()) {
+      targetType = 'INDEX'; // fallback postgres default
+      targetName = this.parseTableName();
+    }
+    return { type: 'Reindex', targetType, targetName };
   }
 
   private parseExpr(): Expr { return this.parseOr(); }

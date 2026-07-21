@@ -140,4 +140,5 @@ export type Statement =
   | { type: 'Commit' }
   | { type: 'Rollback' }
   | { type: 'XrayMeta' }
-  | { type: 'AutoFix' };
+  | { type: 'AutoFix' }
+  | { type: 'Reindex'; targetType: 'DATABASE' | 'TABLE' | 'INDEX'; targetName?: string };
