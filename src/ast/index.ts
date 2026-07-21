@@ -139,4 +139,5 @@ export type Statement =
   | { type: 'Begin' }
   | { type: 'Commit' }
   | { type: 'Rollback' }
-  | { type: 'XrayMeta' };
+  | { type: 'XrayMeta' }
+  | { type: 'AutoFix' };

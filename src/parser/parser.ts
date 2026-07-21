@@ -115,6 +115,11 @@ export class Parser {
           this.consume('KEYWORD', 'META');
           stmt = { type: 'XrayMeta' };
           break;
+        case 'AUTOFIX':
+          this.consume();
+          if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DATABASE') this.consume();
+          stmt = { type: 'AutoFix' };
+          break;
         default: throw new Error(`Parse Error: Unsupported statement starting with '${token.value}'`);
       }
     } else {

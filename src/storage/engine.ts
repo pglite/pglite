@@ -2903,6 +2903,96 @@ export class StorageEngine {
     return target.subarray(0, offset);
   }
 
+  public async autoFix(): Promise<{ success: boolean, message: string }> {
+    if (!this.dbMeta) return { success: false, message: "Not connected to a specific database" };
+
+    let fixed = false;
+    const missingCatalogs = [];
+
+    if (!this.dbMeta.dsc_f) missingCatalogs.push({ name: "pg_description", defKey: "dsc" });
+    if (!this.dbMeta.ad_f) missingCatalogs.push({ name: "pg_attrdef", defKey: "ad" });
+    if (!this.dbMeta.idx_f) missingCatalogs.push({ name: "pg_index", defKey: "idx" });
+
+    if (missingCatalogs.length > 0) {
+      for (const cat of missingCatalogs) {
+        const pid = await this.pager.allocatePage();
+        const buf = await this.pager.readPage(pid);
+        new SlottedPage(buf, true);
+        await this.pager.writePage(pid, buf);
+        (this.dbMeta as any)[cat.defKey + "_f"] = pid;
+        (this.dbMeta as any)[cat.defKey + "_l"] = pid;
+      }
+
+      await this.updateRowsInCatalog(
+        this.clusterCatalogDef,
+        async (r) => r.name === this.dbMeta.name,
+        async (r) => {
+          if (this.dbMeta.dsc_f) { r.dsc_f = this.dbMeta.dsc_f; r.dsc_l = this.dbMeta.dsc_l; }
+          if (this.dbMeta.ad_f) { r.ad_f = this.dbMeta.ad_f; r.ad_l = this.dbMeta.ad_l; }
+          if (this.dbMeta.idx_f) { r.idx_f = this.dbMeta.idx_f; r.idx_l = this.dbMeta.idx_l; }
+        }
+      );
+
+      this.refreshCatalogDefs();
+
+      const systemTables = [
+        { name: "pg_description", def: this.pgDescriptionDef, nsp: 11 },
+        { name: "pg_attrdef", def: this.pgAttrdefDef, nsp: 11 },
+        { name: "pg_index", def: this.pgIndexDef, nsp: 11 }
+      ];
+
+      for (const sys of systemTables) {
+        if (missingCatalogs.some(c => c.name === sys.name)) {
+          let exists = false;
+          for await (const row of this.scanCatalog(this.pgClassDef)) {
+            if (row.relname === sys.name) { exists = true; break; }
+          }
+          if (!exists) {
+            await this.insertRowIntoCatalog(this.pgClassDef, {
+              oid: sys.def.firstPage,
+              relname: sys.name,
+              relnamespace: sys.nsp,
+              relfirstpage: sys.def.firstPage,
+              rellastpage: sys.def.lastPage,
+              relindexroot: sys.def.indexRootPage,
+              relsequence: sys.def.sequence,
+              relkind: "r",
+            });
+            for (let i = 0; i < (sys.def.columns?.length || 0); i++) {
+              const col = sys.def.columns?.[i]!;
+              await this.insertRowIntoCatalog(this.pgAttributeDef, {
+                attrelid: sys.def.firstPage,
+                attname: col.name,
+                atttypid: col.dataType,
+                attnum: i + 1,
+                attnotnull: !!col.isNotNull,
+                attprimary: !!col.isPrimaryKey,
+                attunique: !!col.isUnique,
+                attref_table: col.references?.table || null,
+                attref_col: col.references?.column || null,
+                attref_on_delete: col.references?.onDelete || null,
+                attref_on_update: col.references?.onUpdate || null,
+                attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : null,
+                atttypmod: -1,
+                attisdropped: false,
+              });
+            }
+          }
+        }
+      }
+
+      StorageEngine.dbMetaCache.set(`${this.filepath}:${this.dbMeta.name}`, this.dbMeta);
+      StorageEngine.tableCache.clear();
+      fixed = true;
+    }
+
+    if (fixed) {
+      await this.flush();
+      return { success: true, message: `AutoFix completed. Repaired catalogs: ${missingCatalogs.map(c => c.name).join(', ')}` };
+    }
+    return { success: true, message: "Database is already healthy. No fixes needed." };
+  }
+
   private deserializeRow(columns: ColumnDef[], buf: Buffer): any {
     if (!buf || buf.length < 2) return {};
 

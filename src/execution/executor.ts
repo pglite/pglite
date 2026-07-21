@@ -111,6 +111,10 @@ export class Executor {
         await storage.rollback();
         return { success: true };
 
+      case "AutoFix":
+        const fixRes = await (storage as any).autoFix();
+        return fixRes;
+
       case "CreateSchema": {
         await storage.createSchema(stmt.schemaName, stmt.ifNotExists);
         return { success: true, message: `Schema ${stmt.schemaName} created.` };
