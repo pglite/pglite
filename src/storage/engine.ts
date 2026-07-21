@@ -1375,6 +1375,7 @@ export class StorageEngine {
 
   private static readonly PG_DESCRIPTION_COLS: ColumnDef[] = [
     { name: "objoid", dataType: "NUMBER", isPrimaryKey: false },
+    { name: "classoid", dataType: "NUMBER", isPrimaryKey: false },
     { name: "objsubid", dataType: "NUMBER", isPrimaryKey: false },
     { name: "description", dataType: "TEXT", isPrimaryKey: false },
     { name: "objname", dataType: "TEXT", isPrimaryKey: false },

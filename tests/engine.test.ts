@@ -1360,10 +1360,14 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
     });
 
     test("12.3 COALESCE()", async () => {
-      const rows = await db.query(
-        "SELECT COALESCE(NULL, NULL, 'first_non_null', 'second') as val",
-      );
+      const rows = await db.query("SELECT COALESCE(NULL, NULL, 'first_non_null', 'second') as val");
       expect(rows[0].val).toBe("first_non_null");
+    });
+
+    test("12.7 VERSION()", async () => {
+      const rows = await db.query("SELECT version() as ver");
+      expect(rows[0].ver).toContain("PostgreSQL");
+      expect(rows[0].ver).toContain("LitePostgres");
     });
 
     test("12.4 JSON_EXTRACT()", async () => {
@@ -5314,6 +5318,62 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       console.log(`[In-Memory Performance] Inserted 1000 rows in ${end - start}ms`);
       
       await memDb.close();
+    });
+  });
+
+  describe("LEVEL 88: Comments with Schema Prefixed Functions and classoid", () => {
+    test("88.1 Comments work with pg_catalog prefixed functions", async () => {
+      await db.exec(`CREATE TABLE IF NOT EXISTS schedules (id SERIAL PRIMARY KEY, name TEXT)`);
+      
+      const sql = `
+        -- 1. Thêm chú thích cho bảng schedules
+        COMMENT ON TABLE schedules IS '{ "label": "Lịch trình", "description": "Lịch trình chi tiết các hoạt động diễn ra theo từng ngày của chương trình Retreat." }';
+
+        -- 2. Thêm chú thích cho các cột thuộc bảng schedules
+        COMMENT ON COLUMN schedules.id IS '{ "label": "ID Lịch trình", "type": "number", "required": true, "description": "Mã định danh duy nhất của lịch trình", "visible": false }';
+      `;
+      
+      const res = await db.exec(sql);
+      expect(Array.isArray(res) ? res[res.length-1].success : res.success).toBe(true);
+
+      // Query table comment using prefixed function (pg_catalog.obj_description)
+      const tblRows = await db.query(`
+        SELECT pg_catalog.obj_description((QUOTE_IDENT('public') || '.' || QUOTE_IDENT('schedules'))::regclass) as comment;
+      `);
+      expect(tblRows[0].comment).toContain("Lịch trình chi tiết");
+
+      // Query column comment using prefixed function (pg_catalog.col_description)
+      const colRows = await db.query(`
+        SELECT pg_catalog.col_description((QUOTE_IDENT('public') || '.' || QUOTE_IDENT('schedules'))::regclass, 1) as comment;
+      `);
+      expect(colRows[0].comment).toContain("Mã định danh duy nhất");
+      
+      // Verify classoid existence (Standard Postgres behavior)
+      const descRows = await db.query(`SELECT classoid FROM pg_catalog.pg_description WHERE objname = 'schedules' LIMIT 1`);
+      expect(descRows[0].classoid).toBe(1259);
+    });
+
+    test("88.2 Complex JOIN query for column comments using col_description", async () => {
+      // Thực thi chính xác câu query do ORM / người dùng cung cấp
+      const sql = `
+        SELECT 
+            cols.column_name,
+            pg_catalog.col_description(c.oid, cols.ordinal_position) AS column_comment
+        FROM information_schema.columns cols
+        JOIN pg_catalog.pg_class c ON c.relname = cols.table_name
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = cols.table_schema
+        WHERE cols.table_name = 'schedules'
+          AND cols.table_schema = 'public'
+        ORDER BY cols.ordinal_position;
+      `;
+      
+      const rows = await db.query(sql);
+      expect(rows.length).toBeGreaterThan(0);
+      
+      const idCol = rows.find((r: any) => r.column_name === 'id');
+      expect(idCol).toBeDefined();
+      expect(idCol.column_comment).not.toBeNull();
+      expect(idCol.column_comment).toContain("ID Lịch trình"); // Đảm bảo lấy được comment thay vì NULL
     });
   });
 });

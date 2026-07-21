@@ -1341,6 +1341,7 @@ export class Executor {
 
         await storage.insertRow('pg_catalog.pg_description', {
           objoid,
+          classoid: 1259,
           objsubid,
           description: stmt.comment,
           objname: objNameWithoutSchema,
@@ -3480,7 +3481,9 @@ export class Executor {
         if (row[key] !== undefined) return row[key];
 
         if ((expr as any)._fnNameUpper === undefined) {
-           (expr as any)._fnNameUpper = expr.fnName.toUpperCase();
+           let rawFnName = expr.fnName;
+           if (rawFnName.includes('.')) rawFnName = rawFnName.split('.').pop()!;
+           (expr as any)._fnNameUpper = rawFnName.toUpperCase();
         }
         const fnName = (expr as any)._fnNameUpper;
         if (fnName === "COUNT") return row.__COUNT__ || 0;
@@ -3494,6 +3497,7 @@ export class Executor {
           args.push(await this.evaluateExpr(storage, argExpr, row, params));
         }
 
+        if (fnName === "VERSION") return "PostgreSQL 16.2 (LitePostgres)";
         if (fnName === "NOW" || fnName === "CURRENT_TIMESTAMP" || fnName === "LOCALTIMESTAMP") return new Date().toISOString();
         if (fnName === "CURRENT_DATE") return new Date().toISOString().split("T")[0];
         if (fnName === "CURRENT_TIME" || fnName === "LOCALTIME") return new Date().toISOString().split("T")[1];
