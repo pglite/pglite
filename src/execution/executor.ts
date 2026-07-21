@@ -1480,6 +1480,127 @@ export class Executor {
           params 
         };
       }
+
+      case "XrayMeta": {
+        const meta: any = { tables: {}, schemas: [], enums: {} };
+        
+        const nspMap = new Map<number, string>();
+        for await (const nsp of storage.scanRows('pg_catalog.pg_namespace')) {
+           nspMap.set(nsp.oid, nsp.nspname);
+           meta.schemas.push(nsp.nspname);
+        }
+
+        const clsMap = new Map<number, any>();
+        for await (const cls of storage.scanRows('pg_catalog.pg_class')) {
+           clsMap.set(cls.oid, cls);
+           if (cls.relkind === 'r' || cls.relkind === 'i') {
+              const schemaName = nspMap.get(cls.relnamespace) || 'public';
+              const fullTableName = schemaName === 'public' ? cls.relname : `${schemaName}.${cls.relname}`;
+              if (cls.relkind === 'r') {
+                 meta.tables[fullTableName] = {
+                    oid: cls.oid,
+                    name: cls.relname,
+                    schema: schemaName,
+                    columns: [],
+                    indexes: [],
+                    comment: null
+                 };
+              }
+           }
+        }
+
+        for await (const attr of storage.scanRows('pg_catalog.pg_attribute')) {
+           const cls = clsMap.get(attr.attrelid);
+           if (cls && cls.relkind === 'r') {
+              const schemaName = nspMap.get(cls.relnamespace) || 'public';
+              const fullTableName = schemaName === 'public' ? cls.relname : `${schemaName}.${cls.relname}`;
+              if (meta.tables[fullTableName]) {
+                 let parsedDef = null;
+                 if (attr.attdef) {
+                    try { parsedDef = JSON.parse(attr.attdef); } catch(e) { parsedDef = attr.attdef; }
+                 }
+                 meta.tables[fullTableName].columns.push({
+                    name: attr.attname,
+                    type: attr.atttypid,
+                    num: attr.attnum,
+                    notNull: attr.attnotnull,
+                    isPrimary: attr.attprimary,
+                    isUnique: attr.attunique,
+                    default: parsedDef,
+                    references: attr.attref_table ? {
+                        table: attr.attref_table,
+                        column: attr.attref_col,
+                        onDelete: attr.attref_on_delete,
+                        onUpdate: attr.attref_on_update
+                    } : null,
+                    comment: null
+                 });
+              }
+           }
+        }
+
+        for await (const desc of storage.scanRows('pg_catalog.pg_description')) {
+           if (desc.classoid === 1259) {
+              const rel = clsMap.get(desc.objoid);
+              if (rel && rel.relkind === 'r') {
+                 const schemaName = nspMap.get(rel.relnamespace) || 'public';
+                 const fullTableName = schemaName === 'public' ? rel.relname : `${schemaName}.${rel.relname}`;
+                 const tbl = meta.tables[fullTableName];
+                 if (tbl) {
+                    if (desc.objsubid === 0) {
+                       tbl.comment = desc.description;
+                    } else {
+                       const col = tbl.columns.find((c: any) => c.num === desc.objsubid);
+                       if (col) col.comment = desc.description;
+                    }
+                 }
+              }
+           }
+        }
+
+        for await (const idx of storage.scanRows('pg_catalog.pg_index')) {
+           const rel = clsMap.get(idx.indrelid);
+           const idxRel = clsMap.get(idx.indexrelid);
+           if (rel && idxRel && rel.relkind === 'r') {
+              const schemaName = nspMap.get(rel.relnamespace) || 'public';
+              const fullTableName = schemaName === 'public' ? rel.relname : `${schemaName}.${rel.relname}`;
+              if (meta.tables[fullTableName]) {
+                 meta.tables[fullTableName].indexes.push({
+                    name: idxRel.relname,
+                    isPrimary: idx.indisprimary,
+                    isUnique: idx.indisunique,
+                    keys: idx.indkey
+                 });
+              }
+           }
+        }
+
+        const typeMap = new Map<number, string>();
+        for await (const typ of storage.scanRows('pg_catalog.pg_type')) {
+           typeMap.set(typ.oid, typ.typname);
+           if (typ.typtype === 'e') {
+              meta.enums[typ.typname] = [];
+           }
+        }
+
+        for await (const en of storage.scanRows('pg_catalog.pg_enum')) {
+           const typname = typeMap.get(en.enumtypid);
+           if (typname && meta.enums[typname]) {
+              meta.enums[typname].push({ label: en.enumlabel, order: en.enumsortorder });
+           }
+        }
+        
+        for (const enumName in meta.enums) {
+           meta.enums[enumName].sort((a: any, b: any) => a.order - b.order);
+           meta.enums[enumName] = meta.enums[enumName].map((e: any) => e.label);
+        }
+
+        for (const tbl in meta.tables) {
+           meta.tables[tbl].columns.sort((a: any, b: any) => a.num - b.num);
+        }
+
+        return { rows: [{ meta }], fields: [{ name: 'meta' }] };
+      }
     }
   }
 

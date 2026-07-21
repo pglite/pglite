@@ -138,4 +138,5 @@ export type Statement =
   | { type: 'Comment'; objectType: string; objectName: string; comment: string }
   | { type: 'Begin' }
   | { type: 'Commit' }
-  | { type: 'Rollback' };
+  | { type: 'Rollback' }
+  | { type: 'XrayMeta' };

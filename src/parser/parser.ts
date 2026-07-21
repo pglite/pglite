@@ -110,6 +110,11 @@ export class Parser {
           this.consume();
           stmt = { type: 'Rollback' };
           break;
+        case 'XRAY':
+          this.consume();
+          this.consume('KEYWORD', 'META');
+          stmt = { type: 'XrayMeta' };
+          break;
         default: throw new Error(`Parse Error: Unsupported statement starting with '${token.value}'`);
       }
     } else {

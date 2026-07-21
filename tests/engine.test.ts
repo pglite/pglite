@@ -5376,4 +5376,17 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(idCol.column_comment).toContain("ID Lịch trình"); // Đảm bảo lấy được comment thay vì NULL
     });
   });
+
+  describe("LEVEL 89: XRAY META", () => {
+    test("89.1 XRAY META statement outputs database structure in JSON", async () => {
+      await db.exec(`CREATE TABLE xray_test (id SERIAL PRIMARY KEY, val TEXT)`);
+      await db.exec(`COMMENT ON TABLE xray_test IS 'xray_comment'`);
+      const rows = await db.query(`XRAY META`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].meta).toBeDefined();
+      expect(rows[0].meta.tables).toBeDefined();
+      expect(rows[0].meta.tables['xray_test']).toBeDefined();
+      expect(rows[0].meta.tables['xray_test'].comment).toBe('xray_comment');
+    });
+  });
 });
