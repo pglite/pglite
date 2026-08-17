@@ -1303,6 +1303,7 @@ export class StorageEngine {
   private static tableCache = new LRUCache<string, TableData>(500);
   private static schemaCache = new Map<string, string[]>();
   private static pkIndexes = new LRUCache<string, BTree>(500);
+  private static descriptionCache = new Map<string, Map<string, string>>();
   private tempTables = new Map<string, any[]>();
   private inTransaction = false;
   private txDbMetaBackup: string | null = null;
@@ -1320,6 +1321,28 @@ export class StorageEngine {
   private pgIndexDef!: TableData;
   private pgTypeDef!: TableData;
   private pgEnumDef!: TableData;
+
+  public async getDescription(objoid: number, objsubid: number): Promise<string | null> {
+    const cacheKey = `${this.filepath}:${this.currentDbName}`;
+    let descMap = StorageEngine.descriptionCache.get(cacheKey);
+    
+    if (!descMap) {
+      descMap = new Map<string, string>();
+      if (this.dbMeta && this.pgDescriptionDef) {
+        try {
+          for await (const r of this.scanCatalog(this.pgDescriptionDef)) {
+            descMap.set(`${r.objoid}:${r.objsubid}`, r.description);
+          }
+        } catch (e) {}
+      }
+      StorageEngine.descriptionCache.set(cacheKey, descMap);
+    }
+    return descMap.get(`${objoid}:${objsubid}`) || null;
+  }
+
+  public invalidateDescriptionCache(): void {
+    StorageEngine.descriptionCache.delete(`${this.filepath}:${this.currentDbName}`);
+  }
 
   // Static Column Definitions for catalogs
   private static readonly CLUSTER_CATALOG_COLS: ColumnDef[] = [
@@ -2293,6 +2316,41 @@ export class StorageEngine {
       }
       attrs.sort((a, b) => a.attnum - b.attnum);
 
+      // Logical Fallback for System Catalogs missing columns
+      if (attrs.length === 0 && relRow.relnamespace === 11) {
+        let fallbackCols: ColumnDef[] | null = null;
+        if (relRow.relname === "pg_namespace") fallbackCols = StorageEngine.PG_NAMESPACE_COLS;
+        else if (relRow.relname === "pg_class") fallbackCols = StorageEngine.PG_CLASS_COLS;
+        else if (relRow.relname === "pg_attribute") fallbackCols = StorageEngine.PG_ATTRIBUTE_COLS;
+        else if (relRow.relname === "pg_description") fallbackCols = StorageEngine.PG_DESCRIPTION_COLS;
+        else if (relRow.relname === "pg_attrdef") fallbackCols = StorageEngine.PG_ATTRDEF_COLS;
+        else if (relRow.relname === "pg_index") fallbackCols = StorageEngine.PG_INDEX_COLS;
+        else if (relRow.relname === "pg_type") fallbackCols = StorageEngine.PG_TYPE_COLS;
+        else if (relRow.relname === "pg_enum") fallbackCols = StorageEngine.PG_ENUM_COLS;
+        
+        if (fallbackCols) {
+          for (let i = 0; i < fallbackCols.length; i++) {
+            const col = fallbackCols[i]!;
+            attrs.push({
+              attrelid: relRow.oid,
+              attname: col.name,
+              atttypid: col.dataType,
+              attnum: i + 1,
+              attnotnull: !!col.isNotNull,
+              attprimary: !!col.isPrimaryKey,
+              attunique: !!col.isUnique,
+              attref_table: col.references?.table || null,
+              attref_col: col.references?.column || null,
+              attref_on_delete: col.references?.onDelete || null,
+              attref_on_update: col.references?.onUpdate || null,
+              attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : null,
+              atttypmod: -1,
+              attisdropped: false,
+            });
+          }
+        }
+      }
+
       let pkColumn: string | null = null;
       const uniqueColumns: string[] = [];
       const pkAttrCount = attrs.filter((a) => a.attprimary).length;
@@ -2908,6 +2966,9 @@ export class StorageEngine {
 
     let fixed = false;
     const missingCatalogs = [];
+    const missingColumnsCatalogs = [];
+
+    // 1. Check for missing catalog pages
 
     if (!this.dbMeta.dsc_f) missingCatalogs.push({ name: "pg_description", defKey: "dsc" });
     if (!this.dbMeta.ad_f) missingCatalogs.push({ name: "pg_attrdef", defKey: "ad" });
@@ -2934,61 +2995,113 @@ export class StorageEngine {
       );
 
       this.refreshCatalogDefs();
-
-      const systemTables = [
-        { name: "pg_description", def: this.pgDescriptionDef, nsp: 11 },
-        { name: "pg_attrdef", def: this.pgAttrdefDef, nsp: 11 },
-        { name: "pg_index", def: this.pgIndexDef, nsp: 11 }
-      ];
-
-      for (const sys of systemTables) {
-        if (missingCatalogs.some(c => c.name === sys.name)) {
-          let exists = false;
-          for await (const row of this.scanCatalog(this.pgClassDef)) {
-            if (row.relname === sys.name) { exists = true; break; }
-          }
-          if (!exists) {
-            await this.insertRowIntoCatalog(this.pgClassDef, {
-              oid: sys.def.firstPage,
-              relname: sys.name,
-              relnamespace: sys.nsp,
-              relfirstpage: sys.def.firstPage,
-              rellastpage: sys.def.lastPage,
-              relindexroot: sys.def.indexRootPage,
-              relsequence: sys.def.sequence,
-              relkind: "r",
-            });
-            for (let i = 0; i < (sys.def.columns?.length || 0); i++) {
-              const col = sys.def.columns?.[i]!;
-              await this.insertRowIntoCatalog(this.pgAttributeDef, {
-                attrelid: sys.def.firstPage,
-                attname: col.name,
-                atttypid: col.dataType,
-                attnum: i + 1,
-                attnotnull: !!col.isNotNull,
-                attprimary: !!col.isPrimaryKey,
-                attunique: !!col.isUnique,
-                attref_table: col.references?.table || null,
-                attref_col: col.references?.column || null,
-                attref_on_delete: col.references?.onDelete || null,
-                attref_on_update: col.references?.onUpdate || null,
-                attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : null,
-                atttypmod: -1,
-                attisdropped: false,
-              });
-            }
-          }
-        }
-      }
-
-      StorageEngine.dbMetaCache.set(`${this.filepath}:${this.dbMeta.name}`, this.dbMeta);
-      StorageEngine.tableCache.clear();
       fixed = true;
     }
 
+    // 2. Scan and rebuild missing tables/columns in pg_class and pg_attribute
+    const systemTables = [
+      { name: "pg_namespace", def: this.pgNamespaceDef, nsp: 11 },
+      { name: "pg_class", def: this.pgClassDef, nsp: 11 },
+      { name: "pg_attribute", def: this.pgAttributeDef, nsp: 11 },
+      { name: "pg_description", def: this.pgDescriptionDef, nsp: 11 },
+      { name: "pg_attrdef", def: this.pgAttrdefDef, nsp: 11 },
+      { name: "pg_index", def: this.pgIndexDef, nsp: 11 },
+      { name: "pg_type", def: { columns: StorageEngine.PG_TYPE_COLS, firstPage: 0, lastPage: 0, sequence: 0, indexRootPage: 0 }, nsp: 11 },
+      { name: "pg_enum", def: { columns: StorageEngine.PG_ENUM_COLS, firstPage: 0, lastPage: 0, sequence: 0, indexRootPage: 0 }, nsp: 11 }
+    ];
+
+    // Gather existing table definitions in catalog
+    const existingTables = new Map<string, number>();
+    for await (const row of this.scanCatalog(this.pgClassDef)) {
+      if (row.relnamespace === 11) {
+        existingTables.set(row.relname, row.oid);
+      }
+    }
+
+    // Gather attribute counts
+    const attrCounts = new Map<number, number>();
+    for await (const row of this.scanCatalog(this.pgAttributeDef)) {
+      attrCounts.set(row.attrelid, (attrCounts.get(row.attrelid) || 0) + 1);
+    }
+
+    for (const sys of systemTables) {
+      let oid = existingTables.get(sys.name);
+      
+      // Fix 2.1: Missing table in pg_class
+      if (!oid && sys.def.firstPage !== 0) {
+        oid = sys.def.firstPage;
+        await this.insertRowIntoCatalog(this.pgClassDef, {
+          oid: oid,
+          relname: sys.name,
+          relnamespace: sys.nsp,
+          relfirstpage: sys.def.firstPage,
+          rellastpage: sys.def.lastPage,
+          relindexroot: sys.def.indexRootPage || 0,
+          relsequence: sys.def.sequence || 0,
+          relkind: "r",
+        });
+        if (!missingCatalogs.some(c => c.name === sys.name)) {
+          missingCatalogs.push({ name: sys.name, defKey: "" });
+        }
+        fixed = true;
+      }
+
+      // Fix 2.2: Missing columns in pg_attribute
+      if (oid && (attrCounts.get(oid) || 0) === 0 && sys.def.columns) {
+        missingColumnsCatalogs.push(sys.name);
+        for (let i = 0; i < sys.def.columns.length; i++) {
+          const col = sys.def.columns[i]!;
+          await this.insertRowIntoCatalog(this.pgAttributeDef, {
+            attrelid: oid,
+            attname: col.name,
+            atttypid: col.dataType,
+            attnum: i + 1,
+            attnotnull: !!col.isNotNull,
+            attprimary: !!col.isPrimaryKey,
+            attunique: !!col.isUnique,
+            attref_table: col.references?.table || null,
+            attref_col: col.references?.column || null,
+            attref_on_delete: col.references?.onDelete || null,
+            attref_on_update: col.references?.onUpdate || null,
+            attdef: col.defaultVal ? JSON.stringify(col.defaultVal) : null,
+            atttypmod: -1,
+            attisdropped: false,
+          });
+        }
+        fixed = true;
+      }
+    }
+
+    // Fix 2.3: Detect and clear corrupted pg_description data due to schema migration
+    let corruptedDesc = false;
+    try {
+      for await (const row of this.scanCatalog(this.pgDescriptionDef)) {
+        if (typeof row.objsubid === 'number' && row.objsubid > 1000000) {
+          corruptedDesc = true;
+          break;
+        }
+      }
+    } catch (e) {
+      corruptedDesc = true;
+    }
+
+    if (corruptedDesc) {
+      await this.truncateTable('pg_catalog.pg_description', false, true, new Set(), new Set(), true);
+      fixed = true;
+      missingCatalogs.push({ name: "pg_description (cleared corrupted data)", defKey: "" });
+    }
+
     if (fixed) {
+      StorageEngine.dbMetaCache.set(`${this.filepath}:${this.dbMeta.name}`, this.dbMeta);
+      StorageEngine.tableCache.clear();
+      StorageEngine.descriptionCache.clear();
       await this.flush();
-      return { success: true, message: `AutoFix completed. Repaired catalogs: ${missingCatalogs.map(c => c.name).join(', ')}` };
+      
+      const msgs = [];
+      if (missingCatalogs.length > 0) msgs.push(`Repaired catalogs: ${missingCatalogs.map(c => c.name).join(', ')}`);
+      if (missingColumnsCatalogs.length > 0) msgs.push(`Restored missing columns for: ${missingColumnsCatalogs.join(', ')}`);
+      
+      return { success: true, message: `AutoFix completed. ${msgs.join('. ')}` };
     }
     return { success: true, message: "Database is already healthy. No fixes needed." };
   }
@@ -3918,6 +4031,7 @@ export class StorageEngine {
     StorageEngine.tableCache.clear();
     StorageEngine.schemaCache.clear();
     StorageEngine.pkIndexes.clear();
+    StorageEngine.descriptionCache.clear();
     this.currentDbName = undefined;
     if (this.dbMeta) {
       StorageEngine.dbMetaCache.delete(`${this.filepath}:${this.dbMeta.name}`);

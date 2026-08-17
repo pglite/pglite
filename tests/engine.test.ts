@@ -5389,4 +5389,91 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows[0].meta.tables['xray_test'].comment).toBe('xray_comment');
     });
   });
+
+  describe("LEVEL 90: AutoFix & Zero Column Fallback for system catalogs", () => {
+    test("90.1 Fallback logic works even if pg_description columns are manually deleted", async () => {
+      const storage = (db as any).storage;
+      
+      // 1. Manually corrupt pg_description by deleting its attributes
+      await storage.deleteRowsInCatalog(
+        storage.pgAttributeDef,
+        async (r: any) => r.attrelid === storage.dbMeta.dsc_f
+      );
+
+      // Clear cache so it fetches again
+      storage.invalidateTableCache('pg_catalog.pg_description');
+      
+      // 2. Add comment, it should succeed because of Logical Fallback
+      await db.exec(`CREATE TABLE fallback_comment_test (id INT)`);
+      const res = await db.exec(`COMMENT ON TABLE fallback_comment_test IS 'hello fallback'`);
+      expect(res.success).toBe(true);
+      
+      // 3. Ensure AutoFix actually restores the physical columns
+      const fixRes = await db.exec(`AUTOFIX`);
+      expect(fixRes.success).toBe(true);
+      expect(fixRes.message).toContain('Restored missing columns for: pg_description');
+    });
+  });
+
+  describe("LEVEL 91: Performance - Complex Hash Join and Catalog Caching", () => {
+    test("91.1 Querying system catalog with JSON aggregation and comments is fast and correct", async () => {
+      // Tạo các bảng dữ liệu mô phỏng với comment
+      await db.exec(`CREATE TABLE perf_table_1 (id SERIAL PRIMARY KEY, name TEXT DEFAULT 'unnamed', age INT)`);
+      await db.exec(`COMMENT ON TABLE perf_table_1 IS 'Table 1 comment'`);
+      await db.exec(`COMMENT ON COLUMN perf_table_1.name IS 'Name column'`);
+      
+      await db.exec(`CREATE TABLE perf_table_2 (id SERIAL PRIMARY KEY, title TEXT, is_active BOOLEAN DEFAULT true)`);
+      await db.exec(`COMMENT ON TABLE perf_table_2 IS 'Table 2 comment'`);
+      await db.exec(`COMMENT ON COLUMN perf_table_2.is_active IS 'Active status'`);
+
+      const sql = `
+      SELECT
+        c.relname AS name,
+        obj_description(c.oid, 'pg_class') AS comment,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'name', a.attname,
+              'type', format_type(a.atttypid, a.atttypmod),
+              'nullable', NOT a.attnotnull,
+              'default', pg_get_expr(d.adbin, d.adrelid),
+              'comment', col_description(c.oid, a.attnum)
+            ) ORDER BY a.attnum
+          ) FILTER (WHERE a.attnum > 0),
+          '[]'::json
+        ) AS columns
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+      LEFT JOIN pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum)
+      WHERE n.nspname = $1
+        AND c.relkind IN ('r', 'v', 'm', 'p')
+      GROUP BY c.oid, c.relname
+      ORDER BY c.relname;
+      `;
+
+      const start = performance.now();
+      const rows = await db.query(sql, ['public']);
+      const end = performance.now();
+
+      // Kiểm chứng tốc độ siêu nhanh (phải nhỏ hơn 1s, thực tế sẽ chỉ vài chục ms so với 5s ban đầu)
+      expect(end - start).toBeLessThan(1000);
+      console.log(`[Performance] Complex Catalog Query completed in ${end - start}ms`);
+      
+      // Kiểm chứng tính chính xác của dữ liệu trả về
+      const pt1 = rows.find((r: any) => r.name === 'perf_table_1');
+      expect(pt1).toBeDefined();
+      expect(pt1.comment).toBe('Table 1 comment');
+      expect(pt1.columns.length).toBeGreaterThanOrEqual(3);
+      
+      const nameCol = pt1.columns.find((c: any) => c.name === 'name');
+      expect(nameCol.comment).toBe('Name column');
+      expect(nameCol.default).toContain('unnamed');
+      
+      const pt2 = rows.find((r: any) => r.name === 'perf_table_2');
+      expect(pt2.comment).toBe('Table 2 comment');
+      const activeCol = pt2.columns.find((c: any) => c.name === 'is_active');
+      expect(activeCol.comment).toBe('Active status');
+    });
+  });
 });
