@@ -641,33 +641,62 @@ export class Parser {
   private parseDataType(): string {
     let dataType = this.consume().value;
 
-    // Handle (n) or (p,s)
-    if (this.match('SYMBOL', '(')) {
-      dataType += this.consume().value;
-      while (!this.match('SYMBOL', ')')) {
-        dataType += this.consume().value;
-      }
-      dataType += this.consume().value;
-    }
-
-    // Handle sequences of identifiers/keywords for complex types
-    // e.g., TIMESTAMP WITH TIME ZONE, integer[], USER-DEFINED
     const stopKeywords = new Set([
       'PRIMARY', 'UNIQUE', 'NOT', 'NULL', 'REFERENCES', 'DEFAULT', 'CONSTRAINT', 'CHECK', 'GENERATED',
       'AS', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
       'HAVING', 'RETURNING', 'ON', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'CROSS', 'OUTER', 'JOIN', 'VALUES', 'SET', 'CONFLICT', 'DO',
       'END', 'THEN', 'ELSE', 'WHEN', 'FILTER', 'OVER', 'PARTITION', 'AND', 'OR', 'IS', 'IN',
-      'ASC', 'DESC', 'TRUE', 'FALSE', 'LIKE'
+      'ASC', 'DESC', 'TRUE', 'FALSE', 'LIKE', 'INTERVAL', 'ARRAY', 'CASE', 'SELECT', 'WINDOW', 'COLLATE'
     ]);
-    while (this.match('KEYWORD') || this.match('IDENTIFIER') || this.match('SYMBOL', '[') || this.match('SYMBOL', ']')) {
-      const next = this.current()!;
-      if ((next.type === 'KEYWORD' || next.type === 'IDENTIFIER') && stopKeywords.has(next.value.toUpperCase())) break;
-      if (next.type === 'SYMBOL' && !['[', ']'].includes(next.value)) break;
-      
-      if (next.value === '[' || next.value === ']') {
+
+    while (this.current() && this.current()?.type !== 'EOF') {
+      if (this.match('SYMBOL', '(')) {
         dataType += this.consume().value;
-      } else {
+        while (!this.match('SYMBOL', ')') && this.current() && this.current()?.type !== 'EOF') {
+          dataType += this.consume().value;
+        }
+        if (this.match('SYMBOL', ')')) {
+          dataType += this.consume().value;
+        }
+      } else if (this.match('SYMBOL', '[')) {
+        if (this.tokens[this.pos + 1]?.value === ']') {
+          dataType += '[]';
+          this.pos += 2;
+        } else {
+          dataType += this.consume().value;
+        }
+      } else if (this.match('SYMBOL', '-')) {
+        // Hyphen in data type (e.g. USER-DEFINED)
+        const nextToken = this.tokens[this.pos + 1];
+        if (
+          nextToken &&
+          (nextToken.type === 'IDENTIFIER' || nextToken.type === 'KEYWORD') &&
+          !stopKeywords.has(nextToken.value.toUpperCase())
+        ) {
+          dataType += '-' + nextToken.value;
+          this.pos += 2;
+        } else {
+          break;
+        }
+      } else if (this.match('SYMBOL', '.')) {
+        const nextToken = this.tokens[this.pos + 1];
+        if (
+          nextToken &&
+          (nextToken.type === 'IDENTIFIER' || nextToken.type === 'KEYWORD')
+        ) {
+          dataType += '.' + nextToken.value;
+          this.pos += 2;
+        } else {
+          break;
+        }
+      } else if (this.match('KEYWORD') || this.match('IDENTIFIER') || this.match('NUMBER')) {
+        const next = this.current()!;
+        if ((next.type === 'KEYWORD' || next.type === 'IDENTIFIER') && stopKeywords.has(next.value.toUpperCase())) {
+          break;
+        }
         dataType += ' ' + this.consume().value;
+      } else {
+        break;
       }
     }
 
@@ -847,6 +876,26 @@ export class Parser {
               this.consume();
               while (!this.match('SYMBOL', ')')) this.consume();
               this.consume('SYMBOL', ')');
+            }
+            while (this.match('KEYWORD', 'ON')) {
+              this.consume(); // ON
+              const isDelete = this.match('KEYWORD', 'DELETE');
+              const isUpdate = this.match('KEYWORD', 'UPDATE');
+              if (isDelete || isUpdate) this.consume();
+
+              if (this.match('KEYWORD', 'SET')) {
+                this.consume();
+                if (this.match('KEYWORD', 'NULL') || this.match('KEYWORD', 'DEFAULT')) {
+                  this.consume();
+                }
+              } else if (this.match('KEYWORD', 'CASCADE') || this.match('KEYWORD', 'RESTRICT')) {
+                this.consume();
+              } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'NO') {
+                this.consume();
+                if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'ACTION') {
+                  this.consume();
+                }
+              }
             }
           }
         } else if (this.match('KEYWORD', 'UNIQUE')) {

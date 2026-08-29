@@ -5476,4 +5476,303 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(activeCol.comment).toBe('Active status');
     });
   });
+
+  describe("LEVEL 92: USER-DEFINED Data Types & Database Clone Schema Support", () => {
+    test("92.1 Exact CREATE TABLE with USER-DEFINED type and constraints from database clone", async () => {
+      // First create referenced tables
+      await db.exec(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT)`);
+      await db.exec(`CREATE TABLE IF NOT EXISTS attendances (id SERIAL PRIMARY KEY, note TEXT)`);
+
+      const sql = `
+        CREATE TABLE "attendance_audit_logs" (
+          "id" SERIAL NOT NULL,
+          "attendance_id" integer NOT NULL,
+          "action_type" USER-DEFINED NOT NULL,
+          "changed_by_user_id" integer NOT NULL,
+          "old_data" jsonb,
+          "new_data" jsonb,
+          "change_timestamp" timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+          "notes" text,
+          "created_at" timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+          "updated_at" timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+          "deleted_at" timestamp with time zone,
+          CONSTRAINT "fk_attendance_audit_logs_changed_by_user_id" FOREIGN KEY ("changed_by_user_id") REFERENCES "users" ("id"),
+          CONSTRAINT "fk_attendance_audit_logs_attendance_id" FOREIGN KEY ("attendance_id") REFERENCES "attendances" ("id"),
+          CONSTRAINT "attendance_audit_logs_pkey" PRIMARY KEY
+        );
+      `;
+
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      // Verify table column metadata in pg_attribute / storage
+      const table = await (db as any).storage.getTableAsync('public.attendance_audit_logs');
+      expect(table).toBeDefined();
+      const actionTypeCol = table.columns.find((c: any) => c.name === 'action_type');
+      expect(actionTypeCol).toBeDefined();
+      expect(actionTypeCol.dataType).toBe('USER-DEFINED');
+      expect(actionTypeCol.isNotNull).toBe(true);
+
+      // Verify insert and select work with USER-DEFINED type
+      await db.exec(`INSERT INTO attendances (id, note) VALUES (101, 'Morning Shift')`);
+
+      const insertRes = await db.exec(`
+        INSERT INTO attendance_audit_logs (
+          attendance_id,
+          action_type,
+          changed_by_user_id,
+          old_data,
+          new_data,
+          notes
+        ) VALUES (
+          101,
+          'CHECK_IN',
+          1,
+          '{"status": "pending"}'::jsonb,
+          '{"status": "approved"}'::jsonb,
+          'Manual override'
+        )
+      `);
+      expect(insertRes.success).toBe(true);
+
+      const rows = await db.query(`SELECT * FROM attendance_audit_logs WHERE attendance_id = 101`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].action_type).toBe('CHECK_IN');
+      expect(rows[0].notes).toBe('Manual override');
+      expect(rows[0].old_data).toEqual({ status: 'pending' });
+    });
+
+    test("92.2 Complex data types with hyphen and schema qualification", async () => {
+      const sql = `
+        CREATE TABLE test_custom_types (
+          id SERIAL PRIMARY KEY,
+          custom_col USER-DEFINED,
+          schema_type public.custom_type,
+          arr_type USER-DEFINED[]
+        );
+      `;
+      const res = await db.exec(sql);
+      expect(res.success).toBe(true);
+
+      const table = await (db as any).storage.getTableAsync('public.test_custom_types');
+      expect(table).toBeDefined();
+      expect(table.columns.find((c: any) => c.name === 'custom_col').dataType).toBe('USER-DEFINED');
+      expect(table.columns.find((c: any) => c.name === 'schema_type').dataType).toBe('public.custom_type');
+      expect(table.columns.find((c: any) => c.name === 'arr_type').dataType).toBe('USER-DEFINED[]');
+    });
+
+    test("92.3 ALTER TABLE ADD COLUMN and ALTER COLUMN TYPE with USER-DEFINED", async () => {
+      await db.exec(`CREATE TABLE test_alter_custom (id SERIAL PRIMARY KEY, name TEXT)`);
+
+      // ADD COLUMN with USER-DEFINED
+      const addRes = await db.exec(`ALTER TABLE test_alter_custom ADD COLUMN status_type USER-DEFINED`);
+      expect(addRes.success).toBe(true);
+
+      // INSERT with newly added USER-DEFINED column
+      await db.exec(`INSERT INTO test_alter_custom (name, status_type) VALUES ('Item 1', 'ACTIVE')`);
+      const row = await db.query(`SELECT * FROM test_alter_custom WHERE id = 1`);
+      expect(row[0].status_type).toBe('ACTIVE');
+
+      // ALTER COLUMN TYPE to USER-DEFINED
+      const alterTypeRes = await db.exec(`ALTER TABLE test_alter_custom ALTER COLUMN name TYPE USER-DEFINED`);
+      expect(alterTypeRes.success).toBe(true);
+
+      const table = await (db as any).storage.getTableAsync('public.test_alter_custom');
+      expect(table.columns.find((c: any) => c.name === 'name').dataType).toBe('USER-DEFINED');
+      expect(table.columns.find((c: any) => c.name === 'status_type').dataType).toBe('USER-DEFINED');
+    });
+
+    test("92.4 CAST and :: with USER-DEFINED and complex types", async () => {
+      const rows = await db.query(`
+        SELECT 
+          'PENDING'::USER-DEFINED as cast_double_colon,
+          CAST('APPROVED' AS USER-DEFINED) as cast_func,
+          '{"role": "admin"}'::jsonb as json_val
+      `);
+      expect(rows.length).toBe(1);
+      expect(rows[0].cast_double_colon).toBe('PENDING');
+      expect(rows[0].cast_func).toBe('APPROVED');
+      expect(rows[0].json_val).toEqual({ role: 'admin' });
+    });
+
+    test("92.5 Complex Table Constraints from DB Clones (Composite PK, Multiple FK with ON actions, Unique, Check)", async () => {
+      await db.exec(`CREATE TABLE clone_orgs (id SERIAL PRIMARY KEY, org_name TEXT)`);
+      await db.exec(`CREATE TABLE clone_roles (id SERIAL PRIMARY KEY, role_code USER-DEFINED NOT NULL)`);
+
+      const complexTableSql = `
+        CREATE TABLE "clone_memberships" (
+          "org_id" integer NOT NULL,
+          "role_id" integer NOT NULL,
+          "member_state" USER-DEFINED DEFAULT 'ACTIVE' NOT NULL,
+          "email" character varying(255) NOT NULL,
+          "meta" jsonb DEFAULT '{}'::jsonb,
+          "created_at" timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+          CONSTRAINT "pk_clone_memberships" PRIMARY KEY ("org_id", "role_id"),
+          CONSTRAINT "fk_clone_memberships_org" FOREIGN KEY ("org_id") REFERENCES "clone_orgs" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+          CONSTRAINT "fk_clone_memberships_role" FOREIGN KEY ("role_id") REFERENCES "clone_roles" ("id") ON DELETE RESTRICT,
+          CONSTRAINT "uq_clone_memberships_email" UNIQUE ("org_id", "email")
+        );
+      `;
+
+      const res = await db.exec(complexTableSql);
+      expect(res.success).toBe(true);
+
+      // Verify table metadata
+      const table = await (db as any).storage.getTableAsync('public.clone_memberships');
+      expect(table).toBeDefined();
+      expect(table.columns.length).toBe(6);
+
+      const stateCol = table.columns.find((c: any) => c.name === 'member_state');
+      expect(stateCol.dataType).toBe('USER-DEFINED');
+      expect(stateCol.isNotNull).toBe(true);
+
+      // Insert dependencies
+      await db.exec(`INSERT INTO clone_orgs (id, org_name) VALUES (1, 'Acme Corp')`);
+      await db.exec(`INSERT INTO clone_roles (id, role_code) VALUES (10, 'SYS_ADMIN')`);
+
+      // Insert membership
+      const insertRes = await db.exec(`
+        INSERT INTO clone_memberships (org_id, role_id, member_state, email) 
+        VALUES (1, 10, 'ACTIVE', 'admin@acme.com')
+      `);
+      expect(insertRes.success).toBe(true);
+
+      // Verify query
+      const rows = await db.query(`SELECT * FROM clone_memberships WHERE org_id = 1 AND role_id = 10`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].member_state).toBe('ACTIVE');
+      expect(rows[0].email).toBe('admin@acme.com');
+    });
+
+    test("92.6 Filtering, Grouping, Ordering & Aggregation on USER-DEFINED columns", async () => {
+      await db.exec(`
+        CREATE TABLE test_enum_analytics (
+          id SERIAL PRIMARY KEY,
+          event_type USER-DEFINED NOT NULL,
+          amount integer DEFAULT 0,
+          created_at timestamp DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await db.exec(`INSERT INTO test_enum_analytics (event_type, amount) VALUES ('SIGNUP', 100)`);
+      await db.exec(`INSERT INTO test_enum_analytics (event_type, amount) VALUES ('SIGNUP', 200)`);
+      await db.exec(`INSERT INTO test_enum_analytics (event_type, amount) VALUES ('PURCHASE', 500)`);
+      await db.exec(`INSERT INTO test_enum_analytics (event_type, amount) VALUES ('PURCHASE', 300)`);
+      await db.exec(`INSERT INTO test_enum_analytics (event_type, amount) VALUES ('REFUND', 50)`);
+
+      // WHERE filter
+      const signups = await db.query(`SELECT * FROM test_enum_analytics WHERE event_type = 'SIGNUP' ORDER BY amount DESC`);
+      expect(signups.length).toBe(2);
+      expect(signups[0].amount).toBe(200);
+      expect(signups[1].amount).toBe(100);
+
+      // GROUP BY + Aggregates on USER-DEFINED
+      const summary = await db.query(`
+        SELECT event_type, COUNT(*) as count, SUM(amount) as total
+        FROM test_enum_analytics
+        GROUP BY event_type
+        ORDER BY event_type ASC
+      `);
+      expect(summary.length).toBe(3);
+      expect(summary[0].event_type).toBe('PURCHASE');
+      expect(Number(summary[0].total)).toBe(800);
+      expect(summary[1].event_type).toBe('REFUND');
+      expect(Number(summary[1].total)).toBe(50);
+      expect(summary[2].event_type).toBe('SIGNUP');
+      expect(Number(summary[2].total)).toBe(300);
+
+      // UPDATE with USER-DEFINED in SET and WHERE
+      await db.exec(`UPDATE test_enum_analytics SET event_type = 'RESOLVED_REFUND' WHERE event_type = 'REFUND'`);
+      const updated = await db.query(`SELECT * FROM test_enum_analytics WHERE event_type = 'RESOLVED_REFUND'`);
+      expect(updated.length).toBe(1);
+      expect(updated[0].event_type).toBe('RESOLVED_REFUND');
+    });
+
+    test("92.7 Complete Multi-Table Schema Dump Simulation", async () => {
+      const dumpScript = `
+        CREATE TABLE IF NOT EXISTS "dump_departments" (
+          "dept_id" SERIAL NOT NULL,
+          "dept_name" character varying(100) NOT NULL,
+          "code" USER-DEFINED NOT NULL,
+          CONSTRAINT "pk_dump_departments" PRIMARY KEY ("dept_id")
+        );
+
+        CREATE TABLE IF NOT EXISTS "dump_employees" (
+          "emp_id" SERIAL NOT NULL,
+          "dept_id" integer NOT NULL,
+          "employment_type" USER-DEFINED DEFAULT 'FULL_TIME' NOT NULL,
+          "salary" numeric(12, 2) DEFAULT 0.00,
+          "joined_at" timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+          CONSTRAINT "pk_dump_employees" PRIMARY KEY ("emp_id"),
+          CONSTRAINT "fk_dump_employees_dept" FOREIGN KEY ("dept_id") REFERENCES "dump_departments" ("dept_id") ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS "dump_timesheets" (
+          "id" SERIAL NOT NULL,
+          "emp_id" integer NOT NULL,
+          "status" USER-DEFINED DEFAULT 'SUBMITTED' NOT NULL,
+          "hours_logged" integer DEFAULT 8 NOT NULL,
+          CONSTRAINT "pk_dump_timesheets" PRIMARY KEY ("id"),
+          CONSTRAINT "fk_dump_timesheets_emp" FOREIGN KEY ("emp_id") REFERENCES "dump_employees" ("emp_id") ON DELETE CASCADE
+        );
+      `;
+
+      const res = await db.exec(dumpScript);
+      expect(Array.isArray(res) ? res.every((r: any) => r.success) : res.success).toBe(true);
+
+      // Insert cross-table data
+      await db.exec(`INSERT INTO dump_departments (dept_name, code) VALUES ('Engineering', 'ENG')`);
+      await db.exec(`INSERT INTO dump_employees (dept_id, employment_type, salary) VALUES (1, 'FULL_TIME', 75000.00)`);
+      await db.exec(`INSERT INTO dump_timesheets (emp_id, status, hours_logged) VALUES (1, 'APPROVED', 40)`);
+
+      // Query JOIN with USER-DEFINED columns across multiple tables
+      const rows = await db.query(`
+        SELECT 
+          d.dept_name,
+          d.code as dept_code,
+          e.employment_type,
+          e.salary,
+          t.status as timesheet_status,
+          t.hours_logged
+        FROM dump_departments d
+        JOIN dump_employees e ON e.dept_id = d.dept_id
+        JOIN dump_timesheets t ON t.emp_id = e.emp_id
+        WHERE d.code = 'ENG' AND t.status = 'APPROVED';
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].dept_name).toBe('Engineering');
+      expect(rows[0].dept_code).toBe('ENG');
+      expect(rows[0].employment_type).toBe('FULL_TIME');
+      expect(rows[0].timesheet_status).toBe('APPROVED');
+      expect(rows[0].hours_logged).toBe(40);
+    });
+
+    test("92.8 Transaction Rollback & Commit with USER-DEFINED types", async () => {
+      await db.exec(`CREATE TABLE test_tx_custom (id SERIAL PRIMARY KEY, tag USER-DEFINED)`);
+
+      // Transaction that commits
+      await db.exec(`
+        BEGIN;
+        INSERT INTO test_tx_custom (tag) VALUES ('TX_COMMITTED_1');
+        INSERT INTO test_tx_custom (tag) VALUES ('TX_COMMITTED_2');
+        COMMIT;
+      `);
+
+      let rows = await db.query(`SELECT * FROM test_tx_custom ORDER BY id ASC`);
+      expect(rows.length).toBe(2);
+      expect(rows[0].tag).toBe('TX_COMMITTED_1');
+      expect(rows[1].tag).toBe('TX_COMMITTED_2');
+
+      // Transaction that rolls back
+      await db.exec(`
+        BEGIN;
+        INSERT INTO test_tx_custom (tag) VALUES ('TX_ROLLED_BACK');
+        ROLLBACK;
+      `);
+
+      rows = await db.query(`SELECT * FROM test_tx_custom ORDER BY id ASC`);
+      expect(rows.length).toBe(2); // Still 2 rows, rollback worked cleanly
+    });
+  });
 });
