@@ -1,7 +1,7 @@
 import { Lexer } from './parser/lexer';
 import { Parser } from './parser/parser';
 import { Executor } from './execution/executor';
-import { StorageEngine, MemoryFSAdapter, type VFS } from './storage/engine';
+import { StorageEngine, MemoryFSAdapter, LRUCache, type VFS } from './storage/engine';
 import { Statement } from './ast';
 
 export interface QueryResult<R = any> {
@@ -32,7 +32,7 @@ export class FileMutex {
 
 export class LitePostgres {
   private static readonly executor = new Executor();
-  private static readonly astCache = new Map<string, Statement[]>();
+  private static readonly astCache = new LRUCache<string, Statement[]>(1000);
   private storage: StorageEngine;
 
   private defaultDb: string;
@@ -40,6 +40,28 @@ export class LitePostgres {
   private destroyOnClose: boolean;
   private txRelease?: () => void;
   private queue = Promise.resolve();
+  private queueDepth = 0;
+
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    this.queueDepth++;
+    return new Promise<T>((resolve, reject) => {
+      this.queue = this.queue
+        .then(async () => {
+          try {
+            resolve(await task());
+          } catch (e) {
+            reject(e);
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          this.queueDepth--;
+          if (this.queueDepth === 0) {
+            this.queue = Promise.resolve();
+          }
+        });
+    });
+  }
 
   constructor(filepath: string, options: { database?: string, adapter?: VFS, destroyOnClose?: boolean } = {}) {
     this.defaultDb = options.database || 'postgres';
@@ -71,15 +93,7 @@ export class LitePostgres {
       actualParams = params;
     }
 
-    return new Promise((resolve, reject) => {
-      this.queue = this.queue.then(async () => {
-        try {
-          resolve(await this.run(sql, actualParams, actualDbName || this.defaultDb));
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
+    return this.enqueue(() => this.run(sql, actualParams, actualDbName || this.defaultDb));
   }
 
   /**
@@ -135,15 +149,9 @@ export class LitePostgres {
       actualParams = params;
     }
 
-    return new Promise((resolve, reject) => {
-      this.queue = this.queue.then(async () => {
-        try {
-          const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
-          resolve(this.formatQueryResult<T>(sql, result));
-        } catch (e) {
-          reject(e);
-        }
-      });
+    return this.enqueue(async () => {
+      const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
+      return this.formatQueryResult<T>(sql, result);
     });
   }
 
@@ -159,19 +167,13 @@ export class LitePostgres {
       actualParams = params;
     }
 
-    return new Promise((resolve, reject) => {
-      this.queue = this.queue.then(async () => {
-        try {
-          const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
-          if (result && Array.isArray(result.rows) && result.fields) {
-             resolve(result.rows);
-          } else {
-             resolve(Array.isArray(result) ? result :[]);
-          }
-        } catch (e) {
-          reject(e);
-        }
-      });
+    return this.enqueue(async () => {
+      const result = await this.run(sql, actualParams, actualDbName || this.defaultDb);
+      if (result && Array.isArray(result.rows) && result.fields) {
+        return result.rows;
+      } else {
+        return Array.isArray(result) ? result : [];
+      }
     });
   }
 
@@ -278,19 +280,12 @@ export class LitePostgres {
    * Explicitly release resources. Crucial for handling 1M+ database instances.
    */
   public async close(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.queue = this.queue.then(async () => {
-        try {
-          if (this.destroyOnClose) {
-            await this.storage.destroy();
-          } else {
-            await this.storage.close();
-          }
-          resolve();
-        } catch (e) {
-          reject(e);
-        }
-      });
+    return this.enqueue(async () => {
+      if (this.destroyOnClose) {
+        await this.storage.destroy();
+      } else {
+        await this.storage.close();
+      }
     });
   }
 
@@ -298,15 +293,8 @@ export class LitePostgres {
    * Explicitly destroy the database files.
    */
   public async destroy(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.queue = this.queue.then(async () => {
-        try {
-          await this.storage.destroy();
-          resolve();
-        } catch (e) {
-          reject(e);
-        }
-      });
+    return this.enqueue(async () => {
+      await this.storage.destroy();
     });
   }
 

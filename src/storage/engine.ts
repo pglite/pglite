@@ -296,7 +296,7 @@ class FileHandlePool {
   }
 }
 
-class LRUCache<K, V> {
+export class LRUCache<K, V> {
   private cache = new Map<K, V>();
   constructor(private capacity: number) {}
   get(key: K): V | undefined {
@@ -322,6 +322,16 @@ class LRUCache<K, V> {
   }
   clear(): void {
     this.cache.clear();
+  }
+  get size(): number {
+    return this.cache.size;
+  }
+  deletePrefix(prefix: string): void {
+    for (const k of this.cache.keys()) {
+      if (typeof k === "string" && k.startsWith(prefix)) {
+        this.cache.delete(k);
+      }
+    }
   }
 }
 
@@ -586,14 +596,21 @@ class Pager {
       (a, b) => a - b,
     );
 
-    const walPages = sortedPageIds.map((pageId) => ({
-      pageId,
-      data: this.dirtyPages.get(pageId)!,
-    }));
-    await this.wal.logBatch(walPages);
+    // Log to WAL in chunks to avoid allocating huge object wrapper arrays
+    const WAL_CHUNK = 256;
+    for (let idx = 0; idx < sortedPageIds.length; idx += WAL_CHUNK) {
+      const slice = sortedPageIds.slice(idx, idx + WAL_CHUNK);
+      const walPages = [];
+      for (const pid of slice) {
+        const d = this.dirtyPages.get(pid);
+        if (d) walPages.push({ pageId: pid, data: d });
+      }
+      await this.wal.logBatch(walPages);
+    }
     await this.wal.flush();
 
     let i = 0;
+    const MAX_CHUNK_PAGES = 256; // Max 1MB contiguous buffer per write chunk
     while (i < sortedPageIds.length) {
       let j = i;
       while (
@@ -603,33 +620,37 @@ class Pager {
         j++;
       }
 
-      const startPageId = sortedPageIds[i]!;
-      const count = j - i + 1;
+      let curr = i;
+      while (curr <= j) {
+        const chunkCount = Math.min(MAX_CHUNK_PAGES, j - curr + 1);
+        const startPageId = sortedPageIds[curr]!;
 
-      if (count === 1) {
-        const data = this.dirtyPages.get(startPageId);
-        if (data) {
-          await this.handle!.write(data, 0, PAGE_SIZE, startPageId * PAGE_SIZE);
-        }
-      } else {
-        const batchBuffer = Buffer.allocUnsafe(count * PAGE_SIZE);
-        let actualCount = 0;
-        for (let k = 0; k < count; k++) {
-          const pid = sortedPageIds[i + k]!;
-          const data = this.dirtyPages.get(pid);
+        if (chunkCount === 1) {
+          const data = this.dirtyPages.get(startPageId);
           if (data) {
-            data.copy(batchBuffer, actualCount * PAGE_SIZE);
-            actualCount++;
+            await this.handle!.write(data, 0, PAGE_SIZE, startPageId * PAGE_SIZE);
+          }
+        } else {
+          const batchBuffer = Buffer.allocUnsafe(chunkCount * PAGE_SIZE);
+          let actualCount = 0;
+          for (let k = 0; k < chunkCount; k++) {
+            const pid = sortedPageIds[curr + k]!;
+            const data = this.dirtyPages.get(pid);
+            if (data) {
+              data.copy(batchBuffer, actualCount * PAGE_SIZE);
+              actualCount++;
+            }
+          }
+          if (actualCount > 0) {
+            await this.handle!.write(
+              batchBuffer,
+              0,
+              actualCount * PAGE_SIZE,
+              startPageId * PAGE_SIZE,
+            );
           }
         }
-        if (actualCount > 0) {
-          await this.handle!.write(
-            batchBuffer,
-            0,
-            actualCount * PAGE_SIZE,
-            startPageId * PAGE_SIZE,
-          );
-        }
+        curr += chunkCount;
       }
       i = j + 1;
     }
@@ -4044,10 +4065,25 @@ export class StorageEngine {
   }
 
   public async close(): Promise<void> {
+    this.cleanStaticCaches();
     await this.pager.close();
   }
 
   public async destroy(): Promise<void> {
+    this.cleanStaticCaches();
     await this.pager.destroy();
+  }
+
+  private cleanStaticCaches(): void {
+    const prefix = `${this.filepath}:`;
+    StorageEngine.tableCache.deletePrefix(prefix);
+    StorageEngine.pkIndexes.deletePrefix(prefix);
+    StorageEngine.dbMetaCache.deletePrefix(prefix);
+    for (const k of StorageEngine.schemaCache.keys()) {
+      if (k.startsWith(prefix)) StorageEngine.schemaCache.delete(k);
+    }
+    for (const k of StorageEngine.descriptionCache.keys()) {
+      if (k.startsWith(prefix)) StorageEngine.descriptionCache.delete(k);
+    }
   }
 }

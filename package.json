@@ -44,6 +44,7 @@
     "prompt": "bun run scripts/prompt_maker.ts",
     "test": "bun test",
     "benchmark": "bun run scripts/benchmark.ts",
+    "benchmark-ram": "bun run scripts/benchmark_ram_perf.ts",
     "benchmark-sqlite": "bun run scripts/bun-sqlite-benchmark.ts",
     "publish": "bun publish --access public"
   },

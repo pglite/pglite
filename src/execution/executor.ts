@@ -776,7 +776,9 @@ export class Executor {
 
         const insertedRecords = [];
         const returningRecords = [];
+        let insertedCount = 0;
         let schemaUpdated = false;
+        const verifiedFKs = new Set<string>();
 
         let insertRows: any[] = [];
 
@@ -939,8 +941,7 @@ export class Executor {
                   stmt.tableName,
                   record[col.name],
                 );
-              }
-              if (!existing) {
+              } else if (col.isUnique) {
                 for await (const r of storage.scanRows(stmt.tableName)) {
                   if (r[col.name] == record[col.name]) {
                     existing = r;
@@ -1027,23 +1028,27 @@ export class Executor {
               record[col.name] !== undefined &&
               record[col.name] !== null
             ) {
-              let exists = false;
-              // Optimization: Use O(log N) index lookup if referenced column is the Primary Key
-              const refPK = await storage.getPKColumn(col.references.table);
-              if (refPK === col.references.column) {
-                const refRow = await storage.getRowByPK(
-                  col.references.table,
-                  record[col.name],
-                );
-                if (refRow) exists = true;
-              }
+              const fkKey = `${col.references.table}:${col.references.column}:${record[col.name]}`;
+              let exists = verifiedFKs.has(fkKey);
               if (!exists) {
-                for await (const r of storage.scanRows(col.references.table)) {
-                  if (r[col.references.column] == record[col.name]) {
-                    exists = true;
-                    break;
+                // Optimization: Use O(log N) index lookup if referenced column is the Primary Key
+                const refPK = await storage.getPKColumn(col.references.table);
+                if (refPK === col.references.column) {
+                  const refRow = await storage.getRowByPK(
+                    col.references.table,
+                    record[col.name],
+                  );
+                  if (refRow) exists = true;
+                }
+                if (!exists) {
+                  for await (const r of storage.scanRows(col.references.table)) {
+                    if (r[col.references.column] == record[col.name]) {
+                      exists = true;
+                      break;
+                    }
                   }
                 }
+                if (exists) verifiedFKs.add(fkKey);
               }
               if (!exists) {
                 const errorDetails = [
@@ -1061,7 +1066,10 @@ export class Executor {
           endBenchmarks("constraint_checks");
 
           await storage.insertRow(stmt.tableName, record);
-          insertedRecords.push(record);
+          insertedCount++;
+          if (stmt.returning || insertedRecords.length < 500) {
+            insertedRecords.push(record);
+          }
 
           startBenchmarks();
           if (stmt.returning) {
@@ -1078,7 +1086,7 @@ export class Executor {
         if (stmt.returning) return returningRecords;
 
         if (
-          insertedRecords.length === 0 &&
+          insertedCount === 0 &&
           stmt.onConflict?.action === "NOTHING"
         ) {
           return { success: true, conflict: "nothing" };
@@ -1087,7 +1095,10 @@ export class Executor {
         return {
           success: true,
           inserted:
-            insertedRecords.length === 1 ? insertedRecords[0] : insertedRecords,
+            insertedCount === 1 
+              ? insertedRecords[0] 
+              : (insertedCount <= 500 ? insertedRecords : insertedCount),
+          rowCount: insertedCount,
         };
       }
 
