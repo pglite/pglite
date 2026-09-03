@@ -80,10 +80,20 @@ impl Executor {
         };
 
         let mut table_name = name_part.trim();
-        if table_name.to_uppercase().starts_with("IF NOT EXISTS ") {
+        let if_not_exists = table_name.to_uppercase().starts_with("IF NOT EXISTS ");
+        if if_not_exists {
             table_name = table_name[14..].trim();
         }
         let table_name = table_name.trim_matches('"').to_string();
+
+        if if_not_exists && self.storage.get_table(&table_name).is_some() {
+            return Ok(QueryResult {
+                rows: vec![],
+                row_count: 0,
+                fields: vec![],
+                command: "CREATE TABLE".to_string(),
+            });
+        }
 
         let mut columns = Vec::new();
         for col_def_str in body_part.split(',') {

@@ -79,7 +79,9 @@ export class PGLiteNative {
         let db = typeof params === "string" ? params : dbName;
         const res = this.nativeInstance.exec(sql, p, db) as T;
         const upper = sql.trim().toUpperCase();
-        if (!upper.startsWith("SELECT")) {
+        if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
+          await this.getJsEngine().exec<T>(sql, params, dbName);
+        } else if (!upper.startsWith("SELECT")) {
           this.getJsEngine().exec<T>(sql, params, dbName).catch(() => {});
         }
         return res;
@@ -98,7 +100,9 @@ export class PGLiteNative {
         let db = typeof params === "string" ? params : dbName;
         const res = this.nativeInstance.exec2(sql, p, db) as QueryResult<T>;
         const upper = sql.trim().toUpperCase();
-        if (!upper.startsWith("SELECT")) {
+        if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
+          await this.getJsEngine().exec2<T>(sql, params, dbName);
+        } else if (!upper.startsWith("SELECT")) {
           this.getJsEngine().exec2<T>(sql, params, dbName).catch(() => {});
         }
         return res;
