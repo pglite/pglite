@@ -58,11 +58,26 @@ export class PGLiteNative {
       this.nativeInstance.exec(createSql);
 
       if (res.rows && res.rows.length > 0) {
-        for (const row of res.rows) {
-          const cols = Object.keys(row).map(c => `"${c}"`).join(", ");
-          const placeholders = Object.keys(row).map((_, idx) => `$${idx + 1}`).join(", ");
-          const vals = Object.values(row);
-          this.nativeInstance.query(`INSERT INTO "${tableName}" (${cols}) VALUES (${placeholders})`, vals);
+        const colNames = res.fields.map((f: any) => f.name);
+        const colsList = colNames.map(c => `"${c}"`).join(", ");
+        const CHUNK_SIZE = 50;
+
+        for (let i = 0; i < res.rows.length; i += CHUNK_SIZE) {
+          const chunk = res.rows.slice(i, i + CHUNK_SIZE);
+          const valueClauses: string[] = [];
+          const allVals: any[] = [];
+
+          for (let r = 0; r < chunk.length; r++) {
+            const row = chunk[r];
+            const placeholders: string[] = [];
+            for (let c = 0; c < colNames.length; c++) {
+              allVals.push(row[colNames[c]]);
+              placeholders.push(`$${allVals.length}`);
+            }
+            valueClauses.push(`(${placeholders.join(", ")})`);
+          }
+
+          this.nativeInstance.query(`INSERT INTO "${tableName}" (${colsList}) VALUES ${valueClauses.join(", ")}`, allVals);
         }
       }
 
