@@ -5535,8 +5535,36 @@ export class Executor {
           return args[0] != null ? String(args[0]).toLowerCase() : null;
         if (fnName === "LENGTH")
           return args[0] != null ? String(args[0]).length : null;
-        if (fnName === "TRIM")
-          return args[0] != null ? String(args[0]).trim() : null;
+        if (fnName === "TRIM" || fnName === "BTRIM") {
+          if (args[0] == null) return null;
+          const s = String(args[0]);
+          if (args[1] != null) {
+            const chars = String(args[1]);
+            const escaped = chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return s.replace(new RegExp(`^[${escaped}]+|[${escaped}]+$`, "g"), "");
+          }
+          return s.trim();
+        }
+        if (fnName === "LTRIM") {
+          if (args[0] == null) return null;
+          const s = String(args[0]);
+          if (args[1] != null) {
+            const chars = String(args[1]);
+            const escaped = chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return s.replace(new RegExp(`^[${escaped}]+`, "g"), "");
+          }
+          return s.trimStart();
+        }
+        if (fnName === "RTRIM") {
+          if (args[0] == null) return null;
+          const s = String(args[0]);
+          if (args[1] != null) {
+            const chars = String(args[1]);
+            const escaped = chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return s.replace(new RegExp(`[${escaped}]+$`, "g"), "");
+          }
+          return s.trimEnd();
+        }
         if (fnName === "REPLACE") {
           if (args[0] == null || args[1] == null || args[2] == null)
             return args[0];
@@ -6466,8 +6494,36 @@ export class Executor {
           return args[0] != null ? String(args[0]).toLowerCase() : null;
         if (fnName === "LENGTH")
           return args[0] != null ? String(args[0]).length : null;
-        if (fnName === "TRIM")
-          return args[0] != null ? String(args[0]).trim() : null;
+        if (fnName === "TRIM" || fnName === "BTRIM") {
+          if (args[0] == null) return null;
+          const s = String(args[0]);
+          if (args[1] != null) {
+            const chars = String(args[1]);
+            const escaped = chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return s.replace(new RegExp(`^[${escaped}]+|[${escaped}]+$`, "g"), "");
+          }
+          return s.trim();
+        }
+        if (fnName === "LTRIM") {
+          if (args[0] == null) return null;
+          const s = String(args[0]);
+          if (args[1] != null) {
+            const chars = String(args[1]);
+            const escaped = chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return s.replace(new RegExp(`^[${escaped}]+`, "g"), "");
+          }
+          return s.trimStart();
+        }
+        if (fnName === "RTRIM") {
+          if (args[0] == null) return null;
+          const s = String(args[0]);
+          if (args[1] != null) {
+            const chars = String(args[1]);
+            const escaped = chars.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return s.replace(new RegExp(`[${escaped}]+$`, "g"), "");
+          }
+          return s.trimEnd();
+        }
         if (fnName === "REPLACE") {
           if (args[0] == null || args[1] == null || args[2] == null)
             return args[0];
