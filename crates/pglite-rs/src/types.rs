@@ -54,6 +54,59 @@ impl Value {
         }
     }
 
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            Value::Text(s) => s.parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn is_equal(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => (a - b).abs() <= 1e-6,
+            (Value::Int(a), Value::Float(b)) => (*a as f64 - b).abs() <= 1e-6,
+            (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() <= 1e-6,
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Int(a), Value::Text(b)) | (Value::Text(b), Value::Int(a)) => {
+                if let Ok(i) = b.parse::<i64>() {
+                    *a == i
+                } else if let Ok(f) = b.parse::<f64>() {
+                    (*a as f64 - f).abs() <= 1e-6
+                } else {
+                    false
+                }
+            }
+            (Value::Float(a), Value::Text(b)) | (Value::Text(b), Value::Float(a)) => {
+                if let Ok(f) = b.parse::<f64>() {
+                    (*a - f).abs() <= 1e-6
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub fn cmp_value(&self, other: &Value) -> std::cmp::Ordering {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            (Value::Null, _) => std::cmp::Ordering::Less,
+            (_, Value::Null) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
     pub fn as_str(&self) -> String {
         match self {
             Value::Null => "null".to_string(),

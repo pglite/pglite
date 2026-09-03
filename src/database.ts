@@ -78,7 +78,20 @@ export class LitePostgres {
         // Cấp phát filepath duy nhất để tránh xung đột cache (DB cách ly hoàn toàn)
         actualFilepath = `:memory:${Date.now()}_${Math.random()}`;
       } else {
-        throw new Error("A VFS adapter must be provided. For Node.js, use NodeFSAdapter from '@pglite/core/node-fs'.");
+        if (typeof process !== 'undefined' && process?.versions?.node) {
+          try {
+            const { NodeFSAdapter } = require('./adapters/node');
+            adapter = new NodeFSAdapter();
+          } catch {
+            try {
+              const { NodeFSAdapter } = require('./adapters/node.js');
+              adapter = new NodeFSAdapter();
+            } catch {}
+          }
+        }
+        if (!adapter) {
+          throw new Error("A VFS adapter must be provided. For Node.js, use NodeFSAdapter from '@pglite/core/node-fs'.");
+        }
       }
     }
     this.storage = new StorageEngine(adapter, actualFilepath);

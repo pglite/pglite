@@ -13,7 +13,7 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let trimmed = sql.trim();
+        let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_uppercase();
 
         if upper.starts_with("BEGIN") {
@@ -268,126 +268,162 @@ impl Executor {
         let select_clause = sql[6..from_idx].trim();
         let after_from = sql[from_idx + 4..].trim();
 
-        let (table_name, where_clause) = if let Some(w_idx) = after_from.to_uppercase().find("WHERE") {
-            let tname = after_from[..w_idx].trim().trim_matches('"');
-            let wclause = after_from[w_idx + 5..].trim();
-            (tname, Some(wclause))
-        } else {
-            (after_from.trim().trim_matches('"'), None)
-        };
+        let clauses = parse_select_clauses(after_from);
+        let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
 
-        let table = self.storage.get_table(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+        // 1. Check if SELECT has aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+        let agg_specs = parse_aggregations(select_clause, table);
 
-        // 1. Check if it's a COUNT(*) query
-        let is_count_star = select_clause.to_uppercase().contains("COUNT(*)");
-
-        if is_count_star {
-            if where_clause.is_none() {
-                // Instant O(1) count
-                let total = table.count();
-                let alias = if let Some(as_idx) = select_clause.to_uppercase().find("AS") {
-                    select_clause[as_idx + 2..].trim().to_string()
-                } else {
-                    "count".to_string()
-                };
-
-                return Ok(QueryResult {
-                    rows: vec![json!({ alias.clone(): total })],
-                    row_count: 1,
-                    fields: vec![FieldInfo { name: alias, data_type: "int8".to_string() }],
-                    command: "SELECT".to_string(),
-                });
-            } else {
-                // Filtered scan: COUNT(*) WHERE ...
-                let w = where_clause.unwrap();
-                let count = self.execute_filtered_count(table, w, params)?;
-                let alias = if let Some(as_idx) = select_clause.to_uppercase().find("AS") {
-                    select_clause[as_idx + 2..].trim().to_string()
-                } else {
-                    "count".to_string()
-                };
-
-                return Ok(QueryResult {
-                    rows: vec![json!({ alias.clone(): count })],
-                    row_count: 1,
-                    fields: vec![FieldInfo { name: alias, data_type: "int8".to_string() }],
-                    command: "SELECT".to_string(),
-                });
-            }
+        if !agg_specs.is_empty() {
+            return self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params);
         }
 
-        // 2. Point lookup by Primary Key: WHERE id = $1 or id = 500000
-        if let Some(w) = where_clause {
-            if let Some(pk_idx) = table.pk_col_idx {
-                let pk_col_name = &table.columns[pk_idx].name;
-                let w_upper = w.to_uppercase();
-                if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
-                   w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
-                   w_upper.starts_with("ID =") {
-                    let val_part = w.split('=').nth(1).unwrap().trim();
-                    let target_id = if val_part.starts_with('$') {
-                        let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
-                        params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
-                    } else {
-                        val_part.parse::<i64>().unwrap_or(0)
-                    };
+        // 2. Fast-Path: Point lookup by Primary Key (WHERE id = $1 or WHERE id = 123)
+        if let Some(w) = clauses.where_clause {
+            let w_upper = w.to_uppercase();
+            if clauses.order_by_col.is_none() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
+                if let Some(pk_idx) = table.pk_col_idx {
+                    let pk_col_name = &table.columns[pk_idx].name;
+                    if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
+                       w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
+                       w_upper.starts_with("ID =") {
+                        let val_part = w.split('=').nth(1).unwrap().trim();
+                        let target_id = if val_part.starts_with('$') {
+                            let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
+                            params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
+                        } else {
+                            val_part.parse::<i64>().unwrap_or(0)
+                        };
 
-                    if let Some(row) = table.get_by_pk(target_id) {
-                        let mut row_map = serde_json::Map::new();
-                        for (i, col) in table.columns.iter().enumerate() {
-                            let json_val = match &row[i] {
-                                Value::Null => serde_json::Value::Null,
-                                Value::Bool(b) => json!(b),
-                                Value::Int(iv) => json!(iv),
-                                Value::Float(fv) => json!(fv),
-                                Value::Text(s) => json!(s),
-                            };
-                            row_map.insert(col.name.clone(), json_val);
+                        if let Some(row) = table.get_by_pk(target_id) {
+                            return Ok(QueryResult {
+                                rows: vec![row_to_json(table, row)],
+                                row_count: 1,
+                                fields: table.columns.iter().map(|c| FieldInfo {
+                                    name: c.name.clone(),
+                                    data_type: format!("{:?}", c.data_type).to_lowercase(),
+                                }).collect(),
+                                command: "SELECT".to_string(),
+                            });
+                        } else {
+                            return Ok(QueryResult {
+                                rows: vec![],
+                                row_count: 0,
+                                fields: vec![],
+                                command: "SELECT".to_string(),
+                            });
                         }
-
-                        return Ok(QueryResult {
-                            rows: vec![serde_json::Value::Object(row_map)],
-                            row_count: 1,
-                            fields: table.columns.iter().map(|c| FieldInfo {
-                                name: c.name.clone(),
-                                data_type: format!("{:?}", c.data_type).to_lowercase(),
-                            }).collect(),
-                            command: "SELECT".to_string(),
-                        });
-                    } else {
-                        return Ok(QueryResult {
-                            rows: vec![],
-                            row_count: 0,
-                            fields: vec![],
-                            command: "SELECT".to_string(),
-                        });
                     }
                 }
             }
         }
 
-        // 3. Fallback standard scan (limit up to 100 for safety)
-        let mut rows = Vec::new();
-        for (idx, is_del) in table.is_deleted.iter().enumerate() {
-            if !*is_del {
-                let row = &table.rows[idx];
-                let mut row_map = serde_json::Map::new();
-                for (i, col) in table.columns.iter().enumerate() {
-                    let json_val = match &row[i] {
-                        Value::Null => serde_json::Value::Null,
-                        Value::Bool(b) => json!(b),
-                        Value::Int(iv) => json!(iv),
-                        Value::Float(fv) => json!(fv),
-                        Value::Text(s) => json!(s),
-                    };
-                    row_map.insert(col.name.clone(), json_val);
-                }
-                rows.push(serde_json::Value::Object(row_map));
-                if rows.len() >= 1000 {
-                    break;
+        // 3. Fast-Path: Non-PK exact string lookup (WHERE name = $1 or WHERE name = '...')
+        if let Some(w) = clauses.where_clause {
+            if clauses.order_by_col.is_none() && clauses.limit.is_none() {
+                if let Some(eq_idx) = w.find('=') {
+                    let left = w[..eq_idx].trim().trim_matches('"');
+                    let right = w[eq_idx + 1..].trim();
+                    if !right.contains("AND") && !right.contains("OR") {
+                        if let Some(col_idx) = table.get_column_index(left) {
+                            let target_val = if right.starts_with('$') {
+                                let p_idx = right[1..].parse::<usize>().unwrap_or(1);
+                                params.get(p_idx - 1).cloned().unwrap_or(Value::Null)
+                            } else if right.starts_with('\'') && right.ends_with('\'') {
+                                Value::Text(right[1..right.len() - 1].to_string())
+                            } else {
+                                Value::Text(right.to_string())
+                            };
+
+                            if let Some(row) = table.find_first_by_col(col_idx, &target_val) {
+                                return Ok(QueryResult {
+                                    rows: vec![row_to_json(table, row)],
+                                    row_count: 1,
+                                    fields: table.columns.iter().map(|c| FieldInfo {
+                                        name: c.name.clone(),
+                                        data_type: format!("{:?}", c.data_type).to_lowercase(),
+                                    }).collect(),
+                                    command: "SELECT".to_string(),
+                                });
+                            } else {
+                                return Ok(QueryResult {
+                                    rows: vec![],
+                                    row_count: 0,
+                                    fields: vec![],
+                                    command: "SELECT".to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        // 4. General Scan with WHERE condition filtering
+        let conditions = match clauses.where_clause {
+            Some(w) => parse_conditions(w, table, params)?,
+            None => Vec::new(),
+        };
+
+        let total_rows = table.rows.len();
+        let mut matched_indices: Vec<usize> = if conditions.is_empty() {
+            (0..total_rows)
+                .into_par_iter()
+                .filter(|&i| !table.is_deleted[i])
+                .collect()
+        } else if total_rows > 20_000 {
+            (0..total_rows)
+                .into_par_iter()
+                .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                .collect()
+        } else {
+            (0..total_rows)
+                .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                .collect()
+        };
+
+        // 5. ORDER BY sorting
+        if let Some(order_col) = clauses.order_by_col {
+            if let Some(col_idx) = table.get_column_index(order_col) {
+                let desc = clauses.order_by_desc;
+                if matched_indices.len() > 10_000 {
+                    matched_indices.par_sort_by(|&a, &b| {
+                        let va = &table.rows[a][col_idx];
+                        let vb = &table.rows[b][col_idx];
+                        if desc {
+                            vb.cmp_value(va)
+                        } else {
+                            va.cmp_value(vb)
+                        }
+                    });
+                } else {
+                    matched_indices.sort_by(|&a, &b| {
+                        let va = &table.rows[a][col_idx];
+                        let vb = &table.rows[b][col_idx];
+                        if desc {
+                            vb.cmp_value(va)
+                        } else {
+                            va.cmp_value(vb)
+                        }
+                    });
+                }
+            }
+        }
+
+        // 6. OFFSET and LIMIT pagination
+        let offset = clauses.offset;
+        let limit = clauses.limit.unwrap_or(1000);
+        let paged_indices = if offset < matched_indices.len() {
+            let end = (offset + limit).min(matched_indices.len());
+            &matched_indices[offset..end]
+        } else {
+            &[]
+        };
+
+        let rows: Vec<serde_json::Value> = paged_indices
+            .iter()
+            .map(|&idx| row_to_json(table, &table.rows[idx]))
+            .collect();
 
         Ok(QueryResult {
             row_count: rows.len(),
@@ -400,130 +436,769 @@ impl Executor {
         })
     }
 
-    fn execute_filtered_count(&self, table: &crate::storage::table::Table, _where_clause: &str, _params: &[Value]) -> Result<usize, String> {
-        // Fast optimized scan for common patterns like: "active = true AND age > 50"
-        let active_col_idx = table.get_column_index("active");
-        let age_col_idx = table.get_column_index("age");
+    fn handle_aggregate_query(
+        &self,
+        table: &crate::storage::table::Table,
+        agg_specs: &[AggSpec],
+        where_clause: Option<&str>,
+        params: &[Value],
+    ) -> Result<QueryResult, String> {
+        let mut row_map = serde_json::Map::new();
+        let mut fields = Vec::new();
 
-        if let (Some(act_idx), Some(age_idx)) = (active_col_idx, age_col_idx) {
-            let total_rows = table.rows.len();
-            if total_rows > 50_000 {
-                // Vectorized parallel scan with Rayon
-                let count = (0..total_rows)
-                    .into_par_iter()
-                    .filter(|&i| {
-                        if table.is_deleted[i] {
-                            return false;
-                        }
-                        let row = &table.rows[i];
-                        let is_active = row.get(act_idx).and_then(|v| v.as_bool()).unwrap_or(false);
-                        let age = row.get(age_idx).and_then(|v| v.as_i64()).unwrap_or(0);
-                        is_active && age > 50
-                    })
-                    .count();
-                return Ok(count);
-            } else {
-                let mut count = 0;
-                for i in 0..total_rows {
-                    if !table.is_deleted[i] {
-                        let row = &table.rows[i];
-                        let is_active = row.get(act_idx).and_then(|v| v.as_bool()).unwrap_or(false);
-                        let age = row.get(age_idx).and_then(|v| v.as_i64()).unwrap_or(0);
-                        if is_active && age > 50 {
-                            count += 1;
-                        }
+        if where_clause.is_none() {
+            // Unconditional aggregate fast path
+            for spec in agg_specs {
+                match &spec.func {
+                    AggFunc::CountStar => {
+                        let count = table.count();
+                        row_map.insert(spec.alias.clone(), json!(count));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::Sum(col_idx) => {
+                        let (sum, _, _, _, _) = table.aggregate_stats(*col_idx);
+                        row_map.insert(spec.alias.clone(), json!(sum));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::Avg(col_idx) => {
+                        let (_, avg, _, _, _) = table.aggregate_stats(*col_idx);
+                        row_map.insert(spec.alias.clone(), json!(avg));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "float8".to_string() });
+                    }
+                    AggFunc::Min(col_idx) => {
+                        let (_, _, min, _, _) = table.aggregate_stats(*col_idx);
+                        row_map.insert(spec.alias.clone(), json!(min));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::Max(col_idx) => {
+                        let (_, _, _, max, _) = table.aggregate_stats(*col_idx);
+                        row_map.insert(spec.alias.clone(), json!(max));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
                     }
                 }
-                return Ok(count);
+            }
+        } else {
+            // Filtered scan aggregate
+            let conditions = parse_conditions(where_clause.unwrap(), table, params)?;
+            let total_rows = table.rows.len();
+
+            let matched_indices: Vec<usize> = if total_rows > 20_000 {
+                (0..total_rows)
+                    .into_par_iter()
+                    .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                    .collect()
+            } else {
+                (0..total_rows)
+                    .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                    .collect()
+            };
+
+            for spec in agg_specs {
+                match &spec.func {
+                    AggFunc::CountStar => {
+                        let count = matched_indices.len();
+                        row_map.insert(spec.alias.clone(), json!(count));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::Sum(col_idx) => {
+                        let sum: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).sum();
+                        row_map.insert(spec.alias.clone(), json!(sum));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::Avg(col_idx) => {
+                        let count = matched_indices.len();
+                        let sum: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).sum();
+                        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                        row_map.insert(spec.alias.clone(), json!(avg));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "float8".to_string() });
+                    }
+                    AggFunc::Min(col_idx) => {
+                        let min: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).fold(f64::INFINITY, f64::min);
+                        let final_min = if min.is_infinite() { 0.0 } else { min };
+                        row_map.insert(spec.alias.clone(), json!(final_min));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::Max(col_idx) => {
+                        let max: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).fold(f64::NEG_INFINITY, f64::max);
+                        let final_max = if max.is_infinite() { 0.0 } else { max };
+                        row_map.insert(spec.alias.clone(), json!(final_max));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                }
             }
         }
 
-        // Generic fallback scan
-        let count = table.is_deleted.iter().filter(|&&del| !del).count();
-        Ok(count)
+        Ok(QueryResult {
+            rows: vec![serde_json::Value::Object(row_map)],
+            row_count: 1,
+            fields,
+            command: "SELECT".to_string(),
+        })
     }
 
     fn handle_update(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        // e.g. UPDATE benchmark_users SET age = $1 WHERE id = $2
         let upper = sql.to_uppercase();
         let set_idx = upper.find("SET").ok_or("Missing SET in UPDATE")?;
         let where_idx = upper.find("WHERE").ok_or("Missing WHERE in UPDATE")?;
 
-        let table_name = sql[6..set_idx].trim().trim_matches('"');
+        let table_name = clean_col_name(sql[6..set_idx].trim());
         let set_clause = sql[set_idx + 3..where_idx].trim();
-        let where_clause = sql[where_idx + 5..].trim();
-
-        // Extract SET column and value
-        let set_parts: Vec<&str> = set_clause.split('=').collect();
-        let col_name = set_parts[0].trim().trim_matches('"');
-        let val_token = set_parts[1].trim();
-
-        let new_val = if val_token.starts_with('$') {
-            let p_idx = val_token[1..].parse::<usize>().unwrap_or(1);
-            params.get(p_idx - 1).cloned().unwrap_or(Value::Null)
-        } else if let Ok(num) = val_token.parse::<i64>() {
-            Value::Int(num)
+        
+        let returning_idx = upper.find(" RETURNING ");
+        let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
+            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 11..].trim()))
         } else {
-            Value::Text(val_token.trim_matches('\'').to_string())
-        };
-
-        // Extract WHERE id = $2
-        let where_parts: Vec<&str> = where_clause.split('=').collect();
-        let target_pk = if where_parts.len() > 1 {
-            let token = where_parts[1].trim();
-            if token.starts_with('$') {
-                let p_idx = token[1..].parse::<usize>().unwrap_or(2);
-                params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
-            } else {
-                token.parse::<i64>().unwrap_or(0)
-            }
-        } else {
-            0
+            (&sql[where_idx + 5..].trim(), None)
         };
 
         let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
 
-        let updated = table.update_by_pk(target_pk, col_idx, new_val);
+        // Parse multiple SET assignments: "updated_at" = CURRENT_TIMESTAMP, "student_count" = $1
+        let mut updates = Vec::new();
+        for assign in set_clause.split(',') {
+            let assign = assign.trim();
+            if assign.is_empty() {
+                continue;
+            }
+            let eq_idx = assign.find('=').ok_or("Invalid assignment in SET clause")?;
+            let col_name = clean_col_name(&assign[..eq_idx]);
+            let val_str = assign[eq_idx + 1..].trim();
+
+            let val = if val_str.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+                || val_str.eq_ignore_ascii_case("NOW()")
+                || val_str.to_uppercase().starts_with("CURRENT_TIMESTAMP")
+                || val_str.to_uppercase().starts_with("NOW()")
+            {
+                Value::Text(get_current_timestamp())
+            } else {
+                parse_value(val_str, params)
+            };
+
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found in table {}", col_name, table_name))?;
+
+            // Coerce value type according to column definition if needed
+            let col_def = &table.columns[col_idx];
+            let coerced_val = match (&col_def.data_type, &val) {
+                (crate::types::DataType::Integer | crate::types::DataType::Serial, Value::Text(s)) => {
+                    if let Ok(i) = s.parse::<i64>() {
+                        Value::Int(i)
+                    } else {
+                        val
+                    }
+                }
+                (crate::types::DataType::BigInt, Value::Text(s)) => {
+                    if let Ok(i) = s.parse::<i64>() {
+                        Value::Int(i)
+                    } else {
+                        val
+                    }
+                }
+                (crate::types::DataType::Numeric, Value::Text(s)) => {
+                    if let Ok(f) = s.parse::<f64>() {
+                        Value::Float(f)
+                    } else {
+                        val
+                    }
+                }
+                (crate::types::DataType::Boolean, Value::Text(s)) => {
+                    if s.eq_ignore_ascii_case("true") || s == "1" {
+                        Value::Bool(true)
+                    } else if s.eq_ignore_ascii_case("false") || s == "0" {
+                        Value::Bool(false)
+                    } else {
+                        val
+                    }
+                }
+                _ => val,
+            };
+
+            updates.push((col_idx, coerced_val));
+        }
+
+        // Parse WHERE conditions
+        let conditions = parse_conditions(where_clause, table, params)?;
+
+        // Check if there is a primary key equality check for O(1) point update
+        let pk_target = if let Some(pk_idx) = table.pk_col_idx {
+            conditions.iter().find_map(|c| {
+                if c.col_idx == pk_idx {
+                    if let ColOp::Eq(ref v) = c.op {
+                        return v.as_i64();
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+
+        let mut row_count = 0;
+        let mut returned_rows = Vec::new();
+        if let Some(target_pk) = pk_target {
+            if let Some(&row_idx) = table.pk_index.get(&target_pk) {
+                if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
+                    table.update_row_multi(row_idx, &updates);
+                    row_count = 1;
+                    if returning_cols.is_some() {
+                        returned_rows.push(row_to_json(table, &table.rows[row_idx]));
+                    }
+                }
+            }
+        } else {
+            // General scan update
+            for i in 0..table.rows.len() {
+                if !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions) {
+                    table.update_row_multi(i, &updates);
+                    row_count += 1;
+                    if returning_cols.is_some() {
+                        returned_rows.push(row_to_json(table, &table.rows[i]));
+                    }
+                }
+            }
+        }
+
+        let fields = if returning_cols.is_some() {
+            table.columns.iter().map(|c| FieldInfo {
+                name: c.name.clone(),
+                data_type: format!("{:?}", c.data_type).to_lowercase(),
+            }).collect()
+        } else {
+            vec![]
+        };
 
         Ok(QueryResult {
-            rows: vec![],
-            row_count: if updated { 1 } else { 0 },
-            fields: vec![],
+            rows: returned_rows,
+            row_count,
+            fields,
             command: "UPDATE".to_string(),
         })
     }
 
     fn handle_delete(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        // e.g. DELETE FROM benchmark_users WHERE id = $1
         let upper = sql.to_uppercase();
         let from_idx = upper.find("FROM").ok_or("Missing FROM in DELETE")?;
         let where_idx = upper.find("WHERE").ok_or("Missing WHERE in DELETE")?;
 
-        let table_name = sql[from_idx + 4..where_idx].trim().trim_matches('"');
-        let where_clause = sql[where_idx + 5..].trim();
-
-        let where_parts: Vec<&str> = where_clause.split('=').collect();
-        let target_pk = if where_parts.len() > 1 {
-            let token = where_parts[1].trim();
-            if token.starts_with('$') {
-                let p_idx = token[1..].parse::<usize>().unwrap_or(1);
-                params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
-            } else {
-                token.parse::<i64>().unwrap_or(0)
-            }
+        let table_name = clean_col_name(sql[from_idx + 4..where_idx].trim());
+        
+        let returning_idx = upper.find(" RETURNING ");
+        let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
+            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 11..].trim()))
         } else {
-            0
+            (&sql[where_idx + 5..].trim(), None)
         };
 
         let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-        let deleted = table.delete_by_pk(target_pk);
+        let conditions = parse_conditions(where_clause, table, params)?;
+
+        let pk_target = if let Some(pk_idx) = table.pk_col_idx {
+            conditions.iter().find_map(|c| {
+                if c.col_idx == pk_idx {
+                    if let ColOp::Eq(ref v) = c.op {
+                        return v.as_i64();
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+
+        let mut row_count = 0;
+        let mut returned_rows = Vec::new();
+        if let Some(target_pk) = pk_target {
+            if let Some(&row_idx) = table.pk_index.get(&target_pk) {
+                if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
+                    if returning_cols.is_some() {
+                        returned_rows.push(row_to_json(table, &table.rows[row_idx]));
+                    }
+                    table.delete_row(row_idx);
+                    row_count = 1;
+                }
+            }
+        } else {
+            for i in 0..table.rows.len() {
+                if !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions) {
+                    if returning_cols.is_some() {
+                        returned_rows.push(row_to_json(table, &table.rows[i]));
+                    }
+                    table.delete_row(i);
+                    row_count += 1;
+                }
+            }
+        }
+
+        let fields = if returning_cols.is_some() {
+            table.columns.iter().map(|c| FieldInfo {
+                name: c.name.clone(),
+                data_type: format!("{:?}", c.data_type).to_lowercase(),
+            }).collect()
+        } else {
+            vec![]
+        };
 
         Ok(QueryResult {
-            rows: vec![],
-            row_count: if deleted { 1 } else { 0 },
-            fields: vec![],
+            rows: returned_rows,
+            row_count,
+            fields,
             command: "DELETE".to_string(),
         })
     }
+}
+
+struct SelectClauses<'a> {
+    table_name: &'a str,
+    where_clause: Option<&'a str>,
+    order_by_col: Option<&'a str>,
+    order_by_desc: bool,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
+    let upper = after_from.to_uppercase();
+    let where_pos = upper.find("WHERE ");
+    let order_pos = upper.find("ORDER BY ");
+    let limit_pos = upper.find("LIMIT ");
+    let offset_pos = upper.find("OFFSET ");
+
+    let first_kw_pos = [where_pos, order_pos, limit_pos, offset_pos]
+        .into_iter()
+        .filter_map(|x| x)
+        .min();
+
+    let table_name = match first_kw_pos {
+        Some(pos) => after_from[..pos].trim().trim_matches('"'),
+        None => after_from.trim().trim_matches('"'),
+    };
+
+    let where_clause = where_pos.map(|w_idx| {
+        let after_w = &after_from[w_idx + 6..];
+        let upper_w = after_w.to_uppercase();
+        let end_idx = [upper_w.find("ORDER BY "), upper_w.find("LIMIT "), upper_w.find("OFFSET ")]
+            .into_iter()
+            .filter_map(|x| x)
+            .min();
+        match end_idx {
+            Some(e) => after_w[..e].trim(),
+            None => after_w.trim(),
+        }
+    });
+
+    let (order_by_col, order_by_desc) = match order_pos {
+        Some(o_idx) => {
+            let after_o = &after_from[o_idx + 9..];
+            let upper_o = after_o.to_uppercase();
+            let end_idx = [upper_o.find("LIMIT "), upper_o.find("OFFSET ")]
+                .into_iter()
+                .filter_map(|x| x)
+                .min();
+            let order_part = match end_idx {
+                Some(e) => after_o[..e].trim(),
+                None => after_o.trim(),
+            };
+            let mut parts = order_part.split_whitespace();
+            let col = parts.next().unwrap_or("").trim_matches('"');
+            let desc = parts.next().map(|s| s.eq_ignore_ascii_case("DESC")).unwrap_or(false);
+            (if col.is_empty() { None } else { Some(col) }, desc)
+        }
+        None => (None, false),
+    };
+
+    let limit = match limit_pos {
+        Some(l_idx) => {
+            let after_l = &after_from[l_idx + 6..];
+            let upper_l = after_l.to_uppercase();
+            let end_idx = upper_l.find("OFFSET ");
+            let limit_part = match end_idx {
+                Some(e) => after_l[..e].trim(),
+                None => after_l.trim(),
+            };
+            limit_part.split_whitespace().next().and_then(|s| s.parse::<usize>().ok())
+        }
+        None => None,
+    };
+
+    let offset = match offset_pos {
+        Some(off_idx) => {
+            let after_off = after_from[off_idx + 7..].trim();
+            after_off.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
+        }
+        None => 0,
+    };
+
+    SelectClauses {
+        table_name,
+        where_clause,
+        order_by_col,
+        order_by_desc,
+        limit,
+        offset,
+    }
+}
+
+#[derive(Clone, Debug)]
+enum AggFunc {
+    CountStar,
+    Sum(usize),
+    Avg(usize),
+    Min(usize),
+    Max(usize),
+}
+
+struct AggSpec {
+    func: AggFunc,
+    alias: String,
+}
+
+fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table) -> Vec<AggSpec> {
+    let mut specs = Vec::new();
+    let parts: Vec<&str> = select_clause.split(',').collect();
+
+    for part in parts {
+        let part_trim = part.trim();
+        let upper = part_trim.to_uppercase();
+
+        if upper.contains("COUNT(*)") || upper.contains("COUNT(1)") {
+            let alias = if let Some(as_idx) = upper.find(" AS ") {
+                part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
+            } else {
+                "count".to_string()
+            };
+            specs.push(AggSpec { func: AggFunc::CountStar, alias });
+        } else if let Some(sum_idx) = upper.find("SUM(") {
+            if let Some(close_p) = upper[sum_idx..].find(')') {
+                let col_name = part_trim[sum_idx + 4..sum_idx + close_p].trim().trim_matches('"');
+                let alias = if let Some(as_idx) = upper.find(" AS ") {
+                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
+                } else {
+                    "sum".to_string()
+                };
+                if let Some(col_idx) = table.get_column_index(col_name) {
+                    specs.push(AggSpec { func: AggFunc::Sum(col_idx), alias });
+                }
+            }
+        } else if let Some(avg_idx) = upper.find("AVG(") {
+            if let Some(close_p) = upper[avg_idx..].find(')') {
+                let col_name = part_trim[avg_idx + 4..avg_idx + close_p].trim().trim_matches('"');
+                let alias = if let Some(as_idx) = upper.find(" AS ") {
+                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
+                } else {
+                    "avg".to_string()
+                };
+                if let Some(col_idx) = table.get_column_index(col_name) {
+                    specs.push(AggSpec { func: AggFunc::Avg(col_idx), alias });
+                }
+            }
+        } else if let Some(min_idx) = upper.find("MIN(") {
+            if let Some(close_p) = upper[min_idx..].find(')') {
+                let col_name = part_trim[min_idx + 4..min_idx + close_p].trim().trim_matches('"');
+                let alias = if let Some(as_idx) = upper.find(" AS ") {
+                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
+                } else {
+                    "min".to_string()
+                };
+                if let Some(col_idx) = table.get_column_index(col_name) {
+                    specs.push(AggSpec { func: AggFunc::Min(col_idx), alias });
+                }
+            }
+        } else if let Some(max_idx) = upper.find("MAX(") {
+            if let Some(close_p) = upper[max_idx..].find(')') {
+                let col_name = part_trim[max_idx + 4..max_idx + close_p].trim().trim_matches('"');
+                let alias = if let Some(as_idx) = upper.find(" AS ") {
+                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
+                } else {
+                    "max".to_string()
+                };
+                if let Some(col_idx) = table.get_column_index(col_name) {
+                    specs.push(AggSpec { func: AggFunc::Max(col_idx), alias });
+                }
+            }
+        }
+    }
+
+    specs
+}
+
+#[derive(Clone, Debug)]
+enum ColOp {
+    Eq(Value),
+    NotEq(Value),
+    Gt(f64),
+    Lt(f64),
+    Gte(f64),
+    Lte(f64),
+    Between(f64, f64),
+    In(Vec<Value>),
+    IsNull,
+    IsNotNull,
+}
+
+#[derive(Clone, Debug)]
+struct Condition {
+    col_idx: usize,
+    op: ColOp,
+}
+
+fn clean_col_name(raw: &str) -> &str {
+    let s = raw.trim();
+    if let Some(dot_idx) = s.rfind('.') {
+        s[dot_idx + 1..].trim().trim_matches('"')
+    } else {
+        s.trim_matches('"')
+    }
+}
+
+fn get_current_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now();
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+
+    let days = (secs / 86400) as i64;
+    let rem_secs = secs % 86400;
+    let hours = rem_secs / 3600;
+    let mins = (rem_secs % 3600) / 60;
+    let s = rem_secs % 60;
+
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1029 + doe / 1461 - doe / 36524) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + (if m <= 2 { 1 } else { 0 });
+
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", year, m, d, hours, mins, s, millis)
+}
+
+fn split_where_conditions(w: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let tokens: Vec<&str> = w.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].eq_ignore_ascii_case("AND") {
+            if current.to_uppercase().contains("BETWEEN") && !current.to_uppercase().contains(" AND ") {
+                current.push(' ');
+                current.push_str(tokens[i]);
+            } else {
+                if !current.trim().is_empty() {
+                    parts.push(current.trim().to_string());
+                    current.clear();
+                }
+            }
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(tokens[i]);
+        }
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn parse_number(token: &str, params: &[Value]) -> Result<f64, String> {
+    let t = token.trim();
+    if t.starts_with('$') {
+        let p_idx = t[1..].parse::<usize>().map_err(|_| format!("Invalid param {}", t))?;
+        params.get(p_idx - 1).and_then(|v| v.as_f64()).ok_or_else(|| format!("Param {} not found or not number", t))
+    } else {
+        t.parse::<f64>().map_err(|_| format!("Invalid number {}", t))
+    }
+}
+
+fn parse_value(token: &str, params: &[Value]) -> Value {
+    let t = token.trim();
+    if t.starts_with('$') {
+        if let Ok(p_idx) = t[1..].parse::<usize>() {
+            return params.get(p_idx - 1).cloned().unwrap_or(Value::Null);
+        }
+    }
+    if t.eq_ignore_ascii_case("TRUE") {
+        return Value::Bool(true);
+    }
+    if t.eq_ignore_ascii_case("FALSE") {
+        return Value::Bool(false);
+    }
+    if t.eq_ignore_ascii_case("NULL") {
+        return Value::Null;
+    }
+    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        return Value::Text(t[1..t.len() - 1].to_string());
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Value::Int(i);
+    }
+    if let Ok(f) = t.parse::<f64>() {
+        return Value::Float(f);
+    }
+    Value::Text(t.to_string())
+}
+
+fn parse_conditions(where_clause: &str, table: &crate::storage::table::Table, params: &[Value]) -> Result<Vec<Condition>, String> {
+    let mut conditions = Vec::new();
+    let parts = split_where_conditions(where_clause);
+
+    for part in parts {
+        let upper = part.to_uppercase();
+
+        if let Some(pos) = upper.find(" IS NOT NULL") {
+            let col_name = clean_col_name(&part[..pos]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            conditions.push(Condition { col_idx, op: ColOp::IsNotNull });
+        } else if let Some(pos) = upper.find(" IS NULL") {
+            let col_name = clean_col_name(&part[..pos]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            conditions.push(Condition { col_idx, op: ColOp::IsNull });
+        } else if let Some(b_idx) = upper.find(" BETWEEN ") {
+            let col_name = clean_col_name(&part[..b_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let rest = &part[b_idx + 9..];
+            let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
+            let min_token = rest[..and_idx].trim();
+            let max_token = rest[and_idx + 5..].trim();
+            let min_val = parse_number(min_token, params)?;
+            let max_val = parse_number(max_token, params)?;
+            conditions.push(Condition { col_idx, op: ColOp::Between(min_val, max_val) });
+        } else if let Some(in_idx) = upper.find(" IN ") {
+            let col_name = clean_col_name(&part[..in_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let rest = part[in_idx + 4..].trim();
+            if rest.starts_with('(') && rest.ends_with(')') {
+                let inside = &rest[1..rest.len() - 1];
+                let list: Vec<Value> = inside.split(',').map(|tok| parse_value(tok, params)).collect();
+                conditions.push(Condition { col_idx, op: ColOp::In(list) });
+            }
+        } else if let Some(op_idx) = part.find("!=") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let val = parse_value(&part[op_idx + 2..], params);
+            conditions.push(Condition { col_idx, op: ColOp::NotEq(val) });
+        } else if let Some(op_idx) = part.find("<>") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let val = parse_value(&part[op_idx + 2..], params);
+            conditions.push(Condition { col_idx, op: ColOp::NotEq(val) });
+        } else if let Some(op_idx) = part.find(">=") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let num = parse_number(&part[op_idx + 2..], params)?;
+            conditions.push(Condition { col_idx, op: ColOp::Gte(num) });
+        } else if let Some(op_idx) = part.find("<=") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let num = parse_number(&part[op_idx + 2..], params)?;
+            conditions.push(Condition { col_idx, op: ColOp::Lte(num) });
+        } else if let Some(op_idx) = part.find('>') {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let num = parse_number(&part[op_idx + 1..], params)?;
+            conditions.push(Condition { col_idx, op: ColOp::Gt(num) });
+        } else if let Some(op_idx) = part.find('<') {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let num = parse_number(&part[op_idx + 1..], params)?;
+            conditions.push(Condition { col_idx, op: ColOp::Lt(num) });
+        } else if let Some(op_idx) = part.find('=') {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let val = parse_value(&part[op_idx + 1..], params);
+            conditions.push(Condition { col_idx, op: ColOp::Eq(val) });
+        }
+    }
+
+    Ok(conditions)
+}
+
+fn evaluate_conditions(row: &[Value], conditions: &[Condition]) -> bool {
+    for cond in conditions {
+        if cond.col_idx >= row.len() {
+            return false;
+        }
+        let val = &row[cond.col_idx];
+        match &cond.op {
+            ColOp::IsNull => {
+                match val {
+                    Value::Null => {},
+                    _ => return false,
+                }
+            }
+            ColOp::IsNotNull => {
+                match val {
+                    Value::Null => return false,
+                    _ => {},
+                }
+            }
+            ColOp::NotEq(target) => {
+                if val.is_equal(target) {
+                    return false;
+                }
+            }
+            ColOp::Eq(target) => {
+                if !val.is_equal(target) {
+                    return false;
+                }
+            }
+            ColOp::Gt(threshold) => {
+                if let Some(f) = val.as_f64() {
+                    if f <= *threshold { return false; }
+                } else { return false; }
+            }
+            ColOp::Gte(threshold) => {
+                if let Some(f) = val.as_f64() {
+                    if f < *threshold { return false; }
+                } else { return false; }
+            }
+            ColOp::Lt(threshold) => {
+                if let Some(f) = val.as_f64() {
+                    if f >= *threshold { return false; }
+                } else { return false; }
+            }
+            ColOp::Lte(threshold) => {
+                if let Some(f) = val.as_f64() {
+                    if f > *threshold { return false; }
+                } else { return false; }
+            }
+            ColOp::Between(min_val, max_val) => {
+                if let Some(f) = val.as_f64() {
+                    if f < *min_val || f > *max_val { return false; }
+                } else { return false; }
+            }
+            ColOp::In(list) => {
+                let mut found = false;
+                for item in list {
+                    if val == item {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found { return false; }
+            }
+        }
+    }
+    true
+}
+
+fn row_to_json(table: &crate::storage::table::Table, row: &[Value]) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(table.columns.len());
+    for (i, col) in table.columns.iter().enumerate() {
+        let v = match row.get(i).unwrap_or(&Value::Null) {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(b) => json!(*b),
+            Value::Int(n) => json!(*n),
+            Value::Float(f) => json!(*f),
+            Value::Text(s) => json!(s),
+        };
+        map.insert(col.name.clone(), v);
+    }
+    serde_json::Value::Object(map)
 }

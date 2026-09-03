@@ -101,6 +101,25 @@ impl Table {
         false
     }
 
+    pub fn update_row_multi(&mut self, row_idx: usize, updates: &[(usize, Value)]) {
+        if row_idx < self.rows.len() && !self.is_deleted[row_idx] {
+            for (col_idx, val) in updates {
+                if *col_idx < self.rows[row_idx].len() {
+                    self.rows[row_idx][*col_idx] = val.clone();
+                }
+            }
+        }
+    }
+
+    pub fn delete_row(&mut self, row_idx: usize) -> bool {
+        if row_idx < self.rows.len() && !self.is_deleted[row_idx] {
+            self.is_deleted[row_idx] = true;
+            self.active_count = self.active_count.saturating_sub(1);
+            return true;
+        }
+        false
+    }
+
     pub fn delete_by_pk(&mut self, pk: i64) -> bool {
         if let Some(&row_idx) = self.pk_index.get(&pk) {
             if !self.is_deleted[row_idx] {
@@ -121,5 +140,44 @@ impl Table {
         self.columns
             .iter()
             .position(|c| c.name.to_lowercase() == clean)
+    }
+
+    pub fn find_first_by_col(&self, col_idx: usize, target: &Value) -> Option<&Vec<Value>> {
+        for (i, row) in self.rows.iter().enumerate() {
+            if !self.is_deleted[i] && col_idx < row.len() && &row[col_idx] == target {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn aggregate_stats(&self, col_idx: usize) -> (f64, f64, f64, f64, usize) {
+        use rayon::prelude::*;
+        let total_rows = self.rows.len();
+        if total_rows == 0 {
+            return (0.0, 0.0, 0.0, 0.0, 0);
+        }
+
+        let (sum, min, max, count) = (0..total_rows)
+            .into_par_iter()
+            .filter(|&i| !self.is_deleted[i])
+            .filter_map(|i| {
+                if col_idx < self.rows[i].len() {
+                    self.rows[i][col_idx].as_f64()
+                } else {
+                    None
+                }
+            })
+            .fold(|| (0.0f64, f64::INFINITY, f64::NEG_INFINITY, 0usize), |(s, mi, ma, c), val| {
+                (s + val, mi.min(val), ma.max(val), c + 1)
+            })
+            .reduce(|| (0.0f64, f64::INFINITY, f64::NEG_INFINITY, 0usize), |(s1, mi1, ma1, c1), (s2, mi2, ma2, c2)| {
+                (s1 + s2, mi1.min(mi2), ma1.max(ma2), c1 + c2)
+            });
+
+        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+        let final_min = if min.is_infinite() { 0.0 } else { min };
+        let final_max = if max.is_infinite() { 0.0 } else { max };
+        (sum, avg, final_min, final_max, count)
     }
 }

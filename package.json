@@ -39,7 +39,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "bun build src/index.ts src/adapters/node.ts src/adapters/browser.ts --outdir dist --target node && tsc",
+    "build": "bun run scripts/build_all.ts",
     "prepublishOnly": "bun run build",
     "prompt": "bun run scripts/prompt_maker.ts",
     "test": "bun test",

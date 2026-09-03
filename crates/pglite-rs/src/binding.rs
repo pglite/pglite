@@ -26,7 +26,7 @@ impl LitePostgresNative {
     }
 
     #[napi]
-    pub fn exec(&self, sql: String, params: Option<Vec<serde_json::Value>>) -> Result<serde_json::Value> {
+    pub fn exec(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<serde_json::Value> {
         let rust_params = convert_params(params);
         let mut exec = self.executor.lock();
         match exec.execute(&sql, &rust_params) {
@@ -39,7 +39,22 @@ impl LitePostgresNative {
     }
 
     #[napi]
-    pub fn query(&self, sql: String, params: Option<Vec<serde_json::Value>>) -> Result<Vec<serde_json::Value>> {
+    pub fn exec2(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<serde_json::Value> {
+        let rust_params = convert_params(params);
+        let mut exec = self.executor.lock();
+        match exec.execute(&sql, &rust_params) {
+            Ok(res) => Ok(json!({
+                "rows": res.rows,
+                "rowCount": res.row_count,
+                "fields": res.fields,
+                "command": res.command
+            })),
+            Err(e) => Err(Error::from_reason(e)),
+        }
+    }
+
+    #[napi]
+    pub fn query(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<Vec<serde_json::Value>> {
         let rust_params = convert_params(params);
         let mut exec = self.executor.lock();
         match exec.execute(&sql, &rust_params) {
@@ -49,7 +64,7 @@ impl LitePostgresNative {
     }
 
     #[napi]
-    pub fn query2(&self, sql: String, params: Option<Vec<serde_json::Value>>) -> Result<serde_json::Value> {
+    pub fn query2(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<serde_json::Value> {
         let rust_params = convert_params(params);
         let mut exec = self.executor.lock();
         match exec.execute(&sql, &rust_params) {
