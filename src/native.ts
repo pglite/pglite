@@ -1,6 +1,20 @@
 import { LitePostgres as JSPostgres, QueryResult } from "./database";
 import { getNativeBinding, isNativeAvailable } from "./native-loader";
 
+function isComplexQuery(sql: string): boolean {
+  const upper = sql.toUpperCase();
+  return (
+    upper.includes("(SELECT") ||
+    upper.includes("( SELECT") ||
+    upper.startsWith("WITH ") ||
+    upper.includes(" UNION ") ||
+    upper.includes(" OVER (") ||
+    upper.includes(" OVER(") ||
+    upper.includes(" INTERSECT ") ||
+    upper.includes(" EXCEPT ")
+  );
+}
+
 export class PGLiteNative {
   private nativeInstance: any = null;
   private jsFallback: JSPostgres | null = null;
@@ -150,6 +164,13 @@ export class PGLiteNative {
   }
 
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
+    if (isComplexQuery(sql)) {
+      if (this.writeQueue.length > 0) {
+        await this.flushWriteQueue();
+      }
+      return this.getJsEngine().exec<T>(sql, params, dbName);
+    }
+
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
@@ -198,6 +219,13 @@ export class PGLiteNative {
   }
 
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    if (isComplexQuery(sql)) {
+      if (this.writeQueue.length > 0) {
+        await this.flushWriteQueue();
+      }
+      return this.getJsEngine().exec2<T>(sql, params, dbName);
+    }
+
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
@@ -264,6 +292,13 @@ export class PGLiteNative {
   }
 
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
+    if (isComplexQuery(sql)) {
+      if (this.writeQueue.length > 0) {
+        await this.flushWriteQueue();
+      }
+      return this.getJsEngine().query<T>(sql, params, dbName);
+    }
+
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
@@ -315,6 +350,13 @@ export class PGLiteNative {
   }
 
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    if (isComplexQuery(sql)) {
+      if (this.writeQueue.length > 0) {
+        await this.flushWriteQueue();
+      }
+      return this.getJsEngine().query2<T>(sql, params, dbName);
+    }
+
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;

@@ -358,9 +358,11 @@ impl Executor {
     }
 
     fn handle_select(&self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
-        let upper = sql.to_uppercase();
-        let from_idx = upper.find("FROM").ok_or("Missing FROM clause in SELECT")?;
+        let from_idx = find_top_level_keyword(sql, "FROM").ok_or("Missing FROM clause in SELECT")?;
         let select_clause = sql[6..from_idx].trim();
+        if select_clause.to_uppercase().contains("SELECT") {
+            return Err("Subqueries in SELECT clause are delegated to full engine".to_string());
+        }
         let after_from = sql[from_idx + 4..].trim();
 
         let clauses = parse_select_clauses(after_from);
@@ -988,16 +990,15 @@ impl Executor {
     }
 
     fn handle_update(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let upper = sql.to_uppercase();
-        let set_idx = upper.find("SET").ok_or("Missing SET in UPDATE")?;
-        let where_idx = upper.find("WHERE").ok_or("Missing WHERE in UPDATE")?;
+        let set_idx = find_top_level_keyword(sql, "SET").ok_or("Missing SET in UPDATE")?;
+        let where_idx = find_top_level_keyword(sql, "WHERE").ok_or("Missing WHERE in UPDATE")?;
 
         let table_name = clean_col_name(sql[6..set_idx].trim());
         let set_clause = sql[set_idx + 3..where_idx].trim();
         
-        let returning_idx = upper.find(" RETURNING ");
+        let returning_idx = find_top_level_keyword(sql, "RETURNING");
         let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
-            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 11..].trim()))
+            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
         } else {
             (&sql[where_idx + 5..].trim(), None)
         };
@@ -1123,15 +1124,14 @@ impl Executor {
     }
 
     fn handle_delete(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let upper = sql.to_uppercase();
-        let from_idx = upper.find("FROM").ok_or("Missing FROM in DELETE")?;
-        let where_idx = upper.find("WHERE").ok_or("Missing WHERE in DELETE")?;
+        let from_idx = find_top_level_keyword(sql, "FROM").ok_or("Missing FROM in DELETE")?;
+        let where_idx = find_top_level_keyword(sql, "WHERE").ok_or("Missing WHERE in DELETE")?;
 
         let table_name = clean_col_name(sql[from_idx + 4..where_idx].trim());
         
-        let returning_idx = upper.find(" RETURNING ");
+        let returning_idx = find_top_level_keyword(sql, "RETURNING");
         let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
-            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 11..].trim()))
+            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
         } else {
             (&sql[where_idx + 5..].trim(), None)
         };
@@ -1559,6 +1559,41 @@ enum ColOp {
 struct Condition {
     col_idx: usize,
     op: ColOp,
+}
+
+pub fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
+    let kw_upper = keyword.to_uppercase();
+    let kw_len = kw_upper.len();
+    let upper = sql.to_uppercase();
+    let bytes = upper.as_bytes();
+    let mut depth = 0;
+    let mut in_quote = false;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            in_quote = !in_quote;
+        } else if !in_quote {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            } else if depth == 0 && i + kw_len <= bytes.len() {
+                if &upper[i..i + kw_len] == kw_upper {
+                    let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                    let next_ok = i + kw_len == bytes.len() || bytes[i + kw_len].is_ascii_whitespace();
+                    if prev_ok && next_ok {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn clean_col_name(raw: &str) -> &str {
