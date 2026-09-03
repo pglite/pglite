@@ -263,7 +263,9 @@ export class PGLiteNative {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
         const res = this.runNativeQuery<T>(sql, p, db);
-        console.log(`[PGLite Native ⚡] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+        if (this.options?.debug || process.env.PGLITE_DEBUG) {
+          console.log(`[PGLite Native ⚡] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+        }
         const upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SELECT")) {
           this.queueBackgroundWrite(sql, params, dbName, false);
@@ -283,7 +285,9 @@ export class PGLiteNative {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
                 const res = this.runNativeQuery<T>(sql, p, db);
-                console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+                if (this.options?.debug || process.env.PGLITE_DEBUG) {
+                  console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+                }
                 const upper = sql.trim().toUpperCase();
                 if (!upper.startsWith("SELECT")) {
                   this.queueBackgroundWrite(sql, params, dbName, false);
@@ -297,8 +301,7 @@ export class PGLiteNative {
           }
           break;
         }
-        const errMsg = currentErr?.message || String(currentErr);
-        console.warn(`[PGLite Native Fallback] query: ${errMsg} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        console.warn(`[PGLite Native Fallback] query: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         return this.getJsEngine().query<T>(sql, params, dbName);
       }
     }
@@ -311,7 +314,9 @@ export class PGLiteNative {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
         const res = this.runNativeQuery2<T>(sql, p, db);
-        console.log(`[PGLite Native ⚡] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+        if (this.options?.debug || process.env.PGLITE_DEBUG) {
+          console.log(`[PGLite Native ⚡] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+        }
         const upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SELECT")) {
           this.queueBackgroundWrite(sql, params, dbName, false);
@@ -331,7 +336,9 @@ export class PGLiteNative {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
                 const res = this.runNativeQuery2<T>(sql, p, db);
-                console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+                if (this.options?.debug || process.env.PGLITE_DEBUG) {
+                  console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+                }
                 const upper = sql.trim().toUpperCase();
                 if (!upper.startsWith("SELECT")) {
                   this.queueBackgroundWrite(sql, params, dbName, false);

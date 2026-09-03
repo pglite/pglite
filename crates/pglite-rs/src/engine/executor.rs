@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 pub use crate::engine::plan::PlannedProjectedExpr as ProjectedExpr;
 use crate::engine::plan::{
-    evaluate_planned_condition, project_row_planned, ColOpTemplate, ConditionTemplate,
+    evaluate_planned_condition, project_row_planned, resolve_operand, ColOpTemplate, ConditionTemplate,
     ExecutionPlan, OperandTemplate, PlannedJoin,
 };
 
@@ -448,7 +448,30 @@ impl Executor {
         };
 
         let total_rows = table.rows.len();
-        let mut matched_indices: Vec<usize> = if conditions.is_empty() {
+
+        // Check if any condition is an exact equality on the Primary Key column!
+        let pk_target = table.pk_col_idx.and_then(|pk_idx| {
+            conditions.iter().find_map(|c| {
+                if c.col_idx == pk_idx {
+                    if let ColOp::Eq(v) = &c.op {
+                        return v.as_i64();
+                    }
+                }
+                None
+            })
+        });
+
+        let mut matched_indices: Vec<usize> = if let Some(target_pk) = pk_target {
+            if let Some(&row_idx) = table.pk_index.get(&target_pk) {
+                if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
+                    vec![row_idx]
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        } else if conditions.is_empty() {
             (0..total_rows)
                 .into_par_iter()
                 .filter(|&i| !table.is_deleted[i])
@@ -719,18 +742,48 @@ impl Executor {
                 };
 
                 let mut matched_indices = Vec::new();
-                for i in 0..table.rows.len() {
-                    if !table.is_deleted[i] {
-                        let row = &table.rows[i];
-                        let mut ok = true;
-                        for c in conditions {
-                            if !evaluate_planned_condition(row, c, params) {
-                                ok = false;
-                                break;
+
+                let pk_target = table.pk_col_idx.and_then(|pk_idx| {
+                    conditions.iter().find_map(|c| {
+                        if c.col_idx == pk_idx {
+                            if let ColOpTemplate::Eq(opnd) = &c.op {
+                                return resolve_operand(opnd, params).as_i64();
                             }
                         }
-                        if ok {
-                            matched_indices.push(i);
+                        None
+                    })
+                });
+
+                if let Some(target_pk) = pk_target {
+                    if let Some(&row_idx) = table.pk_index.get(&target_pk) {
+                        if !table.is_deleted[row_idx] {
+                            let row = &table.rows[row_idx];
+                            let mut ok = true;
+                            for c in conditions {
+                                if !evaluate_planned_condition(row, c, params) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                matched_indices.push(row_idx);
+                            }
+                        }
+                    }
+                } else {
+                    for i in 0..table.rows.len() {
+                        if !table.is_deleted[i] {
+                            let row = &table.rows[i];
+                            let mut ok = true;
+                            for c in conditions {
+                                if !evaluate_planned_condition(row, c, params) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                matched_indices.push(i);
+                            }
                         }
                     }
                 }
@@ -1674,6 +1727,15 @@ fn compile_condition_templates(where_clause: &str, table: &crate::storage::table
         }
     }
 
+    // Prioritize cheap, high-selectivity conditions: Eq > IsNull/IsNotNull > Range > Lower/Upper
+    templates.sort_by_key(|c| match &c.op {
+        ColOpTemplate::Eq(_) => 0,
+        ColOpTemplate::IsNull | ColOpTemplate::IsNotNull => 1,
+        ColOpTemplate::Between(_, _) | ColOpTemplate::Gt(_) | ColOpTemplate::Gte(_) | ColOpTemplate::Lt(_) | ColOpTemplate::Lte(_) => 2,
+        ColOpTemplate::NotEq(_) => 3,
+        ColOpTemplate::LowerEq(_) | ColOpTemplate::UpperEq(_) => 4,
+    });
+
     Ok(templates)
 }
 
@@ -1773,6 +1835,15 @@ fn parse_conditions(where_clause: &str, table: &crate::storage::table::Table, pa
             }
         }
     }
+
+    // Prioritize cheap, high-selectivity conditions: Eq > IsNull/IsNotNull > Range > Lower/Upper
+    conditions.sort_by_key(|c| match &c.op {
+        ColOp::Eq(_) => 0,
+        ColOp::IsNull | ColOp::IsNotNull => 1,
+        ColOp::Between(_, _) | ColOp::Gt(_) | ColOp::Gte(_) | ColOp::Lt(_) | ColOp::Lte(_) => 2,
+        ColOp::In(_) | ColOp::NotEq(_) => 3,
+        ColOp::LowerEq(_) | ColOp::UpperEq(_) => 4,
+    });
 
     Ok(conditions)
 }
