@@ -158,13 +158,20 @@ impl Executor {
                 continue;
             }
 
-            let parts: Vec<&str> = col_def_str.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
+            let (col_name, rest_def) = if col_def_str.starts_with('"') {
+                if let Some(close_q) = col_def_str[1..].find('"') {
+                    let name = &col_def_str[1..1 + close_q];
+                    (name.to_string(), &col_def_str[2 + close_q..])
+                } else {
+                    let parts: Vec<&str> = col_def_str.split_whitespace().collect();
+                    (parts[0].trim_matches('"').to_string(), &col_def_str[parts[0].len()..])
+                }
+            } else {
+                let parts: Vec<&str> = col_def_str.split_whitespace().collect();
+                (parts[0].trim_matches('"').to_string(), &col_def_str[parts[0].len()..])
+            };
 
-            let col_name = parts[0].trim_matches('"').to_string();
-            let upper_rest = col_def_str[parts[0].len()..].to_uppercase();
+            let upper_rest = rest_def.to_uppercase();
 
             let data_type = if upper_rest.contains("SERIAL") || upper_rest.contains("IDENTITY") {
                 DataType::Serial
@@ -178,17 +185,11 @@ impl Executor {
                 DataType::Numeric
             } else if upper_rest.contains("TIMESTAMP") {
                 DataType::Timestamp
-            } else if upper_rest.contains("JSON") {
-                DataType::Jsonb
             } else {
                 DataType::Text
             };
 
-            let is_id_col = col_name.eq_ignore_ascii_case("id") || col_name.eq_ignore_ascii_case("_id");
-            let is_primary_key = upper_rest.contains("PRIMARY KEY")
-                || data_type == DataType::Serial
-                || is_id_col
-                || table_level_pks.iter().any(|pk| pk.eq_ignore_ascii_case(&col_name));
+            let is_primary_key = upper_rest.contains("PRIMARY KEY");
             let is_nullable = !upper_rest.contains("NOT NULL") && !is_primary_key;
 
             columns.push(ColumnDef {
@@ -200,21 +201,20 @@ impl Executor {
             });
         }
 
-        // Apply any table level primary keys that appeared after column definitions
-        for pk_col_name in &table_level_pks {
-            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pk_col_name)) {
+        // Apply table-level primary keys
+        for pk_col_name in table_level_pks {
+            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&pk_col_name)) {
                 col.is_primary_key = true;
-                col.is_nullable = false;
             }
         }
 
-        self.storage.create_table(table_name, columns)?;
+        let _ = self.storage.create_table(table_name, columns);
 
         Ok(QueryResult {
             rows: vec![],
             row_count: 0,
             fields: vec![],
-            command: "CREATE".to_string(),
+            command: "CREATE TABLE".to_string(),
         })
     }
 
@@ -222,9 +222,9 @@ impl Executor {
         // Format: INSERT INTO <table> (<col1>, <col2>) VALUES ($1, $2), ($3, $4) [RETURNING <cols>]
         let (sql_before_returning, returning_cols) = extract_returning_clause(sql);
 
-        let upper = sql_before_returning.to_uppercase();
-        let values_idx = upper.find("VALUES").ok_or("Missing VALUES clause in INSERT")?;
-        let table_part = sql_before_returning[11..values_idx].trim();
+        let values_idx = find_top_level_keyword(sql_before_returning, "VALUES").ok_or("Missing VALUES clause in INSERT")?;
+        let into_idx = find_top_level_keyword(sql_before_returning, "INTO").unwrap_or(6);
+        let table_part = sql_before_returning[into_idx + 4..values_idx].trim();
 
         let (table_name, target_cols) = if let Some(open_p) = table_part.find('(') {
             let close_p = table_part.find(')').ok_or("Missing closing parenthesis for columns")?;
@@ -447,12 +447,13 @@ impl Executor {
                                     let p_idx = right[1..].parse::<usize>().unwrap_or(1);
                                     let tv = params.get(p_idx - 1).cloned().unwrap_or(Value::Null);
                                     (Some(p_idx.saturating_sub(1)), None, tv)
-                                } else if right.starts_with('\'') && right.ends_with('\'') {
-                                    let s = right[1..right.len() - 1].to_string();
-                                    (None, Some(s.clone()), Value::Text(s))
                                 } else {
-                                    let s = right.to_string();
-                                    (None, Some(s.clone()), Value::Text(s))
+                                    let tv = parse_value(right, params);
+                                    let s = match &tv {
+                                        Value::Text(s) => s.clone(),
+                                        _ => right.to_string(),
+                                    };
+                                    (None, Some(s), tv)
                                 };
 
                                 let fields: Vec<FieldInfo> = table.columns.iter().map(|c| FieldInfo {
@@ -468,21 +469,17 @@ impl Executor {
                                     fields: fields.clone(),
                                 };
 
-                                if let Some(row) = table.find_first_by_col(col_idx, &target_val) {
-                                    return Ok((QueryResult {
-                                        rows: vec![row_to_json(table, row)],
-                                        row_count: 1,
-                                        fields,
-                                        command: "SELECT".to_string(),
-                                    }, Some(plan)));
-                                } else {
-                                    return Ok((QueryResult {
-                                        rows: vec![],
-                                        row_count: 0,
-                                        fields: vec![],
-                                        command: "SELECT".to_string(),
-                                    }, Some(plan)));
-                                }
+                                let matched_rows: Vec<serde_json::Value> = table.rows.iter().enumerate()
+                                    .filter(|(r_idx, r)| !table.is_deleted[*r_idx] && r.get(col_idx) == Some(&target_val))
+                                    .map(|(_, r)| row_to_json(table, r))
+                                    .collect();
+                                let row_count = matched_rows.len();
+                                return Ok((QueryResult {
+                                    rows: matched_rows,
+                                    row_count,
+                                    fields,
+                                    command: "SELECT".to_string(),
+                                }, Some(plan)));
                             }
                         }
                     }
@@ -590,10 +587,10 @@ impl Executor {
         }
 
         // 6. OFFSET and LIMIT pagination
-        let offset = clauses.offset;
-        let limit = clauses.limit.unwrap_or(1000);
+        let offset = clauses.offset.as_ref().map(|o| resolve_operand(o, params).as_i64().unwrap_or(0) as usize).unwrap_or(0);
+        let limit = clauses.limit.as_ref().map(|l| resolve_operand(l, params).as_i64().unwrap_or(1000) as usize).unwrap_or(usize::MAX);
         let paged_indices = if offset < matched_indices.len() {
-            let end = (offset + limit).min(matched_indices.len());
+            let end = (offset.saturating_add(limit)).min(matched_indices.len());
             &matched_indices[offset..end]
         } else {
             &[]
@@ -776,25 +773,22 @@ impl Executor {
                     Value::Null
                 };
 
+                let mut matched_rows = Vec::new();
                 for i in 0..table.rows.len() {
                     if !table.is_deleted[i] {
                         if let Some(v) = table.rows[i].get(*col_idx) {
                             if v == &target_val {
-                                return Ok(QueryResult {
-                                    rows: vec![row_to_json(table, &table.rows[i])],
-                                    row_count: 1,
-                                    fields: fields.clone(),
-                                    command: "SELECT".to_string(),
-                                });
+                                matched_rows.push(row_to_json(table, &table.rows[i]));
                             }
                         }
                     }
                 }
 
+                let row_count = matched_rows.len();
                 Ok(QueryResult {
-                    rows: vec![],
-                    row_count: 0,
-                    fields: vec![],
+                    rows: matched_rows,
+                    row_count,
+                    fields: fields.clone(),
                     command: "SELECT".to_string(),
                 })
             }
@@ -876,8 +870,9 @@ impl Executor {
                 }
 
                 // Pagination
-                let start = (*offset).min(matched_indices.len());
-                let end = if let Some(lim) = limit {
+                let start = offset.as_ref().map(|o| resolve_operand(o, params).as_i64().unwrap_or(0) as usize).unwrap_or(0).min(matched_indices.len());
+                let end = if let Some(lim_op) = limit {
+                    let lim = resolve_operand(lim_op, params).as_i64().unwrap_or(0) as usize;
                     (start + lim).min(matched_indices.len())
                 } else {
                     matched_indices.len()
@@ -1023,9 +1018,9 @@ impl Executor {
         
         let returning_idx = find_top_level_keyword(sql, "RETURNING");
         let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
-            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
+            (sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
         } else {
-            (&sql[where_idx + 5..].trim(), None)
+            (sql[where_idx + 5..].trim(), None)
         };
 
         let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
@@ -1156,9 +1151,9 @@ impl Executor {
         
         let returning_idx = find_top_level_keyword(sql, "RETURNING");
         let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
-            (&sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
+            (sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
         } else {
-            (&sql[where_idx + 5..].trim(), None)
+            (sql[where_idx + 5..].trim(), None)
         };
 
         let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
@@ -1230,8 +1225,8 @@ struct SelectClauses<'a> {
     where_clause: Option<&'a str>,
     order_by_col: Option<&'a str>,
     order_by_desc: bool,
-    limit: Option<usize>,
-    offset: usize,
+    limit: Option<OperandTemplate>,
+    offset: Option<OperandTemplate>,
 }
 
 fn split_projection_items(s: &str) -> Vec<String> {
@@ -1330,35 +1325,33 @@ fn parse_projection(
 }
 
 fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
-    let upper = after_from.to_uppercase();
-
     // Check for JOIN keywords
-    let (join_pos, kw_len, is_left) = if let Some(pos) = upper.find("LEFT JOIN ") {
-        (Some(pos), 10, true)
-    } else if let Some(pos) = upper.find("LEFT OUTER JOIN ") {
-        (Some(pos), 16, true)
-    } else if let Some(pos) = upper.find("INNER JOIN ") {
-        (Some(pos), 11, false)
-    } else if let Some(pos) = upper.find("JOIN ") {
-        (Some(pos), 5, false)
+    let (join_pos, kw_len, is_left) = if let Some(pos) = find_top_level_keyword(after_from, "LEFT JOIN") {
+        (Some(pos), 9, true)
+    } else if let Some(pos) = find_top_level_keyword(after_from, "LEFT OUTER JOIN") {
+        (Some(pos), 15, true)
+    } else if let Some(pos) = find_top_level_keyword(after_from, "INNER JOIN") {
+        (Some(pos), 10, false)
+    } else if let Some(pos) = find_top_level_keyword(after_from, "JOIN") {
+        (Some(pos), 4, false)
     } else {
         (None, 0, false)
     };
 
     let table_name = match join_pos {
-        Some(pos) => after_from[..pos].trim().trim_matches('"'),
+        Some(pos) => clean_table_name(&after_from[..pos]),
         None => {
-            let where_pos = upper.find("WHERE ");
-            let order_pos = upper.find("ORDER BY ");
-            let limit_pos = upper.find("LIMIT ");
-            let offset_pos = upper.find("OFFSET ");
+            let where_pos = find_top_level_keyword(after_from, "WHERE");
+            let order_pos = find_top_level_keyword(after_from, "ORDER BY");
+            let limit_pos = find_top_level_keyword(after_from, "LIMIT");
+            let offset_pos = find_top_level_keyword(after_from, "OFFSET");
             let first_kw_pos = [where_pos, order_pos, limit_pos, offset_pos]
                 .into_iter()
                 .filter_map(|x| x)
                 .min();
             match first_kw_pos {
-                Some(pos) => after_from[..pos].trim().trim_matches('"'),
-                None => after_from.trim().trim_matches('"'),
+                Some(pos) => clean_table_name(&after_from[..pos]),
+                None => clean_table_name(after_from),
             }
         }
     };
@@ -1366,16 +1359,19 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
     let join_clause = match join_pos {
         Some(j_pos) => {
             let after_j = &after_from[j_pos + kw_len..];
-            let upper_j = after_j.to_uppercase();
-            if let Some(on_pos) = upper_j.find(" ON ") {
-                let joined_table_name = after_j[..on_pos].trim().trim_matches('"');
-                let after_on = &after_j[on_pos + 4..];
-                let upper_on = after_on.to_uppercase();
-                let end_pos = [upper_on.find("WHERE "), upper_on.find("ORDER BY "), upper_on.find("LIMIT "), upper_on.find("OFFSET ")]
-                    .into_iter()
-                    .filter_map(|x| x)
-                    .min()
-                    .unwrap_or(after_on.len());
+            if let Some(on_pos) = find_top_level_keyword(after_j, "ON") {
+                let joined_table_name = clean_table_name(&after_j[..on_pos]);
+                let after_on = &after_j[on_pos + 2..];
+                let end_pos = [
+                    find_top_level_keyword(after_on, "WHERE"),
+                    find_top_level_keyword(after_on, "ORDER BY"),
+                    find_top_level_keyword(after_on, "LIMIT"),
+                    find_top_level_keyword(after_on, "OFFSET"),
+                ]
+                .into_iter()
+                .filter_map(|x| x)
+                .min()
+                .unwrap_or(after_on.len());
                 let on_str = after_on[..end_pos].trim();
 
                 if let Some(eq_idx) = on_str.find('=') {
@@ -1411,29 +1407,34 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         None => None,
     };
 
-    let where_pos = upper.find("WHERE ");
+    let where_pos = find_top_level_keyword(after_from, "WHERE");
     let where_clause = where_pos.map(|w_idx| {
-        let after_w = &after_from[w_idx + 6..];
-        let upper_w = after_w.to_uppercase();
-        let end_idx = [upper_w.find("ORDER BY "), upper_w.find("LIMIT "), upper_w.find("OFFSET ")]
-            .into_iter()
-            .filter_map(|x| x)
-            .min();
+        let after_w = &after_from[w_idx + 5..];
+        let end_idx = [
+            find_top_level_keyword(after_w, "ORDER BY"),
+            find_top_level_keyword(after_w, "LIMIT"),
+            find_top_level_keyword(after_w, "OFFSET"),
+        ]
+        .into_iter()
+        .filter_map(|x| x)
+        .min();
         match end_idx {
             Some(e) => after_w[..e].trim(),
             None => after_w.trim(),
         }
     });
 
-    let order_pos = upper.find("ORDER BY ");
+    let order_pos = find_top_level_keyword(after_from, "ORDER BY");
     let (order_by_col, order_by_desc) = match order_pos {
         Some(o_idx) => {
-            let after_o = &after_from[o_idx + 9..];
-            let upper_o = after_o.to_uppercase();
-            let end_idx = [upper_o.find("LIMIT "), upper_o.find("OFFSET ")]
-                .into_iter()
-                .filter_map(|x| x)
-                .min();
+            let after_o = &after_from[o_idx + 8..];
+            let end_idx = [
+                find_top_level_keyword(after_o, "LIMIT"),
+                find_top_level_keyword(after_o, "OFFSET"),
+            ]
+            .into_iter()
+            .filter_map(|x| x)
+            .min();
             let order_part = match end_idx {
                 Some(e) => after_o[..e].trim(),
                 None => after_o.trim(),
@@ -1447,28 +1448,37 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         None => (None, false),
     };
 
-    let limit_pos = upper.find("LIMIT ");
+    let limit_pos = find_top_level_keyword(after_from, "LIMIT");
     let limit = match limit_pos {
         Some(l_idx) => {
-            let after_l = &after_from[l_idx + 6..];
-            let upper_l = after_l.to_uppercase();
-            let end_idx = upper_l.find("OFFSET ");
+            let after_l = &after_from[l_idx + 5..];
+            let end_idx = find_top_level_keyword(after_l, "OFFSET");
             let limit_part = match end_idx {
                 Some(e) => after_l[..e].trim(),
                 None => after_l.trim(),
             };
-            limit_part.split_whitespace().next().and_then(|s| s.parse::<usize>().ok())
+            let tok = limit_part.split_whitespace().next().unwrap_or("");
+            if tok.is_empty() {
+                None
+            } else {
+                Some(parse_operand_template(tok))
+            }
         }
         None => None,
     };
 
-    let offset_pos = upper.find("OFFSET ");
+    let offset_pos = find_top_level_keyword(after_from, "OFFSET");
     let offset = match offset_pos {
         Some(off_idx) => {
-            let after_off = after_from[off_idx + 7..].trim();
-            after_off.split_whitespace().next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
+            let after_off = after_from[off_idx + 6..].trim();
+            let tok = after_off.split_whitespace().next().unwrap_or("");
+            if tok.is_empty() {
+                None
+            } else {
+                Some(parse_operand_template(tok))
+            }
         }
-        None => 0,
+        None => None,
     };
 
     SelectClauses {
@@ -1587,20 +1597,22 @@ struct Condition {
     op: ColOp,
 }
 
-pub fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
-    let kw_upper = keyword.to_uppercase();
-    let kw_len = kw_upper.len();
-    let upper = sql.to_uppercase();
-    let bytes = upper.as_bytes();
+pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
+    let kw_bytes = kw.as_bytes();
+    let kw_len = kw_bytes.len();
+    let bytes = sql.as_bytes();
     let mut depth = 0;
-    let mut in_quote = false;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
 
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'\'' || b == b'"' {
-            in_quote = !in_quote;
-        } else if !in_quote {
+        if b == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if b == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        } else if !in_single_quote && !in_double_quote {
             if b == b'(' {
                 depth += 1;
             } else if b == b')' {
@@ -1608,7 +1620,7 @@ pub fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
                     depth -= 1;
                 }
             } else if depth == 0 && i + kw_len <= bytes.len() {
-                if &upper[i..i + kw_len] == kw_upper {
+                if bytes[i..i + kw_len].eq_ignore_ascii_case(kw_bytes) {
                     let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
                     let next_ok = i + kw_len == bytes.len() || bytes[i + kw_len].is_ascii_whitespace();
                     if prev_ok && next_ok {
@@ -1623,6 +1635,15 @@ pub fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 }
 
 fn clean_col_name(raw: &str) -> &str {
+    let s = raw.trim();
+    if let Some(dot_idx) = s.rfind('.') {
+        s[dot_idx + 1..].trim().trim_matches('"')
+    } else {
+        s.trim_matches('"')
+    }
+}
+
+fn clean_table_name(raw: &str) -> &str {
     let s = raw.trim();
     if let Some(dot_idx) = s.rfind('.') {
         s[dot_idx + 1..].trim().trim_matches('"')
@@ -2072,15 +2093,8 @@ fn row_to_json(table: &crate::storage::table::Table, row: &[Value]) -> serde_jso
 }
 
 fn extract_returning_clause(sql: &str) -> (&str, Option<&str>) {
-    let upper = sql.to_uppercase();
-    if let Some(pos) = upper.rfind(" RETURNING ") {
-        (sql[..pos].trim(), Some(sql[pos + 11..].trim()))
-    } else if let Some(pos) = upper.rfind(")RETURNING ") {
-        (sql[..pos + 1].trim(), Some(sql[pos + 11..].trim()))
-    } else if let Some(pos) = upper.rfind("\nRETURNING ") {
-        (sql[..pos].trim(), Some(sql[pos + 11..].trim()))
-    } else if let Some(pos) = upper.rfind("\tRETURNING ") {
-        (sql[..pos].trim(), Some(sql[pos + 11..].trim()))
+    if let Some(pos) = find_top_level_keyword(sql, "RETURNING") {
+        (sql[..pos].trim(), Some(sql[pos + 9..].trim()))
     } else {
         (sql, None)
     }

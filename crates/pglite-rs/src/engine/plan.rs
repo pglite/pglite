@@ -70,8 +70,8 @@ pub enum ExecutionPlan {
         join: Option<PlannedJoin>,
         conditions: Vec<ConditionTemplate>,
         order_by: Option<(usize, bool)>, // (col_idx, is_desc)
-        limit: Option<usize>,
-        offset: usize,
+        limit: Option<OperandTemplate>,
+        offset: Option<OperandTemplate>,
         projections: Vec<PlannedProjectedExpr>,
         fields: Vec<FieldInfo>,
     },

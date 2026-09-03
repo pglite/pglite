@@ -33,6 +33,7 @@ impl LitePostgresNative {
         let mut exec = self.executor.lock();
         match exec.execute(&sql, &rust_params) {
             Ok(res) => Ok(json!({
+                "success": true,
                 "rowCount": res.row_count,
                 "command": res.command
             })),
@@ -46,6 +47,7 @@ impl LitePostgresNative {
         let mut exec = self.executor.lock();
         match exec.execute(&sql, &rust_params) {
             Ok(res) => Ok(json!({
+                "success": true,
                 "rows": res.rows,
                 "rowCount": res.row_count,
                 "fields": res.fields,
@@ -91,6 +93,13 @@ impl LitePostgresNative {
         let parse_fn: JsFunction = json_obj.get_named_property("parse")?;
         let js_str = env.create_string(&json_str)?;
         parse_fn.call(None, &[js_str.into_unknown()])
+    }
+
+    #[napi]
+    pub fn flush(&self) -> Result<()> {
+        let mut exec = self.executor.lock();
+        exec.storage.flush();
+        Ok(())
     }
 
     #[napi]

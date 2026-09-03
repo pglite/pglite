@@ -11,7 +11,14 @@ function isComplexQuery(sql: string): boolean {
     upper.includes(" OVER (") ||
     upper.includes(" OVER(") ||
     upper.includes(" INTERSECT ") ||
-    upper.includes(" EXCEPT ")
+    upper.includes(" EXCEPT ") ||
+    upper.includes(" GROUP BY ") ||
+    upper.includes(" HAVING ") ||
+    upper.includes("JSONB_AGG") ||
+    upper.includes("JSON_AGG") ||
+    upper.includes("ARRAY_AGG") ||
+    upper.includes("[]") ||
+    upper.includes("ARRAY[")
   );
 }
 
@@ -24,19 +31,44 @@ export class PGLiteNative {
   constructor(filepath: string, options: any = {}) {
     this.filepath = filepath;
     this.options = options;
-    const binding = getNativeBinding();
-    if (binding && binding.LitePostgresNative) {
-      try {
-        this.nativeInstance = new binding.LitePostgresNative(filepath);
-      } catch (err) {
-        console.warn("[PGLiteNative] Failed to initialize native engine, falling back to JS:", err);
+
+    const disableNative = Boolean(
+      options.forceJs ||
+      options.native === false ||
+      options.useNative === false ||
+      options.mode === "js" ||
+      options.mode === "node" ||
+      process.env.PGLITE_NATIVE === "0" ||
+      process.env.PGLITE_NATIVE === "false" ||
+      process.env.PGLITE_USE_NATIVE === "0" ||
+      process.env.PGLITE_USE_NATIVE === "false" ||
+      process.env.PGLITE_FORCE_JS === "1" ||
+      process.env.PGLITE_FORCE_JS === "true"
+    );
+
+    if (!disableNative) {
+      const binding = getNativeBinding();
+      if (binding && binding.LitePostgresNative) {
+        try {
+          this.nativeInstance = new binding.LitePostgresNative(filepath);
+        } catch (err) {
+          console.warn("[PGLiteNative] Failed to initialize native engine, falling back to JS:", err);
+        }
       }
     }
 
     // Initialize JS fallback in case native is unavailable or query is unsupported
-    if (!this.nativeInstance || options.forceJs) {
+    if (!this.nativeInstance || disableNative) {
       this.getJsEngine();
     }
+  }
+
+  public get storage() {
+    return this.getJsEngine().storage;
+  }
+
+  public get tables() {
+    return (this.getJsEngine() as any).tables;
   }
 
   private hydratedTables = new Set<string>();
@@ -176,6 +208,9 @@ export class PGLiteNative {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
         const res = this.nativeInstance.exec(sql, p, db) as T;
+        if (res && typeof res === "object" && (res as any).success === undefined) {
+          (res as any).success = true;
+        }
         const upper = sql.trim().toUpperCase();
         if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
           await this.flushWriteQueue();
@@ -212,9 +247,11 @@ export class PGLiteNative {
           break;
         }
         console.warn(`[PGLite Native Fallback] exec: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        await this.flushWriteQueue();
         return this.getJsEngine().exec<T>(sql, params, dbName);
       }
     }
+    await this.flushWriteQueue();
     return this.getJsEngine().exec<T>(sql, params, dbName);
   }
 
@@ -267,9 +304,11 @@ export class PGLiteNative {
           break;
         }
         console.warn(`[PGLite Native Fallback] exec2: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        await this.flushWriteQueue();
         return this.getJsEngine().exec2<T>(sql, params, dbName);
       }
     }
+    await this.flushWriteQueue();
     return this.getJsEngine().exec2<T>(sql, params, dbName);
   }
 
@@ -343,9 +382,11 @@ export class PGLiteNative {
           break;
         }
         console.warn(`[PGLite Native Fallback] query: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        await this.flushWriteQueue();
         return this.getJsEngine().query<T>(sql, params, dbName);
       }
     }
+    await this.flushWriteQueue();
     return this.getJsEngine().query<T>(sql, params, dbName);
   }
 
@@ -402,17 +443,21 @@ export class PGLiteNative {
         }
         const errMsg = currentErr?.message || String(currentErr);
         console.warn(`[PGLite Native Fallback] query2: ${errMsg} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        await this.flushWriteQueue();
         return this.getJsEngine().query2<T>(sql, params, dbName);
       }
     }
+    await this.flushWriteQueue();
     return this.getJsEngine().query2<T>(sql, params, dbName);
   }
 
   public async transaction<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {
+    await this.flushWriteQueue();
     return this.getJsEngine().transaction<T>(callback, dbName);
   }
 
   public async transaction2<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {
+    await this.flushWriteQueue();
     return this.getJsEngine().transaction2<T>(callback, dbName);
   }
 
