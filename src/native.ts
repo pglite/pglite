@@ -123,26 +123,34 @@ export class PGLiteNative {
         }
         return res;
       } catch (err: any) {
-        const errMsg = err?.message || String(err);
-        const match = errMsg.match(/Table\s+([a-zA-Z0-9_"\.-]+)\s+not found/i);
-        if (match) {
-          const rawTable = match[1].replace(/"/g, "");
-          const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
-          const hydrated = await this.tryHydrateTable(tbl, dbName);
-          if (hydrated) {
-            try {
-              let p = Array.isArray(params) ? params : undefined;
-              let db = typeof params === "string" ? params : dbName;
-              const res = this.nativeInstance.query(sql, p, db) as T[];
-              console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
-              const upper = sql.trim().toUpperCase();
-              if (!upper.startsWith("SELECT")) {
-                this.getJsEngine().query<T>(sql, params, dbName).catch(() => {});
+        let currentErr = err;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const errMsg = currentErr?.message || String(currentErr);
+          const match = errMsg.match(/Table\s+([a-zA-Z0-9_"\.-]+)\s+not found/i);
+          if (match) {
+            const rawTable = match[1].replace(/"/g, "");
+            const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
+            const hydrated = await this.tryHydrateTable(tbl, dbName);
+            if (hydrated) {
+              try {
+                let p = Array.isArray(params) ? params : undefined;
+                let db = typeof params === "string" ? params : dbName;
+                const res = this.nativeInstance.query(sql, p, db) as T[];
+                console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+                const upper = sql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  this.getJsEngine().query<T>(sql, params, dbName).catch(() => {});
+                }
+                return res;
+              } catch (retryErr) {
+                currentErr = retryErr;
+                continue;
               }
-              return res;
-            } catch {}
+            }
           }
+          break;
         }
+        const errMsg = currentErr?.message || String(currentErr);
         console.warn(`[PGLite Native Fallback] query: ${errMsg} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         return this.getJsEngine().query<T>(sql, params, dbName);
       }
@@ -163,26 +171,34 @@ export class PGLiteNative {
         }
         return res;
       } catch (err: any) {
-        const errMsg = err?.message || String(err);
-        const match = errMsg.match(/Table\s+([a-zA-Z0-9_"\.-]+)\s+not found/i);
-        if (match) {
-          const rawTable = match[1].replace(/"/g, "");
-          const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
-          const hydrated = await this.tryHydrateTable(tbl, dbName);
-          if (hydrated) {
-            try {
-              let p = Array.isArray(params) ? params : undefined;
-              let db = typeof params === "string" ? params : dbName;
-              const res = this.nativeInstance.query2(sql, p, db) as QueryResult<T>;
-              console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
-              const upper = sql.trim().toUpperCase();
-              if (!upper.startsWith("SELECT")) {
-                this.getJsEngine().query2<T>(sql, params, dbName).catch(() => {});
+        let currentErr = err;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const errMsg = currentErr?.message || String(currentErr);
+          const match = errMsg.match(/Table\s+([a-zA-Z0-9_"\.-]+)\s+not found/i);
+          if (match) {
+            const rawTable = match[1].replace(/"/g, "");
+            const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
+            const hydrated = await this.tryHydrateTable(tbl, dbName);
+            if (hydrated) {
+              try {
+                let p = Array.isArray(params) ? params : undefined;
+                let db = typeof params === "string" ? params : dbName;
+                const res = this.nativeInstance.query2(sql, p, db) as QueryResult<T>;
+                console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+                const upper = sql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  this.getJsEngine().query2<T>(sql, params, dbName).catch(() => {});
+                }
+                return res;
+              } catch (retryErr) {
+                currentErr = retryErr;
+                continue;
               }
-              return res;
-            } catch {}
+            }
           }
+          break;
         }
+        const errMsg = currentErr?.message || String(currentErr);
         console.warn(`[PGLite Native Fallback] query2: ${errMsg} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         return this.getJsEngine().query2<T>(sql, params, dbName);
       }

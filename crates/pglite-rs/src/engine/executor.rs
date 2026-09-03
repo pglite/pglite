@@ -271,6 +271,14 @@ impl Executor {
         let clauses = parse_select_clauses(after_from);
         let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
 
+        let joined_table_opt = if let Some(ref jc) = clauses.join_clause {
+            let jt = self.storage.get_table(jc.joined_table_name)
+                .ok_or_else(|| format!("Table {} not found", jc.joined_table_name))?;
+            Some(jt)
+        } else {
+            None
+        };
+
         // 1. Check if SELECT has aggregate functions (COUNT, SUM, AVG, MIN, MAX)
         let agg_specs = parse_aggregations(select_clause, table);
 
@@ -278,64 +286,25 @@ impl Executor {
             return self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params);
         }
 
-        // 2. Fast-Path: Point lookup by Primary Key (WHERE id = $1 or WHERE id = 123)
-        if let Some(w) = clauses.where_clause {
-            let w_upper = w.to_uppercase();
-            if clauses.order_by_col.is_none() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
-                if let Some(pk_idx) = table.pk_col_idx {
-                    let pk_col_name = &table.columns[pk_idx].name;
-                    if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
-                       w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
-                       w_upper.starts_with("ID =") {
-                        let val_part = w.split('=').nth(1).unwrap().trim();
-                        let target_id = if val_part.starts_with('$') {
-                            let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
-                            params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
-                        } else {
-                            val_part.parse::<i64>().unwrap_or(0)
-                        };
-
-                        if let Some(row) = table.get_by_pk(target_id) {
-                            return Ok(QueryResult {
-                                rows: vec![row_to_json(table, row)],
-                                row_count: 1,
-                                fields: table.columns.iter().map(|c| FieldInfo {
-                                    name: c.name.clone(),
-                                    data_type: format!("{:?}", c.data_type).to_lowercase(),
-                                }).collect(),
-                                command: "SELECT".to_string(),
-                            });
-                        } else {
-                            return Ok(QueryResult {
-                                rows: vec![],
-                                row_count: 0,
-                                fields: vec![],
-                                command: "SELECT".to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Fast-Path: Non-PK exact string lookup (WHERE name = $1 or WHERE name = '...')
-        if let Some(w) = clauses.where_clause {
-            if clauses.order_by_col.is_none() && clauses.limit.is_none() {
-                if let Some(eq_idx) = w.find('=') {
-                    let left = w[..eq_idx].trim().trim_matches('"');
-                    let right = w[eq_idx + 1..].trim();
-                    if !right.contains("AND") && !right.contains("OR") {
-                        if let Some(col_idx) = table.get_column_index(left) {
-                            let target_val = if right.starts_with('$') {
-                                let p_idx = right[1..].parse::<usize>().unwrap_or(1);
-                                params.get(p_idx - 1).cloned().unwrap_or(Value::Null)
-                            } else if right.starts_with('\'') && right.ends_with('\'') {
-                                Value::Text(right[1..right.len() - 1].to_string())
+        if clauses.join_clause.is_none() {
+            // 2. Fast-Path: Point lookup by Primary Key (WHERE id = $1 or WHERE id = 123)
+            if let Some(w) = clauses.where_clause {
+                let w_upper = w.to_uppercase();
+                if clauses.order_by_col.is_none() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
+                    if let Some(pk_idx) = table.pk_col_idx {
+                        let pk_col_name = &table.columns[pk_idx].name;
+                        if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
+                           w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
+                           w_upper.starts_with("ID =") {
+                            let val_part = w.split('=').nth(1).unwrap().trim();
+                            let target_id = if val_part.starts_with('$') {
+                                let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
+                                params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
                             } else {
-                                Value::Text(right.to_string())
+                                val_part.parse::<i64>().unwrap_or(0)
                             };
 
-                            if let Some(row) = table.find_first_by_col(col_idx, &target_val) {
+                            if let Some(row) = table.get_by_pk(target_id) {
                                 return Ok(QueryResult {
                                     rows: vec![row_to_json(table, row)],
                                     row_count: 1,
@@ -352,6 +321,47 @@ impl Executor {
                                     fields: vec![],
                                     command: "SELECT".to_string(),
                                 });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Fast-Path: Non-PK exact string lookup (WHERE name = $1 or WHERE name = '...')
+            if let Some(w) = clauses.where_clause {
+                if clauses.order_by_col.is_none() && clauses.limit.is_none() {
+                    if let Some(eq_idx) = w.find('=') {
+                        let left = w[..eq_idx].trim().trim_matches('"');
+                        let right = w[eq_idx + 1..].trim();
+                        if !right.contains("AND") && !right.contains("OR") {
+                            if let Some(col_idx) = table.get_column_index(left) {
+                                let target_val = if right.starts_with('$') {
+                                    let p_idx = right[1..].parse::<usize>().unwrap_or(1);
+                                    params.get(p_idx - 1).cloned().unwrap_or(Value::Null)
+                                } else if right.starts_with('\'') && right.ends_with('\'') {
+                                    Value::Text(right[1..right.len() - 1].to_string())
+                                } else {
+                                    Value::Text(right.to_string())
+                                };
+
+                                if let Some(row) = table.find_first_by_col(col_idx, &target_val) {
+                                    return Ok(QueryResult {
+                                        rows: vec![row_to_json(table, row)],
+                                        row_count: 1,
+                                        fields: table.columns.iter().map(|c| FieldInfo {
+                                            name: c.name.clone(),
+                                            data_type: format!("{:?}", c.data_type).to_lowercase(),
+                                        }).collect(),
+                                        command: "SELECT".to_string(),
+                                    });
+                                } else {
+                                    return Ok(QueryResult {
+                                        rows: vec![],
+                                        row_count: 0,
+                                        fields: vec![],
+                                        command: "SELECT".to_string(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -420,51 +430,82 @@ impl Executor {
             &[]
         };
 
-        let projected_cols: Option<Vec<usize>> = if select_clause.trim() == "*" {
-            None
+        let projected_exprs = if select_clause.trim() == "*" {
+            Vec::new()
         } else {
-            let mut indices = Vec::new();
-            for part in select_clause.split(',') {
-                let col = clean_col_name(part);
-                if let Some(idx) = table.get_column_index(col) {
-                    indices.push(idx);
-                }
-            }
-            if indices.is_empty() { None } else { Some(indices) }
+            parse_projection(select_clause, table, joined_table_opt, params)
         };
 
-        let fields: Vec<FieldInfo> = match &projected_cols {
-            Some(indices) => indices.iter().map(|&idx| {
-                let c = &table.columns[idx];
-                FieldInfo {
-                    name: c.name.clone(),
-                    data_type: format!("{:?}", c.data_type).to_lowercase(),
-                }
-            }).collect(),
-            None => table.columns.iter().map(|c| FieldInfo {
-                name: c.name.clone(),
-                data_type: format!("{:?}", c.data_type).to_lowercase(),
-            }).collect(),
-        };
-
-        let rows: Vec<serde_json::Value> = match &projected_cols {
-            Some(indices) => paged_indices
+        let rows: Vec<serde_json::Value> = if !projected_exprs.is_empty() {
+            paged_indices
                 .iter()
                 .map(|&idx| {
-                    let row = &table.rows[idx];
-                    let mut map = serde_json::Map::with_capacity(indices.len());
-                    for &c_idx in indices {
-                        let col = &table.columns[c_idx];
-                        let val = &row[c_idx];
-                        map.insert(col.name.clone(), value_to_json(val));
+                    let primary_row = &table.rows[idx];
+                    let joined_row: Option<&Vec<Value>> = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
+                        if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
+                            let join_key = &primary_row[p_col_idx];
+                            if let Some(target_pk) = join_key.as_i64() {
+                                jt.get_by_pk(target_pk)
+                            } else if let Some(j_col_idx) = jt.get_column_index(jc.joined_join_col) {
+                                jt.rows.iter().find(|r| !r.is_empty() && r[j_col_idx].is_equal(join_key))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut map = serde_json::Map::with_capacity(projected_exprs.len());
+                    for expr in &projected_exprs {
+                        match expr {
+                            ProjectedExpr::PrimaryCol { col_idx, alias } => {
+                                let v = primary_row.get(*col_idx).unwrap_or(&Value::Null);
+                                map.insert(alias.clone(), value_to_json(v));
+                            }
+                            ProjectedExpr::JoinedCol { col_idx, alias } => {
+                                let v = joined_row.and_then(|r| r.get(*col_idx)).unwrap_or(&Value::Null);
+                                map.insert(alias.clone(), value_to_json(v));
+                            }
+                            ProjectedExpr::CoalescePrimaryCol { col_idx, default_val, alias } => {
+                                let raw_v = primary_row.get(*col_idx).unwrap_or(&Value::Null);
+                                let v = match raw_v {
+                                    Value::Null => default_val,
+                                    _ => raw_v,
+                                };
+                                map.insert(alias.clone(), value_to_json(v));
+                            }
+                        }
                     }
                     serde_json::Value::Object(map)
                 })
-                .collect(),
-            None => paged_indices
+                .collect()
+        } else {
+            paged_indices
                 .iter()
                 .map(|&idx| row_to_json(table, &table.rows[idx]))
-                .collect(),
+                .collect()
+        };
+
+        let fields: Vec<FieldInfo> = if !projected_exprs.is_empty() {
+            projected_exprs.iter().map(|e| {
+                let alias = match e {
+                    ProjectedExpr::PrimaryCol { alias, .. } => alias.clone(),
+                    ProjectedExpr::JoinedCol { alias, .. } => alias.clone(),
+                    ProjectedExpr::CoalescePrimaryCol { alias, .. } => alias.clone(),
+                };
+                FieldInfo {
+                    name: alias,
+                    data_type: "text".to_string(),
+                }
+            }).collect()
+        } else {
+            table.columns.iter().map(|c| FieldInfo {
+                name: c.name.clone(),
+                data_type: format!("{:?}", c.data_type).to_lowercase(),
+            }).collect()
         };
 
         Ok(QueryResult {
@@ -785,8 +826,17 @@ impl Executor {
     }
 }
 
+struct JoinClause<'a> {
+    #[allow(dead_code)]
+    is_left: bool,
+    joined_table_name: &'a str,
+    primary_join_col: &'a str,
+    joined_join_col: &'a str,
+}
+
 struct SelectClauses<'a> {
     table_name: &'a str,
+    join_clause: Option<JoinClause<'a>>,
     where_clause: Option<&'a str>,
     order_by_col: Option<&'a str>,
     order_by_desc: bool,
@@ -794,23 +844,190 @@ struct SelectClauses<'a> {
     offset: usize,
 }
 
+enum ProjectedExpr {
+    PrimaryCol { col_idx: usize, alias: String },
+    JoinedCol { col_idx: usize, alias: String },
+    CoalescePrimaryCol { col_idx: usize, default_val: Value, alias: String },
+}
+
+fn split_projection_items(s: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth: usize = 0;
+    for c in s.chars() {
+        if c == '(' {
+            depth += 1;
+            current.push(c);
+        } else if c == ')' {
+            depth = depth.saturating_sub(1);
+            current.push(c);
+        } else if c == ',' && depth == 0 {
+            items.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+    items
+}
+
+fn parse_projection(
+    select_clause: &str,
+    primary_table: &crate::storage::table::Table,
+    joined_table: Option<&crate::storage::table::Table>,
+    params: &[Value],
+) -> Vec<ProjectedExpr> {
+    let items = split_projection_items(select_clause);
+    let mut exprs = Vec::new();
+
+    for item in items {
+        let upper = item.to_uppercase();
+        let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+            (item[..as_idx].trim(), item[as_idx + 4..].trim().trim_matches('"').to_string())
+        } else {
+            let col = clean_col_name(item.trim());
+            (item.trim(), col.to_string())
+        };
+
+        let upper_expr = expr_part.to_uppercase();
+
+        // 1. Check for COALESCE(..., default)
+        if upper_expr.starts_with("COALESCE(") && expr_part.ends_with(')') {
+            let inner = &expr_part[9..expr_part.len() - 1];
+            let inner_parts: Vec<&str> = inner.split(',').collect();
+            if inner_parts.len() >= 2 {
+                let first = inner_parts[0].trim();
+                let second = inner_parts[1].trim();
+                let default_val = parse_value(second, params);
+
+                let upper_first = first.to_uppercase();
+                let raw_col = if upper_first.starts_with("CAST(") && first.ends_with(')') {
+                    let inside = &first[5..first.len() - 1];
+                    let as_pos = inside.to_uppercase().find(" AS ").unwrap_or(inside.len());
+                    inside[..as_pos].trim()
+                } else {
+                    first
+                };
+
+                let col_name = clean_col_name(raw_col);
+                if let Some(col_idx) = primary_table.get_column_index(col_name) {
+                    exprs.push(ProjectedExpr::CoalescePrimaryCol { col_idx, default_val, alias });
+                    continue;
+                }
+            }
+        }
+
+        // 2. Check if expression references joined_table
+        if let Some(jt) = joined_table {
+            if expr_part.to_lowercase().contains(&jt.name.to_lowercase()) {
+                let col_name = clean_col_name(expr_part);
+                if let Some(col_idx) = jt.get_column_index(col_name) {
+                    exprs.push(ProjectedExpr::JoinedCol { col_idx, alias });
+                    continue;
+                }
+            }
+        }
+
+        // 3. Default to primary_table column
+        let col_name = clean_col_name(expr_part);
+        if let Some(col_idx) = primary_table.get_column_index(col_name) {
+            exprs.push(ProjectedExpr::PrimaryCol { col_idx, alias });
+        } else if let Some(jt) = joined_table {
+            if let Some(col_idx) = jt.get_column_index(col_name) {
+                exprs.push(ProjectedExpr::JoinedCol { col_idx, alias });
+            }
+        }
+    }
+
+    exprs
+}
+
 fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
     let upper = after_from.to_uppercase();
-    let where_pos = upper.find("WHERE ");
-    let order_pos = upper.find("ORDER BY ");
-    let limit_pos = upper.find("LIMIT ");
-    let offset_pos = upper.find("OFFSET ");
 
-    let first_kw_pos = [where_pos, order_pos, limit_pos, offset_pos]
-        .into_iter()
-        .filter_map(|x| x)
-        .min();
-
-    let table_name = match first_kw_pos {
-        Some(pos) => after_from[..pos].trim().trim_matches('"'),
-        None => after_from.trim().trim_matches('"'),
+    // Check for JOIN keywords
+    let (join_pos, kw_len, is_left) = if let Some(pos) = upper.find("LEFT JOIN ") {
+        (Some(pos), 10, true)
+    } else if let Some(pos) = upper.find("LEFT OUTER JOIN ") {
+        (Some(pos), 16, true)
+    } else if let Some(pos) = upper.find("INNER JOIN ") {
+        (Some(pos), 11, false)
+    } else if let Some(pos) = upper.find("JOIN ") {
+        (Some(pos), 5, false)
+    } else {
+        (None, 0, false)
     };
 
+    let table_name = match join_pos {
+        Some(pos) => after_from[..pos].trim().trim_matches('"'),
+        None => {
+            let where_pos = upper.find("WHERE ");
+            let order_pos = upper.find("ORDER BY ");
+            let limit_pos = upper.find("LIMIT ");
+            let offset_pos = upper.find("OFFSET ");
+            let first_kw_pos = [where_pos, order_pos, limit_pos, offset_pos]
+                .into_iter()
+                .filter_map(|x| x)
+                .min();
+            match first_kw_pos {
+                Some(pos) => after_from[..pos].trim().trim_matches('"'),
+                None => after_from.trim().trim_matches('"'),
+            }
+        }
+    };
+
+    let join_clause = match join_pos {
+        Some(j_pos) => {
+            let after_j = &after_from[j_pos + kw_len..];
+            let upper_j = after_j.to_uppercase();
+            if let Some(on_pos) = upper_j.find(" ON ") {
+                let joined_table_name = after_j[..on_pos].trim().trim_matches('"');
+                let after_on = &after_j[on_pos + 4..];
+                let upper_on = after_on.to_uppercase();
+                let end_pos = [upper_on.find("WHERE "), upper_on.find("ORDER BY "), upper_on.find("LIMIT "), upper_on.find("OFFSET ")]
+                    .into_iter()
+                    .filter_map(|x| x)
+                    .min()
+                    .unwrap_or(after_on.len());
+                let on_str = after_on[..end_pos].trim();
+
+                if let Some(eq_idx) = on_str.find('=') {
+                    let side_a = on_str[..eq_idx].trim();
+                    let side_b = on_str[eq_idx + 1..].trim();
+
+                    let col_a = clean_col_name(side_a);
+                    let col_b = clean_col_name(side_b);
+
+                    let (primary_col, joined_col) = if side_a.contains(joined_table_name) {
+                        (col_b, col_a)
+                    } else if side_b.contains(joined_table_name) {
+                        (col_a, col_b)
+                    } else if side_a.contains(table_name) {
+                        (col_a, col_b)
+                    } else {
+                        (col_b, col_a)
+                    };
+
+                    Some(JoinClause {
+                        is_left,
+                        joined_table_name,
+                        primary_join_col: primary_col,
+                        joined_join_col: joined_col,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    let where_pos = upper.find("WHERE ");
     let where_clause = where_pos.map(|w_idx| {
         let after_w = &after_from[w_idx + 6..];
         let upper_w = after_w.to_uppercase();
@@ -824,6 +1041,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         }
     });
 
+    let order_pos = upper.find("ORDER BY ");
     let (order_by_col, order_by_desc) = match order_pos {
         Some(o_idx) => {
             let after_o = &after_from[o_idx + 9..];
@@ -844,6 +1062,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         None => (None, false),
     };
 
+    let limit_pos = upper.find("LIMIT ");
     let limit = match limit_pos {
         Some(l_idx) => {
             let after_l = &after_from[l_idx + 6..];
@@ -858,6 +1077,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         None => None,
     };
 
+    let offset_pos = upper.find("OFFSET ");
     let offset = match offset_pos {
         Some(off_idx) => {
             let after_off = after_from[off_idx + 7..].trim();
@@ -868,6 +1088,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
 
     SelectClauses {
         table_name,
+        join_clause,
         where_clause,
         order_by_col,
         order_by_desc,

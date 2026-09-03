@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[napi(js_name = "LitePostgresNative")]
 pub struct LitePostgresNative {
     executor: Arc<Mutex<Executor>>,
+    #[allow(dead_code)]
     filepath: String,
 }
 
