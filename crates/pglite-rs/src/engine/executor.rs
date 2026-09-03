@@ -13,7 +13,7 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let trimmed = sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
         let upper = trimmed.to_uppercase();
 
         if upper.starts_with("BEGIN") {
@@ -420,18 +420,57 @@ impl Executor {
             &[]
         };
 
-        let rows: Vec<serde_json::Value> = paged_indices
-            .iter()
-            .map(|&idx| row_to_json(table, &table.rows[idx]))
-            .collect();
+        let projected_cols: Option<Vec<usize>> = if select_clause.trim() == "*" {
+            None
+        } else {
+            let mut indices = Vec::new();
+            for part in select_clause.split(',') {
+                let col = clean_col_name(part);
+                if let Some(idx) = table.get_column_index(col) {
+                    indices.push(idx);
+                }
+            }
+            if indices.is_empty() { None } else { Some(indices) }
+        };
+
+        let fields: Vec<FieldInfo> = match &projected_cols {
+            Some(indices) => indices.iter().map(|&idx| {
+                let c = &table.columns[idx];
+                FieldInfo {
+                    name: c.name.clone(),
+                    data_type: format!("{:?}", c.data_type).to_lowercase(),
+                }
+            }).collect(),
+            None => table.columns.iter().map(|c| FieldInfo {
+                name: c.name.clone(),
+                data_type: format!("{:?}", c.data_type).to_lowercase(),
+            }).collect(),
+        };
+
+        let rows: Vec<serde_json::Value> = match &projected_cols {
+            Some(indices) => paged_indices
+                .iter()
+                .map(|&idx| {
+                    let row = &table.rows[idx];
+                    let mut map = serde_json::Map::with_capacity(indices.len());
+                    for &c_idx in indices {
+                        let col = &table.columns[c_idx];
+                        let val = &row[c_idx];
+                        map.insert(col.name.clone(), value_to_json(val));
+                    }
+                    serde_json::Value::Object(map)
+                })
+                .collect(),
+            None => paged_indices
+                .iter()
+                .map(|&idx| row_to_json(table, &table.rows[idx]))
+                .collect(),
+        };
 
         Ok(QueryResult {
             row_count: rows.len(),
             rows,
-            fields: table.columns.iter().map(|c| FieldInfo {
-                name: c.name.clone(),
-                data_type: format!("{:?}", c.data_type).to_lowercase(),
-            }).collect(),
+            fields,
             command: "SELECT".to_string(),
         })
     }
@@ -924,6 +963,8 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
 enum ColOp {
     Eq(Value),
     NotEq(Value),
+    LowerEq(String),
+    UpperEq(String),
     Gt(f64),
     Lt(f64),
     Gte(f64),
@@ -1109,10 +1150,35 @@ fn parse_conditions(where_clause: &str, table: &crate::storage::table::Table, pa
             let num = parse_number(&part[op_idx + 1..], params)?;
             conditions.push(Condition { col_idx, op: ColOp::Lt(num) });
         } else if let Some(op_idx) = part.find('=') {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let left_raw = part[..op_idx].trim();
+            let upper_left = left_raw.to_uppercase();
             let val = parse_value(&part[op_idx + 1..], params);
-            conditions.push(Condition { col_idx, op: ColOp::Eq(val) });
+
+            if upper_left.starts_with("LOWER(") && left_raw.ends_with(')') {
+                let inner = &left_raw[6..left_raw.len() - 1].trim();
+                let col_name = clean_col_name(inner);
+                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+                let target_str = match &val {
+                    Value::Text(s) => s.to_lowercase(),
+                    Value::Int(i) => i.to_string(),
+                    _ => "".to_string(),
+                };
+                conditions.push(Condition { col_idx, op: ColOp::LowerEq(target_str) });
+            } else if upper_left.starts_with("UPPER(") && left_raw.ends_with(')') {
+                let inner = &left_raw[6..left_raw.len() - 1].trim();
+                let col_name = clean_col_name(inner);
+                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+                let target_str = match &val {
+                    Value::Text(s) => s.to_uppercase(),
+                    Value::Int(i) => i.to_string(),
+                    _ => "".to_string(),
+                };
+                conditions.push(Condition { col_idx, op: ColOp::UpperEq(target_str) });
+            } else {
+                let col_name = clean_col_name(left_raw);
+                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+                conditions.push(Condition { col_idx, op: ColOp::Eq(val) });
+            }
         }
     }
 
@@ -1146,6 +1212,36 @@ fn evaluate_conditions(row: &[Value], conditions: &[Condition]) -> bool {
             ColOp::Eq(target) => {
                 if !val.is_equal(target) {
                     return false;
+                }
+            }
+            ColOp::LowerEq(target) => {
+                match val {
+                    Value::Text(s) => {
+                        if s.to_lowercase() != *target {
+                            return false;
+                        }
+                    }
+                    Value::Int(i) => {
+                        if i.to_string() != *target {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            ColOp::UpperEq(target) => {
+                match val {
+                    Value::Text(s) => {
+                        if s.to_uppercase() != *target {
+                            return false;
+                        }
+                    }
+                    Value::Int(i) => {
+                        if i.to_string() != *target {
+                            return false;
+                        }
+                    }
+                    _ => return false,
                 }
             }
             ColOp::Gt(threshold) => {
@@ -1188,17 +1284,21 @@ fn evaluate_conditions(row: &[Value], conditions: &[Condition]) -> bool {
     true
 }
 
+fn value_to_json(val: &Value) -> serde_json::Value {
+    match val {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => json!(*b),
+        Value::Int(n) => json!(*n),
+        Value::Float(f) => json!(*f),
+        Value::Text(s) => json!(s),
+    }
+}
+
 fn row_to_json(table: &crate::storage::table::Table, row: &[Value]) -> serde_json::Value {
     let mut map = serde_json::Map::with_capacity(table.columns.len());
     for (i, col) in table.columns.iter().enumerate() {
-        let v = match row.get(i).unwrap_or(&Value::Null) {
-            Value::Null => serde_json::Value::Null,
-            Value::Bool(b) => json!(*b),
-            Value::Int(n) => json!(*n),
-            Value::Float(f) => json!(*f),
-            Value::Text(s) => json!(s),
-        };
-        map.insert(col.name.clone(), v);
+        let v = row.get(i).unwrap_or(&Value::Null);
+        map.insert(col.name.clone(), value_to_json(v));
     }
     serde_json::Value::Object(map)
 }

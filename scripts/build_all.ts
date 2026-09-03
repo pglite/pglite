@@ -57,24 +57,28 @@ try {
     console.log("  ✓ Generated pglite.linux-x64.node");
   }
 
-  // 4. Sync Linux addon to NATA backend if present
-  console.log("\n🔗 [4/4] Synchronizing Linux Native Addon to NATA backend...");
+  // 4. Sync Native Addons to NATA backend if present
+  console.log("\n🔗 [4/4] Synchronizing Native Addons to NATA backend...");
   const nataBackendDist = resolve(ROOT_DIR, "../NATA/backend/dist");
   const nataBackendWs5 = resolve(ROOT_DIR, "../NATA/backend/dist-ws5");
   const nataBackendRoot = resolve(ROOT_DIR, "../NATA/backend");
 
+  if (existsSync(macDylib)) {
+    for (const targetDir of [nataBackendDist, nataBackendWs5, nataBackendRoot]) {
+      if (existsSync(targetDir)) {
+        copyFileSync(macDylib, join(targetDir, "pglite.darwin-arm64.node"));
+        copyFileSync(macDylib, join(targetDir, "pglite.node"));
+        console.log(`  ✓ Synced macOS addon to ${targetDir}`);
+      }
+    }
+  }
+
   if (existsSync(linuxSo)) {
-    if (existsSync(nataBackendDist)) {
-      copyFileSync(linuxSo, join(nataBackendDist, "pglite.linux-x64.node"));
-      console.log(`  ✓ Synced to ${nataBackendDist}/pglite.linux-x64.node`);
-    }
-    if (existsSync(nataBackendWs5)) {
-      copyFileSync(linuxSo, join(nataBackendWs5, "pglite.linux-x64.node"));
-      console.log(`  ✓ Synced to ${nataBackendWs5}/pglite.linux-x64.node`);
-    }
-    if (existsSync(nataBackendRoot)) {
-      copyFileSync(linuxSo, join(nataBackendRoot, "pglite.linux-x64.node"));
-      console.log(`  ✓ Synced to ${nataBackendRoot}/pglite.linux-x64.node`);
+    for (const targetDir of [nataBackendDist, nataBackendWs5, nataBackendRoot]) {
+      if (existsSync(targetDir)) {
+        copyFileSync(linuxSo, join(targetDir, "pglite.linux-x64.node"));
+        console.log(`  ✓ Synced Linux addon to ${targetDir}`);
+      }
     }
   }
 
