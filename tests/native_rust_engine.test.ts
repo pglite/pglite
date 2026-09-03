@@ -405,6 +405,8 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       const rows = await dbInstance1.query(`SELECT * FROM "items"`);
       expect(rows.length).toBe(2);
       expect(rows[0].price).toBe(24.99);
+
+      await dbInstance1.close();
     });
 
     test("9.2 Re-open database instance and verify data integrity across reboots", async () => {

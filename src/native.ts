@@ -26,6 +26,62 @@ export class PGLiteNative {
   }
 
   private hydratedTables = new Set<string>();
+  private writeQueue: Array<{ sql: string; params?: any[]; dbName?: string; isExec?: boolean }> = [];
+  private flushTimer: any = null;
+  private isFlushing = false;
+  private readonly MAX_BATCH_SIZE = 50;
+  private readonly FLUSH_INTERVAL_MS = 50;
+
+  private queueBackgroundWrite(sql: string, params?: any, dbName?: string, isExec: boolean = false) {
+    let p = Array.isArray(params) ? params : undefined;
+    let db = typeof params === "string" ? params : dbName;
+    this.writeQueue.push({ sql, params: p, dbName: db, isExec });
+
+    if (this.writeQueue.length >= this.MAX_BATCH_SIZE) {
+      this.flushWriteQueue().catch(() => {});
+    } else if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        this.flushWriteQueue().catch(() => {});
+      }, this.FLUSH_INTERVAL_MS);
+    }
+  }
+
+  public async flushWriteQueue(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.writeQueue.length === 0 || this.isFlushing) {
+      return;
+    }
+
+    const tasks = this.writeQueue.splice(0, this.writeQueue.length);
+    this.isFlushing = true;
+
+    try {
+      const js = this.getJsEngine();
+      for (const task of tasks) {
+        try {
+          if (task.isExec) {
+            await js.exec(task.sql, task.params, task.dbName);
+          } else {
+            await js.query2(task.sql, task.params, task.dbName);
+          }
+        } catch {
+          // Ignore write-through errors in background flush
+        }
+      }
+    } finally {
+      this.isFlushing = false;
+      if (this.writeQueue.length > 0 && !this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = null;
+          this.flushWriteQueue().catch(() => {});
+        }, this.FLUSH_INTERVAL_MS);
+      }
+    }
+  }
 
   private async tryHydrateTable(tableName: string, dbName?: string): Promise<boolean> {
     const key = `${dbName || "public"}.${tableName.toLowerCase()}`;
@@ -95,9 +151,10 @@ export class PGLiteNative {
         const res = this.nativeInstance.exec(sql, p, db) as T;
         const upper = sql.trim().toUpperCase();
         if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
+          await this.flushWriteQueue();
           await this.getJsEngine().exec<T>(sql, params, dbName);
         } else if (!upper.startsWith("SELECT")) {
-          this.getJsEngine().exec<T>(sql, params, dbName).catch(() => {});
+          this.queueBackgroundWrite(sql, params, dbName, true);
         }
         return res;
       } catch (err: any) {
@@ -116,9 +173,10 @@ export class PGLiteNative {
         const res = this.nativeInstance.exec2(sql, p, db) as QueryResult<T>;
         const upper = sql.trim().toUpperCase();
         if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
+          await this.flushWriteQueue();
           await this.getJsEngine().exec2<T>(sql, params, dbName);
         } else if (!upper.startsWith("SELECT")) {
-          this.getJsEngine().exec2<T>(sql, params, dbName).catch(() => {});
+          this.queueBackgroundWrite(sql, params, dbName, true);
         }
         return res;
       } catch (err: any) {
@@ -138,7 +196,7 @@ export class PGLiteNative {
         console.log(`[PGLite Native ⚡] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
         const upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SELECT")) {
-          this.getJsEngine().query<T>(sql, params, dbName).catch(() => {});
+          this.queueBackgroundWrite(sql, params, dbName, false);
         }
         return res;
       } catch (err: any) {
@@ -158,7 +216,7 @@ export class PGLiteNative {
                 console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
                 const upper = sql.trim().toUpperCase();
                 if (!upper.startsWith("SELECT")) {
-                  this.getJsEngine().query<T>(sql, params, dbName).catch(() => {});
+                  this.queueBackgroundWrite(sql, params, dbName, false);
                 }
                 return res;
               } catch (retryErr) {
@@ -186,7 +244,7 @@ export class PGLiteNative {
         console.log(`[PGLite Native ⚡] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
         const upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SELECT")) {
-          this.getJsEngine().query2<T>(sql, params, dbName).catch(() => {});
+          this.queueBackgroundWrite(sql, params, dbName, false);
         }
         return res;
       } catch (err: any) {
@@ -206,7 +264,7 @@ export class PGLiteNative {
                 console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
                 const upper = sql.trim().toUpperCase();
                 if (!upper.startsWith("SELECT")) {
-                  this.getJsEngine().query2<T>(sql, params, dbName).catch(() => {});
+                  this.queueBackgroundWrite(sql, params, dbName, false);
                 }
                 return res;
               } catch (retryErr) {
@@ -234,6 +292,7 @@ export class PGLiteNative {
   }
 
   public async close(): Promise<void> {
+    await this.flushWriteQueue();
     if (this.nativeInstance) {
       try {
         this.nativeInstance.close();
