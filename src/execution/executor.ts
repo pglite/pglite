@@ -26,11 +26,153 @@ export class Executor {
     if (!r) return r;
     const copy: any = {};
     for (const k in r) {
-      if (!k.startsWith("__lpg_tbl_")) {
+      if (k.charCodeAt(0) !== 95 || !k.startsWith("__lpg_tbl_")) {
         copy[k] = r[k];
       }
     }
     return copy;
+  }
+
+  private hasAsyncOps(expr: any): boolean {
+    if (!expr) return false;
+    if (expr._hasAsync !== undefined) return expr._hasAsync;
+    let res = false;
+    switch (expr.type) {
+      case "Subquery":
+      case "Exists":
+        res = true;
+        break;
+      case "In":
+        if (!Array.isArray(expr.right)) res = true;
+        else res = this.hasAsyncOps(expr.left) || expr.right.some((e: any) => this.hasAsyncOps(e));
+        break;
+      case "Binary":
+      case "Logical":
+      case "Like":
+        res = this.hasAsyncOps(expr.left) || this.hasAsyncOps(expr.right);
+        break;
+      case "Not":
+      case "IsNull":
+      case "Cast": {
+        const dt = (expr.dataType || "").toUpperCase();
+        if (
+          dt.includes("REGCLASS") ||
+          dt.includes("REGTYPE") ||
+          dt.includes("REGNAMESPACE")
+        ) {
+          res = true;
+        } else {
+          res = this.hasAsyncOps(expr.expr);
+        }
+        break;
+      }
+      case "Extract":
+        res = this.hasAsyncOps(expr.source);
+        break;
+      case "Alias":
+        res = this.hasAsyncOps(expr.expr);
+        break;
+      case "Call": {
+        let fn = (expr.fnName || "").toUpperCase();
+        if (fn.includes(".")) fn = fn.split(".").pop()!;
+        if (fn === "OBJ_DESCRIPTION" || fn === "COL_DESCRIPTION") {
+          res = true;
+        } else {
+          res =
+            (expr.args && expr.args.some((e: any) => this.hasAsyncOps(e))) ||
+            (expr.filter && this.hasAsyncOps(expr.filter));
+        }
+        break;
+      }
+      case "Case":
+        res =
+          (expr.cases &&
+            expr.cases.some(
+              (c: any) => this.hasAsyncOps(c.when) || this.hasAsyncOps(c.then),
+            )) ||
+          (expr.elseExpr && this.hasAsyncOps(expr.elseExpr));
+        break;
+      case "Array":
+        res = expr.elements && expr.elements.some((e: any) => this.hasAsyncOps(e));
+        break;
+      default:
+        res = false;
+    }
+    expr._hasAsync = res;
+    return res;
+  }
+
+  private hasOuterReferences(subquery: any, row: any): boolean {
+    if (!row || !subquery) return false;
+    const rowKeys = Object.keys(row);
+    if (rowKeys.length === 0) return false;
+
+    const localTables = new Set<string>();
+    const collectTables = (stmt: any) => {
+      if (!stmt) return;
+      if (stmt.from) {
+        if (stmt.from.tableName) localTables.add(stmt.from.tableName.toLowerCase());
+        if (stmt.from.alias) localTables.add(stmt.from.alias.toLowerCase());
+        if (stmt.from.stmt) collectTables(stmt.from.stmt);
+      }
+      if (stmt.joins) {
+        for (const j of stmt.joins) {
+          if (j.tableName) localTables.add(j.tableName.toLowerCase());
+          if (j.alias) localTables.add(j.alias.toLowerCase());
+          if (j.stmt) collectTables(j.stmt);
+        }
+      }
+      if (stmt.where) collectSubqueryTables(stmt.where);
+    };
+
+    const collectSubqueryTables = (e: any) => {
+      if (!e) return;
+      if (e.type === "In" && !Array.isArray(e.right)) {
+        collectTables(e.right);
+      } else if (e.type === "Subquery" && e.stmt) {
+        collectTables(e.stmt);
+      }
+      for (const k in e) {
+        if (e[k] && typeof e[k] === "object") collectSubqueryTables(e[k]);
+      }
+    };
+
+    collectTables(subquery);
+
+    let isCorrelated = false;
+    const scanExpr = (e: any) => {
+      if (!e || isCorrelated) return;
+      if (e.type === "Identifier") {
+        if (e.name.includes(".")) {
+          const [tbl] = e.name.split(".");
+          if (tbl && !localTables.has(tbl.toLowerCase())) {
+            isCorrelated = true;
+          }
+        }
+      } else {
+        for (const k in e) {
+          if (e[k] && typeof e[k] === "object") scanExpr(e[k]);
+        }
+      }
+    };
+
+    if (subquery.where) scanExpr(subquery.where);
+    return isCorrelated;
+  }
+
+  private getMaxParamIndex(node: any): number {
+    let max = 0;
+    const scan = (n: any) => {
+      if (!n) return;
+      if (n.type === "Parameter" && typeof n.index === "number") {
+        if (n.index > max) max = n.index;
+      }
+      for (const k in n) {
+        if (n[k] && typeof n[k] === "object") scan(n[k]);
+      }
+    };
+    scan(node);
+    return max;
   }
 
   private extractAggregates(expr: any, aggs: Expr[]) {
@@ -133,6 +275,15 @@ export class Executor {
     stmt: Statement,
     params: any = [],
   ): Promise<any> {
+    if (Array.isArray(params)) {
+      const maxParam = this.getMaxParamIndex(stmt);
+      if (maxParam > params.length) {
+        throw new Error(
+          `bind message supplies ${params.length} parameters, but prepared statement requires at least ${maxParam}`,
+        );
+      }
+    }
+
     switch (stmt.type) {
       case "Begin":
         storage.begin();
@@ -2578,12 +2729,20 @@ export class Executor {
               }
               return r;
             });
-            if ((!stmt.joins || stmt.joins.length === 0) && stmt.where)
-              source = this.filterStream(
-                source,
-                async (r) =>
-                  await this.evaluateExpr(storage, stmt.where, r, params),
-              );
+            if ((!stmt.joins || stmt.joins.length === 0) && stmt.where) {
+              if (!this.hasAsyncOps(stmt.where)) {
+                source = this.filterStreamSync(
+                  source,
+                  (r) => !!this.evaluateExprSync(storage, stmt.where, r, params),
+                );
+              } else {
+                source = this.filterStream(
+                  source,
+                  async (r) =>
+                    await this.evaluateExpr(storage, stmt.where, r, params),
+                );
+              }
+            }
           }
         }
       } else {
@@ -2616,16 +2775,31 @@ export class Executor {
         }
       }
 
-      if (stmt.where && stmt.joins && stmt.joins.length > 0)
-        source = this.filterStream(
-          source,
-          async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
-        );
-      else if (stmt.where && (stmt.from?.stmt || stmt.from?.fn || !stmt.from))
-        source = this.filterStream(
-          source,
-          async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
-        );
+      if (stmt.where && stmt.joins && stmt.joins.length > 0) {
+        if (!this.hasAsyncOps(stmt.where)) {
+          source = this.filterStreamSync(
+            source,
+            (r) => !!this.evaluateExprSync(storage, stmt.where, r, params),
+          );
+        } else {
+          source = this.filterStream(
+            source,
+            async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
+          );
+        }
+      } else if (stmt.where && (stmt.from?.stmt || stmt.from?.fn || !stmt.from)) {
+        if (!this.hasAsyncOps(stmt.where)) {
+          source = this.filterStreamSync(
+            source,
+            (r) => !!this.evaluateExprSync(storage, stmt.where, r, params),
+          );
+        } else {
+          source = this.filterStream(
+            source,
+            async (r) => await this.evaluateExpr(storage, stmt.where, r, params),
+          );
+        }
+      }
 
       const allAggs: Expr[] = [];
       for (const c of stmt.columns) this.extractAggregates(c, allAggs);
@@ -2678,16 +2852,31 @@ export class Executor {
       }
 
       const _this = this;
-      sourceStream = this.mapStream(sourceStream, async function (r) {
-        const proj = await _this.projectRow(
-          storage,
-          r,
-          stmt.columns,
-          params,
-          exclusions,
-        );
-        return { ...r, ...proj, ___lpg_projected___: proj };
-      });
+      const needInternalProps = !!(stmt.orderBy || stmt.distinctOn || stmt.having);
+      const hasAsyncProj = stmt.columns.some((c: any) => this.hasAsyncOps(c));
+      if (!hasAsyncProj) {
+        sourceStream = this.mapStreamSync(sourceStream, function (r) {
+          const proj = _this.projectRowSync(
+            storage,
+            r,
+            stmt.columns,
+            params,
+            exclusions,
+          );
+          return needInternalProps ? { ...r, ...proj, ___lpg_projected___: proj } : proj;
+        });
+      } else {
+        sourceStream = this.mapStream(sourceStream, async function (r) {
+          const proj = await _this.projectRow(
+            storage,
+            r,
+            stmt.columns,
+            params,
+            exclusions,
+          );
+          return needInternalProps ? { ...r, ...proj, ___lpg_projected___: proj } : proj;
+        });
+      }
 
       if (stmt.distinct && !stmt.distinctOn) {
         sourceStream = this.distinctStream(sourceStream);
@@ -2755,36 +2944,84 @@ export class Executor {
         sourceStream = this.exceptAllStream(sourceStream, rightStream);
       }
 
-      if (stmt.orderBy) {
-        sourceStream = this.externalSortStream(
-          storage,
-          sourceStream,
-          stmt.orderBy,
-          params,
-        );
+      let handledSortLimit = false;
+      if (
+        stmt.orderBy &&
+        stmt.limit &&
+        !stmt.distinct &&
+        !stmt.distinctOn &&
+        !stmt.union &&
+        !stmt.unionAll &&
+        !stmt.intersect &&
+        !stmt.except
+      ) {
+        let limitVal: number | null = null;
+        let offsetVal = 0;
+        if (!this.hasAsyncOps(stmt.limit)) {
+          limitVal = Number(this.evaluateExprSync(storage, stmt.limit, {}, params));
+        } else {
+          limitVal = Number(await this.evaluateExpr(storage, stmt.limit, {}, params));
+        }
+        if (stmt.offset) {
+          if (!this.hasAsyncOps(stmt.offset)) {
+            offsetVal = Number(this.evaluateExprSync(storage, stmt.offset, {}, params)) || 0;
+          } else {
+            offsetVal = Number(await this.evaluateExpr(storage, stmt.offset, {}, params)) || 0;
+          }
+        }
+        if (
+          limitVal !== null &&
+          !isNaN(limitVal) &&
+          limitVal > 0 &&
+          limitVal < 10000 &&
+          !isNaN(offsetVal) &&
+          offsetVal >= 0 &&
+          offsetVal < 10000
+        ) {
+          sourceStream = this.topNSortStream(
+            storage,
+            sourceStream,
+            stmt.orderBy,
+            limitVal,
+            offsetVal,
+            params,
+          );
+          handledSortLimit = true;
+        }
       }
 
-      if (stmt.distinctOn) {
-        sourceStream = this.distinctStream(
-          sourceStream,
-          stmt.distinctOn,
-          storage,
-          params,
-        );
-      }
+      if (!handledSortLimit) {
+        if (stmt.orderBy) {
+          sourceStream = this.externalSortStream(
+            storage,
+            sourceStream,
+            stmt.orderBy,
+            params,
+          );
+        }
 
-      if (stmt.offset) {
-        sourceStream = this.applyOffset(
-          sourceStream,
-          await this.evaluateExpr(storage, stmt.offset, {}, params),
-        );
-      }
+        if (stmt.distinctOn) {
+          sourceStream = this.distinctStream(
+            sourceStream,
+            stmt.distinctOn,
+            storage,
+            params,
+          );
+        }
 
-      if (stmt.limit) {
-        sourceStream = this.applyLimit(
-          sourceStream,
-          await this.evaluateExpr(storage, stmt.limit, {}, params),
-        );
+        if (stmt.offset) {
+          sourceStream = this.applyOffset(
+            sourceStream,
+            await this.evaluateExpr(storage, stmt.offset, {}, params),
+          );
+        }
+
+        if (stmt.limit) {
+          sourceStream = this.applyLimit(
+            sourceStream,
+            await this.evaluateExpr(storage, stmt.limit, {}, params),
+          );
+        }
       }
 
       for await (const row of sourceStream) {
@@ -2794,6 +3031,128 @@ export class Executor {
       if (stmt.ctes) {
         for (const cte of stmt.ctes) storage.dropTempTable(cte.name);
       }
+    }
+  }
+
+  private async *mapStreamSync(
+    source: AsyncIterableIterator<any>,
+    fn: (r: any) => any,
+  ) {
+    for await (const row of source) yield fn(row);
+  }
+
+  private async *filterStreamSync(
+    source: AsyncIterableIterator<any>,
+    fn: (r: any) => boolean,
+  ) {
+    for await (const row of source) if (fn(row)) yield row;
+  }
+
+  private async *topNSortStream(
+    storage: StorageEngine,
+    source: AsyncIterableIterator<any>,
+    orderBy: OrderBy[],
+    limit: number,
+    offset: number,
+    params: any = [],
+  ): AsyncIterableIterator<any> {
+    const isSync = orderBy.every((ob) => !this.hasAsyncOps(ob.expr));
+    const kTotal = limit + offset;
+
+    const evalSortKey = isSync
+      ? (r: any) =>
+          orderBy.map((ob) => this.evaluateExprSync(storage, ob.expr, r, params))
+      : async (r: any) => {
+          const vals = [];
+          for (const ob of orderBy) {
+            vals.push(await this.evaluateExpr(storage, ob.expr, r, params));
+          }
+          return vals;
+        };
+
+    const compareVals = (vA: any[], vB: any[]): number => {
+      for (let i = 0; i < orderBy.length; i++) {
+        const ob = orderBy[i]!;
+        const a = vA[i];
+        const b = vB[i];
+        if ((a === null || a === undefined) && b !== null && b !== undefined)
+          return ob.nullsFirst ? -1 : ob.nullsLast ? 1 : ob.desc ? -1 : 1;
+        if (a !== null && a !== undefined && (b === null || b === undefined))
+          return ob.nullsFirst ? 1 : ob.nullsLast ? -1 : ob.desc ? 1 : -1;
+        if (a < b) return ob.desc ? 1 : -1;
+        if (a > b) return ob.desc ? -1 : 1;
+      }
+      return 0;
+    };
+
+    interface HeapNode {
+      row: any;
+      vals: any[];
+    }
+    const heap: HeapNode[] = [];
+
+    const siftUp = (idx: number) => {
+      while (idx > 0) {
+        const parentIdx = (idx - 1) >> 1;
+        if (compareVals(heap[idx]!.vals, heap[parentIdx]!.vals) > 0) {
+          const tmp = heap[idx]!;
+          heap[idx] = heap[parentIdx]!;
+          heap[parentIdx] = tmp;
+          idx = parentIdx;
+        } else {
+          break;
+        }
+      }
+    };
+
+    const siftDown = (idx: number) => {
+      const len = heap.length;
+      while (true) {
+        let largest = idx;
+        const left = (idx << 1) + 1;
+        const right = left + 1;
+        if (
+          left < len &&
+          compareVals(heap[left]!.vals, heap[largest]!.vals) > 0
+        ) {
+          largest = left;
+        }
+        if (
+          right < len &&
+          compareVals(heap[right]!.vals, heap[largest]!.vals) > 0
+        ) {
+          largest = right;
+        }
+        if (largest !== idx) {
+          const tmp = heap[idx]!;
+          heap[idx] = heap[largest]!;
+          heap[largest] = tmp;
+          idx = largest;
+        } else {
+          break;
+        }
+      }
+    };
+
+    for await (const row of source) {
+      const vals = isSync
+        ? (evalSortKey(row) as any[])
+        : await evalSortKey(row);
+      if (heap.length < kTotal) {
+        heap.push({ row, vals });
+        siftUp(heap.length - 1);
+      } else {
+        if (compareVals(vals, heap[0]!.vals) < 0) {
+          heap[0] = { row, vals };
+          siftDown(0);
+        }
+      }
+    }
+
+    heap.sort((a, b) => compareVals(a.vals, b.vals));
+
+    for (let i = offset; i < Math.min(offset + limit, heap.length); i++) {
+      yield heap[i]!.row;
     }
   }
 
@@ -3168,10 +3527,13 @@ export class Executor {
           }
         } catch (e) {}
 
+        const isRightKeySync = !this.hasAsyncOps(rightKeyExpr);
         for (let i = 0; i < rightRows.length; i++) {
           const jRow = rightRows[i];
           const k = String(
-            await this.evaluateExpr(storage, rightKeyExpr, jRow, params),
+            isRightKeySync
+              ? this.evaluateExprSync(storage, rightKeyExpr, jRow, params)
+              : await this.evaluateExpr(storage, rightKeyExpr, jRow, params),
           );
           let arr = rightMap.get(k);
           if (!arr) {
@@ -3213,16 +3575,24 @@ export class Executor {
           }
         }
       } else {
+        const isLeftKeySync = !this.hasAsyncOps(leftKeyExpr);
+        const isSimpleEqui = join.on.type === "Binary" && join.on.operator === "=";
         for await (const row of source) {
           let matched = false;
           const kLeft = String(
-            await this.evaluateExpr(storage, leftKeyExpr, row, params),
+            isLeftKeySync
+              ? this.evaluateExprSync(storage, leftKeyExpr, row, params)
+              : await this.evaluateExpr(storage, leftKeyExpr, row, params),
           );
           const matches = rightMap.get(kLeft);
           if (matches) {
-            for (const jRow of matches) {
+            for (let m = 0; m < matches.length; m++) {
+              const jRow = matches[m];
               const candidate = { ...row, ...jRow };
-              if (await this.evaluateExpr(storage, join.on, candidate, params)) {
+              if (
+                isSimpleEqui ||
+                (await this.evaluateExpr(storage, join.on, candidate, params))
+              ) {
                 yield candidate;
                 matched = true;
               }
@@ -3450,12 +3820,20 @@ export class Executor {
       return 0;
     };
 
+    const isSync = orderBy.every((ob) => !this.hasAsyncOps(ob.expr));
     const asyncSort = async (arr: any[]) => {
       const mapVals = new Map<any, any>();
       for (const r of arr) {
-        const vals = [];
-        for (const ob of orderBy)
-          vals.push(await this.evaluateExpr(storage, ob.expr, r, params));
+        let vals: any[];
+        if (isSync) {
+          vals = orderBy.map((ob) =>
+            this.evaluateExprSync(storage, ob.expr, r, params),
+          );
+        } else {
+          vals = [];
+          for (const ob of orderBy)
+            vals.push(await this.evaluateExpr(storage, ob.expr, r, params));
+        }
         mapVals.set(r, vals);
       }
       arr.sort((a, b) => {
@@ -3559,6 +3937,89 @@ export class Executor {
     }
 
     await Promise.all(tempFiles.map((f: string) => vfs.unlink(f)));
+  }
+
+  private projectRowSync(
+    storage: StorageEngine,
+    row: any,
+    columns: Expr[],
+    params: any = [],
+    exclusions?: Set<string>,
+  ): any {
+    const outRow: any = {};
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      if (
+        col.type === "Identifier" &&
+        (col.name === "*" || col.name.endsWith(".*"))
+      ) {
+        if (col.name === "*") {
+          const keys = Object.keys(row);
+          for (let j = 0; j < keys.length; j++) {
+            const k = keys[j];
+            if (
+              !k.startsWith("__") &&
+              !k.startsWith("___") &&
+              (!exclusions || !exclusions.has(k))
+            )
+              outRow[k] = row[k];
+          }
+        } else {
+          if ((col as any)._prefix === undefined) {
+            (col as any)._prefix = col.name.substring(0, col.name.length - 2);
+          }
+          const prefix = (col as any)._prefix;
+          const targetObj = row["__lpg_tbl_" + prefix] || row[prefix];
+          if (targetObj && typeof targetObj === "object") {
+            const keys = Object.keys(targetObj);
+            for (let j = 0; j < keys.length; j++) {
+              const k = keys[j];
+              if (!k.startsWith("__") && !k.startsWith("___"))
+                outRow[k] = targetObj[k];
+            }
+          }
+        }
+      } else if (col.type === "Alias") {
+        const key = this.getExprKey(col.expr);
+        let outKey = col.alias;
+        if (outRow[outKey] !== undefined) {
+          let suffix = 1;
+          while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+          outKey = `${outKey}${suffix}`;
+        }
+        if (row[key] !== undefined) outRow[outKey] = row[key];
+        else
+          outRow[outKey] = this.evaluateExprSync(
+            storage,
+            col.expr,
+            row,
+            params,
+          );
+      } else {
+        const key = this.getExprKey(col);
+        let outKey = "col";
+        if ((col as any).name) {
+          outKey = (col as any).name.includes(".")
+            ? (col as any).name.split(".")[1]
+            : (col as any).name;
+        } else if (col.type === "Call") {
+          outKey = col.fnName.toLowerCase();
+        }
+
+        if (outRow[outKey] !== undefined) {
+          let suffix = 1;
+          while (outRow[`${outKey}${suffix}`] !== undefined) suffix++;
+          outKey = `${outKey}${suffix}`;
+        }
+
+        if (row[key] !== undefined) {
+          outRow[outKey] = row[key];
+        } else {
+          outRow[outKey] = this.evaluateExprSync(storage, col, row, params);
+        }
+      }
+    }
+    return outRow;
   }
 
   private async projectRow(
@@ -4161,11 +4622,7 @@ export class Executor {
     }
   }
 
-  private async castValue(
-    storage: StorageEngine,
-    val: any,
-    dataType: string,
-  ): Promise<any> {
+  private castValueSync(val: any, dataType: string): any {
     if (val === null || val === undefined) return null;
     const dt = dataType.toUpperCase().split("(")[0]?.trim();
 
@@ -4185,9 +4642,6 @@ export class Executor {
       "SMALLSERIAL",
       "MONEY",
       "OID",
-      "REGCLASS",
-      "REGTYPE",
-      "REGNAMESPACE",
       "INT2",
       "INT4",
       "INT8",
@@ -4195,39 +4649,6 @@ export class Executor {
       "FLOAT8",
     ];
     if (numerics.includes(dt!)) {
-      if (dt === "REGCLASS" || dt === "REGTYPE" || dt === "REGNAMESPACE") {
-        if (typeof val === "string") {
-          try {
-            if (dt === "REGNAMESPACE") {
-              const name = val.trim().replace(/^"|"$/g, "").replace(/""/g, '"');
-              for await (const row of storage.scanRows("pg_namespace")) {
-                if (row.nspname === name) return row.oid;
-              }
-              return null;
-            } else if (dt === "REGTYPE") {
-              const typeName = val
-                .trim()
-                .replace(/^"|"$/g, "")
-                .replace(/""/g, '"');
-              for await (const row of storage.scanRows("pg_catalog.pg_type")) {
-                if (row.typname === typeName) return row.oid;
-              }
-              return null;
-            } else {
-              const tableName = val
-                .split(".")
-                .map((p) => p.trim().replace(/^"|"$/g, "").replace(/""/g, '"'))
-                .join(".");
-              const tbl = await (storage as any).getTableAsync(tableName);
-              return tbl?.firstPage || null;
-            }
-          } catch {
-            return null;
-          }
-        } else if (typeof val === "number") {
-          return val;
-        }
-      }
       const num = Number(val);
       return isNaN(num) ? null : num;
     } else if (dt === "BOOLEAN" || dt === "BOOL") {
@@ -4259,7 +4680,6 @@ export class Executor {
       return val;
     } else if (dt?.endsWith("[]") || dt === "ARRAY") {
       if (typeof val === "string") {
-        // Parse format mảng của Postgres: '{1,2,3}' -> '[1,2,3]'
         if (val.trim().startsWith("{") && val.trim().endsWith("}")) {
           try {
             const jsonStr = val
@@ -4323,6 +4743,53 @@ export class Executor {
       return null;
     }
     return val;
+  }
+
+  private async castValue(
+    storage: StorageEngine,
+    val: any,
+    dataType: string,
+  ): Promise<any> {
+    if (val === null || val === undefined) return null;
+    const dt = dataType.toUpperCase().split("(")[0]?.trim();
+
+    if (dt === "REGCLASS" || dt === "REGTYPE" || dt === "REGNAMESPACE") {
+      if (typeof val === "string") {
+        try {
+          if (dt === "REGNAMESPACE") {
+            const name = val.trim().replace(/^"|"$/g, "").replace(/""/g, '"');
+            for await (const row of storage.scanRows("pg_namespace")) {
+              if (row.nspname === name) return row.oid;
+            }
+            return null;
+          } else if (dt === "REGTYPE") {
+            const typeName = val
+              .trim()
+              .replace(/^"|"$/g, "")
+              .replace(/""/g, '"');
+            for await (const row of storage.scanRows("pg_catalog.pg_type")) {
+              if (row.typname === typeName) return row.oid;
+            }
+            return null;
+          } else {
+            const tableName = val
+              .split(".")
+              .map((p) => p.trim().replace(/^"|"$/g, "").replace(/""/g, '"'))
+              .join(".");
+            const tbl = await (storage as any).getTableAsync(tableName);
+            return tbl?.firstPage || null;
+          }
+        } catch {
+          return null;
+        }
+      } else if (typeof val === "number") {
+        return val;
+      }
+      const num = Number(val);
+      return isNaN(num) ? null : num;
+    }
+
+    return this.castValueSync(val, dataType);
   }
 
   private getDatePart(date: Date, field: string): number {
@@ -4516,12 +4983,880 @@ export class Executor {
     return "null";
   }
 
+  private evaluateExprSync(
+    storage: StorageEngine,
+    expr: Expr,
+    row: any,
+    params: any = [],
+  ): any {
+    switch (expr.type) {
+      case "Literal":
+        return expr.value;
+      case "Parameter": {
+        if (!Array.isArray(params) || expr.index > params.length) {
+          throw new Error(
+            `bind message supplies ${Array.isArray(params) ? params.length : 0} parameters, but prepared statement requires at least ${expr.index}`,
+          );
+        }
+        const pVal = params[expr.index - 1];
+        if (
+          typeof pVal === "string" &&
+          pVal.includes(".") &&
+          !pVal.includes(" ") &&
+          !pVal.includes("%")
+        ) {
+          const parts = pVal.split(".");
+          if (parts.length === 2) {
+            const tbl = parts[0]!;
+            const col = parts[1]!;
+            const tblObj = row["__lpg_tbl_" + tbl] || row[tbl];
+            if (tblObj && tblObj[col] !== undefined) {
+              return tblObj[col];
+            }
+          }
+        }
+        return pVal instanceof Date ? pVal.toISOString() : pVal;
+      }
+      case "NamedParameter": {
+        if (
+          !params ||
+          (params[expr.name] === undefined && !(expr.name in params))
+        ) {
+          throw new Error(
+            `bind message does not supply named parameter '${expr.name}'`,
+          );
+        }
+        const npVal = params[expr.name];
+        return npVal instanceof Date ? npVal.toISOString() : npVal;
+      }
+      case "Identifier": {
+        if ((expr as any)._nameUpper === undefined) {
+          (expr as any)._nameUpper = expr.name.toUpperCase();
+        }
+        const nameUpper = (expr as any)._nameUpper;
+        if (nameUpper === "CURRENT_TIMESTAMP") return new Date().toISOString();
+        if (nameUpper === "CURRENT_DATE")
+          return new Date().toISOString().split("T")[0];
+        if (nameUpper === "CURRENT_TIME")
+          return new Date().toISOString().split("T")[1];
+        if (nameUpper === "LOCALTIMESTAMP") return new Date().toISOString();
+        if (nameUpper === "LOCALTIME")
+          return new Date().toISOString().split("T")[1];
+
+        if (expr.name === "*") return "*";
+
+        if ((expr as any)._isNested === undefined) {
+          (expr as any)._isNested = expr.name.includes(".");
+          if ((expr as any)._isNested) {
+            const parts = expr.name.split(".");
+            (expr as any)._col = parts.pop()!;
+            (expr as any)._tbl = parts.join(".");
+          }
+        }
+
+        if ((expr as any)._isNested) {
+          const tblObj =
+            row["__lpg_tbl_" + (expr as any)._tbl] || row[(expr as any)._tbl];
+          if (tblObj && tblObj[(expr as any)._col] !== undefined) {
+            return tblObj[(expr as any)._col];
+          }
+          if (row[expr.name] !== undefined) return row[expr.name];
+          return null;
+        }
+
+        if (row[expr.name] !== undefined) return row[expr.name];
+        if ((expr as any).isDoubleQuoted) return expr.name;
+        return null;
+      }
+      case "Binary": {
+        const left = this.evaluateExprSync(storage, expr.left, row, params);
+        const right = this.evaluateExprSync(storage, expr.right, row, params);
+        switch (expr.operator) {
+          case "=":
+            return left == right;
+          case "!=":
+            return left != right;
+          case ">":
+            return left > right;
+          case "<":
+            return left < right;
+          case ">=":
+            return left >= right;
+          case "<=":
+            return left <= right;
+          case "+":
+          case "-": {
+            if (expr.operator === "-") {
+              if (left !== null && typeof left === "object") {
+                if (Array.isArray(left)) {
+                  if (typeof right === "number") {
+                    let idx = right;
+                    if (idx < 0) idx = left.length + idx;
+                    return left.filter((_, i) => i !== idx);
+                  } else {
+                    return left.filter((v) => String(v) !== String(right));
+                  }
+                } else {
+                  if (typeof right === "string") {
+                    const res = { ...left };
+                    delete res[right];
+                    return res;
+                  } else if (Array.isArray(right)) {
+                    const res = { ...left };
+                    for (const k of right) delete res[String(k)];
+                    return res;
+                  }
+                }
+              }
+            }
+            if (
+              typeof left === "string" &&
+              left.includes("-") &&
+              !isNaN(Date.parse(left)) &&
+              typeof right === "string"
+            ) {
+              const parts = right.toLowerCase().trim().split(/\s+/);
+              const val = parseFloat(parts[0] || "0");
+              const unit = parts[1] || "day";
+              const d = new Date(left);
+              const multiplier = expr.operator === "+" ? 1 : -1;
+              if (unit.startsWith("year"))
+                d.setFullYear(d.getFullYear() + multiplier * val);
+              else if (unit.startsWith("month"))
+                d.setMonth(d.getMonth() + multiplier * val);
+              else if (unit.startsWith("day"))
+                d.setDate(d.getDate() + multiplier * val);
+              else if (unit.startsWith("hour"))
+                d.setHours(d.getHours() + multiplier * val);
+              else if (unit.startsWith("minute"))
+                d.setMinutes(d.getMinutes() + multiplier * val);
+              else if (unit.startsWith("second"))
+                d.setSeconds(d.getSeconds() + multiplier * val);
+              return d.toISOString();
+            }
+            return expr.operator === "+" ? left + right : left - right;
+          }
+          case "*":
+            return left * right;
+          case "/":
+            return left / right;
+          case "||":
+            if (left == null || right == null) return null;
+            if (typeof left === "object" && typeof right === "object") {
+              if (Array.isArray(left) && Array.isArray(right))
+                return [...left, ...right];
+              if (Array.isArray(left)) return [...left, right];
+              if (Array.isArray(right)) return [left, ...right];
+              return { ...left, ...right };
+            }
+            return String(left) + String(right);
+          case "~":
+            return (
+              left != null &&
+              right != null &&
+              new RegExp(String(right)).test(String(left))
+            );
+          case "~*":
+            return (
+              left != null &&
+              right != null &&
+              new RegExp(String(right), "i").test(String(left))
+            );
+          case "!~":
+            return (
+              left != null &&
+              right != null &&
+              !new RegExp(String(right)).test(String(left))
+            );
+          case "->":
+            return left != null && typeof left === "object"
+              ? left[right]
+              : null;
+          case "->>":
+            return left != null && typeof left === "object"
+              ? left[right] != null
+                ? String(left[right])
+                : null
+              : null;
+          case "#>": {
+            let path = right;
+            if (typeof path === "string") {
+              const trimmed = path.trim();
+              if (trimmed === "{}") path = [];
+              else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+                path = trimmed
+                  .slice(1, -1)
+                  .split(",")
+                  .map((s) => s.trim().replace(/^"|"$/g, ""));
+              } else path = [path];
+            }
+            if (left == null || !Array.isArray(path)) return null;
+            let curr = left;
+            for (const p of path) curr = curr?.[p];
+            return curr;
+          }
+          case "#-": {
+            let path = right;
+            if (typeof path === "string") {
+              const trimmed = path.trim();
+              if (trimmed === "{}") path = [];
+              else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+                path = trimmed
+                  .slice(1, -1)
+                  .split(",")
+                  .map((s) => s.trim().replace(/^"|"$/g, ""));
+              } else path = [path];
+            }
+            if (left == null || !Array.isArray(path)) return left;
+
+            const deletePath = (obj: any, p: any[]): any => {
+              if (p.length === 0) return obj;
+              if (obj === null || typeof obj !== "object") return obj;
+
+              const key = p[0];
+              if (p.length === 1) {
+                if (Array.isArray(obj)) {
+                  let idx = parseInt(String(key));
+                  if (isNaN(idx)) return obj;
+                  if (idx < 0) idx = obj.length + idx;
+                  if (idx < 0 || idx >= obj.length) return obj;
+                  const newArr = [...obj];
+                  newArr.splice(idx, 1);
+                  return newArr;
+                } else {
+                  const newObj = { ...obj };
+                  delete newObj[key];
+                  return newObj;
+                }
+              }
+
+              if (Array.isArray(obj)) {
+                let idx = parseInt(String(key));
+                if (isNaN(idx)) return obj;
+                if (idx < 0) idx = obj.length + idx;
+                if (idx < 0 || idx >= obj.length) return obj;
+
+                const newArr = [...obj];
+                newArr[idx] = deletePath(newArr[idx], p.slice(1));
+                return newArr;
+              } else {
+                if (obj[key] === undefined) return obj;
+                const newObj = { ...obj };
+                newObj[key] = deletePath(newObj[key], p.slice(1));
+                return newObj;
+              }
+            };
+
+            return deletePath(left, path);
+          }
+          case "@>":
+            if (Array.isArray(left) && Array.isArray(right))
+              return right.every((v) => left.includes(v));
+            if (
+              typeof left === "object" &&
+              typeof right === "object" &&
+              left !== null &&
+              right !== null
+            ) {
+              return Object.keys(right).every(
+                (k) => JSON.stringify(left[k]) === JSON.stringify(right[k]),
+              );
+            }
+            return false;
+          case "?":
+            if (Array.isArray(left)) return left.includes(right);
+            if (typeof left === "object" && left !== null)
+              return Object.prototype.hasOwnProperty.call(left, right);
+            return false;
+          case "&&":
+            if (Array.isArray(left) && Array.isArray(right))
+              return left.some((v) => right.includes(v));
+            return false;
+        }
+        return false;
+      }
+      case "Logical": {
+        if (expr.operator === "AND") {
+          const left = this.evaluateExprSync(storage, expr.left, row, params);
+          if (!left) return false;
+          const right = this.evaluateExprSync(storage, expr.right, row, params);
+          return !!right;
+        }
+        if (expr.operator === "OR") {
+          const left = this.evaluateExprSync(storage, expr.left, row, params);
+          if (left) return true;
+          const right = this.evaluateExprSync(storage, expr.right, row, params);
+          return !!right;
+        }
+        return false;
+      }
+      case "Like": {
+        const left = this.evaluateExprSync(storage, expr.left, row, params);
+        if (typeof left !== "string") return false;
+
+        let regex: RegExp = (expr as any)._cachedRegex;
+        if (!regex) {
+          const right = this.evaluateExprSync(storage, expr.right, row, params);
+          if (typeof right !== "string") return false;
+          const escapeChar =
+            (expr as any).escapeStr !== undefined
+              ? (expr as any).escapeStr
+              : "\\";
+          let pattern = "";
+          for (let i = 0; i < right.length; i++) {
+            const ch = right[i];
+            if (ch === escapeChar && i + 1 < right.length && escapeChar !== "") {
+              const next = right[i + 1];
+              if (next === "_" || next === "%" || next === escapeChar) {
+                pattern += next!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                i++;
+                continue;
+              }
+            }
+            if (ch === "%") {
+              pattern += ".*";
+            } else if (ch === "_") {
+              pattern += ".";
+            } else {
+              pattern += ch!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            }
+          }
+          regex = new RegExp(
+            "^" + pattern + "$",
+            (expr as any).ilike ? "i" : "",
+          );
+          if (expr.right?.type === "Literal" || expr.right?.type === "Parameter") {
+            (expr as any)._cachedRegex = regex;
+          }
+        }
+        const res = regex.test(left);
+        return (expr as any).not ? !res : res;
+      }
+      case "In": {
+        const left = this.evaluateExprSync(storage, expr.left, row, params);
+        let res = false;
+        if (Array.isArray(expr.right)) {
+          let valSet: Set<any> | undefined = (expr as any)._cachedSet;
+          if (!valSet) {
+            let isStatic = true;
+            for (const e of expr.right) {
+              if (e.type === "Identifier") {
+                isStatic = false;
+                break;
+              }
+            }
+            if (isStatic) {
+              valSet = new Set();
+              for (const e of expr.right) {
+                const evaluated = this.evaluateExprSync(storage, e, {}, params);
+                if (Array.isArray(evaluated) && expr.right.length === 1) {
+                  for (const v of evaluated) {
+                    valSet.add(v);
+                    valSet.add(String(v));
+                    if (typeof v === "number") valSet.add(Number(v));
+                  }
+                } else {
+                  valSet.add(evaluated);
+                  valSet.add(String(evaluated));
+                  if (typeof evaluated === "number") valSet.add(Number(evaluated));
+                }
+              }
+              (expr as any)._cachedSet = valSet;
+            }
+          }
+
+          if (valSet) {
+            res = valSet.has(left) || valSet.has(String(left)) || (typeof left === "number" && valSet.has(Number(left)));
+          } else {
+            let vals: any[] = [];
+            for (const e of expr.right) {
+              const evaluated = this.evaluateExprSync(storage, e, row, params);
+              if (Array.isArray(evaluated) && expr.right.length === 1) {
+                vals = vals.concat(evaluated);
+              } else {
+                vals.push(evaluated);
+              }
+            }
+            res = vals.some((v) => v == left);
+          }
+        }
+        return (expr as any).not ? !res : res;
+      }
+      case "Interval":
+        return expr.value;
+      case "Extract": {
+        const val = this.evaluateExprSync(storage, expr.source, row, params);
+        if (val == null) return null;
+        const d = new Date(val);
+        if (isNaN(d.getTime())) return null;
+        return this.getDatePart(d, expr.field);
+      }
+      case "Alias":
+        return this.evaluateExprSync(storage, expr.expr, row, params);
+      case "Not":
+        return !this.evaluateExprSync(storage, expr.expr, row, params);
+      case "IsNull": {
+        const val = this.evaluateExprSync(storage, expr.expr, row, params);
+        const isNull = val === null || val === undefined;
+        return expr.not ? !isNull : isNull;
+      }
+      case "Case": {
+        for (const c of expr.cases) {
+          if (this.evaluateExprSync(storage, c.when, row, params)) {
+            return this.evaluateExprSync(storage, c.then, row, params);
+          }
+        }
+        if (expr.elseExpr)
+          return this.evaluateExprSync(storage, expr.elseExpr, row, params);
+        return null;
+      }
+      case "Array": {
+        const elements = expr.elements;
+        const res = new Array(elements.length);
+        for (let i = 0; i < elements.length; i++) {
+          res[i] = this.evaluateExprSync(storage, elements[i], row, params);
+        }
+        return res;
+      }
+      case "Cast": {
+        const val = this.evaluateExprSync(storage, expr.expr, row, params);
+        return this.castValueSync(val, expr.dataType);
+      }
+      case "Call": {
+        const key = this.getExprKey(expr);
+        if (row[key] !== undefined) return row[key];
+
+        if ((expr as any)._fnNameUpper === undefined) {
+          let rawFnName = expr.fnName;
+          if (rawFnName.includes(".")) rawFnName = rawFnName.split(".").pop()!;
+          (expr as any)._fnNameUpper = rawFnName.toUpperCase();
+        }
+        const fnName = (expr as any)._fnNameUpper;
+        if (fnName === "COUNT") return row.__COUNT__ || 0;
+        if (fnName === "AVG") return row.__AVG__ || 0;
+        if (fnName === "SUM" || fnName === "MIN" || fnName === "MAX")
+          return null;
+        if (
+          fnName === "ARRAY_AGG" ||
+          fnName === "JSON_AGG" ||
+          fnName === "JSONB_AGG"
+        )
+          return [];
+        if (fnName === "JSON_OBJECT_AGG" || fnName === "JSONB_OBJECT_AGG")
+          return {};
+
+        const args = [];
+        for (const argExpr of expr.args) {
+          args.push(this.evaluateExprSync(storage, argExpr, row, params));
+        }
+
+        if (fnName === "VERSION") return "PostgreSQL 16.2 (LitePostgres)";
+        if (
+          fnName === "NOW" ||
+          fnName === "CURRENT_TIMESTAMP" ||
+          fnName === "LOCALTIMESTAMP"
+        )
+          return new Date().toISOString();
+        if (fnName === "CURRENT_DATE")
+          return new Date().toISOString().split("T")[0];
+        if (fnName === "CURRENT_TIME" || fnName === "LOCALTIME")
+          return new Date().toISOString().split("T")[1];
+        if (fnName === "UPPER")
+          return args[0] != null ? String(args[0]).toUpperCase() : null;
+        if (fnName === "LOWER")
+          return args[0] != null ? String(args[0]).toLowerCase() : null;
+        if (fnName === "LENGTH")
+          return args[0] != null ? String(args[0]).length : null;
+        if (fnName === "TRIM")
+          return args[0] != null ? String(args[0]).trim() : null;
+        if (fnName === "REPLACE") {
+          if (args[0] == null || args[1] == null || args[2] == null)
+            return args[0];
+          return String(args[0]).split(String(args[1])).join(String(args[2]));
+        }
+        if (fnName === "SUBSTRING") {
+          if (args[0] == null) return null;
+          const str = String(args[0]);
+          const start = (args[1] != null ? Number(args[1]) : 1) - 1;
+          if (args[2] != null) {
+            const count = Number(args[2]);
+            return str.substring(start, start + count);
+          }
+          return str.substring(start);
+        }
+        if (fnName === "CONCAT") {
+          return args
+            .filter((v) => v != null)
+            .map((v) => String(v))
+            .join("");
+        }
+        if (fnName === "CONCAT_WS") {
+          if (args[0] == null) return null;
+          const sep = String(args[0]);
+          return args
+            .slice(1)
+            .filter((v) => v != null)
+            .map((v) => String(v))
+            .join(sep);
+        }
+        if (fnName === "LTRIM")
+          return args[0] != null ? String(args[0]).trimStart() : null;
+        if (fnName === "RTRIM")
+          return args[0] != null ? String(args[0]).trimEnd() : null;
+        if (fnName === "LEFT") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          return n >= 0
+            ? str.substring(0, n)
+            : str.substring(0, Math.max(0, str.length + n));
+        }
+        if (fnName === "RIGHT") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          return n >= 0
+            ? str.substring(Math.max(0, str.length - n))
+            : str.substring(Math.max(0, -n));
+        }
+        if (fnName === "LPAD") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          const fill = String(args[2] ?? " ");
+          return str.length > n ? str.substring(0, n) : str.padStart(n, fill);
+        }
+        if (fnName === "RPAD") {
+          if (args[0] == null || args[1] == null) return null;
+          const str = String(args[0]);
+          const n = Number(args[1]);
+          const fill = String(args[2] ?? " ");
+          return str.length > n ? str.substring(0, n) : str.padEnd(n, fill);
+        }
+        if (fnName === "INITCAP") {
+          if (args[0] == null) return null;
+          const str = String(args[0]).toLowerCase();
+          return str.replace(/(^|\s)\S/g, (l) => l.toUpperCase());
+        }
+        if (fnName === "REVERSE") {
+          return args[0] != null
+            ? String(args[0]).split("").reverse().join("")
+            : null;
+        }
+        if (fnName === "STRPOS") {
+          if (args[0] == null || args[1] == null) return null;
+          return String(args[0]).indexOf(String(args[1])) + 1;
+        }
+        if (fnName === "REPEAT") {
+          if (args[0] == null || args[1] == null) return null;
+          const n = Number(args[1]);
+          return n > 0 ? String(args[0]).repeat(n) : "";
+        }
+        if (fnName === "SPLIT_PART") {
+          if (args[0] == null || args[1] == null || args[2] == null)
+            return null;
+          const parts = String(args[0]).split(String(args[1]));
+          const idx = Number(args[2]);
+          return idx > 0 && idx <= parts.length ? parts[idx - 1] : "";
+        }
+        if (fnName === "COALESCE") {
+          for (const val of args) {
+            if (val !== null && val !== undefined) return val;
+          }
+          return null;
+        }
+        if (fnName === "ABS")
+          return args[0] != null ? Math.abs(Number(args[0])) : null;
+        if (fnName === "CEIL" || fnName === "CEILING")
+          return args[0] != null ? Math.ceil(Number(args[0])) : null;
+        if (fnName === "FLOOR")
+          return args[0] != null ? Math.floor(Number(args[0])) : null;
+        if (fnName === "ROUND") {
+          if (args[0] == null) return null;
+          const num = Number(args[0]);
+          const precision = args[1] != null ? Math.floor(Number(args[1])) : 0;
+          const factor = Math.pow(10, precision);
+          return Math.round(num * factor) / factor;
+        }
+        if (fnName === "TRUNC") {
+          if (args[0] == null) return null;
+          const num = Number(args[0]);
+          const precision = args[1] != null ? Math.floor(Number(args[1])) : 0;
+          const factor = Math.pow(10, precision);
+          return Math.trunc(num * factor) / factor;
+        }
+        if (fnName === "POWER" || fnName === "POW") {
+          if (args[0] == null || args[1] == null) return null;
+          return Math.pow(Number(args[0]), Number(args[1]));
+        }
+        if (fnName === "SQRT")
+          return args[0] != null ? Math.sqrt(Number(args[0])) : null;
+        if (fnName === "EXP")
+          return args[0] != null ? Math.exp(Number(args[0])) : null;
+        if (fnName === "LN")
+          return args[0] != null ? Math.log(Number(args[0])) : null;
+        if (fnName === "LOG")
+          return args[0] != null ? Math.log10(Number(args[0])) : null;
+        if (fnName === "MOD") {
+          if (args[0] == null || args[1] == null) return null;
+          return Number(args[0]) % Number(args[1]);
+        }
+        if (fnName === "SIGN") {
+          if (args[0] == null) return null;
+          const n = Number(args[0]);
+          return n > 0 ? 1 : n < 0 ? -1 : 0;
+        }
+        if (fnName === "PI") return Math.PI;
+        if (fnName === "RANDOM") return Math.random();
+        if (fnName === "GEN_RANDOM_UUID" || fnName === "UUID_GENERATE_V4") {
+          return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(
+            /[xy]/g,
+            function (c) {
+              const r = (Math.random() * 16) | 0,
+                v = c === "x" ? r : (r & 0x3) | 0x8;
+              return v.toString(16);
+            },
+          );
+        }
+        if (fnName === "DEGREES")
+          return args[0] != null ? Number(args[0]) * (180 / Math.PI) : null;
+        if (fnName === "RADIANS")
+          return args[0] != null ? Number(args[0]) * (Math.PI / 180) : null;
+
+        if (fnName === "JSON_EXTRACT" || fnName === "JSONB_EXTRACT") {
+          let json = args[0];
+          if (typeof json === "string") {
+            try {
+              json = JSON.parse(json);
+            } catch {
+              return null;
+            }
+          }
+          let current = json;
+          for (let i = 1; i < args.length; i++) {
+            current = current?.[args[i]];
+          }
+          return current;
+        }
+
+        if (fnName === "JSON_BUILD_OBJECT" || fnName === "JSONB_BUILD_OBJECT") {
+          const obj: any = {};
+          for (let i = 0; i < args.length; i += 2) {
+            if (args[i] !== undefined && args[i] !== null) {
+              obj[String(args[i])] = args[i + 1];
+            }
+          }
+          return obj;
+        }
+
+        if (fnName === "JSON_BUILD_ARRAY" || fnName === "JSONB_BUILD_ARRAY") {
+          return args;
+        }
+
+        if (fnName === "JSONB_SET") {
+          let target = args[0];
+          if (typeof target === "string") {
+            try {
+              target = JSON.parse(target);
+            } catch (e) {}
+          }
+          let path = args[1];
+          const newValue = args[2];
+          const createMissing = args[3] !== false;
+          if (typeof path === "string") {
+            const trimmed = path.trim();
+            if (trimmed === "{}") path = [];
+            else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+              path = trimmed
+                .slice(1, -1)
+                .split(",")
+                .map((s) => s.trim().replace(/^"|"$/g, ""));
+            } else path = [path];
+          }
+          if (!Array.isArray(path)) return target;
+          return this.deepSet(target, path, newValue, createMissing);
+        }
+
+        if (fnName === "JSONB_INSERT") {
+          let target = args[0];
+          if (typeof target === "string") {
+            try {
+              target = JSON.parse(target);
+            } catch (e) {}
+          }
+          let path = args[1];
+          const newValue = args[2];
+          const insertAfter = args[3] === true;
+          if (typeof path === "string") {
+            const trimmed = path.trim();
+            if (trimmed === "{}") path = [];
+            else if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+              path = trimmed
+                .slice(1, -1)
+                .split(",")
+                .map((s) => s.trim().replace(/^"|"$/g, ""));
+            } else path = [path];
+          }
+          if (!Array.isArray(path)) return target;
+          return this.deepInsert(target, path, newValue, insertAfter);
+        }
+
+        if (fnName === "JSON_TYPEOF" || fnName === "JSONB_TYPEOF") {
+          return this.jsonTypeof(args[0]);
+        }
+
+        if (fnName === "JSON_STRIP_NULLS" || fnName === "JSONB_STRIP_NULLS") {
+          return this.stripNulls(args[0]);
+        }
+
+        if (fnName === "JSONB_PRETTY") {
+          return JSON.stringify(args[0], null, 2);
+        }
+        if (fnName === "DATE_TRUNC") {
+          const unit = String(args[0]).toLowerCase();
+          const val = args[1];
+          if (val == null) return null;
+          const d = new Date(val);
+          if (isNaN(d.getTime())) return null;
+          switch (unit) {
+            case "year":
+              d.setMonth(0, 1);
+              d.setHours(0, 0, 0, 0);
+              break;
+            case "month":
+              d.setDate(1);
+              d.setHours(0, 0, 0, 0);
+              break;
+            case "day":
+              d.setHours(0, 0, 0, 0);
+              break;
+            case "hour":
+              d.setMinutes(0, 0, 0);
+              break;
+            case "minute":
+              d.setSeconds(0, 0);
+              break;
+            case "second":
+              d.setMilliseconds(0);
+              break;
+          }
+          return d.toISOString();
+        }
+        if (fnName === "AGE") {
+          if (args.length === 0) return null;
+          const t1 = new Date(args[0]);
+          const t2 = args.length > 1 ? new Date(args[1]) : new Date();
+          if (isNaN(t1.getTime()) || isNaN(t2.getTime())) return null;
+          if (args.length === 1) return this.calculateAge(new Date(), t1);
+          return this.calculateAge(t1, t2);
+        }
+        if (fnName === "TO_CHAR") {
+          const val = args[0];
+          const format = args[1];
+          if (val == null || format == null) return null;
+          const d = new Date(val);
+          if (isNaN(d.getTime())) return String(val);
+          let result = String(format);
+          const months = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+          ];
+          const days = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+          ];
+          const pad = (n: number, l: number = 2) => String(n).padStart(l, "0");
+          const replacements: Record<string, () => string> = {
+            YYYY: () => String(d.getFullYear()),
+            YY: () => String(d.getFullYear()).slice(-2),
+            MM: () => pad(d.getMonth() + 1),
+            DD: () => pad(d.getDate()),
+            HH24: () => pad(d.getHours()),
+            HH: () => pad(d.getHours() % 12 || 12),
+            MI: () => pad(d.getMinutes()),
+            SS: () => pad(d.getSeconds()),
+            MS: () => pad(d.getMilliseconds(), 3),
+            Month: () => months[d.getMonth()]!,
+            Mon: () => months[d.getMonth()]!.slice(0, 3),
+            Day: () => days[d.getDay()]!,
+            Dy: () => days[d.getDay()]!.slice(0, 3),
+          };
+          const sortedPatterns = Object.keys(replacements).sort(
+            (a, b) => b.length - a.length,
+          );
+          for (const pattern of sortedPatterns) {
+            result = result.replace(
+              new RegExp(pattern, "g"),
+              replacements[pattern]!(),
+            );
+          }
+          return result;
+        }
+        if (fnName === "DATE_PART") {
+          const field = args[0];
+          const source = args[1];
+          if (field == null || source == null) return null;
+          const d = new Date(source);
+          if (isNaN(d.getTime())) return null;
+          return this.getDatePart(d, String(field));
+        }
+        if (fnName === "QUOTE_IDENT") {
+          if (args[0] == null) return null;
+          const str = String(args[0]);
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        if (fnName === "FORMAT_TYPE") {
+          return args[0] != null ? String(args[0]) : null;
+        }
+        if (fnName === "PG_GET_EXPR") {
+          const adbin = args[0];
+          if (adbin == null) return null;
+          try {
+            const parsed = JSON.parse(String(adbin));
+            if (
+              parsed &&
+              typeof parsed === "object" &&
+              parsed.type === "Literal"
+            ) {
+              return String(parsed.value);
+            }
+            return String(adbin);
+          } catch {
+            return String(adbin);
+          }
+        }
+        return null;
+      }
+      default:
+        return null;
+    }
+  }
+
   private async evaluateExpr(
     storage: StorageEngine,
     expr: Expr,
     row: any,
     params: any = [],
   ): Promise<any> {
+    if (!this.hasAsyncOps(expr)) {
+      return this.evaluateExprSync(storage, expr, row, params);
+    }
+
     switch (expr.type) {
       case "Literal":
         return expr.value;
@@ -4815,45 +6150,61 @@ export class Executor {
         return false;
       }
       case "Logical": {
-        const left = await this.evaluateExpr(storage, expr.left, row, params);
-        const right = await this.evaluateExpr(storage, expr.right, row, params);
-        if (expr.operator === "AND") return left && right;
-        if (expr.operator === "OR") return left || right;
+        if (expr.operator === "AND") {
+          const left = await this.evaluateExpr(storage, expr.left, row, params);
+          if (!left) return false;
+          const right = await this.evaluateExpr(storage, expr.right, row, params);
+          return !!right;
+        }
+        if (expr.operator === "OR") {
+          const left = await this.evaluateExpr(storage, expr.left, row, params);
+          if (left) return true;
+          const right = await this.evaluateExpr(storage, expr.right, row, params);
+          return !!right;
+        }
         return false;
       }
       case "Like": {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
-        const right = await this.evaluateExpr(storage, expr.right, row, params);
-        if (typeof left !== "string" || typeof right !== "string") return false;
-        // Build regex with proper escape handling
-        const escapeChar =
-          (expr as any).escapeStr !== undefined
-            ? (expr as any).escapeStr
-            : "\\";
-        let pattern = "";
-        for (let i = 0; i < right.length; i++) {
-          const ch = right[i];
-          if (ch === escapeChar && i + 1 < right.length && escapeChar !== "") {
-            const next = right[i + 1];
-            if (next === "_" || next === "%" || next === escapeChar) {
-              // Escaped special char → literal (escape for regex)
-              pattern += next!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-              i++;
-              continue;
+        if (typeof left !== "string") return false;
+
+        let regex: RegExp = (expr as any)._cachedRegex;
+        if (!regex) {
+          const right = await this.evaluateExpr(storage, expr.right, row, params);
+          if (typeof right !== "string") return false;
+          // Build regex with proper escape handling
+          const escapeChar =
+            (expr as any).escapeStr !== undefined
+              ? (expr as any).escapeStr
+              : "\\";
+          let pattern = "";
+          for (let i = 0; i < right.length; i++) {
+            const ch = right[i];
+            if (ch === escapeChar && i + 1 < right.length && escapeChar !== "") {
+              const next = right[i + 1];
+              if (next === "_" || next === "%" || next === escapeChar) {
+                // Escaped special char → literal (escape for regex)
+                pattern += next!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                i++;
+                continue;
+              }
+            }
+            if (ch === "%") {
+              pattern += ".*";
+            } else if (ch === "_") {
+              pattern += ".";
+            } else {
+              pattern += ch!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             }
           }
-          if (ch === "%") {
-            pattern += ".*";
-          } else if (ch === "_") {
-            pattern += ".";
-          } else {
-            pattern += ch!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          regex = new RegExp(
+            "^" + pattern + "$",
+            (expr as any).ilike ? "i" : "",
+          );
+          if (expr.right?.type === "Literal" || expr.right?.type === "Parameter") {
+            (expr as any)._cachedRegex = regex;
           }
         }
-        const regex = new RegExp(
-          "^" + pattern + "$",
-          (expr as any).ilike ? "i" : "",
-        );
         const res = regex.test(left);
         return (expr as any).not ? !res : res;
       }
@@ -4861,27 +6212,80 @@ export class Executor {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
         let res = false;
         if (Array.isArray(expr.right)) {
-          let vals: any[] = [];
-          for (const e of expr.right) {
-            const evaluated = await this.evaluateExpr(storage, e, row, params);
-            if (Array.isArray(evaluated) && expr.right.length === 1) {
-              vals = vals.concat(evaluated);
-            } else {
-              vals.push(evaluated);
+          let valSet: Set<any> | undefined = (expr as any)._cachedSet;
+          if (!valSet) {
+            let isStatic = true;
+            for (const e of expr.right) {
+              if (e.type === "Identifier") {
+                isStatic = false;
+                break;
+              }
+            }
+            if (isStatic) {
+              valSet = new Set();
+              for (const e of expr.right) {
+                const evaluated = await this.evaluateExpr(storage, e, {}, params);
+                if (Array.isArray(evaluated) && expr.right.length === 1) {
+                  for (const v of evaluated) {
+                    valSet.add(v);
+                    valSet.add(String(v));
+                    if (typeof v === "number") valSet.add(Number(v));
+                  }
+                } else {
+                  valSet.add(evaluated);
+                  valSet.add(String(evaluated));
+                  if (typeof evaluated === "number") valSet.add(Number(evaluated));
+                }
+              }
+              (expr as any)._cachedSet = valSet;
             }
           }
-          res = vals.some((v) => v == left);
+
+          if (valSet) {
+            res = valSet.has(left) || valSet.has(String(left)) || (typeof left === "number" && valSet.has(Number(left)));
+          } else {
+            let vals: any[] = [];
+            for (const e of expr.right) {
+              const evaluated = await this.evaluateExpr(storage, e, row, params);
+              if (Array.isArray(evaluated) && expr.right.length === 1) {
+                vals = vals.concat(evaluated);
+              } else {
+                vals.push(evaluated);
+              }
+            }
+            res = vals.some((v) => v == left);
+          }
         } else {
-          const results = [];
-          for await (const r of this.executeSelect(
-            storage,
-            expr.right,
-            params,
-            row,
-          ))
-            results.push(r);
-          const vals = results.map((r: any) => Object.values(r)[0]);
-          res = vals.some((v) => v == left);
+          let valSet: Set<any> | undefined = (expr as any)._cachedSubquerySet;
+          if (!valSet) {
+            const isCorrelated = this.hasOuterReferences(expr.right, row);
+            if (!isCorrelated) {
+              valSet = new Set();
+              for await (const r of this.executeSelect(storage, expr.right, params, {})) {
+                const firstVal = Object.values(r)[0];
+                valSet.add(firstVal);
+                valSet.add(String(firstVal));
+                if (typeof firstVal === "number") valSet.add(Number(firstVal));
+              }
+              (expr as any)._cachedSubquerySet = valSet;
+            }
+          }
+
+          if (valSet) {
+            res = valSet.has(left) || valSet.has(String(left)) || (typeof left === "number" && valSet.has(Number(left)));
+          } else {
+            const results = [];
+            for await (const r of this.executeSelect(
+              storage,
+              expr.right,
+              params,
+              row,
+            )) {
+              results.push(r);
+            }
+            const vals = results.map((r: any) => Object.values(r)[0]);
+            res = vals.some((v) => v == left);
+          }
         }
         return (expr as any).not ? !res : res;
       }

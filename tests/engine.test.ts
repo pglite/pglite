@@ -5775,4 +5775,125 @@ describe("LitePostgres Engine Comprehensive Test Suite", () => {
       expect(rows.length).toBe(2); // Still 2 rows, rollback worked cleanly
     });
   });
+
+  describe("LEVEL 93: High-Complexity Query Performance & Short-Circuit Optimization", () => {
+    test("93.1 Short-circuiting evaluation on Logical (AND / OR) with expensive sub-expressions", async () => {
+      await db.exec(`
+        CREATE TABLE test_perf_logical (
+          id SERIAL PRIMARY KEY,
+          code TEXT NOT NULL,
+          is_deleted BOOLEAN DEFAULT false,
+          payload TEXT
+        );
+      `);
+
+      // Insert 2,000 records
+      await db.exec("BEGIN");
+      for (let i = 0; i < 2000; i++) {
+        await db.exec(
+          "INSERT INTO test_perf_logical (code, is_deleted, payload) VALUES ($1, $2, $3)",
+          [`CODE_${i}`, i % 10 === 0, `PAYLOAD_DATA_${i}_${'x'.repeat(100)}`]
+        );
+      }
+      await db.exec("COMMIT");
+
+      // Case 1: AND short-circuiting - when is_deleted is false (90% of rows),
+      // the expensive ILIKE pattern '%NON_EXISTENT_STRING%' should be completely skipped.
+      const t0 = performance.now();
+      const resAnd = await db.query(
+        "SELECT id FROM test_perf_logical WHERE is_deleted = true AND payload ILIKE '%NON_EXISTENT_STRING%'"
+      );
+      const durationAnd = performance.now() - t0;
+      expect(resAnd.length).toBe(0);
+      expect(durationAnd).toBeLessThan(100);
+
+      // Case 2: OR short-circuiting - when is_deleted is false, short-circuit returns immediately
+      const t1 = performance.now();
+      const resOr = await db.query(
+        "SELECT id FROM test_perf_logical WHERE is_deleted = false OR payload ILIKE '%NON_EXISTENT_STRING%'"
+      );
+      const durationOr = performance.now() - t1;
+      expect(resOr.length).toBe(1800);
+      expect(durationOr).toBeLessThan(100);
+    });
+
+    test("93.2 High-complexity LIKE & ILIKE with regex caching on large dataset", async () => {
+      await db.exec(`
+        CREATE TABLE test_perf_like (
+          id SERIAL PRIMARY KEY,
+          school_name TEXT NOT NULL,
+          address TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      await db.exec("BEGIN");
+      for (let i = 0; i < 1500; i++) {
+        const district = i % 2 === 0 ? "Quận 1" : "Quận 3";
+        const name = i % 3 === 0 ? `THCS Trần Văn Ơn ${i}` : `Trường THPT Lê Hồng Phong ${i}`;
+        await db.exec(
+          "INSERT INTO test_perf_like (school_name, address) VALUES ($1, $2)",
+          [name, `Số ${i} Nguyễn Du, ${district}, TP.HCM`]
+        );
+      }
+      await db.exec("COMMIT");
+
+      // Complex ILIKE with multiple wildcards
+      const t0 = performance.now();
+      const rows = await db.query(
+        "SELECT id, school_name, address FROM test_perf_like WHERE school_name ILIKE '%trần%văn%ơn%' AND address ILIKE '%quận%1%'"
+      );
+      const duration = performance.now() - t0;
+
+      expect(rows.length).toBeGreaterThan(0);
+      expect(duration).toBeLessThan(80);
+    });
+
+    test("93.3 End-to-end user scenario with high-complexity multi-branch conditions, IN subquery & LOWER", async () => {
+      await db.exec(`
+        CREATE TABLE test_regions (id SERIAL PRIMARY KEY, name TEXT, province_id INT, deleted_at TIMESTAMP);
+        CREATE TABLE test_schools (id SERIAL PRIMARY KEY, name TEXT, region_id INT, address TEXT, deleted_at TIMESTAMP);
+        CREATE TABLE test_classes (id SERIAL PRIMARY KEY, name TEXT, school_id INT, student_count INT, description TEXT, deleted_at TIMESTAMP);
+      `);
+
+      await db.exec("BEGIN");
+      for (let r = 1; r <= 10; r++) {
+        await db.exec("INSERT INTO test_regions (name, province_id) VALUES ($1, 100)", [`Quận ${r}`]);
+      }
+      for (let s = 1; s <= 50; s++) {
+        await db.exec("INSERT INTO test_schools (name, region_id, address) VALUES ($1, $2, $3)", [
+          `Trường Số ${s}`,
+          (s % 10) + 1,
+          `Địa chỉ trường ${s}`
+        ]);
+      }
+      for (let c = 1; c <= 1200; c++) {
+        await db.exec("INSERT INTO test_classes (name, school_id, student_count, description) VALUES ($1, $2, $3, $4)", [
+          `Lớp ${(c % 12) + 1}A`,
+          (c % 50) + 1,
+          30 + (c % 15),
+          c % 5 === 0 ? "Lớp chuyên Toán nâng cao" : "Lớp đại trà"
+        ]);
+      }
+      await db.exec("COMMIT");
+
+      // The exact high-complexity query:
+      // Combines: deleted_at IS NULL, IN (subquery), LOWER(name), LIKE/ILIKE, student_count range
+      const t0 = performance.now();
+      const result = await db.query(`
+        SELECT id, name, student_count
+        FROM test_classes
+        WHERE deleted_at IS NULL
+          AND school_id IN (
+            SELECT id FROM test_schools
+            WHERE region_id IN (SELECT id FROM test_regions WHERE province_id = 100 AND LOWER(name) = lower('Quận 1'))
+          )
+          AND (student_count >= 35 OR description ILIKE '%toán%')
+      `);
+      const duration = performance.now() - t0;
+
+      expect(result.length).toBeGreaterThan(0);
+      expect(duration).toBeLessThan(100);
+    });
+  });
 });

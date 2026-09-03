@@ -983,7 +983,15 @@ export class Parser {
               if (isUpdate) references.onUpdate = action;
             }
           } else if (this.match('KEYWORD', 'DEFAULT')) {
-            this.consume(); defaultVal = this.parseExpr();
+            this.consume();
+            if (this.match('SYMBOL', '[') && this.tokens[this.pos + 1]?.value?.toLowerCase() === 'object') {
+              this.pos += 2;
+              if (this.tokens[this.pos]?.value?.toLowerCase() === 'object') this.pos++;
+              if (this.match('SYMBOL', ']')) this.pos++;
+              defaultVal = undefined;
+            } else {
+              defaultVal = this.parseExpr();
+            }
           } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'GENERATED') {
             this.consume(); // GENERATED
             if (this.matchIdentifier() && ['ALWAYS', 'BY'].includes(this.current()?.value.toUpperCase() || '')) {
@@ -1261,7 +1269,15 @@ export class Parser {
               if (isUpdate) references.onUpdate = action;
             }
           } else if (this.match('KEYWORD', 'DEFAULT')) {
-            this.consume(); defaultVal = this.parseExpr();
+            this.consume();
+            if (this.match('SYMBOL', '[') && this.tokens[this.pos + 1]?.value?.toLowerCase() === 'object') {
+              this.pos += 2;
+              if (this.tokens[this.pos]?.value?.toLowerCase() === 'object') this.pos++;
+              if (this.match('SYMBOL', ']')) this.pos++;
+              defaultVal = undefined;
+            } else {
+              defaultVal = this.parseExpr();
+            }
           } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'GENERATED') {
             this.consume(); // GENERATED
             if (this.matchIdentifier() && ['ALWAYS', 'BY'].includes(this.current()?.value.toUpperCase() || '')) {
@@ -1328,7 +1344,14 @@ export class Parser {
             return { type: 'AlterColumnSetNotNull', columnName };
           } else if (this.match('KEYWORD', 'DEFAULT')) {
             this.consume();
-            const defaultVal = this.parseExpr();
+            let defaultVal: Expr = { type: 'Literal', value: null };
+            if (this.match('SYMBOL', '[') && this.tokens[this.pos + 1]?.value?.toLowerCase() === 'object') {
+              this.pos += 2;
+              if (this.tokens[this.pos]?.value?.toLowerCase() === 'object') this.pos++;
+              if (this.match('SYMBOL', ']')) this.pos++;
+            } else {
+              defaultVal = this.parseExpr();
+            }
             return { type: 'AlterColumnSetDefault', columnName, defaultVal };
           }
         } else if (this.match('KEYWORD', 'DROP')) {
@@ -1590,11 +1613,17 @@ export class Parser {
 
     let limit: Expr | undefined;
     let offset: Expr | undefined;
-    if (this.match('KEYWORD', 'LIMIT')) {
-      this.consume(); limit = this.parseExpr();
-    }
-    if (this.match('KEYWORD', 'OFFSET')) {
-      this.consume(); offset = this.parseExpr();
+    while (this.match('KEYWORD', 'LIMIT') || this.match('KEYWORD', 'OFFSET')) {
+      if (this.match('KEYWORD', 'LIMIT')) {
+        this.consume();
+        limit = this.parseExpr();
+      } else if (this.match('KEYWORD', 'OFFSET')) {
+        this.consume();
+        offset = this.parseExpr();
+        if (this.matchIdentifier() && ['ROW', 'ROWS'].includes(this.current()?.value.toUpperCase() || '')) {
+          this.consume();
+        }
+      }
     }
 
     let stmt: Statement = { type: 'Select', columns, distinct, distinctOn, from, joins, where, groupBy, having, orderBy, limit, offset };

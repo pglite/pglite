@@ -58,6 +58,9 @@ export class LitePostgres {
           this.queueDepth--;
           if (this.queueDepth === 0) {
             this.queue = Promise.resolve();
+            if (!this.storage.isInTransaction()) {
+              this.storage.flush().catch(() => {});
+            }
           }
         });
     });
@@ -337,7 +340,9 @@ export class LitePostgres {
       }
 
       if (!this.storage.isInTransaction()) {
-        await this.storage.flush();
+        if (this.queueDepth <= 1) {
+          await this.storage.flush();
+        }
         if (release) release();
         if (this.txRelease) {
           this.txRelease();
