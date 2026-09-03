@@ -36,7 +36,9 @@ try {
     copyFileSync(macDylib, join(CRATES_DIR, "pglite.darwin-arm64.node"));
     copyFileSync(macDylib, join(CRATES_DIR, "pglite.node"));
     copyFileSync(macDylib, join(DIST_DIR, "pglite.darwin-arm64.node"));
-    console.log("  ✓ Generated pglite.darwin-arm64.node");
+    copyFileSync(macDylib, join(DIST_DIR, "pglite.node"));
+    copyFileSync(macDylib, join(ROOT_DIR, "pglite.node"));
+    console.log("  ✓ Generated pglite.darwin-arm64.node & pglite.node");
   }
 
   // 3. Cross-compile Linux x86_64 Native Addon

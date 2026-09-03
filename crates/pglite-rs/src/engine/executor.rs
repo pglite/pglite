@@ -185,10 +185,12 @@ impl Executor {
     }
 
     fn handle_insert(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        // Format: INSERT INTO <table> (<col1>, <col2>) VALUES ($1, $2), ($3, $4)
-        let upper = sql.to_uppercase();
+        // Format: INSERT INTO <table> (<col1>, <col2>) VALUES ($1, $2), ($3, $4) [RETURNING <cols>]
+        let (sql_before_returning, returning_cols) = extract_returning_clause(sql);
+
+        let upper = sql_before_returning.to_uppercase();
         let values_idx = upper.find("VALUES").ok_or("Missing VALUES clause in INSERT")?;
-        let table_part = sql[11..values_idx].trim();
+        let table_part = sql_before_returning[11..values_idx].trim();
 
         let (table_name, target_cols) = if let Some(open_p) = table_part.find('(') {
             let close_p = table_part.find(')').ok_or("Missing closing parenthesis for columns")?;
@@ -202,7 +204,7 @@ impl Executor {
             (table_part.trim_matches('"'), None)
         };
 
-        let values_part = sql[values_idx + 6..].trim();
+        let values_part = sql_before_returning[values_idx + 6..].trim();
 
         // Borrow table
         let (col_indices, num_table_cols, _pk_idx, clean_table_name) = {
@@ -290,22 +292,33 @@ impl Executor {
         let count = inserted_rows.len();
         let in_tx = self.storage.in_transaction;
 
+        let mut returned_rows = Vec::new();
         if let Some(table) = self.storage.get_table_mut(&clean_table_name) {
             table.rows.reserve(count);
             table.is_deleted.reserve(count);
             for row in inserted_rows {
-                let _pk = table.insert(row.clone());
+                let _pk = table.insert(row);
+                if let Some(r_cols) = returning_cols {
+                    if let Some(last_row) = table.rows.last() {
+                        returned_rows.push(project_returning_row(table, last_row, r_cols));
+                    }
+                }
                 if in_tx {
                     // Log for undo if rollback needed
-                    // (we skip excessive per-row undo allocations if commit is standard)
                 }
             }
         }
 
+        let fields = if let (Some(r_cols), Some(table)) = (returning_cols, self.storage.get_table(&clean_table_name)) {
+            get_returning_fields(table, r_cols)
+        } else {
+            vec![]
+        };
+
         Ok(QueryResult {
-            rows: vec![],
+            rows: returned_rows,
             row_count: count,
-            fields: vec![],
+            fields,
             command: "INSERT".to_string(),
         })
     }
@@ -1043,8 +1056,8 @@ impl Executor {
                 if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
                     table.update_row_multi(row_idx, &updates);
                     row_count = 1;
-                    if returning_cols.is_some() {
-                        returned_rows.push(row_to_json(table, &table.rows[row_idx]));
+                    if let Some(r_cols) = returning_cols {
+                        returned_rows.push(project_returning_row(table, &table.rows[row_idx], r_cols));
                     }
                 }
             }
@@ -1054,18 +1067,15 @@ impl Executor {
                 if !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions) {
                     table.update_row_multi(i, &updates);
                     row_count += 1;
-                    if returning_cols.is_some() {
-                        returned_rows.push(row_to_json(table, &table.rows[i]));
+                    if let Some(r_cols) = returning_cols {
+                        returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
                     }
                 }
             }
         }
 
-        let fields = if returning_cols.is_some() {
-            table.columns.iter().map(|c| FieldInfo {
-                name: c.name.clone(),
-                data_type: format!("{:?}", c.data_type).to_lowercase(),
-            }).collect()
+        let fields = if let Some(r_cols) = returning_cols {
+            get_returning_fields(table, r_cols)
         } else {
             vec![]
         };
@@ -1113,8 +1123,8 @@ impl Executor {
         if let Some(target_pk) = pk_target {
             if let Some(&row_idx) = table.pk_index.get(&target_pk) {
                 if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
-                    if returning_cols.is_some() {
-                        returned_rows.push(row_to_json(table, &table.rows[row_idx]));
+                    if let Some(r_cols) = returning_cols {
+                        returned_rows.push(project_returning_row(table, &table.rows[row_idx], r_cols));
                     }
                     table.delete_row(row_idx);
                     row_count = 1;
@@ -1123,8 +1133,8 @@ impl Executor {
         } else {
             for i in 0..table.rows.len() {
                 if !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions) {
-                    if returning_cols.is_some() {
-                        returned_rows.push(row_to_json(table, &table.rows[i]));
+                    if let Some(r_cols) = returning_cols {
+                        returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
                     }
                     table.delete_row(i);
                     row_count += 1;
@@ -1132,11 +1142,8 @@ impl Executor {
             }
         }
 
-        let fields = if returning_cols.is_some() {
-            table.columns.iter().map(|c| FieldInfo {
-                name: c.name.clone(),
-                data_type: format!("{:?}", c.data_type).to_lowercase(),
-            }).collect()
+        let fields = if let Some(r_cols) = returning_cols {
+            get_returning_fields(table, r_cols)
         } else {
             vec![]
         };
@@ -1968,3 +1975,84 @@ fn row_to_json(table: &crate::storage::table::Table, row: &[Value]) -> serde_jso
     }
     serde_json::Value::Object(map)
 }
+
+fn extract_returning_clause(sql: &str) -> (&str, Option<&str>) {
+    let upper = sql.to_uppercase();
+    if let Some(pos) = upper.rfind(" RETURNING ") {
+        (sql[..pos].trim(), Some(sql[pos + 11..].trim()))
+    } else if let Some(pos) = upper.rfind(")RETURNING ") {
+        (sql[..pos + 1].trim(), Some(sql[pos + 11..].trim()))
+    } else if let Some(pos) = upper.rfind("\nRETURNING ") {
+        (sql[..pos].trim(), Some(sql[pos + 11..].trim()))
+    } else if let Some(pos) = upper.rfind("\tRETURNING ") {
+        (sql[..pos].trim(), Some(sql[pos + 11..].trim()))
+    } else {
+        (sql, None)
+    }
+}
+
+fn project_returning_row(
+    table: &crate::storage::table::Table,
+    row: &[Value],
+    r_cols: &str,
+) -> serde_json::Value {
+    let trimmed = r_cols.trim();
+    if trimmed == "*" {
+        return row_to_json(table, row);
+    }
+    let mut map = serde_json::Map::new();
+    for item in trimmed.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let upper_item = item.to_uppercase();
+        let (expr_col, alias) = if let Some(as_pos) = upper_item.find(" AS ") {
+            (item[..as_pos].trim(), item[as_pos + 4..].trim().trim_matches('"'))
+        } else {
+            (item, clean_col_name(item))
+        };
+        let col_name = clean_col_name(expr_col);
+        if let Some(col_idx) = table.get_column_index(col_name) {
+            let v = row.get(col_idx).unwrap_or(&Value::Null);
+            map.insert(alias.to_string(), value_to_json(v));
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn get_returning_fields(
+    table: &crate::storage::table::Table,
+    r_cols: &str,
+) -> Vec<FieldInfo> {
+    let trimmed = r_cols.trim();
+    if trimmed == "*" {
+        table.columns.iter().map(|c| FieldInfo {
+            name: c.name.clone(),
+            data_type: format!("{:?}", c.data_type).to_lowercase(),
+        }).collect()
+    } else {
+        let mut fields = Vec::new();
+        for item in trimmed.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let upper_item = item.to_uppercase();
+            let (expr_col, alias) = if let Some(as_pos) = upper_item.find(" AS ") {
+                (item[..as_pos].trim(), item[as_pos + 4..].trim().trim_matches('"'))
+            } else {
+                (item, clean_col_name(item))
+            };
+            let col_name = clean_col_name(expr_col);
+            if let Some(col_idx) = table.get_column_index(col_name) {
+                fields.push(FieldInfo {
+                    name: alias.to_string(),
+                    data_type: format!("{:?}", table.columns[col_idx].data_type).to_lowercase(),
+                });
+            }
+        }
+        fields
+    }
+}
+

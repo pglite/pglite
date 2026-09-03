@@ -120,6 +120,27 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       expect(rows[0].score).toBeNull();
     });
 
+    test("2.4 INSERT with RETURNING clause", () => {
+      db.exec(`CREATE TABLE "provinces" ("id" SERIAL PRIMARY KEY, "name" TEXT, "description" TEXT)`);
+      const res1 = db.query2(
+        `INSERT INTO "provinces" ("name", "description") VALUES ($1, $2) RETURNING "id"`,
+        ["Hanoi", "Capital"]
+      );
+      expect(res1.rowCount).toBe(1);
+      expect(res1.rows.length).toBe(1);
+      expect(res1.rows[0].id).toBe(1);
+      expect(res1.fields).toEqual([{ name: "id", data_type: "serial" }]);
+
+      const res2 = db.query2(
+        `INSERT INTO "provinces" ("name", "description") VALUES ($1, $2) RETURNING "id", "name" AS "provinceName"`,
+        ["Danang", "Central"]
+      );
+      expect(res2.rowCount).toBe(1);
+      expect(res2.rows.length).toBe(1);
+      expect(res2.rows[0].id).toBe(2);
+      expect(res2.rows[0].provinceName).toBe("Danang");
+    });
+
     test("2.4 Populating schools and classes for relational testing", () => {
       db.query(`INSERT INTO "schools" ("name", "city") VALUES ($1, $2)`, ["Hoa Mai School", "Hanoi"]);
       db.query(`INSERT INTO "schools" ("name", "city") VALUES ($1, $2)`, ["Sao Mai School", "Saigon"]);

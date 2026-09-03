@@ -188,6 +188,7 @@ pub struct FieldInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub rows: Vec<serde_json::Value>,
+    #[serde(rename = "rowCount")]
     pub row_count: usize,
     pub fields: Vec<FieldInfo>,
     pub command: String,
