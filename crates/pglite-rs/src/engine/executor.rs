@@ -130,9 +130,31 @@ impl Executor {
         }
 
         let mut columns = Vec::new();
+        let mut table_level_pks = Vec::new();
+
         for col_def_str in body_part.split(',') {
             let col_def_str = col_def_str.trim();
             if col_def_str.is_empty() {
+                continue;
+            }
+
+            let upper_def = col_def_str.to_uppercase();
+            // Handle table-level PRIMARY KEY (id) or CONSTRAINT pk PRIMARY KEY (id)
+            if upper_def.starts_with("PRIMARY KEY") || (upper_def.starts_with("CONSTRAINT") && upper_def.contains("PRIMARY KEY")) {
+                if let Some(open_p) = col_def_str.find('(') {
+                    if let Some(close_p) = col_def_str.rfind(')') {
+                        let inner = &col_def_str[open_p + 1..close_p];
+                        for pk_col in inner.split(',') {
+                            let pk_clean = clean_col_name(pk_col).to_string();
+                            table_level_pks.push(pk_clean);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Ignore other table constraints like FOREIGN KEY, CHECK, UNIQUE (...)
+            if upper_def.starts_with("FOREIGN KEY") || upper_def.starts_with("CHECK") || (upper_def.starts_with("CONSTRAINT") && !upper_def.contains("PRIMARY KEY")) {
                 continue;
             }
 
@@ -144,7 +166,7 @@ impl Executor {
             let col_name = parts[0].trim_matches('"').to_string();
             let upper_rest = col_def_str[parts[0].len()..].to_uppercase();
 
-            let data_type = if upper_rest.contains("SERIAL") {
+            let data_type = if upper_rest.contains("SERIAL") || upper_rest.contains("IDENTITY") {
                 DataType::Serial
             } else if upper_rest.contains("BIGINT") {
                 DataType::BigInt
@@ -162,8 +184,12 @@ impl Executor {
                 DataType::Text
             };
 
-            let is_primary_key = upper_rest.contains("PRIMARY KEY") || data_type == DataType::Serial;
-            let is_nullable = !upper_rest.contains("NOT NULL");
+            let is_id_col = col_name.eq_ignore_ascii_case("id") || col_name.eq_ignore_ascii_case("_id");
+            let is_primary_key = upper_rest.contains("PRIMARY KEY")
+                || data_type == DataType::Serial
+                || is_id_col
+                || table_level_pks.iter().any(|pk| pk.eq_ignore_ascii_case(&col_name));
+            let is_nullable = !upper_rest.contains("NOT NULL") && !is_primary_key;
 
             columns.push(ColumnDef {
                 name: col_name,
@@ -172,6 +198,14 @@ impl Executor {
                 is_nullable,
                 default_value: None,
             });
+        }
+
+        // Apply any table level primary keys that appeared after column definitions
+        for pk_col_name in &table_level_pks {
+            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pk_col_name)) {
+                col.is_primary_key = true;
+                col.is_nullable = false;
+            }
         }
 
         self.storage.create_table(table_name, columns)?;

@@ -999,14 +999,22 @@ export class Executor {
           for (let i = 0; i < table.columns.length; i++) {
             const col = table.columns[i];
             if (col._isSerial === undefined) {
-              const dt = col.dataType.toUpperCase();
+              const dt = col.dataType ? col.dataType.toUpperCase() : "";
+              const isIdCol = col.name.toLowerCase() === "id" || col.name.toLowerCase() === "_id";
               col._isSerial =
-                dt === "SERIAL" || dt === "BIGSERIAL" || dt === "SMALLSERIAL";
+                dt === "SERIAL" || dt === "BIGSERIAL" || dt === "SMALLSERIAL" || dt.includes("SERIAL")
+                || (col.isPrimaryKey && (dt.includes("INT") || dt === "NUMBER" || dt === ""))
+                || (isIdCol && (col.isPrimaryKey || dt.includes("INT") || dt === "SERIAL" || dt === "NUMBER" || dt === ""));
             }
-            if (col._isSerial && record[col.name] === undefined) {
-              table.sequence += 1;
+            if (col._isSerial && (record[col.name] === undefined || record[col.name] === null)) {
+              table.sequence = (table.sequence || 0) + 1;
               schemaUpdated = true;
               record[col.name] = table.sequence;
+            } else if (col._isSerial && record[col.name] !== undefined && record[col.name] !== null) {
+              const valNum = Number(record[col.name]);
+              if (!isNaN(valNum) && valNum >= (table.sequence || 0)) {
+                table.sequence = valNum;
+              }
             }
             if (record[col.name] === undefined && col.defaultVal) {
               record[col.name] = await this.evaluateExpr(

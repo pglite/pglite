@@ -16,8 +16,17 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn new(name: String, columns: Vec<ColumnDef>) -> Self {
-        let pk_col_idx = columns.iter().position(|c| c.is_primary_key);
+    pub fn new(name: String, mut columns: Vec<ColumnDef>) -> Self {
+        let pk_col_idx = columns.iter().position(|c| c.is_primary_key)
+            .or_else(|| columns.iter().position(|c| c.data_type == crate::types::DataType::Serial))
+            .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("id")))
+            .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("_id")));
+
+        // Ensure the detected PK column is marked as primary key
+        if let Some(idx) = pk_col_idx {
+            columns[idx].is_primary_key = true;
+        }
+
         Self {
             name,
             columns,
@@ -32,28 +41,31 @@ impl Table {
     }
 
     pub fn insert(&mut self, mut row: Vec<Value>) -> i64 {
-        // Handle SERIAL / Primary Key auto-increment
+        // Ensure row has slots for all table columns
+        while row.len() < self.columns.len() {
+            row.push(Value::Null);
+        }
+
+        // Handle SERIAL / Primary Key auto-increment for all ID types
         let mut assigned_pk = 0;
         if let Some(pk_idx) = self.pk_col_idx {
-            if pk_idx < row.len() {
-                match &row[pk_idx] {
-                    Value::Null => {
-                        assigned_pk = self.auto_increment;
-                        self.auto_increment += 1;
-                        row[pk_idx] = Value::Int(assigned_pk);
-                    }
-                    Value::Int(v) => {
-                        assigned_pk = *v;
-                        if *v >= self.auto_increment {
-                            self.auto_increment = *v + 1;
-                        }
-                    }
-                    _ => {}
-                }
-            } else if pk_idx == row.len() {
+            let is_missing_or_null = match row.get(pk_idx) {
+                None | Some(Value::Null) => true,
+                Some(Value::Text(s)) if s.trim().is_empty() => true,
+                _ => false,
+            };
+
+            if is_missing_or_null {
                 assigned_pk = self.auto_increment;
                 self.auto_increment += 1;
-                row.push(Value::Int(assigned_pk));
+                row[pk_idx] = Value::Int(assigned_pk);
+            } else if let Some(val) = row.get(pk_idx) {
+                if let Some(v) = val.as_i64() {
+                    assigned_pk = v;
+                    if v >= self.auto_increment {
+                        self.auto_increment = v + 1;
+                    }
+                }
             }
         }
 

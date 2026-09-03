@@ -97,15 +97,21 @@ export class PGLiteNative {
 
       const colDefs = res.fields.map((f: any) => {
         let typeStr = "TEXT";
+        const colNameLower = (f.name || "").toLowerCase();
         const dt = (f.data_type || "").toLowerCase();
-        if (dt.includes("int") || dt.includes("serial")) {
-          typeStr = f.name.toLowerCase() === "id" ? "SERIAL PRIMARY KEY" : "INT";
+
+        if (colNameLower === "id" || colNameLower === "_id") {
+          typeStr = "SERIAL PRIMARY KEY";
+        } else if (dt.includes("int") || dt.includes("serial")) {
+          typeStr = "INT";
         } else if (dt.includes("float") || dt.includes("double") || dt.includes("numeric") || dt.includes("real")) {
           typeStr = "FLOAT";
         } else if (dt.includes("bool")) {
           typeStr = "BOOLEAN";
         } else if (dt.includes("time") || dt.includes("date")) {
           typeStr = "TIMESTAMP";
+        } else if (colNameLower.endsWith("_id")) {
+          typeStr = "INT";
         }
         return `"${f.name}" ${typeStr}`;
       }).join(", ");
