@@ -3161,7 +3161,11 @@ export class StorageEngine {
     }
   }
 
-  private deserializeRow(columns: ColumnDef[], buf: Buffer): any {
+  private deserializeRow(
+    columns: ColumnDef[],
+    buf: Buffer,
+    requiredIndices?: Set<number> | null,
+  ): any {
     if (!buf || buf.length < 2) return {};
 
     const storedColCount = buf.readUInt16LE(0);
@@ -3174,9 +3178,11 @@ export class StorageEngine {
 
     for (let i = 0; i < maxIdx; i++) {
       const col = columns[i];
-      // Fast bitwise null check
-      if ((buf[2 + (i >> 3)] & (1 << (i & 7))) !== 0) {
-        row[col!.name] = null;
+      const isNull = (buf[2 + (i >> 3)] & (1 << (i & 7))) !== 0;
+      const skip = requiredIndices && !requiredIndices.has(i);
+
+      if (isNull) {
+        if (!skip) row[col!.name] = null;
         continue;
       }
 
@@ -3192,48 +3198,56 @@ export class StorageEngine {
 
       if (isNum) {
         if (offset + 8 > buf.length) {
-          row[col!.name] = null;
+          if (!skip) row[col!.name] = null;
           break;
         }
-        row[col!.name] = buf.readDoubleLE(offset);
+        if (!skip) row[col!.name] = buf.readDoubleLE(offset);
         offset += 8;
       } else if (isBool) {
         if (offset + 1 > buf.length) {
-          row[col!.name] = null;
+          if (!skip) row[col!.name] = null;
           break;
         }
-        row[col!.name] = buf[offset] === 1;
+        if (!skip) row[col!.name] = buf[offset] === 1;
         offset += 1;
       } else {
         if (offset + 4 > buf.length) {
-          row[col!.name] = null;
+          if (!skip) row[col!.name] = null;
           break;
         }
         const len = buf.readUInt32LE(offset);
         offset += 4;
         if (offset + len > buf.length) {
-          row[col!.name] = null;
+          if (!skip) row[col!.name] = null;
           break;
         }
-        const str = buf.toString("utf-8", offset, offset + len);
-        offset += len;
-
-        // Optimization: Lazy check for JSON structure
-        if (col!._isJson && (str[0] === "{" || str[0] === "[")) {
-          try {
-            row[col!.name] = JSON.parse(str);
-          } catch {
+        if (!skip) {
+          const str = buf.toString("utf-8", offset, offset + len);
+          if (col!._isJson && (str[0] === "{" || str[0] === "[")) {
+            try {
+              row[col!.name] = JSON.parse(str);
+            } catch {
+              row[col!.name] = str;
+            }
+          } else {
             row[col!.name] = str;
           }
-        } else {
-          row[col!.name] = str;
         }
+        offset += len;
       }
     }
 
-    for (let i = maxIdx; i < columns.length; i++) {
-      if (columns[i] && columns[i]?.name) {
-        row[columns[i]!.name] = null;
+    if (!requiredIndices) {
+      for (let i = maxIdx; i < columns.length; i++) {
+        if (columns[i] && columns[i]?.name) {
+          row[columns[i]!.name] = null;
+        }
+      }
+    } else {
+      for (let i = maxIdx; i < columns.length; i++) {
+        if (requiredIndices.has(i) && columns[i] && columns[i]?.name) {
+          row[columns[i]!.name] = null;
+        }
       }
     }
 
@@ -3745,6 +3759,78 @@ export class StorageEngine {
       }
       pageId = page.nextPageId;
     }
+  }
+
+  public async scanRowsArray(
+    name: string,
+    requiredColumns?: string[],
+  ): Promise<any[]> {
+    let temp = this.tempTables.get(name);
+    if (temp !== undefined) {
+      return [...temp];
+    }
+    const tableInfo = await this.getTableAsync(name);
+    let fullName = name.includes(".") ? name : `public.${name}`;
+    if (tableInfo && !name.includes(".")) {
+      if (
+        StorageEngine.tableCache.has(
+          `${this.filepath}:${this.currentDbName}:pg_catalog.${name}`,
+        )
+      )
+        fullName = `pg_catalog.${name}`;
+    }
+
+    temp = this.tempTables.get(fullName);
+    if (temp !== undefined) {
+      return [...temp];
+    }
+
+    // For catalogs or virtual tables, fallback to collecting scanRows
+    if (
+      fullName.startsWith("pg_catalog.") ||
+      fullName.startsWith("information_schema.")
+    ) {
+      const rows: any[] = [];
+      for await (const r of this.scanRows(name)) rows.push(r);
+      return rows;
+    }
+
+    const table = await this.getTableAsync(fullName);
+    if (!table) throw new Error(`Table ${fullName} not found`);
+
+    let requiredIndices: Set<number> | null = null;
+    if (requiredColumns && requiredColumns.length > 0) {
+      requiredIndices = new Set();
+      for (let c = 0; c < requiredColumns.length; c++) {
+        const colName = requiredColumns[c]!;
+        const idx = table.columns.findIndex((col) => col.name === colName);
+        if (idx !== -1) requiredIndices.add(idx);
+      }
+    }
+
+    const rows: any[] = [];
+    let pageId = table.firstPage;
+    const columns = table.columns;
+    const visited = new Set<number>();
+
+    while (pageId !== 0xffffffff && pageId !== 0) {
+      if (visited.has(pageId)) break;
+      visited.add(pageId);
+      const buf = await this.pager.readPage(pageId!);
+      const page = new SlottedPage(buf);
+      const numSlots = page.numSlots;
+      for (let i = 0; i < numSlots; i++) {
+        const tuple = page.getTuple(i);
+        if (!tuple) continue;
+        const resolved = this.isOverflow(tuple.data)
+          ? await this.resolveOverflow(tuple.data)
+          : tuple.data;
+        rows.push(this.deserializeRow(columns, resolved, requiredIndices));
+      }
+      pageId = page.nextPageId;
+    }
+
+    return rows;
   }
 
   public async insertRow(name: string, row: any) {

@@ -3,6 +3,7 @@ import { endBenchmarks, startBenchmarks } from "../benchmarks";
 import { StorageEngine } from "../storage/engine";
 import { Lexer } from "../parser/lexer";
 import { Parser } from "../parser/parser";
+import { JITCompiler } from "./jit";
 
 export class Executor {
   private exprKeyMap = new WeakMap<Expr, string>();
@@ -2409,6 +2410,20 @@ export class Executor {
     params: any = [],
     outerRow: any = {},
   ): AsyncIterableIterator<any> {
+    if (!stmt.ctes && Object.keys(outerRow).length === 0) {
+      if ((stmt as any)._jitExecutable === undefined) {
+        (stmt as any)._jitExecutable = JITCompiler.compile(stmt);
+      }
+      const jit = (stmt as any)._jitExecutable;
+      if (jit) {
+        const rows = await jit.execute(storage, params);
+        for (let i = 0; i < rows.length; i++) {
+          yield rows[i];
+        }
+        return;
+      }
+    }
+
     if (stmt.ctes) {
       for (const cte of stmt.ctes) {
         if (cte.recursive && (cte.stmt.union || cte.stmt.unionAll)) {
@@ -2720,7 +2735,7 @@ export class Executor {
             const fromTableName = stmt.from.tableName!;
             const fromAlias = stmt.from.alias;
             const hasOuterRow = Object.keys(outerRow).length > 0;
-            source = this.mapStream(storage.scanRows(fromTableName), (r) => {
+            source = this.mapStreamSync(storage.scanRows(fromTableName), (r) => {
               const tblCopy = this.getTableCopy(r);
               r["__lpg_tbl_" + fromTableName] = tblCopy;
               if (fromAlias) r["__lpg_tbl_" + fromAlias] = tblCopy;
@@ -2854,7 +2869,51 @@ export class Executor {
       const _this = this;
       const needInternalProps = !!(stmt.orderBy || stmt.distinctOn || stmt.having);
       const hasAsyncProj = stmt.columns.some((c: any) => this.hasAsyncOps(c));
-      if (!hasAsyncProj) {
+      const hasWildcard = stmt.columns.some(
+        (c: any) =>
+          c.type === "Identifier" && (c.name === "*" || c.name.endsWith(".*")),
+      );
+
+      if (!hasAsyncProj && !hasWildcard) {
+        const compiledCols: { outKey: string; expr: Expr; key: string }[] = [];
+        const usedKeys = new Set<string>();
+        for (let i = 0; i < stmt.columns.length; i++) {
+          const col = stmt.columns[i]!;
+          let outKey = "col";
+          let expr = col;
+          if (col.type === "Alias") {
+            outKey = col.alias;
+            expr = col.expr;
+          } else if (col.type === "Identifier") {
+            outKey = col.name.includes(".")
+              ? col.name.split(".").pop()!
+              : col.name;
+          } else if (col.type === "Call") {
+            outKey = col.fnName.toLowerCase();
+          }
+
+          if (usedKeys.has(outKey)) {
+            let suffix = 1;
+            while (usedKeys.has(`${outKey}${suffix}`)) suffix++;
+            outKey = `${outKey}${suffix}`;
+          }
+          usedKeys.add(outKey);
+          compiledCols.push({ outKey, expr, key: this.getExprKey(expr) });
+        }
+
+        sourceStream = this.mapStreamSync(sourceStream, function (r) {
+          const proj: any = {};
+          for (let i = 0; i < compiledCols.length; i++) {
+            const c = compiledCols[i]!;
+            if (r[c.key] !== undefined) {
+              proj[c.outKey] = r[c.key];
+            } else {
+              proj[c.outKey] = _this.evaluateExprSync(storage, c.expr, r, params);
+            }
+          }
+          return needInternalProps ? { ...r, ...proj, ___lpg_projected___: proj } : proj;
+        });
+      } else if (!hasAsyncProj) {
         sourceStream = this.mapStreamSync(sourceStream, function (r) {
           const proj = _this.projectRowSync(
             storage,
@@ -5051,12 +5110,13 @@ export class Executor {
             const parts = expr.name.split(".");
             (expr as any)._col = parts.pop()!;
             (expr as any)._tbl = parts.join(".");
+            (expr as any)._tblProp = "__lpg_tbl_" + (expr as any)._tbl;
           }
         }
 
         if ((expr as any)._isNested) {
           const tblObj =
-            row["__lpg_tbl_" + (expr as any)._tbl] || row[(expr as any)._tbl];
+            row[(expr as any)._tblProp] || row[(expr as any)._tbl];
           if (tblObj && tblObj[(expr as any)._col] !== undefined) {
             return tblObj[(expr as any)._col];
           }
@@ -5922,12 +5982,13 @@ export class Executor {
             const parts = expr.name.split(".");
             (expr as any)._col = parts.pop()!;
             (expr as any)._tbl = parts.join(".");
+            (expr as any)._tblProp = "__lpg_tbl_" + (expr as any)._tbl;
           }
         }
 
         if ((expr as any)._isNested) {
           const tblObj =
-            row["__lpg_tbl_" + (expr as any)._tbl] || row[(expr as any)._tbl];
+            row[(expr as any)._tblProp] || row[(expr as any)._tbl];
           if (tblObj && tblObj[(expr as any)._col] !== undefined) {
             return tblObj[(expr as any)._col];
           }
