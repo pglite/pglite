@@ -116,7 +116,7 @@ export class PGLiteNative {
       if (res.rows && res.rows.length > 0) {
         const colNames = res.fields.map((f: any) => f.name);
         const colsList = colNames.map(c => `"${c}"`).join(", ");
-        const CHUNK_SIZE = 50;
+        const CHUNK_SIZE = 500;
 
         for (let i = 0; i < res.rows.length; i += CHUNK_SIZE) {
           const chunk = res.rows.slice(i, i + CHUNK_SIZE);
@@ -158,7 +158,33 @@ export class PGLiteNative {
         }
         return res;
       } catch (err: any) {
-        console.warn(`[PGLite Native Fallback] exec: ${err?.message || err} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        let currentErr = err;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const errMsg = currentErr?.message || String(currentErr);
+          const match = errMsg.match(/Table\s+([a-zA-Z0-9_"\.-]+)\s+not found/i);
+          if (match) {
+            const rawTable = match[1].replace(/"/g, "");
+            const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
+            const hydrated = await this.tryHydrateTable(tbl, dbName);
+            if (hydrated) {
+              try {
+                let p = Array.isArray(params) ? params : undefined;
+                let db = typeof params === "string" ? params : dbName;
+                const res = this.nativeInstance.exec(sql, p, db) as T;
+                const upper = sql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  this.queueBackgroundWrite(sql, params, dbName, true);
+                }
+                return res;
+              } catch (retryErr) {
+                currentErr = retryErr;
+                continue;
+              }
+            }
+          }
+          break;
+        }
+        console.warn(`[PGLite Native Fallback] exec: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         return this.getJsEngine().exec<T>(sql, params, dbName);
       }
     }
@@ -180,7 +206,33 @@ export class PGLiteNative {
         }
         return res;
       } catch (err: any) {
-        console.warn(`[PGLite Native Fallback] exec2: ${err?.message || err} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
+        let currentErr = err;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const errMsg = currentErr?.message || String(currentErr);
+          const match = errMsg.match(/Table\s+([a-zA-Z0-9_"\.-]+)\s+not found/i);
+          if (match) {
+            const rawTable = match[1].replace(/"/g, "");
+            const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
+            const hydrated = await this.tryHydrateTable(tbl, dbName);
+            if (hydrated) {
+              try {
+                let p = Array.isArray(params) ? params : undefined;
+                let db = typeof params === "string" ? params : dbName;
+                const res = this.nativeInstance.exec2(sql, p, db) as QueryResult<T>;
+                const upper = sql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  this.queueBackgroundWrite(sql, params, dbName, true);
+                }
+                return res;
+              } catch (retryErr) {
+                currentErr = retryErr;
+                continue;
+              }
+            }
+          }
+          break;
+        }
+        console.warn(`[PGLite Native Fallback] exec2: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         return this.getJsEngine().exec2<T>(sql, params, dbName);
       }
     }

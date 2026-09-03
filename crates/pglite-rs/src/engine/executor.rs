@@ -257,6 +257,10 @@ impl Executor {
                             } else {
                                 Value::Null
                             }
+                        } else if token.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+                            || token.eq_ignore_ascii_case("NOW()")
+                            || token.to_uppercase().starts_with("CURRENT_TIMESTAMP") {
+                            Value::Text(get_current_timestamp())
                         } else if token.eq_ignore_ascii_case("NULL") {
                             Value::Null
                         } else if token.eq_ignore_ascii_case("TRUE") {
