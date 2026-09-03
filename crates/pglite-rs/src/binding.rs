@@ -2,6 +2,7 @@ use crate::engine::Executor;
 use crate::storage::StorageEngine;
 use crate::types::Value;
 use napi::bindgen_prelude::*;
+use napi::{JsFunction, JsObject, JsUnknown};
 use napi_derive::napi;
 use parking_lot::Mutex;
 use serde_json::json;
@@ -55,28 +56,41 @@ impl LitePostgresNative {
     }
 
     #[napi]
-    pub fn query(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<Vec<serde_json::Value>> {
+    pub fn query_json(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<String> {
         let rust_params = convert_params(params);
         let mut exec = self.executor.lock();
-        match exec.execute(&sql, &rust_params) {
-            Ok(res) => Ok(res.rows),
-            Err(e) => Err(Error::from_reason(e)),
-        }
+        exec.execute_rows_json(&sql, &rust_params).map_err(Error::from_reason)
     }
 
     #[napi]
-    pub fn query2(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<serde_json::Value> {
+    pub fn query2_json(&self, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<String> {
         let rust_params = convert_params(params);
         let mut exec = self.executor.lock();
-        match exec.execute(&sql, &rust_params) {
-            Ok(res) => Ok(json!({
-                "rows": res.rows,
-                "rowCount": res.row_count,
-                "fields": res.fields,
-                "command": res.command
-            })),
-            Err(e) => Err(Error::from_reason(e)),
-        }
+        exec.execute_full_json(&sql, &rust_params).map_err(Error::from_reason)
+    }
+
+    #[napi]
+    pub fn query(&self, env: Env, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<JsUnknown> {
+        let rust_params = convert_params(params);
+        let mut exec = self.executor.lock();
+        let json_str = exec.execute_rows_json(&sql, &rust_params).map_err(Error::from_reason)?;
+        let global = env.get_global()?;
+        let json_obj: JsObject = global.get_named_property("JSON")?;
+        let parse_fn: JsFunction = json_obj.get_named_property("parse")?;
+        let js_str = env.create_string(&json_str)?;
+        parse_fn.call(None, &[js_str.into_unknown()])
+    }
+
+    #[napi]
+    pub fn query2(&self, env: Env, sql: String, params: Option<Vec<serde_json::Value>>, _db_name: Option<String>) -> Result<JsUnknown> {
+        let rust_params = convert_params(params);
+        let mut exec = self.executor.lock();
+        let json_str = exec.execute_full_json(&sql, &rust_params).map_err(Error::from_reason)?;
+        let global = env.get_global()?;
+        let json_obj: JsObject = global.get_named_property("JSON")?;
+        let parse_fn: JsFunction = json_obj.get_named_property("parse")?;
+        let js_str = env.create_string(&json_str)?;
+        parse_fn.call(None, &[js_str.into_unknown()])
     }
 
     #[napi]

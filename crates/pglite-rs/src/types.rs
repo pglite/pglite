@@ -127,6 +127,56 @@ impl Value {
             Value::Text(s) => s.clone(),
         }
     }
+
+    #[inline]
+    pub fn write_json(&self, buf: &mut String) {
+        match self {
+            Value::Null => buf.push_str("null"),
+            Value::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
+            Value::Int(i) => {
+                use std::fmt::Write;
+                let _ = write!(buf, "{}", i);
+            }
+            Value::Float(f) => {
+                use std::fmt::Write;
+                if f.is_nan() || f.is_infinite() {
+                    buf.push_str("null");
+                } else {
+                    let _ = write!(buf, "{}", f);
+                }
+            }
+            Value::Text(s) => {
+                write_json_str(s, buf);
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn write_json_str(s: &str, buf: &mut String) {
+    buf.push('"');
+    let mut last = 0;
+    for (i, b) in s.bytes().enumerate() {
+        let escape = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            _ => continue,
+        };
+        if last < i {
+            buf.push_str(&s[last..i]);
+        }
+        buf.push_str(escape);
+        last = i + 1;
+    }
+    if last < s.len() {
+        buf.push_str(&s[last..]);
+    }
+    buf.push('"');
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,4 +191,14 @@ pub struct QueryResult {
     pub row_count: usize,
     pub fields: Vec<FieldInfo>,
     pub command: String,
+}
+
+impl QueryResult {
+    pub fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn rows_to_json_string(&self) -> String {
+        serde_json::to_string(&self.rows).unwrap_or_else(|_| "[]".to_string())
+    }
 }

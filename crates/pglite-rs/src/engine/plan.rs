@@ -1,5 +1,4 @@
 use crate::types::{FieldInfo, Value};
-use serde_json::json;
 
 #[derive(Clone, Debug)]
 pub enum OperandTemplate {
@@ -190,8 +189,10 @@ fn value_to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => json!(i),
-        Value::Float(f) => json!(f),
+        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Text(s) => serde_json::Value::String(s.clone()),
     }
 }

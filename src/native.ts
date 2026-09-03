@@ -187,12 +187,30 @@ export class PGLiteNative {
     return this.getJsEngine().exec2<T>(sql, params, dbName);
   }
 
+  private runNativeQuery<T = any>(sql: string, p?: any[], db?: string): T[] {
+    const fn = this.nativeInstance.queryJson || this.nativeInstance.query_json;
+    if (typeof fn === "function") {
+      const raw = fn.call(this.nativeInstance, sql, p, db);
+      return JSON.parse(raw) as T[];
+    }
+    return this.nativeInstance.query(sql, p, db) as T[];
+  }
+
+  private runNativeQuery2<T = any>(sql: string, p?: any[], db?: string): QueryResult<T> {
+    const fn = this.nativeInstance.query2Json || this.nativeInstance.query2_json;
+    if (typeof fn === "function") {
+      const raw = fn.call(this.nativeInstance, sql, p, db);
+      return JSON.parse(raw) as QueryResult<T>;
+    }
+    return this.nativeInstance.query2(sql, p, db) as QueryResult<T>;
+  }
+
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
-        const res = this.nativeInstance.query(sql, p, db) as T[];
+        const res = this.runNativeQuery<T>(sql, p, db);
         console.log(`[PGLite Native ⚡] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
         const upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SELECT")) {
@@ -212,7 +230,7 @@ export class PGLiteNative {
               try {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
-                const res = this.nativeInstance.query(sql, p, db) as T[];
+                const res = this.runNativeQuery<T>(sql, p, db);
                 console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
                 const upper = sql.trim().toUpperCase();
                 if (!upper.startsWith("SELECT")) {
@@ -240,7 +258,7 @@ export class PGLiteNative {
       try {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
-        const res = this.nativeInstance.query2(sql, p, db) as QueryResult<T>;
+        const res = this.runNativeQuery2<T>(sql, p, db);
         console.log(`[PGLite Native ⚡] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
         const upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SELECT")) {
@@ -260,7 +278,7 @@ export class PGLiteNative {
               try {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
-                const res = this.nativeInstance.query2(sql, p, db) as QueryResult<T>;
+                const res = this.runNativeQuery2<T>(sql, p, db);
                 console.log(`[PGLite Native ⚡ (Auto-Hydrated)] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
                 const upper = sql.trim().toUpperCase();
                 if (!upper.startsWith("SELECT")) {

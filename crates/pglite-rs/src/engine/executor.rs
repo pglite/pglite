@@ -23,6 +23,16 @@ impl Executor {
         }
     }
 
+    pub fn execute_rows_json(&mut self, sql: &str, params: &[Value]) -> Result<String, String> {
+        let res = self.execute(sql, params)?;
+        Ok(res.rows_to_json_string())
+    }
+
+    pub fn execute_full_json(&mut self, sql: &str, params: &[Value]) -> Result<String, String> {
+        let res = self.execute(sql, params)?;
+        Ok(res.to_json_string())
+    }
+
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let trimmed = sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
         let upper = trimmed.to_uppercase();
@@ -1862,13 +1872,16 @@ fn evaluate_conditions(row: &[Value], conditions: &[Condition]) -> bool {
     true
 }
 
+#[inline(always)]
 fn value_to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => json!(*b),
-        Value::Int(n) => json!(*n),
-        Value::Float(f) => json!(*f),
-        Value::Text(s) => json!(s),
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(n) => serde_json::Value::Number((*n).into()),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Text(s) => serde_json::Value::String(s.clone()),
     }
 }
 
