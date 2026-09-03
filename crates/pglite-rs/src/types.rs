@@ -63,6 +63,17 @@ impl Value {
         }
     }
 
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
     pub fn is_equal(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,

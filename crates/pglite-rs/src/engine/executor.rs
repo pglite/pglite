@@ -2,14 +2,25 @@ use crate::storage::engine::StorageEngine;
 use crate::types::{ColumnDef, DataType, FieldInfo, QueryResult, Value};
 use rayon::prelude::*;
 use serde_json::json;
+use std::collections::HashMap;
+
+pub use crate::engine::plan::PlannedProjectedExpr as ProjectedExpr;
+use crate::engine::plan::{
+    evaluate_planned_condition, project_row_planned, ColOpTemplate, ConditionTemplate,
+    ExecutionPlan, OperandTemplate, PlannedJoin,
+};
 
 pub struct Executor {
     pub storage: StorageEngine,
+    pub plan_cache: HashMap<String, ExecutionPlan>,
 }
 
 impl Executor {
     pub fn new(storage: StorageEngine) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            plan_cache: HashMap::new(),
+        }
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
@@ -46,6 +57,10 @@ impl Executor {
             });
         }
 
+        if upper.starts_with("CREATE") || upper.starts_with("DROP") || upper.starts_with("ALTER") {
+            self.plan_cache.clear();
+        }
+
         if upper.starts_with("CREATE TABLE") {
             return self.handle_create_table(trimmed);
         }
@@ -55,7 +70,16 @@ impl Executor {
         }
 
         if upper.starts_with("SELECT") {
-            return self.handle_select(trimmed, params);
+            if let Some(plan) = self.plan_cache.get(trimmed) {
+                if let Ok(res) = self.execute_select_plan(plan, params) {
+                    return Ok(res);
+                }
+            }
+            let (res, plan_opt) = self.handle_select(trimmed, params)?;
+            if let Some(plan) = plan_opt {
+                self.plan_cache.insert(trimmed.to_string(), plan);
+            }
+            return Ok(res);
         }
 
         if upper.starts_with("UPDATE") {
@@ -272,7 +296,7 @@ impl Executor {
         })
     }
 
-    fn handle_select(&self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+    fn handle_select(&self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
         let upper = sql.to_uppercase();
         let from_idx = upper.find("FROM").ok_or("Missing FROM clause in SELECT")?;
         let select_clause = sql[6..from_idx].trim();
@@ -293,7 +317,7 @@ impl Executor {
         let agg_specs = parse_aggregations(select_clause, table);
 
         if !agg_specs.is_empty() {
-            return self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params);
+            return Ok((self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params)?, None));
         }
 
         if clauses.join_clause.is_none() {
@@ -307,30 +331,41 @@ impl Executor {
                            w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
                            w_upper.starts_with("ID =") {
                             let val_part = w.split('=').nth(1).unwrap().trim();
-                            let target_id = if val_part.starts_with('$') {
+                            let (param_idx, literal_pk, target_id) = if val_part.starts_with('$') {
                                 let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
-                                params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0)
+                                let tid = params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0);
+                                (Some(p_idx.saturating_sub(1)), None, tid)
                             } else {
-                                val_part.parse::<i64>().unwrap_or(0)
+                                let tid = val_part.parse::<i64>().unwrap_or(0);
+                                (None, Some(tid), tid)
+                            };
+
+                            let fields: Vec<FieldInfo> = table.columns.iter().map(|c| FieldInfo {
+                                name: c.name.clone(),
+                                data_type: format!("{:?}", c.data_type).to_lowercase(),
+                            }).collect();
+
+                            let plan = ExecutionPlan::PointLookupPk {
+                                table_name: table.name.clone(),
+                                param_idx,
+                                literal_pk,
+                                fields: fields.clone(),
                             };
 
                             if let Some(row) = table.get_by_pk(target_id) {
-                                return Ok(QueryResult {
+                                return Ok((QueryResult {
                                     rows: vec![row_to_json(table, row)],
                                     row_count: 1,
-                                    fields: table.columns.iter().map(|c| FieldInfo {
-                                        name: c.name.clone(),
-                                        data_type: format!("{:?}", c.data_type).to_lowercase(),
-                                    }).collect(),
+                                    fields,
                                     command: "SELECT".to_string(),
-                                });
+                                }, Some(plan)));
                             } else {
-                                return Ok(QueryResult {
+                                return Ok((QueryResult {
                                     rows: vec![],
                                     row_count: 0,
                                     fields: vec![],
                                     command: "SELECT".to_string(),
-                                });
+                                }, Some(plan)));
                             }
                         }
                     }
@@ -345,32 +380,45 @@ impl Executor {
                         let right = w[eq_idx + 1..].trim();
                         if !right.contains("AND") && !right.contains("OR") {
                             if let Some(col_idx) = table.get_column_index(left) {
-                                let target_val = if right.starts_with('$') {
+                                let (param_idx, literal_str, target_val) = if right.starts_with('$') {
                                     let p_idx = right[1..].parse::<usize>().unwrap_or(1);
-                                    params.get(p_idx - 1).cloned().unwrap_or(Value::Null)
+                                    let tv = params.get(p_idx - 1).cloned().unwrap_or(Value::Null);
+                                    (Some(p_idx.saturating_sub(1)), None, tv)
                                 } else if right.starts_with('\'') && right.ends_with('\'') {
-                                    Value::Text(right[1..right.len() - 1].to_string())
+                                    let s = right[1..right.len() - 1].to_string();
+                                    (None, Some(s.clone()), Value::Text(s))
                                 } else {
-                                    Value::Text(right.to_string())
+                                    let s = right.to_string();
+                                    (None, Some(s.clone()), Value::Text(s))
+                                };
+
+                                let fields: Vec<FieldInfo> = table.columns.iter().map(|c| FieldInfo {
+                                    name: c.name.clone(),
+                                    data_type: format!("{:?}", c.data_type).to_lowercase(),
+                                }).collect();
+
+                                let plan = ExecutionPlan::PointLookupString {
+                                    table_name: table.name.clone(),
+                                    col_idx,
+                                    param_idx,
+                                    literal_str,
+                                    fields: fields.clone(),
                                 };
 
                                 if let Some(row) = table.find_first_by_col(col_idx, &target_val) {
-                                    return Ok(QueryResult {
+                                    return Ok((QueryResult {
                                         rows: vec![row_to_json(table, row)],
                                         row_count: 1,
-                                        fields: table.columns.iter().map(|c| FieldInfo {
-                                            name: c.name.clone(),
-                                            data_type: format!("{:?}", c.data_type).to_lowercase(),
-                                        }).collect(),
+                                        fields,
                                         command: "SELECT".to_string(),
-                                    });
+                                    }, Some(plan)));
                                 } else {
-                                    return Ok(QueryResult {
+                                    return Ok((QueryResult {
                                         rows: vec![],
                                         row_count: 0,
                                         fields: vec![],
                                         command: "SELECT".to_string(),
-                                    });
+                                    }, Some(plan)));
                                 }
                             }
                         }
@@ -518,12 +566,211 @@ impl Executor {
             }).collect()
         };
 
-        Ok(QueryResult {
+        let condition_templates = if let Some(w) = clauses.where_clause {
+            compile_condition_templates(w, table).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
+            let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
+            let j_idx = jt.get_column_index(clean_col_name(jc.joined_join_col)).unwrap_or(0);
+            let is_pk = jt.pk_col_idx == Some(j_idx);
+            Some(PlannedJoin {
+                joined_table_name: jt.name.clone(),
+                primary_join_col_idx: p_idx,
+                joined_join_col_idx: j_idx,
+                is_pk_join: is_pk,
+            })
+        } else {
+            None
+        };
+
+        let order_by_info = clauses.order_by_col.and_then(|col| {
+            table.get_column_index(clean_col_name(col)).map(|idx| (idx, clauses.order_by_desc))
+        });
+
+        let plan_projections = if !projected_exprs.is_empty() {
+            projected_exprs
+        } else {
+            table.columns.iter().enumerate().map(|(i, c)| ProjectedExpr::PrimaryCol {
+                col_idx: i,
+                alias: c.name.clone(),
+            }).collect()
+        };
+
+        let plan = ExecutionPlan::GeneralSelect {
+            table_name: table.name.clone(),
+            join: planned_join,
+            conditions: condition_templates,
+            order_by: order_by_info,
+            limit: clauses.limit,
+            offset: clauses.offset,
+            projections: plan_projections,
+            fields: fields.clone(),
+        };
+
+        Ok((QueryResult {
             row_count: rows.len(),
             rows,
             fields,
             command: "SELECT".to_string(),
-        })
+        }, Some(plan)))
+    }
+
+    fn execute_select_plan(&self, plan: &ExecutionPlan, params: &[Value]) -> Result<QueryResult, String> {
+        match plan {
+            ExecutionPlan::PointLookupPk {
+                table_name,
+                param_idx,
+                literal_pk,
+                fields,
+            } => {
+                let table = self.storage.get_table(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+                let target_id = if let Some(p_idx) = param_idx {
+                    params.get(*p_idx).and_then(|v| v.as_i64()).unwrap_or(0)
+                } else {
+                    literal_pk.unwrap_or(0)
+                };
+
+                if let Some(row) = table.get_by_pk(target_id) {
+                    Ok(QueryResult {
+                        rows: vec![row_to_json(table, row)],
+                        row_count: 1,
+                        fields: fields.clone(),
+                        command: "SELECT".to_string(),
+                    })
+                } else {
+                    Ok(QueryResult {
+                        rows: vec![],
+                        row_count: 0,
+                        fields: vec![],
+                        command: "SELECT".to_string(),
+                    })
+                }
+            }
+            ExecutionPlan::PointLookupString {
+                table_name,
+                col_idx,
+                param_idx,
+                literal_str,
+                fields,
+            } => {
+                let table = self.storage.get_table(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+                let target_val = if let Some(p_idx) = param_idx {
+                    params.get(*p_idx).cloned().unwrap_or(Value::Null)
+                } else if let Some(s) = literal_str {
+                    Value::Text(s.clone())
+                } else {
+                    Value::Null
+                };
+
+                for i in 0..table.rows.len() {
+                    if !table.is_deleted[i] {
+                        if let Some(v) = table.rows[i].get(*col_idx) {
+                            if v == &target_val {
+                                return Ok(QueryResult {
+                                    rows: vec![row_to_json(table, &table.rows[i])],
+                                    row_count: 1,
+                                    fields: fields.clone(),
+                                    command: "SELECT".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                Ok(QueryResult {
+                    rows: vec![],
+                    row_count: 0,
+                    fields: vec![],
+                    command: "SELECT".to_string(),
+                })
+            }
+            ExecutionPlan::GeneralSelect {
+                table_name,
+                join,
+                conditions,
+                order_by,
+                limit,
+                offset,
+                projections,
+                fields,
+            } => {
+                let table = self.storage.get_table(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+                let joined_table_opt = if let Some(ref j) = join {
+                    Some(self.storage.get_table(&j.joined_table_name).ok_or_else(|| format!("Table {} not found", j.joined_table_name))?)
+                } else {
+                    None
+                };
+
+                let mut matched_indices = Vec::new();
+                for i in 0..table.rows.len() {
+                    if !table.is_deleted[i] {
+                        let row = &table.rows[i];
+                        let mut ok = true;
+                        for c in conditions {
+                            if !evaluate_planned_condition(row, c, params) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            matched_indices.push(i);
+                        }
+                    }
+                }
+
+                // Sorting
+                if let Some((order_idx, is_desc)) = order_by {
+                    matched_indices.sort_by(|&a, &b| {
+                        let val_a = table.rows[a].get(*order_idx).unwrap_or(&Value::Null);
+                        let val_b = table.rows[b].get(*order_idx).unwrap_or(&Value::Null);
+                        if *is_desc {
+                            val_b.cmp_value(val_a)
+                        } else {
+                            val_a.cmp_value(val_b)
+                        }
+                    });
+                }
+
+                // Pagination
+                let start = (*offset).min(matched_indices.len());
+                let end = if let Some(lim) = limit {
+                    (start + lim).min(matched_indices.len())
+                } else {
+                    matched_indices.len()
+                };
+                let paged_indices = &matched_indices[start..end];
+
+                // Output projection
+                let mut out_rows = Vec::with_capacity(paged_indices.len());
+                for &idx in paged_indices {
+                    let p_row = &table.rows[idx];
+                    let j_row = if let (Some(ref j), Some(jt)) = (join, joined_table_opt) {
+                        if j.is_pk_join {
+                            p_row.get(j.primary_join_col_idx).and_then(|v| v.as_i64()).and_then(|pk| jt.get_by_pk(pk))
+                        } else {
+                            let target_val = p_row.get(j.primary_join_col_idx);
+                            jt.rows.iter().enumerate().find(|(r_idx, r)| !jt.is_deleted[*r_idx] && r.get(j.joined_join_col_idx) == target_val).map(|(_, r)| r)
+                        }
+                    } else {
+                        None
+                    };
+
+                    out_rows.push(project_row_planned(p_row, j_row.map(|r| r.as_slice()), projections));
+                }
+
+                let row_count = out_rows.len();
+                Ok(QueryResult {
+                    rows: out_rows,
+                    row_count,
+                    fields: fields.clone(),
+                    command: "SELECT".to_string(),
+                })
+            }
+            _ => Err("Invalid plan type for select".to_string()),
+        }
     }
 
     fn handle_aggregate_query(
@@ -852,12 +1099,6 @@ struct SelectClauses<'a> {
     order_by_desc: bool,
     limit: Option<usize>,
     offset: usize,
-}
-
-enum ProjectedExpr {
-    PrimaryCol { col_idx: usize, alias: String },
-    JoinedCol { col_idx: usize, alias: String },
-    CoalescePrimaryCol { col_idx: usize, default_val: Value, alias: String },
 }
 
 fn split_projection_items(s: &str) -> Vec<String> {
@@ -1314,6 +1555,112 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
         return Value::Float(f);
     }
     Value::Text(t.to_string())
+}
+
+fn parse_operand_template(token: &str) -> OperandTemplate {
+    let t = token.trim();
+    if t.starts_with('$') {
+        if let Ok(p_idx) = t[1..].parse::<usize>() {
+            return OperandTemplate::Param(p_idx.saturating_sub(1));
+        }
+    }
+    if t.eq_ignore_ascii_case("TRUE") {
+        return OperandTemplate::Literal(Value::Bool(true));
+    }
+    if t.eq_ignore_ascii_case("FALSE") {
+        return OperandTemplate::Literal(Value::Bool(false));
+    }
+    if t.eq_ignore_ascii_case("NULL") {
+        return OperandTemplate::Literal(Value::Null);
+    }
+    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        return OperandTemplate::Literal(Value::Text(t[1..t.len() - 1].to_string()));
+    }
+    if let Ok(f) = t.parse::<f64>() {
+        return OperandTemplate::Number(f);
+    }
+    OperandTemplate::Literal(Value::Text(t.to_string()))
+}
+
+fn compile_condition_templates(where_clause: &str, table: &crate::storage::table::Table) -> Result<Vec<ConditionTemplate>, String> {
+    let mut templates = Vec::new();
+    let parts = split_where_conditions(where_clause);
+
+    for part in parts {
+        let upper = part.to_uppercase();
+
+        if let Some(pos) = upper.find(" IS NOT NULL") {
+            let col_name = clean_col_name(&part[..pos]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::IsNotNull });
+        } else if let Some(pos) = upper.find(" IS NULL") {
+            let col_name = clean_col_name(&part[..pos]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::IsNull });
+        } else if let Some(b_idx) = upper.find(" BETWEEN ") {
+            let col_name = clean_col_name(&part[..b_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let rest = &part[b_idx + 9..];
+            let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
+            let min_token = rest[..and_idx].trim();
+            let max_token = rest[and_idx + 5..].trim();
+            let min_opnd = parse_operand_template(min_token);
+            let max_opnd = parse_operand_template(max_token);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Between(min_opnd, max_opnd) });
+        } else if let Some(op_idx) = part.find("!=") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let opnd = parse_operand_template(&part[op_idx + 2..]);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::NotEq(opnd) });
+        } else if let Some(op_idx) = part.find("<>") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let opnd = parse_operand_template(&part[op_idx + 2..]);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::NotEq(opnd) });
+        } else if let Some(op_idx) = part.find(">=") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let opnd = parse_operand_template(&part[op_idx + 2..]);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Gte(opnd) });
+        } else if let Some(op_idx) = part.find("<=") {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let opnd = parse_operand_template(&part[op_idx + 2..]);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Lte(opnd) });
+        } else if let Some(op_idx) = part.find('>') {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let opnd = parse_operand_template(&part[op_idx + 1..]);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Gt(opnd) });
+        } else if let Some(op_idx) = part.find('<') {
+            let col_name = clean_col_name(&part[..op_idx]);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let opnd = parse_operand_template(&part[op_idx + 1..]);
+            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Lt(opnd) });
+        } else if let Some(op_idx) = part.find('=') {
+            let left_raw = part[..op_idx].trim();
+            let upper_left = left_raw.to_uppercase();
+            let opnd = parse_operand_template(&part[op_idx + 1..]);
+
+            if upper_left.starts_with("LOWER(") && left_raw.ends_with(')') {
+                let inner = &left_raw[6..left_raw.len() - 1].trim();
+                let col_name = clean_col_name(inner);
+                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+                templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::LowerEq(opnd) });
+            } else if upper_left.starts_with("UPPER(") && left_raw.ends_with(')') {
+                let inner = &left_raw[6..left_raw.len() - 1].trim();
+                let col_name = clean_col_name(inner);
+                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+                templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::UpperEq(opnd) });
+            } else {
+                let col_name = clean_col_name(left_raw);
+                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+                templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Eq(opnd) });
+            }
+        }
+    }
+
+    Ok(templates)
 }
 
 fn parse_conditions(where_clause: &str, table: &crate::storage::table::Table, params: &[Value]) -> Result<Vec<Condition>, String> {
