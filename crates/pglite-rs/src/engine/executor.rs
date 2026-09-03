@@ -538,8 +538,8 @@ impl Executor {
 
         // 5. ORDER BY sorting
         if let Some(order_col) = clauses.order_by_col {
+            let desc = clauses.order_by_desc;
             if let Some(col_idx) = table.get_column_index(order_col) {
-                let desc = clauses.order_by_desc;
                 if matched_indices.len() > 10_000 {
                     matched_indices.par_sort_by(|&a, &b| {
                         let va = &table.rows[a][col_idx];
@@ -560,6 +560,31 @@ impl Executor {
                             va.cmp_value(vb)
                         }
                     });
+                }
+            } else if let Some(jt) = joined_table_opt {
+                if let Some(j_col_idx) = jt.get_column_index(order_col) {
+                    if let Some(ref jc) = clauses.join_clause {
+                        if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
+                            matched_indices.sort_by(|&a, &b| {
+                                let get_val = |row_idx: usize| -> Option<&Value> {
+                                    let key = table.rows[row_idx].get(p_col_idx)?;
+                                    if let Some(pk) = key.as_i64() {
+                                        let j_row = jt.get_by_pk(pk)?;
+                                        j_row.get(j_col_idx)
+                                    } else {
+                                        None
+                                    }
+                                };
+                                let va = get_val(a).unwrap_or(&Value::Null);
+                                let vb = get_val(b).unwrap_or(&Value::Null);
+                                if desc {
+                                    vb.cmp_value(va)
+                                } else {
+                                    va.cmp_value(vb)
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1414,7 +1439,8 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
                 None => after_o.trim(),
             };
             let mut parts = order_part.split_whitespace();
-            let col = parts.next().unwrap_or("").trim_matches('"');
+            let raw_col = parts.next().unwrap_or("");
+            let col = clean_col_name(raw_col);
             let desc = parts.next().map(|s| s.eq_ignore_ascii_case("DESC")).unwrap_or(false);
             (if col.is_empty() { None } else { Some(col) }, desc)
         }
