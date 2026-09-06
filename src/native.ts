@@ -64,7 +64,7 @@ export class PGLiteNative {
   }
 
   public get storage() {
-    return this.getJsEngine().storage;
+    return (this.getJsEngine() as any).storage;
   }
 
   public get tables() {

@@ -488,28 +488,27 @@ impl Executor {
         }
 
         // 4. General Scan with WHERE condition filtering
-        let conditions = match clauses.where_clause {
-            Some(w) => parse_conditions(w, table, params)?,
-            None => Vec::new(),
+        let where_expr = match clauses.where_clause {
+            Some(w) => Some(parse_where_expr(w, table, params)?),
+            None => None,
         };
 
         let total_rows = table.rows.len();
 
         // Check if any condition is an exact equality on the Primary Key column!
-        let pk_target = table.pk_col_idx.and_then(|pk_idx| {
-            conditions.iter().find_map(|c| {
-                if c.col_idx == pk_idx {
-                    if let ColOp::Eq(v) = &c.op {
-                        return v.as_i64();
-                    }
-                }
-                None
-            })
-        });
+        let pk_target = if let Some(ref expr) = where_expr {
+            table.pk_col_idx.and_then(|pk_idx| extract_single_pk_eq(expr, pk_idx))
+        } else {
+            None
+        };
 
         let mut matched_indices: Vec<usize> = if let Some(target_pk) = pk_target {
             if let Some(&row_idx) = table.pk_index.get(&target_pk) {
-                if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
+                let matches = match &where_expr {
+                    Some(expr) => evaluate_where_expr(&table.rows[row_idx], expr),
+                    None => true,
+                };
+                if !table.is_deleted[row_idx] && matches {
                     vec![row_idx]
                 } else {
                     vec![]
@@ -517,19 +516,21 @@ impl Executor {
             } else {
                 vec![]
             }
-        } else if conditions.is_empty() {
+        } else if where_expr.is_none() {
             (0..total_rows)
                 .into_par_iter()
                 .filter(|&i| !table.is_deleted[i])
                 .collect()
         } else if total_rows > 20_000 {
+            let expr_ref = where_expr.as_ref().unwrap();
             (0..total_rows)
                 .into_par_iter()
-                .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], expr_ref))
                 .collect()
         } else {
+            let expr_ref = where_expr.as_ref().unwrap();
             (0..total_rows)
-                .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], expr_ref))
                 .collect()
         };
 
@@ -952,17 +953,17 @@ impl Executor {
             }
         } else {
             // Filtered scan aggregate
-            let conditions = parse_conditions(where_clause.unwrap(), table, params)?;
+            let where_expr = parse_where_expr(where_clause.unwrap(), table, params)?;
             let total_rows = table.rows.len();
 
             let matched_indices: Vec<usize> = if total_rows > 20_000 {
                 (0..total_rows)
                     .into_par_iter()
-                    .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                    .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], &where_expr))
                     .collect()
             } else {
                 (0..total_rows)
-                    .filter(|&i| !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions))
+                    .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], &where_expr))
                     .collect()
             };
 
@@ -1011,16 +1012,19 @@ impl Executor {
 
     fn handle_update(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let set_idx = find_top_level_keyword(sql, "SET").ok_or("Missing SET in UPDATE")?;
-        let where_idx = find_top_level_keyword(sql, "WHERE").ok_or("Missing WHERE in UPDATE")?;
-
-        let table_name = clean_col_name(sql[6..set_idx].trim());
-        let set_clause = sql[set_idx + 3..where_idx].trim();
-        
+        let where_idx = find_top_level_keyword(sql, "WHERE");
         let returning_idx = find_top_level_keyword(sql, "RETURNING");
-        let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
-            (sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
-        } else {
-            (sql[where_idx + 5..].trim(), None)
+
+        let table_name = clean_table_name(sql[6..set_idx].trim());
+
+        let set_end = where_idx.or(returning_idx).unwrap_or(sql.len());
+        let set_clause = sql[set_idx + 3..set_end].trim();
+
+        let (where_clause, returning_cols) = match (where_idx, returning_idx) {
+            (Some(w_idx), Some(r_idx)) => (Some(sql[w_idx + 5..r_idx].trim()), Some(sql[r_idx + 9..].trim())),
+            (Some(w_idx), None) => (Some(sql[w_idx + 5..].trim()), None),
+            (None, Some(r_idx)) => (None, Some(sql[r_idx + 9..].trim())),
+            (None, None) => (None, None),
         };
 
         let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
@@ -1088,18 +1092,23 @@ impl Executor {
         }
 
         // Parse WHERE conditions
-        let conditions = parse_conditions(where_clause, table, params)?;
+        let where_expr = if let Some(w) = where_clause {
+            if !w.is_empty() {
+                Some(parse_where_expr(w, table, params)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Check if there is a primary key equality check for O(1) point update
-        let pk_target = if let Some(pk_idx) = table.pk_col_idx {
-            conditions.iter().find_map(|c| {
-                if c.col_idx == pk_idx {
-                    if let ColOp::Eq(ref v) = c.op {
-                        return v.as_i64();
-                    }
-                }
+        let pk_target = if let Some(ref expr) = where_expr {
+            if let Some(pk_idx) = table.pk_col_idx {
+                extract_single_pk_eq(expr, pk_idx)
+            } else {
                 None
-            })
+            }
         } else {
             None
         };
@@ -1108,7 +1117,11 @@ impl Executor {
         let mut returned_rows = Vec::new();
         if let Some(target_pk) = pk_target {
             if let Some(&row_idx) = table.pk_index.get(&target_pk) {
-                if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
+                let matches = match &where_expr {
+                    Some(expr) => evaluate_where_expr(&table.rows[row_idx], expr),
+                    None => true,
+                };
+                if !table.is_deleted[row_idx] && matches {
                     table.update_row_multi(row_idx, &updates);
                     row_count = 1;
                     if let Some(r_cols) = returning_cols {
@@ -1119,7 +1132,11 @@ impl Executor {
         } else {
             // General scan update
             for i in 0..table.rows.len() {
-                if !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions) {
+                let matches = match &where_expr {
+                    Some(expr) => evaluate_where_expr(&table.rows[i], expr),
+                    None => true,
+                };
+                if !table.is_deleted[i] && matches {
                     table.update_row_multi(i, &updates);
                     row_count += 1;
                     if let Some(r_cols) = returning_cols {
@@ -1145,29 +1162,37 @@ impl Executor {
 
     fn handle_delete(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let from_idx = find_top_level_keyword(sql, "FROM").ok_or("Missing FROM in DELETE")?;
-        let where_idx = find_top_level_keyword(sql, "WHERE").ok_or("Missing WHERE in DELETE")?;
-
-        let table_name = clean_col_name(sql[from_idx + 4..where_idx].trim());
-        
+        let where_idx = find_top_level_keyword(sql, "WHERE");
         let returning_idx = find_top_level_keyword(sql, "RETURNING");
-        let (where_clause, returning_cols) = if let Some(r_idx) = returning_idx {
-            (sql[where_idx + 5..r_idx].trim(), Some(sql[r_idx + 9..].trim()))
-        } else {
-            (sql[where_idx + 5..].trim(), None)
+
+        let (where_clause, returning_cols) = match (where_idx, returning_idx) {
+            (Some(w_idx), Some(r_idx)) => (Some(sql[w_idx + 5..r_idx].trim()), Some(sql[r_idx + 9..].trim())),
+            (Some(w_idx), None) => (Some(sql[w_idx + 5..].trim()), None),
+            (None, Some(r_idx)) => (None, Some(sql[r_idx + 9..].trim())),
+            (None, None) => (None, None),
         };
 
-        let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-        let conditions = parse_conditions(where_clause, table, params)?;
+        let table_end = where_idx.or(returning_idx).unwrap_or(sql.len());
+        let table_name = clean_table_name(sql[from_idx + 4..table_end].trim());
 
-        let pk_target = if let Some(pk_idx) = table.pk_col_idx {
-            conditions.iter().find_map(|c| {
-                if c.col_idx == pk_idx {
-                    if let ColOp::Eq(ref v) = c.op {
-                        return v.as_i64();
-                    }
-                }
+        let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+        
+        let where_expr = if let Some(w) = where_clause {
+            if !w.is_empty() {
+                Some(parse_where_expr(w, table, params)?)
+            } else {
                 None
-            })
+            }
+        } else {
+            None
+        };
+
+        let pk_target = if let Some(ref expr) = where_expr {
+            if let Some(pk_idx) = table.pk_col_idx {
+                extract_single_pk_eq(expr, pk_idx)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1176,7 +1201,11 @@ impl Executor {
         let mut returned_rows = Vec::new();
         if let Some(target_pk) = pk_target {
             if let Some(&row_idx) = table.pk_index.get(&target_pk) {
-                if !table.is_deleted[row_idx] && evaluate_conditions(&table.rows[row_idx], &conditions) {
+                let matches = match &where_expr {
+                    Some(expr) => evaluate_where_expr(&table.rows[row_idx], expr),
+                    None => true,
+                };
+                if !table.is_deleted[row_idx] && matches {
                     if let Some(r_cols) = returning_cols {
                         returned_rows.push(project_returning_row(table, &table.rows[row_idx], r_cols));
                     }
@@ -1186,7 +1215,11 @@ impl Executor {
             }
         } else {
             for i in 0..table.rows.len() {
-                if !table.is_deleted[i] && evaluate_conditions(&table.rows[i], &conditions) {
+                let matches = match &where_expr {
+                    Some(expr) => evaluate_where_expr(&table.rows[i], expr),
+                    None => true,
+                };
+                if !table.is_deleted[i] && matches {
                     if let Some(r_cols) = returning_cols {
                         returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
                     }
@@ -1635,7 +1668,10 @@ pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
 }
 
 fn clean_col_name(raw: &str) -> &str {
-    let s = raw.trim();
+    let mut s = raw.trim();
+    while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
+        s = s[1..s.len() - 1].trim();
+    }
     if let Some(dot_idx) = s.rfind('.') {
         s[dot_idx + 1..].trim().trim_matches('"')
     } else {
@@ -1644,12 +1680,147 @@ fn clean_col_name(raw: &str) -> &str {
 }
 
 fn clean_table_name(raw: &str) -> &str {
-    let s = raw.trim();
+    let mut s = raw.trim();
+    while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
+        s = s[1..s.len() - 1].trim();
+    }
     if let Some(dot_idx) = s.rfind('.') {
         s[dot_idx + 1..].trim().trim_matches('"')
     } else {
         s.trim_matches('"')
     }
+}
+
+fn is_fully_enclosed_in_parens(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+        return false;
+    }
+    let mut depth = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\'' && !in_dq {
+            in_sq = !in_sq;
+        } else if b == b'"' && !in_sq {
+            in_dq = !in_dq;
+        } else if !in_sq && !in_dq {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 && i < bytes.len() - 1 {
+                    return false;
+                }
+            }
+        }
+    }
+    depth == 0
+}
+
+fn split_top_level_or(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' && !in_dq {
+            in_sq = !in_sq;
+        } else if b == b'"' && !in_sq {
+            in_dq = !in_dq;
+        } else if !in_sq && !in_dq {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                if depth > 0 { depth -= 1; }
+            } else if depth == 0 && i + 2 <= bytes.len() {
+                if bytes[i..i + 2].eq_ignore_ascii_case(b"OR") {
+                    let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')';
+                    let next_ok = i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace() || bytes[i + 2] == b'(';
+                    if prev_ok && next_ok {
+                        let part = s[start..i].trim();
+                        if !part.is_empty() {
+                            parts.push(part);
+                        }
+                        start = i + 2;
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts
+}
+
+fn split_top_level_and(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut between_count = 0;
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' && !in_dq {
+            in_sq = !in_sq;
+        } else if b == b'"' && !in_sq {
+            in_dq = !in_dq;
+        } else if !in_sq && !in_dq {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                if depth > 0 { depth -= 1; }
+            } else if depth == 0 {
+                if i + 7 <= bytes.len() && bytes[i..i + 7].eq_ignore_ascii_case(b"BETWEEN") {
+                    let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                    let next_ok = i + 7 == bytes.len() || bytes[i + 7].is_ascii_whitespace();
+                    if prev_ok && next_ok {
+                        between_count += 1;
+                        i += 7;
+                        continue;
+                    }
+                }
+                if i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"AND") {
+                    let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')';
+                    let next_ok = i + 3 == bytes.len() || bytes[i + 3].is_ascii_whitespace() || bytes[i + 3] == b'(';
+                    if prev_ok && next_ok {
+                        if between_count > 0 {
+                            between_count -= 1;
+                            i += 3;
+                            continue;
+                        }
+                        let part = s[start..i].trim();
+                        if !part.is_empty() {
+                            parts.push(part);
+                        }
+                        start = i + 3;
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        parts.push(last);
+    }
+    parts
 }
 
 fn get_current_timestamp() -> String {
@@ -1710,20 +1881,26 @@ fn split_where_conditions(w: &str) -> Vec<String> {
 }
 
 fn parse_number(token: &str, params: &[Value]) -> Result<f64, String> {
-    let t = token.trim();
+    let mut t = token.trim();
+    while is_fully_enclosed_in_parens(t) {
+        t = t[1..t.len() - 1].trim();
+    }
     if t.starts_with('$') {
         let p_idx = t[1..].parse::<usize>().map_err(|_| format!("Invalid param {}", t))?;
-        params.get(p_idx - 1).and_then(|v| v.as_f64()).ok_or_else(|| format!("Param {} not found or not number", t))
+        params.get(p_idx.saturating_sub(1)).and_then(|v| v.as_f64()).ok_or_else(|| format!("Param {} not found or not number", t))
     } else {
         t.parse::<f64>().map_err(|_| format!("Invalid number {}", t))
     }
 }
 
 fn parse_value(token: &str, params: &[Value]) -> Value {
-    let t = token.trim();
+    let mut t = token.trim();
+    while is_fully_enclosed_in_parens(t) {
+        t = t[1..t.len() - 1].trim();
+    }
     if t.starts_with('$') {
         if let Ok(p_idx) = t[1..].parse::<usize>() {
-            return params.get(p_idx - 1).cloned().unwrap_or(Value::Null);
+            return params.get(p_idx.saturating_sub(1)).cloned().unwrap_or(Value::Null);
         }
     }
     if t.eq_ignore_ascii_case("TRUE") {
@@ -1748,7 +1925,10 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
 }
 
 fn parse_operand_template(token: &str) -> OperandTemplate {
-    let t = token.trim();
+    let mut t = token.trim();
+    while is_fully_enclosed_in_parens(t) {
+        t = t[1..t.len() - 1].trim();
+    }
     if t.starts_with('$') {
         if let Ok(p_idx) = t[1..].parse::<usize>() {
             return OperandTemplate::Param(p_idx.saturating_sub(1));
@@ -1862,212 +2042,232 @@ fn compile_condition_templates(where_clause: &str, table: &crate::storage::table
     Ok(templates)
 }
 
-fn parse_conditions(where_clause: &str, table: &crate::storage::table::Table, params: &[Value]) -> Result<Vec<Condition>, String> {
-    let mut conditions = Vec::new();
-    let parts = split_where_conditions(where_clause);
-
-    for part in parts {
-        let upper = part.to_uppercase();
-
-        if let Some(pos) = upper.find(" IS NOT NULL") {
-            let col_name = clean_col_name(&part[..pos]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            conditions.push(Condition { col_idx, op: ColOp::IsNotNull });
-        } else if let Some(pos) = upper.find(" IS NULL") {
-            let col_name = clean_col_name(&part[..pos]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            conditions.push(Condition { col_idx, op: ColOp::IsNull });
-        } else if let Some(b_idx) = upper.find(" BETWEEN ") {
-            let col_name = clean_col_name(&part[..b_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let rest = &part[b_idx + 9..];
-            let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
-            let min_token = rest[..and_idx].trim();
-            let max_token = rest[and_idx + 5..].trim();
-            let min_val = parse_number(min_token, params)?;
-            let max_val = parse_number(max_token, params)?;
-            conditions.push(Condition { col_idx, op: ColOp::Between(min_val, max_val) });
-        } else if let Some(in_idx) = upper.find(" IN ") {
-            let col_name = clean_col_name(&part[..in_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let rest = part[in_idx + 4..].trim();
-            if rest.starts_with('(') && rest.ends_with(')') {
-                let inside = &rest[1..rest.len() - 1];
-                let list: Vec<Value> = inside.split(',').map(|tok| parse_value(tok, params)).collect();
-                conditions.push(Condition { col_idx, op: ColOp::In(list) });
-            }
-        } else if let Some(op_idx) = part.find("!=") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let val = parse_value(&part[op_idx + 2..], params);
-            conditions.push(Condition { col_idx, op: ColOp::NotEq(val) });
-        } else if let Some(op_idx) = part.find("<>") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let val = parse_value(&part[op_idx + 2..], params);
-            conditions.push(Condition { col_idx, op: ColOp::NotEq(val) });
-        } else if let Some(op_idx) = part.find(">=") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let num = parse_number(&part[op_idx + 2..], params)?;
-            conditions.push(Condition { col_idx, op: ColOp::Gte(num) });
-        } else if let Some(op_idx) = part.find("<=") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let num = parse_number(&part[op_idx + 2..], params)?;
-            conditions.push(Condition { col_idx, op: ColOp::Lte(num) });
-        } else if let Some(op_idx) = part.find('>') {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let num = parse_number(&part[op_idx + 1..], params)?;
-            conditions.push(Condition { col_idx, op: ColOp::Gt(num) });
-        } else if let Some(op_idx) = part.find('<') {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let num = parse_number(&part[op_idx + 1..], params)?;
-            conditions.push(Condition { col_idx, op: ColOp::Lt(num) });
-        } else if let Some(op_idx) = part.find('=') {
-            let left_raw = part[..op_idx].trim();
-            let upper_left = left_raw.to_uppercase();
-            let val = parse_value(&part[op_idx + 1..], params);
-
-            if upper_left.starts_with("LOWER(") && left_raw.ends_with(')') {
-                let inner = &left_raw[6..left_raw.len() - 1].trim();
-                let col_name = clean_col_name(inner);
-                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-                let target_str = match &val {
-                    Value::Text(s) => s.to_lowercase(),
-                    Value::Int(i) => i.to_string(),
-                    _ => "".to_string(),
-                };
-                conditions.push(Condition { col_idx, op: ColOp::LowerEq(target_str) });
-            } else if upper_left.starts_with("UPPER(") && left_raw.ends_with(')') {
-                let inner = &left_raw[6..left_raw.len() - 1].trim();
-                let col_name = clean_col_name(inner);
-                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-                let target_str = match &val {
-                    Value::Text(s) => s.to_uppercase(),
-                    Value::Int(i) => i.to_string(),
-                    _ => "".to_string(),
-                };
-                conditions.push(Condition { col_idx, op: ColOp::UpperEq(target_str) });
-            } else {
-                let col_name = clean_col_name(left_raw);
-                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-                conditions.push(Condition { col_idx, op: ColOp::Eq(val) });
-            }
-        }
-    }
-
-    // Prioritize cheap, high-selectivity conditions: Eq > IsNull/IsNotNull > Range > Lower/Upper
-    conditions.sort_by_key(|c| match &c.op {
-        ColOp::Eq(_) => 0,
-        ColOp::IsNull | ColOp::IsNotNull => 1,
-        ColOp::Between(_, _) | ColOp::Gt(_) | ColOp::Gte(_) | ColOp::Lt(_) | ColOp::Lte(_) => 2,
-        ColOp::In(_) | ColOp::NotEq(_) => 3,
-        ColOp::LowerEq(_) | ColOp::UpperEq(_) => 4,
-    });
-
-    Ok(conditions)
+#[derive(Clone, Debug)]
+enum WhereExpr {
+    And(Vec<WhereExpr>),
+    Or(Vec<WhereExpr>),
+    Not(Box<WhereExpr>),
+    Condition(Condition),
 }
 
-fn evaluate_conditions(row: &[Value], conditions: &[Condition]) -> bool {
-    for cond in conditions {
-        if cond.col_idx >= row.len() {
-            return false;
+fn parse_where_expr(
+    s: &str,
+    table: &crate::storage::table::Table,
+    params: &[Value],
+) -> Result<WhereExpr, String> {
+    let mut trimmed = s.trim();
+    while is_fully_enclosed_in_parens(trimmed) {
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
+    if trimmed.is_empty() {
+        return Err("Empty WHERE expression".to_string());
+    }
+
+    // 1. Check for top-level OR
+    let or_parts = split_top_level_or(trimmed);
+    if or_parts.len() > 1 {
+        let mut list = Vec::with_capacity(or_parts.len());
+        for p in or_parts {
+            list.push(parse_where_expr(p, table, params)?);
         }
-        let val = &row[cond.col_idx];
-        match &cond.op {
-            ColOp::IsNull => {
-                match val {
-                    Value::Null => {},
-                    _ => return false,
-                }
-            }
-            ColOp::IsNotNull => {
-                match val {
-                    Value::Null => return false,
-                    _ => {},
-                }
-            }
-            ColOp::NotEq(target) => {
-                if val.is_equal(target) {
-                    return false;
-                }
-            }
-            ColOp::Eq(target) => {
-                if !val.is_equal(target) {
-                    return false;
-                }
-            }
-            ColOp::LowerEq(target) => {
-                match val {
-                    Value::Text(s) => {
-                        if s.to_lowercase() != *target {
-                            return false;
-                        }
-                    }
-                    Value::Int(i) => {
-                        if i.to_string() != *target {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            ColOp::UpperEq(target) => {
-                match val {
-                    Value::Text(s) => {
-                        if s.to_uppercase() != *target {
-                            return false;
-                        }
-                    }
-                    Value::Int(i) => {
-                        if i.to_string() != *target {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            ColOp::Gt(threshold) => {
-                if let Some(f) = val.as_f64() {
-                    if f <= *threshold { return false; }
-                } else { return false; }
-            }
-            ColOp::Gte(threshold) => {
-                if let Some(f) = val.as_f64() {
-                    if f < *threshold { return false; }
-                } else { return false; }
-            }
-            ColOp::Lt(threshold) => {
-                if let Some(f) = val.as_f64() {
-                    if f >= *threshold { return false; }
-                } else { return false; }
-            }
-            ColOp::Lte(threshold) => {
-                if let Some(f) = val.as_f64() {
-                    if f > *threshold { return false; }
-                } else { return false; }
-            }
-            ColOp::Between(min_val, max_val) => {
-                if let Some(f) = val.as_f64() {
-                    if f < *min_val || f > *max_val { return false; }
-                } else { return false; }
-            }
-            ColOp::In(list) => {
-                let mut found = false;
-                for item in list {
-                    if val == item {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found { return false; }
-            }
+        return Ok(WhereExpr::Or(list));
+    }
+
+    // 2. Check for top-level AND
+    let and_parts = split_top_level_and(trimmed);
+    if and_parts.len() > 1 {
+        let mut list = Vec::with_capacity(and_parts.len());
+        for p in and_parts {
+            list.push(parse_where_expr(p, table, params)?);
+        }
+        return Ok(WhereExpr::And(list));
+    }
+
+    // 3. Check for top-level NOT
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("NOT ") || upper.starts_with("NOT(") {
+        let inner = trimmed[3..].trim();
+        return Ok(WhereExpr::Not(Box::new(parse_where_expr(inner, table, params)?)));
+    }
+
+    // 4. Parse single condition
+    let cond = parse_single_condition(trimmed, table, params)?;
+    Ok(WhereExpr::Condition(cond))
+}
+
+fn parse_single_condition(
+    part: &str,
+    table: &crate::storage::table::Table,
+    params: &[Value],
+) -> Result<Condition, String> {
+    let mut s = part.trim();
+    while is_fully_enclosed_in_parens(s) {
+        s = s[1..s.len() - 1].trim();
+    }
+    let upper = s.to_uppercase();
+
+    if let Some(pos) = upper.find(" IS NOT NULL") {
+        let col_name = clean_col_name(&s[..pos]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        return Ok(Condition { col_idx, op: ColOp::IsNotNull });
+    }
+    if let Some(pos) = upper.find(" IS NULL") {
+        let col_name = clean_col_name(&s[..pos]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        return Ok(Condition { col_idx, op: ColOp::IsNull });
+    }
+    if let Some(b_idx) = upper.find(" BETWEEN ") {
+        let col_name = clean_col_name(&s[..b_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let rest = &s[b_idx + 9..];
+        let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
+        let min_token = rest[..and_idx].trim();
+        let max_token = rest[and_idx + 5..].trim();
+        let min_val = parse_number(min_token, params)?;
+        let max_val = parse_number(max_token, params)?;
+        return Ok(Condition { col_idx, op: ColOp::Between(min_val, max_val) });
+    }
+    if let Some(in_idx) = upper.find(" IN ") {
+        let col_name = clean_col_name(&s[..in_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let rest = s[in_idx + 4..].trim();
+        if rest.starts_with('(') && rest.ends_with(')') {
+            let inside = &rest[1..rest.len() - 1];
+            let list: Vec<Value> = inside.split(',').map(|tok| parse_value(tok, params)).collect();
+            return Ok(Condition { col_idx, op: ColOp::In(list) });
         }
     }
-    true
+    if let Some(op_idx) = s.find("!=") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let val = parse_value(&s[op_idx + 2..], params);
+        return Ok(Condition { col_idx, op: ColOp::NotEq(val) });
+    }
+    if let Some(op_idx) = s.find("<>") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let val = parse_value(&s[op_idx + 2..], params);
+        return Ok(Condition { col_idx, op: ColOp::NotEq(val) });
+    }
+    if let Some(op_idx) = s.find(">=") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let num = parse_number(&s[op_idx + 2..], params)?;
+        return Ok(Condition { col_idx, op: ColOp::Gte(num) });
+    }
+    if let Some(op_idx) = s.find("<=") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let num = parse_number(&s[op_idx + 2..], params)?;
+        return Ok(Condition { col_idx, op: ColOp::Lte(num) });
+    }
+    if let Some(op_idx) = s.find('>') {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let num = parse_number(&s[op_idx + 1..], params)?;
+        return Ok(Condition { col_idx, op: ColOp::Gt(num) });
+    }
+    if let Some(op_idx) = s.find('<') {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let num = parse_number(&s[op_idx + 1..], params)?;
+        return Ok(Condition { col_idx, op: ColOp::Lt(num) });
+    }
+    if let Some(op_idx) = s.find('=') {
+        let left_raw = s[..op_idx].trim();
+        let upper_left = left_raw.to_uppercase();
+        let val = parse_value(&s[op_idx + 1..], params);
+
+        if upper_left.starts_with("LOWER(") && left_raw.ends_with(')') {
+            let inner = &left_raw[6..left_raw.len() - 1].trim();
+            let col_name = clean_col_name(inner);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let target_str = match &val {
+                Value::Text(s) => s.to_lowercase(),
+                Value::Int(i) => i.to_string(),
+                _ => "".to_string(),
+            };
+            return Ok(Condition { col_idx, op: ColOp::LowerEq(target_str) });
+        } else if upper_left.starts_with("UPPER(") && left_raw.ends_with(')') {
+            let inner = &left_raw[6..left_raw.len() - 1].trim();
+            let col_name = clean_col_name(inner);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            let target_str = match &val {
+                Value::Text(s) => s.to_uppercase(),
+                Value::Int(i) => i.to_string(),
+                _ => "".to_string(),
+            };
+            return Ok(Condition { col_idx, op: ColOp::UpperEq(target_str) });
+        } else {
+            let col_name = clean_col_name(left_raw);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            return Ok(Condition { col_idx, op: ColOp::Eq(val) });
+        }
+    }
+
+    Err(format!("Unsupported condition syntax: {}", s))
+}
+
+fn extract_single_pk_eq(expr: &WhereExpr, pk_idx: usize) -> Option<i64> {
+    match expr {
+        WhereExpr::Condition(cond) => {
+            if cond.col_idx == pk_idx {
+                if let ColOp::Eq(ref v) = cond.op {
+                    return v.as_i64();
+                }
+            }
+            None
+        }
+        WhereExpr::And(list) => {
+            for item in list {
+                if let Some(pk) = extract_single_pk_eq(item, pk_idx) {
+                    return Some(pk);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn evaluate_where_expr(row: &[Value], expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::And(list) => list.iter().all(|e| evaluate_where_expr(row, e)),
+        WhereExpr::Or(list) => list.iter().any(|e| evaluate_where_expr(row, e)),
+        WhereExpr::Not(inner) => !evaluate_where_expr(row, inner),
+        WhereExpr::Condition(cond) => evaluate_single_condition(row, cond),
+    }
+}
+
+fn evaluate_single_condition(row: &[Value], cond: &Condition) -> bool {
+    if cond.col_idx >= row.len() {
+        return false;
+    }
+    let val = &row[cond.col_idx];
+    match &cond.op {
+        ColOp::IsNull => matches!(val, Value::Null),
+        ColOp::IsNotNull => !matches!(val, Value::Null),
+        ColOp::NotEq(target) => !val.is_equal(target),
+        ColOp::Eq(target) => val.is_equal(target),
+        ColOp::LowerEq(target) => match val {
+            Value::Text(s) => s.to_lowercase() == *target,
+            Value::Int(i) => i.to_string() == *target,
+            _ => false,
+        },
+        ColOp::UpperEq(target) => match val {
+            Value::Text(s) => s.to_uppercase() == *target,
+            Value::Int(i) => i.to_string() == *target,
+            _ => false,
+        },
+        ColOp::Gt(threshold) => val.as_f64().map(|f| f > *threshold).unwrap_or(false),
+        ColOp::Gte(threshold) => val.as_f64().map(|f| f >= *threshold).unwrap_or(false),
+        ColOp::Lt(threshold) => val.as_f64().map(|f| f < *threshold).unwrap_or(false),
+        ColOp::Lte(threshold) => val.as_f64().map(|f| f <= *threshold).unwrap_or(false),
+        ColOp::Between(min_val, max_val) => {
+            val.as_f64().map(|f| f >= *min_val && f <= *max_val).unwrap_or(false)
+        }
+        ColOp::In(list) => list.iter().any(|item| val == item),
+    }
 }
 
 #[inline(always)]

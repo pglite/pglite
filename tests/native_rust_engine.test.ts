@@ -419,6 +419,71 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       const remaining = db.query(`SELECT COUNT(*) FROM "classes"`);
       expect(remaining[0].count).toBe(4);
     });
+
+    test("8.3 DELETE with multiple OR clauses and parenthesized column equality", () => {
+      db.exec(`DELETE FROM "provinces"`);
+      for (let i = 1; i <= 10; i++) {
+        db.query(`INSERT INTO "provinces" ("id", "name") VALUES ($1, $2)`, [i, `Province ${i}`]);
+      }
+      expect(db.query(`SELECT COUNT(*) FROM "provinces"`)[0].count).toBe(10);
+
+      // Exact query requested by user
+      const delRes = db.exec(`DELETE FROM "provinces" WHERE ("id" = 6) OR ("id" = 7) OR ("id" = 8) OR ("id" = 9)`);
+      expect(delRes).toBeDefined();
+
+      const remaining = db.query(`SELECT COUNT(*) FROM "provinces"`);
+      expect(remaining[0].count).toBe(6);
+
+      const deletedRows = db.query(`SELECT * FROM "provinces" WHERE "id" IN (6, 7, 8, 9)`);
+      expect(deletedRows.length).toBe(0);
+
+      const remainingRows = db.query(`SELECT "id" FROM "provinces" ORDER BY "id" ASC`);
+      expect(remainingRows.map((r: any) => r.id)).toEqual([1, 2, 3, 4, 5, 10]);
+    });
+
+    test("8.4 DELETE with nested parentheses and compound AND/OR logic", () => {
+      db.query(`INSERT INTO "provinces" ("id", "name") VALUES ($1, $2)`, [6, "Special City"]);
+      db.query(`INSERT INTO "provinces" ("id", "name") VALUES ($1, $2)`, [7, "Normal Town"]);
+
+      db.exec(`DELETE FROM "provinces" WHERE (("id" = 6) OR ("id" = 7)) AND "name" = 'Special City'`);
+
+      const res6 = db.query(`SELECT * FROM "provinces" WHERE "id" = 6`);
+      const res7 = db.query(`SELECT * FROM "provinces" WHERE "id" = 7`);
+      expect(res6.length).toBe(0);
+      expect(res7.length).toBe(1);
+    });
+
+    test("8.5 DELETE with RETURNING clause", () => {
+      const returned = db.exec2(`DELETE FROM "provinces" WHERE "id" = 10 RETURNING "id", "name"`);
+      expect(returned.rows).toBeDefined();
+      expect(returned.rows.length).toBe(1);
+      expect(returned.rows[0].id).toBe(10);
+      expect(returned.rows[0].name).toBe("Province 10");
+    });
+
+    test("8.6 DELETE without WHERE clause (truncates all rows)", () => {
+      db.exec(`CREATE TABLE "temp_cleanup" ("id" SERIAL PRIMARY KEY, "val" TEXT)`);
+      db.exec(`INSERT INTO "temp_cleanup" ("val") VALUES ('a'), ('b'), ('c')`);
+      expect(db.query(`SELECT COUNT(*) FROM "temp_cleanup"`)[0].count).toBe(3);
+
+      db.exec(`DELETE FROM "temp_cleanup"`);
+      expect(db.query(`SELECT COUNT(*) FROM "temp_cleanup"`)[0].count).toBe(0);
+    });
+
+    test("8.7 Unified PGLiteNative instance DELETE with OR conditions", async () => {
+      const pgliteDb = new PGLiteNative("test_pglite_del.db", { native: true });
+      await pgliteDb.exec(`CREATE TABLE "locations" ("id" INT PRIMARY KEY, "title" TEXT)`);
+      for (let i = 1; i <= 5; i++) {
+        await pgliteDb.query(`INSERT INTO "locations" ("id", "title") VALUES ($1, $2)`, [i, `Loc ${i}`]);
+      }
+
+      await pgliteDb.exec(`DELETE FROM "locations" WHERE ("id" = 2) OR ("id" = 4)`);
+      const rows = await pgliteDb.query(`SELECT "id" FROM "locations" ORDER BY "id" ASC`);
+      expect(rows.map((r: any) => r.id)).toEqual([1, 3, 5]);
+
+      await pgliteDb.close();
+      cleanFiles("test_pglite_del.db");
+    });
   });
 
   // ==========================================
