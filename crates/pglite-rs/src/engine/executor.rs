@@ -1,4 +1,5 @@
 use crate::storage::engine::StorageEngine;
+use crate::storage::wal::WalRecord;
 use crate::types::{ColumnDef, DataType, FieldInfo, QueryResult, Value};
 use rayon::prelude::*;
 use serde_json::json;
@@ -6,8 +7,8 @@ use std::collections::HashMap;
 
 pub use crate::engine::plan::PlannedProjectedExpr as ProjectedExpr;
 use crate::engine::plan::{
-    evaluate_planned_condition, project_row_planned, resolve_operand, ColOpTemplate, ConditionTemplate,
-    ExecutionPlan, OperandTemplate, PlannedJoin,
+    evaluate_planned_condition, project_row_planned, resolve_operand, ColOpTemplate,
+    ConditionTemplate, ExecutionPlan, OperandTemplate, PlannedJoin, PlannedProjectedExpr,
 };
 
 pub struct Executor {
@@ -34,7 +35,8 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let trimmed = sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
+        let clean_sql = strip_sql_comments(sql);
+        let trimmed = clean_sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
         let upper = trimmed.to_uppercase();
 
         if upper.starts_with("BEGIN") {
@@ -314,7 +316,7 @@ impl Executor {
                 } else if token.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
                     || token.eq_ignore_ascii_case("NOW()")
                     || token.to_uppercase().starts_with("CURRENT_TIMESTAMP") {
-                    Value::Text(get_current_timestamp())
+                    Value::text(get_current_timestamp())
                 } else if token.eq_ignore_ascii_case("NULL") {
                     Value::Null
                 } else if token.eq_ignore_ascii_case("TRUE") {
@@ -322,13 +324,13 @@ impl Executor {
                 } else if token.eq_ignore_ascii_case("FALSE") {
                     Value::Bool(false)
                 } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
-                    Value::Text(token[1..token.len() - 1].replace("''", "'"))
+                    Value::text(token[1..token.len() - 1].replace("''", "'"))
                 } else if let Ok(int_val) = token.parse::<i64>() {
                     Value::Int(int_val)
                 } else if let Ok(flt_val) = token.parse::<f64>() {
                     Value::Float(flt_val)
                 } else {
-                    Value::Text(token.to_string())
+                    Value::text(token)
                 };
 
                 row[target_idx] = val;
@@ -342,20 +344,26 @@ impl Executor {
         let in_tx = self.storage.in_transaction;
 
         let mut returned_rows = Vec::new();
+        let mut appended_records = Vec::new();
         if let Some(table) = self.storage.get_table_mut(&clean_table_name) {
             table.rows.reserve(count);
             table.is_deleted.reserve(count);
             for row in inserted_rows {
                 let _pk = table.insert(row);
-                if let Some(r_cols) = returning_cols {
-                    if let Some(last_row) = table.rows.last() {
+                if let Some(last_row) = table.rows.last() {
+                    appended_records.push(last_row.clone());
+                    if let Some(r_cols) = returning_cols {
                         returned_rows.push(project_returning_row(table, last_row, r_cols));
                     }
                 }
-                if in_tx {
-                    // Log for undo if rollback needed
-                }
             }
+        }
+
+        for row in appended_records {
+            self.storage.wal.append(WalRecord::Insert {
+                table: clean_table_name.clone(),
+                row,
+            });
         }
 
         let fields = if let (Some(r_cols), Some(table)) = (returning_cols, self.storage.get_table(&clean_table_name)) {
@@ -375,9 +383,6 @@ impl Executor {
     fn handle_select(&self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
         let from_idx = find_top_level_keyword(sql, "FROM").ok_or("Missing FROM clause in SELECT")?;
         let select_clause = sql[6..from_idx].trim();
-        if select_clause.to_uppercase().contains("SELECT") {
-            return Err("Subqueries in SELECT clause are delegated to full engine".to_string());
-        }
         let after_from = sql[from_idx + 4..].trim();
 
         let clauses = parse_select_clauses(after_from);
@@ -392,7 +397,11 @@ impl Executor {
         };
 
         // 1. Check if SELECT has aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-        let agg_specs = parse_aggregations(select_clause, table);
+        let agg_specs = if !select_clause.to_uppercase().contains("SELECT") {
+            parse_aggregations(select_clause, table)
+        } else {
+            vec![]
+        };
 
         if !agg_specs.is_empty() {
             return Ok((self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params)?, None));
@@ -465,7 +474,7 @@ impl Executor {
                                 } else {
                                     let tv = parse_value(right, params);
                                     let s = match &tv {
-                                        Value::Text(s) => s.clone(),
+                                        Value::Text(s) => s.to_string(),
                                         _ => right.to_string(),
                                     };
                                     (None, Some(s), tv)
@@ -548,6 +557,26 @@ impl Executor {
                 .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], expr_ref))
                 .collect()
         };
+
+        if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
+            if !jc.is_left {
+                if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
+                    matched_indices.retain(|&idx| {
+                        let join_key = &table.rows[idx][p_col_idx];
+                        if join_key.is_null() {
+                            return false;
+                        }
+                        if let Some(target_pk) = join_key.as_i64() {
+                            jt.get_by_pk(target_pk).is_some()
+                        } else if let Some(j_col_idx) = jt.get_column_index(jc.joined_join_col) {
+                            jt.rows.iter().enumerate().any(|(r_idx, r)| !jt.is_deleted[r_idx] && r.get(j_col_idx).map(|v| v.is_equal(join_key)).unwrap_or(false))
+                        } else {
+                            false
+                        }
+                    });
+                }
+            }
+        }
 
         // 5. ORDER BY sorting
         if !clauses.order_by_specs.is_empty() {
@@ -635,12 +664,54 @@ impl Executor {
         let projected_exprs = if select_clause.trim() == "*" {
             Vec::new()
         } else {
-            let exprs = parse_projection(select_clause, table, joined_table_opt, params);
+            let exprs = parse_projection(
+                select_clause,
+                table,
+                clauses.table_alias,
+                joined_table_opt,
+                clauses.join_clause.as_ref().and_then(|j| j.joined_table_alias),
+                &self.storage,
+                params,
+            );
             if exprs.is_empty() {
                 return Err(format!("Unsupported projection clause: {}", select_clause));
             }
             exprs
         };
+
+        let mut count_maps: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
+        for expr in &projected_exprs {
+            if let ProjectedExpr::CorrelatedCount {
+                child_table_name,
+                child_join_col_idx,
+                extra_child_conditions,
+                alias,
+                ..
+            } = expr {
+                if let Some(child_table) = self.storage.get_table(child_table_name) {
+                    let mut map = std::collections::HashMap::new();
+                    for i in 0..child_table.rows.len() {
+                        if !child_table.is_deleted[i] {
+                            let mut matches = true;
+                            for cond in extra_child_conditions {
+                                if !crate::engine::plan::evaluate_planned_condition(&child_table.rows[i], cond, params) {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+                            if matches {
+                                if let Some(fk_val) = child_table.rows[i].get(*child_join_col_idx) {
+                                    if !fk_val.is_null() {
+                                        *map.entry(fk_val.as_str()).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    count_maps.insert(alias.clone(), map);
+                }
+            }
+        }
 
         let rows: Vec<serde_json::Value> = if !projected_exprs.is_empty() {
             paged_indices
@@ -683,6 +754,20 @@ impl Executor {
                                 };
                                 map.insert(alias.clone(), value_to_json(v));
                             }
+                            ProjectedExpr::CoalesceJoinedCol { col_idx, default_val, alias } => {
+                                let raw_v = joined_row.and_then(|r| r.get(*col_idx)).unwrap_or(&Value::Null);
+                                let v = match raw_v {
+                                    Value::Null => default_val,
+                                    _ => raw_v,
+                                };
+                                map.insert(alias.clone(), value_to_json(v));
+                            }
+                            ProjectedExpr::CorrelatedCount { parent_join_col_idx, alias, .. } => {
+                                let parent_val = primary_row.get(*parent_join_col_idx).unwrap_or(&Value::Null);
+                                let key = parent_val.as_str();
+                                let count = count_maps.get(alias).and_then(|m| m.get(&key).copied()).unwrap_or(0);
+                                map.insert(alias.clone(), serde_json::Value::Number(count.into()));
+                            }
                         }
                     }
                     serde_json::Value::Object(map)
@@ -697,14 +782,16 @@ impl Executor {
 
         let fields: Vec<FieldInfo> = if !projected_exprs.is_empty() {
             projected_exprs.iter().map(|e| {
-                let alias = match e {
-                    ProjectedExpr::PrimaryCol { alias, .. } => alias.clone(),
-                    ProjectedExpr::JoinedCol { alias, .. } => alias.clone(),
-                    ProjectedExpr::CoalescePrimaryCol { alias, .. } => alias.clone(),
+                let (alias, dt) = match e {
+                    ProjectedExpr::PrimaryCol { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::JoinedCol { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::CoalescePrimaryCol { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::CoalesceJoinedCol { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::CorrelatedCount { alias, .. } => (alias.clone(), "bigint".to_string()),
                 };
                 FieldInfo {
                     name: alias,
-                    data_type: "text".to_string(),
+                    data_type: dt,
                 }
             }).collect()
         } else {
@@ -810,7 +897,7 @@ impl Executor {
                 let target_val = if let Some(p_idx) = param_idx {
                     params.get(*p_idx).cloned().unwrap_or(Value::Null)
                 } else if let Some(s) = literal_str {
-                    Value::Text(s.clone())
+                    Value::text(s)
                 } else {
                     Value::Null
                 };
@@ -921,6 +1008,40 @@ impl Executor {
                 };
                 let paged_indices = &matched_indices[start..end];
 
+                let mut count_maps: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
+                for expr in projections {
+                    if let PlannedProjectedExpr::CorrelatedCount {
+                        child_table_name,
+                        child_join_col_idx,
+                        extra_child_conditions,
+                        alias,
+                        ..
+                    } = expr {
+                        if let Some(child_table) = self.storage.get_table(child_table_name) {
+                            let mut map = std::collections::HashMap::new();
+                            for i in 0..child_table.rows.len() {
+                                if !child_table.is_deleted[i] {
+                                    let mut matches = true;
+                                    for cond in extra_child_conditions {
+                                        if !evaluate_planned_condition(&child_table.rows[i], cond, params) {
+                                            matches = false;
+                                            break;
+                                        }
+                                    }
+                                    if matches {
+                                        if let Some(fk_val) = child_table.rows[i].get(*child_join_col_idx) {
+                                            if !fk_val.is_null() {
+                                                *map.entry(fk_val.as_str()).or_insert(0) += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            count_maps.insert(alias.clone(), map);
+                        }
+                    }
+                }
+
                 // Output projection
                 let mut out_rows = Vec::with_capacity(paged_indices.len());
                 for &idx in paged_indices {
@@ -936,7 +1057,7 @@ impl Executor {
                         None
                     };
 
-                    out_rows.push(project_row_planned(p_row, j_row.map(|r| r.as_slice()), projections));
+                    out_rows.push(project_row_planned(p_row, j_row.map(|r| r.as_slice()), projections, &count_maps));
                 }
 
                 let row_count = out_rows.len();
@@ -1126,7 +1247,7 @@ impl Executor {
                 || val_str.to_uppercase().starts_with("CURRENT_TIMESTAMP")
                 || val_str.to_uppercase().starts_with("NOW()")
             {
-                Value::Text(get_current_timestamp())
+                Value::text(get_current_timestamp())
             } else {
                 parse_value(val_str, params)
             };
@@ -1326,9 +1447,9 @@ impl Executor {
 }
 
 struct JoinClause<'a> {
-    #[allow(dead_code)]
     is_left: bool,
     joined_table_name: &'a str,
+    joined_table_alias: Option<&'a str>,
     primary_join_col: &'a str,
     joined_join_col: &'a str,
 }
@@ -1341,6 +1462,7 @@ struct OrderBySpec<'a> {
 
 struct SelectClauses<'a> {
     table_name: &'a str,
+    table_alias: Option<&'a str>,
     join_clause: Option<JoinClause<'a>>,
     where_clause: Option<&'a str>,
     order_by_specs: Vec<OrderBySpec<'a>>,
@@ -1375,7 +1497,10 @@ fn split_projection_items(s: &str) -> Vec<String> {
 fn parse_projection(
     select_clause: &str,
     primary_table: &crate::storage::table::Table,
+    _primary_alias: Option<&str>,
     joined_table: Option<&crate::storage::table::Table>,
+    joined_alias: Option<&str>,
+    storage: &crate::storage::engine::StorageEngine,
     params: &[Value],
 ) -> Vec<ProjectedExpr> {
     let items = split_projection_items(select_clause);
@@ -1389,6 +1514,83 @@ fn parse_projection(
             let col = clean_col_name(item.trim());
             (item.trim(), col.to_string())
         };
+
+        let mut trimmed_expr = expr_part;
+        while trimmed_expr.starts_with('(') && trimmed_expr.ends_with(')') && is_fully_enclosed_in_parens(trimmed_expr) {
+            trimmed_expr = trimmed_expr[1..trimmed_expr.len() - 1].trim();
+        }
+        let upper_trimmed = trimmed_expr.to_uppercase();
+
+        // Check for subquery in projection: (SELECT COUNT(*) FROM schools s WHERE s.region_id = r.id AND s.deleted_at IS NULL)
+        if upper_trimmed.starts_with("SELECT") && upper_trimmed.contains("FROM") {
+            if upper_trimmed.starts_with("SELECT COUNT") {
+                if let Some(from_pos) = find_top_level_keyword(trimmed_expr, "FROM") {
+                    let after_sub_from = trimmed_expr[from_pos + 4..].trim();
+                    let where_sub_pos = find_top_level_keyword(after_sub_from, "WHERE");
+                    let child_tbl_part = if let Some(w_pos) = where_sub_pos {
+                        &after_sub_from[..w_pos]
+                    } else {
+                        after_sub_from
+                    };
+                    let (child_table_name, _child_alias) = extract_table_name_and_alias(child_tbl_part);
+
+                    if let Some(child_table) = storage.get_table(child_table_name) {
+                        if let Some(w_pos) = where_sub_pos {
+                            let sub_where = after_sub_from[w_pos + 5..].trim();
+                            let and_parts = split_top_level_and(sub_where);
+                            let mut join_cols: Option<(usize, usize)> = None; // (child_join_col_idx, parent_join_col_idx)
+                            let mut extra_conds = Vec::new();
+
+                            for part in and_parts {
+                                let part_trimmed = part.trim();
+                                if let Some(eq_idx) = part_trimmed.find('=') {
+                                    let left = part_trimmed[..eq_idx].trim();
+                                    let right = part_trimmed[eq_idx + 1..].trim();
+                                    let col_l = clean_col_name(left);
+                                    let col_r = clean_col_name(right);
+
+                                    let left_in_child = child_table.get_column_index(col_l);
+                                    let right_in_child = child_table.get_column_index(col_r);
+                                    let left_in_parent = primary_table.get_column_index(col_l);
+                                    let right_in_parent = primary_table.get_column_index(col_r);
+
+                                    if let (Some(c_idx), Some(p_idx)) = (left_in_child, right_in_parent) {
+                                        if join_cols.is_none() {
+                                            join_cols = Some((c_idx, p_idx));
+                                            continue;
+                                        }
+                                    } else if let (Some(c_idx), Some(p_idx)) = (right_in_child, left_in_parent) {
+                                        if join_cols.is_none() {
+                                            join_cols = Some((c_idx, p_idx));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                extra_conds.push(part_trimmed);
+                            }
+
+                            if let Some((child_join_col_idx, parent_join_col_idx)) = join_cols {
+                                let extra_str = extra_conds.join(" AND ");
+                                let extra_child_conditions = if !extra_str.is_empty() {
+                                    compile_condition_templates(&extra_str, child_table).unwrap_or_default()
+                                } else {
+                                    vec![]
+                                };
+
+                                exprs.push(ProjectedExpr::CorrelatedCount {
+                                    child_table_name: child_table.name.clone(),
+                                    child_join_col_idx,
+                                    parent_join_col_idx,
+                                    extra_child_conditions,
+                                    alias,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let upper_expr = expr_part.to_uppercase();
 
@@ -1414,13 +1616,26 @@ fn parse_projection(
                 if let Some(col_idx) = primary_table.get_column_index(col_name) {
                     exprs.push(ProjectedExpr::CoalescePrimaryCol { col_idx, default_val, alias });
                     continue;
+                } else if let Some(jt) = joined_table {
+                    if let Some(col_idx) = jt.get_column_index(col_name) {
+                        exprs.push(ProjectedExpr::CoalesceJoinedCol { col_idx, default_val, alias });
+                        continue;
+                    }
                 }
             }
         }
 
-        // 2. Check if expression references joined_table
-        if let Some(jt) = joined_table {
-            if expr_part.to_lowercase().contains(&jt.name.to_lowercase()) {
+        // 2. Check if expression references joined_table or joined_alias
+        let is_joined = if let Some(jt) = joined_table {
+            let lower_expr = expr_part.to_lowercase();
+            lower_expr.contains(&jt.name.to_lowercase())
+                || joined_alias.map(|a| lower_expr.starts_with(&format!("{}.", a.to_lowercase()))).unwrap_or(false)
+        } else {
+            false
+        };
+
+        if is_joined {
+            if let Some(jt) = joined_table {
                 let col_name = clean_col_name(expr_part);
                 if let Some(col_idx) = jt.get_column_index(col_name) {
                     exprs.push(ProjectedExpr::JoinedCol { col_idx, alias });
@@ -1457,8 +1672,8 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         (None, 0, false)
     };
 
-    let table_name = match join_pos {
-        Some(pos) => clean_table_name(&after_from[..pos]),
+    let raw_table_part = match join_pos {
+        Some(pos) => &after_from[..pos],
         None => {
             let where_pos = find_top_level_keyword(after_from, "WHERE");
             let order_pos = find_top_level_keyword(after_from, "ORDER BY");
@@ -1469,17 +1684,19 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
                 .filter_map(|x| x)
                 .min();
             match first_kw_pos {
-                Some(pos) => clean_table_name(&after_from[..pos]),
-                None => clean_table_name(after_from),
+                Some(pos) => &after_from[..pos],
+                None => after_from,
             }
         }
     };
+
+    let (table_name, table_alias) = extract_table_name_and_alias(raw_table_part);
 
     let join_clause = match join_pos {
         Some(j_pos) => {
             let after_j = &after_from[j_pos + kw_len..];
             if let Some(on_pos) = find_top_level_keyword(after_j, "ON") {
-                let joined_table_name = clean_table_name(&after_j[..on_pos]);
+                let (joined_table_name, joined_table_alias) = extract_table_name_and_alias(&after_j[..on_pos]);
                 let after_on = &after_j[on_pos + 2..];
                 let end_pos = [
                     find_top_level_keyword(after_on, "WHERE"),
@@ -1500,19 +1717,20 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
                     let col_a = clean_col_name(side_a);
                     let col_b = clean_col_name(side_b);
 
-                    let (primary_col, joined_col) = if side_a.contains(joined_table_name) {
+                    let side_a_lower = side_a.to_lowercase();
+                    let is_a_joined = side_a_lower.contains(&joined_table_name.to_lowercase())
+                        || joined_table_alias.map(|a| side_a_lower.starts_with(&format!("{}.", a.to_lowercase()))).unwrap_or(false);
+
+                    let (primary_col, joined_col) = if is_a_joined {
                         (col_b, col_a)
-                    } else if side_b.contains(joined_table_name) {
-                        (col_a, col_b)
-                    } else if side_a.contains(table_name) {
-                        (col_a, col_b)
                     } else {
-                        (col_b, col_a)
+                        (col_a, col_b)
                     };
 
                     Some(JoinClause {
                         is_left,
                         joined_table_name,
+                        joined_table_alias,
                         primary_join_col: primary_col,
                         joined_join_col: joined_col,
                     })
@@ -1610,6 +1828,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
 
     SelectClauses {
         table_name,
+        table_alias,
         join_clause,
         where_clause,
         order_by_specs,
@@ -1858,16 +2077,79 @@ fn clean_col_name(raw: &str) -> &str {
     }
 }
 
-fn clean_table_name(raw: &str) -> &str {
+fn extract_table_name_and_alias<'a>(raw: &'a str) -> (&'a str, Option<&'a str>) {
     let mut s = raw.trim();
     while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
         s = s[1..s.len() - 1].trim();
     }
-    if let Some(dot_idx) = s.rfind('.') {
-        s[dot_idx + 1..].trim().trim_matches('"')
-    } else {
-        s.trim_matches('"')
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() {
+        return ("", None);
     }
+    let tbl = if let Some(dot_idx) = parts[0].rfind('.') {
+        parts[0][dot_idx + 1..].trim().trim_matches('"')
+    } else {
+        parts[0].trim_matches('"')
+    };
+
+    if parts.len() == 2 {
+        let alias = parts[1].trim_matches('"');
+        if alias.eq_ignore_ascii_case("WHERE") || alias.eq_ignore_ascii_case("JOIN") || alias.eq_ignore_ascii_case("LEFT") || alias.eq_ignore_ascii_case("INNER") {
+            (tbl, None)
+        } else {
+            (tbl, Some(alias))
+        }
+    } else if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("AS") {
+        (tbl, Some(parts[2].trim_matches('"')))
+    } else {
+        (tbl, None)
+    }
+}
+
+fn clean_table_name(raw: &str) -> &str {
+    extract_table_name_and_alias(raw).0
+}
+
+fn strip_sql_comments(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut in_sq = false;
+    let mut in_dq = false;
+
+    while let Some(c) = chars.next() {
+        if c == '\'' && !in_dq {
+            in_sq = !in_sq;
+            result.push(c);
+        } else if c == '"' && !in_sq {
+            in_dq = !in_dq;
+            result.push(c);
+        } else if !in_sq && !in_dq {
+            if c == '-' && chars.peek() == Some(&'-') {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    if nc == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+                result.push(' ');
+            } else if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                while let Some(nc) = chars.next() {
+                    if nc == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+                result.push(' ');
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn is_fully_enclosed_in_parens(s: &str) -> bool {
@@ -2092,7 +2374,7 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
         return Value::Null;
     }
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
-        return Value::Text(t[1..t.len() - 1].to_string());
+        return Value::text(&t[1..t.len() - 1]);
     }
     if let Ok(i) = t.parse::<i64>() {
         return Value::Int(i);
@@ -2100,7 +2382,7 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
     if let Ok(f) = t.parse::<f64>() {
         return Value::Float(f);
     }
-    Value::Text(t.to_string())
+    Value::text(t)
 }
 
 fn parse_operand_template(token: &str) -> OperandTemplate {
@@ -2123,12 +2405,12 @@ fn parse_operand_template(token: &str) -> OperandTemplate {
         return OperandTemplate::Literal(Value::Null);
     }
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
-        return OperandTemplate::Literal(Value::Text(t[1..t.len() - 1].to_string()));
+        return OperandTemplate::Literal(Value::text(&t[1..t.len() - 1]));
     }
     if let Ok(f) = t.parse::<f64>() {
         return OperandTemplate::Number(f);
     }
-    OperandTemplate::Literal(Value::Text(t.to_string()))
+    OperandTemplate::Literal(Value::text(t))
 }
 
 fn compile_condition_templates(where_clause: &str, table: &crate::storage::table::Table) -> Result<Vec<ConditionTemplate>, String> {
@@ -2362,7 +2644,7 @@ fn parse_single_condition(
             let col_name = clean_col_name(inner);
             let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
             let target_str = match &val {
-                Value::Text(s) => s.to_lowercase(),
+                Value::Text(s) => s.to_lowercase().to_string(),
                 Value::Int(i) => i.to_string(),
                 _ => "".to_string(),
             };
@@ -2372,7 +2654,7 @@ fn parse_single_condition(
             let col_name = clean_col_name(inner);
             let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
             let target_str = match &val {
-                Value::Text(s) => s.to_uppercase(),
+                Value::Text(s) => s.to_uppercase().to_string(),
                 Value::Int(i) => i.to_string(),
                 _ => "".to_string(),
             };
@@ -2458,7 +2740,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Text(s) => serde_json::Value::String(s.to_string()),
     }
 }
 

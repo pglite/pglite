@@ -40,7 +40,7 @@ fn main() {
             let idx = (i + j + 1) as i64;
             let offset = j * 3;
             placeholders.push(format!("(${0}, ${1}, ${2})", offset + 1, offset + 2, offset + 3));
-            params.push(Value::Text(format!("User_{}", idx)));
+            params.push(Value::text(format!("User_{}", idx)));
             params.push(Value::Int(idx % 100));
             params.push(Value::Bool(idx % 2 == 0));
         }

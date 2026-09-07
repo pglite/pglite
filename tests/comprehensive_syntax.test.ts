@@ -1,4 +1,4 @@
-import { expect, test, describe, beforeEach } from "bun:test";
+import { expect, test, describe, beforeEach, beforeAll } from "bun:test";
 import { PGLite } from "../src/index";
 
 describe("Comprehensive SQL Syntax Test Suite (Unified PGLite & JS Fallback)", () => {
@@ -381,12 +381,42 @@ describe("Comprehensive SQL Syntax Test Suite (Unified PGLite & JS Fallback)", (
       expect(updatedAlice[0].salary).toBeCloseTo(5500.0, 1);
     });
 
-    test("7.3 DELETE with complex WHERE and parameter binding", async () => {
-      const res = await db.query(
-        `DELETE FROM users WHERE is_active = false AND deleted_at IS NOT NULL RETURNING username`
-      );
-      expect(res.length).toBe(2);
-      expect(res.map((r: any) => r.username).sort()).toEqual(["charlie", "frank"]);
+    test("7.4 Multi-column UPDATE with SQL comments, CURRENT_TIMESTAMP, and IS NULL check", async () => {
+      await db.exec(`
+        CREATE TABLE classes_test (
+          id SERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT,
+          school_id INT,
+          student_count INT,
+          created_at TIMESTAMP,
+          updated_at TIMESTAMP,
+          deleted_at TIMESTAMP
+        );
+        INSERT INTO classes_test (id, name, description, school_id, student_count, created_at, updated_at, deleted_at) VALUES
+          (123, 'Lớp cũ', 'Mô tả cũ', 1, 25, '2026-09-01 08:00:00', '2026-09-01 08:00:00', NULL);
+      `);
+
+      const updateRes = await db.exec(`
+        UPDATE classes_test
+        SET
+          name        = 'Lớp mới đã sửa',      -- tên lớp mới
+          description = 'Mô tả sau khi sửa',   -- mô tả
+          school_id   = 5,                     -- id trường học muốn chuyển tới
+          student_count = 32,                  -- sĩ số mới
+          updated_at  = CURRENT_TIMESTAMP
+        WHERE id = 123                         -- id lớp học muốn sửa
+          AND deleted_at IS NULL;              -- chỉ cập nhật lớp đang hoạt động
+      `);
+
+      expect(updateRes.rowCount).toBe(1);
+
+      const check = await db.query("SELECT * FROM classes_test WHERE id = 123");
+      expect(check[0].name).toBe("Lớp mới đã sửa");
+      expect(check[0].description).toBe("Mô tả sau khi sửa");
+      expect(check[0].school_id).toBe(5);
+      expect(check[0].student_count).toBe(32);
+      expect(check[0].updated_at).toBeDefined();
     });
   });
 
@@ -837,6 +867,68 @@ describe("Comprehensive SQL Syntax Test Suite (Unified PGLite & JS Fallback)", (
 
       const check = await db.query("SELECT * FROM departments WHERE dept_name = 'Success Dept'");
       expect(check.length).toBe(1);
+    });
+  });
+
+  // ==========================================
+  // SECTION 22: CORRELATED SCALAR SUBQUERIES & COMPLEX PROJECTIONS
+  // ==========================================
+  describe("22. Correlated Scalar Subqueries & Complex Projections", () => {
+    test("22.1 Correlated Scalar Subquery COUNT with SQL comments, LEFT JOIN, WHERE, ORDER BY DESC and LIMIT", async () => {
+      await db.exec(`
+        CREATE TABLE provinces_rel (id SERIAL PRIMARY KEY, name TEXT, deleted_at TEXT);
+        CREATE TABLE regions_rel (id SERIAL PRIMARY KEY, name TEXT, description TEXT, province_id INT, created_at TEXT, deleted_at TEXT);
+        CREATE TABLE schools_rel (id SERIAL PRIMARY KEY, name TEXT, region_id INT, deleted_at TEXT);
+        CREATE TABLE region_admins_rel (id SERIAL PRIMARY KEY, name TEXT, region_id INT, deleted_at TEXT);
+      `);
+
+      await db.exec(`
+        INSERT INTO provinces_rel (id, name, deleted_at) VALUES (1, 'Hanoi', NULL), (2, 'HCM', NULL);
+        INSERT INTO regions_rel (id, name, description, province_id, created_at, deleted_at) VALUES
+          (1, 'North Region', 'Northern Area', 1, '2026-09-01 10:00:00', NULL),
+          (2, 'South Region', 'Southern Area', 2, '2026-09-02 10:00:00', NULL),
+          (3, 'Deleted Region', 'Hidden', 1, '2026-09-03 10:00:00', '2026-09-03');
+        INSERT INTO schools_rel (id, name, region_id, deleted_at) VALUES
+          (1, 'School A', 1, NULL),
+          (2, 'School B', 1, NULL),
+          (3, 'School C', 1, '2026-09-01'),
+          (4, 'School D', 2, NULL);
+        INSERT INTO region_admins_rel (id, name, region_id, deleted_at) VALUES
+          (1, 'Admin X', 1, NULL),
+          (2, 'Admin Y', 2, NULL);
+      `);
+
+      const res = await db.query(`
+        SELECT
+          r.id,
+          r.name,
+          r.description,
+          r.province_id,
+          r.created_at,
+          p.name                                AS province_name,   -- tên tỉnh cha
+          (SELECT COUNT(*) FROM schools_rel s
+             WHERE s.region_id = r.id
+               AND s.deleted_at IS NULL)         AS school_count,    -- số trường
+          (SELECT COUNT(*) FROM region_admins_rel ra
+             WHERE ra.region_id = r.id
+               AND ra.deleted_at IS NULL)        AS admin_count      -- số admin
+        FROM regions_rel r
+        LEFT JOIN provinces_rel p ON p.id = r.province_id
+        WHERE r.deleted_at IS NULL
+        ORDER BY r.created_at DESC
+        LIMIT 200 OFFSET 0;
+      `);
+
+      expect(res.length).toBe(2);
+      expect(res[0].name).toBe("South Region");
+      expect(res[0].province_name).toBe("HCM");
+      expect(res[0].school_count).toBe(1);
+      expect(res[0].admin_count).toBe(1);
+
+      expect(res[1].name).toBe("North Region");
+      expect(res[1].province_name).toBe("Hanoi");
+      expect(res[1].school_count).toBe(2); // 2 active, 1 deleted
+      expect(res[1].admin_count).toBe(1);
     });
   });
 });

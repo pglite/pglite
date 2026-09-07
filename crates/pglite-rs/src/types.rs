@@ -1,3 +1,4 @@
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,16 +23,18 @@ pub struct ColumnDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
 pub enum Value {
     Null,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Text(String),
+    Text(CompactString),
 }
 
 impl Value {
+    pub fn text(s: impl AsRef<str>) -> Self {
+        Value::Text(CompactString::new(s.as_ref()))
+    }
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(i) => Some(*i),
@@ -124,7 +127,7 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
         }
     }
 

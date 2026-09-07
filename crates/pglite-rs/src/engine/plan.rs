@@ -33,6 +33,14 @@ pub enum PlannedProjectedExpr {
     PrimaryCol { col_idx: usize, alias: String },
     JoinedCol { col_idx: usize, alias: String },
     CoalescePrimaryCol { col_idx: usize, default_val: Value, alias: String },
+    CoalesceJoinedCol { col_idx: usize, default_val: Value, alias: String },
+    CorrelatedCount {
+        child_table_name: String,
+        child_join_col_idx: usize,
+        parent_join_col_idx: usize,
+        extra_child_conditions: Vec<ConditionTemplate>,
+        alias: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +168,7 @@ pub fn project_row_planned(
     primary_row: &[Value],
     joined_row: Option<&[Value]>,
     projections: &[PlannedProjectedExpr],
+    count_maps: &std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
 ) -> serde_json::Value {
     let mut map = serde_json::Map::with_capacity(projections.len());
     for p in projections {
@@ -179,6 +188,19 @@ pub fn project_row_planned(
                 };
                 map.insert(alias.clone(), value_to_json(v));
             }
+            PlannedProjectedExpr::CoalesceJoinedCol { col_idx, default_val, alias } => {
+                let v = match joined_row.and_then(|r| r.get(*col_idx)) {
+                    Some(val) if !val.is_null() => val,
+                    _ => default_val,
+                };
+                map.insert(alias.clone(), value_to_json(v));
+            }
+            PlannedProjectedExpr::CorrelatedCount { parent_join_col_idx, alias, .. } => {
+                let parent_val = primary_row.get(*parent_join_col_idx).unwrap_or(&Value::Null);
+                let key = parent_val.as_str();
+                let count = count_maps.get(alias).and_then(|m| m.get(&key).copied()).unwrap_or(0);
+                map.insert(alias.clone(), serde_json::Value::Number(count.into()));
+            }
         }
     }
     serde_json::Value::Object(map)
@@ -193,6 +215,6 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Text(s) => serde_json::Value::String(s.to_string()),
     }
 }

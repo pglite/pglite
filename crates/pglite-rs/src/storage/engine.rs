@@ -21,13 +21,46 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn new(filepath: String) -> Self {
         let wal = WalManager::new(&filepath);
-        Self {
+        let mut engine = Self {
             filepath,
             tables: HashMap::new(),
             in_transaction: false,
             tx_undo_log: Vec::new(),
             wal,
+        };
+
+        // Replay WAL records recovered via zero-copy mmap
+        let records = engine.wal.buffer.clone();
+        for record in records {
+            match record {
+                WalRecord::CreateTable { name, columns } => {
+                    let clean = name.to_lowercase();
+                    engine.tables.insert(clean, Table::new(name, columns));
+                }
+                WalRecord::DropTable { name } => {
+                    let clean = name.to_lowercase();
+                    engine.tables.remove(&clean);
+                }
+                WalRecord::Insert { table, row } => {
+                    if let Some(t) = engine.get_table_mut(&table) {
+                        t.insert(row);
+                    }
+                }
+                WalRecord::Update { table, pk, col_idx, new_val } => {
+                    if let Some(t) = engine.get_table_mut(&table) {
+                        t.update_by_pk(pk, col_idx, new_val);
+                    }
+                }
+                WalRecord::Delete { table, pk } => {
+                    if let Some(t) = engine.get_table_mut(&table) {
+                        t.delete_by_pk(pk);
+                    }
+                }
+                _ => {}
+            }
         }
+
+        engine
     }
 
     pub fn create_table(&mut self, name: String, columns: Vec<ColumnDef>) -> Result<(), String> {
@@ -35,12 +68,19 @@ impl StorageEngine {
         if self.tables.contains_key(&clean_name) {
             return Err(format!("Table {} already exists", name));
         }
+        self.wal.append(WalRecord::CreateTable {
+            name: name.clone(),
+            columns: columns.clone(),
+        });
         self.tables.insert(clean_name.clone(), Table::new(name, columns));
         Ok(())
     }
 
     pub fn drop_table(&mut self, name: &str) -> bool {
         let clean_name = name.to_lowercase();
+        self.wal.append(WalRecord::DropTable {
+            name: name.to_string(),
+        });
         self.tables.remove(&clean_name).is_some()
     }
 

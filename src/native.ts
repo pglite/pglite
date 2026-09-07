@@ -1,9 +1,102 @@
 import { LitePostgres as JSPostgres, QueryResult } from "./database";
 import { getNativeBinding, isNativeAvailable } from "./native-loader";
 
-function isComplexQuery(sql: string): boolean {
+function stripSqlComments(sql: string): string {
+  let result = "";
+  let inLineComment = false;
+  let inBlockComment = false;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  const len = sql.length;
+  let i = 0;
+
+  while (i < len) {
+    const ch = sql[i];
+    const nextCh = i + 1 < len ? sql[i + 1] : "";
+
+    if (inLineComment) {
+      if (ch === "\n" || ch === "\r") {
+        inLineComment = false;
+        result += ch;
+      }
+      i++;
+    } else if (inBlockComment) {
+      if (ch === "*" && nextCh === "/") {
+        inBlockComment = false;
+        i += 2;
+      } else {
+        i++;
+      }
+    } else if (inSingleQuote) {
+      result += ch;
+      if (ch === "'") {
+        if (nextCh === "'") {
+          result += "'";
+          i += 2;
+          continue;
+        }
+        inSingleQuote = false;
+      }
+      i++;
+    } else if (inDoubleQuote) {
+      result += ch;
+      if (ch === '"') {
+        inDoubleQuote = false;
+      }
+      i++;
+    } else {
+      if (ch === "-" && nextCh === "-") {
+        inLineComment = true;
+        i += 2;
+      } else if (ch === "/" && nextCh === "*") {
+        inBlockComment = true;
+        i += 2;
+      } else {
+        if (ch === "'") inSingleQuote = true;
+        else if (ch === '"') inDoubleQuote = true;
+        result += ch;
+        i++;
+      }
+    }
+  }
+  return result;
+}
+
+function hasSubqueryInWhere(sql: string): boolean {
+  let depth = 0;
+  let inWhereOrHaving = false;
+  const len = sql.length;
+
+  for (let i = 0; i < len; i++) {
+    const ch = sql[i];
+    if (ch === "(") {
+      if (depth === 0 && inWhereOrHaving) {
+        const rest = sql.slice(i + 1).trimStart();
+        if (/^SELECT\b/i.test(rest)) {
+          return true;
+        }
+      }
+      depth++;
+    } else if (ch === ")") {
+      if (depth > 0) depth--;
+    } else if (depth === 0) {
+      const rest = sql.slice(i);
+      if (/^\b(WHERE|HAVING)\b/i.test(rest)) {
+        inWhereOrHaving = true;
+      }
+    }
+  }
+  return false;
+}
+
+function isComplexQuery(rawSql: string): boolean {
+  const sql = stripSqlComments(rawSql);
+
+  if (hasSubqueryInWhere(sql)) {
+    return true;
+  }
+
   return (
-    /\(\s*SELECT\b/i.test(sql) ||
     /^\s*WITH\b/i.test(sql) ||
     /\b(UNION|INTERSECT|EXCEPT)\b/i.test(sql) ||
     /\bOVER\s*\(/i.test(sql) ||
@@ -235,6 +328,18 @@ export class PGLiteNative {
   }
 
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
+    const stripped = stripSqlComments(sql).trim();
+    if (stripped.includes(";")) {
+      const stmts = stripped.split(";").map(s => s.trim()).filter(s => s.length > 0);
+      if (stmts.length > 1) {
+        let lastRes: any = null;
+        for (const stmt of stmts) {
+          lastRes = await this.exec(stmt, params, dbName);
+        }
+        return lastRes;
+      }
+    }
+
     const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
     if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
@@ -256,7 +361,9 @@ export class PGLiteNative {
         const upper = sql.trim().toUpperCase();
         if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
           await this.flushWriteQueue();
-          await this.getJsEngine().exec<T>(sql, params, dbName);
+          try {
+            await this.getJsEngine().exec<T>(sql, params, dbName);
+          } catch {}
         } else if (!upper.startsWith("SELECT")) {
           this.queueBackgroundWrite(sql, params, dbName, true);
         }
@@ -300,6 +407,18 @@ export class PGLiteNative {
   }
 
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    const stripped = stripSqlComments(sql).trim();
+    if (stripped.includes(";")) {
+      const stmts = stripped.split(";").map(s => s.trim()).filter(s => s.length > 0);
+      if (stmts.length > 1) {
+        let lastRes: any = null;
+        for (const stmt of stmts) {
+          lastRes = await this.exec2(stmt, params, dbName);
+        }
+        return lastRes;
+      }
+    }
+
     const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
     if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
@@ -317,7 +436,9 @@ export class PGLiteNative {
         const upper = sql.trim().toUpperCase();
         if (upper.startsWith("CREATE") || upper.startsWith("DROP") || upper.startsWith("ALTER")) {
           await this.flushWriteQueue();
-          await this.getJsEngine().exec2<T>(sql, params, dbName);
+          try {
+            await this.getJsEngine().exec2<T>(sql, params, dbName);
+          } catch {}
         } else if (!upper.startsWith("SELECT")) {
           this.queueBackgroundWrite(sql, params, dbName, true);
         }

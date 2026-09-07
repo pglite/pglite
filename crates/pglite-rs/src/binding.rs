@@ -126,8 +126,8 @@ fn convert_params(params: Option<Vec<serde_json::Value>>) -> Vec<Value> {
                         Value::Null
                     }
                 }
-                serde_json::Value::String(s) => Value::Text(s),
-                _ => Value::Text(v.to_string()),
+                serde_json::Value::String(s) => Value::text(s),
+                _ => Value::text(v.to_string()),
             })
             .collect(),
         None => Vec::new(),
