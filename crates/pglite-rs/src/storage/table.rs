@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone)]
 pub struct Table {
     pub name: String,
+    pub comment: Option<String>,
     pub columns: Vec<ColumnDef>,
     pub pk_col_idx: Option<usize>,
     pub auto_increment: i64,
@@ -29,6 +30,7 @@ impl Table {
 
         Self {
             name,
+            comment: None,
             columns,
             pk_col_idx,
             auto_increment: 1,

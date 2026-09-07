@@ -41,6 +41,10 @@ pub enum PlannedProjectedExpr {
         extra_child_conditions: Vec<ConditionTemplate>,
         alias: String,
     },
+    Expr {
+        expr_str: String,
+        alias: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +204,9 @@ pub fn project_row_planned(
                 let key = parent_val.as_str();
                 let count = count_maps.get(alias).and_then(|m| m.get(&key).copied()).unwrap_or(0);
                 map.insert(alias.clone(), serde_json::Value::Number(count.into()));
+            }
+            PlannedProjectedExpr::Expr { alias, .. } => {
+                map.insert(alias.clone(), serde_json::Value::Null);
             }
         }
     }

@@ -20,6 +20,8 @@ pub struct ColumnDef {
     pub is_primary_key: bool,
     pub is_nullable: bool,
     pub default_value: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

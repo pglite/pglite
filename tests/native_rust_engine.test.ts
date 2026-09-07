@@ -6,7 +6,7 @@ import { unlinkSync, existsSync } from "fs";
 const TEST_DB_FILE = "test_native_engine.db";
 
 function cleanFiles(prefix: string) {
-  for (const ext of ["", ".wal", ".lock"]) {
+  for (const ext of ["", ".wal", ".rwal", ".lock"]) {
     if (existsSync(prefix + ext)) {
       try { unlinkSync(prefix + ext); } catch {}
     }
@@ -545,26 +545,9 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
   // LEVEL 10: JIT Auto-Hydration in PGLiteNative
   // ==========================================
   describe("LEVEL 10: TypeScript JIT Auto-Hydration Integration", () => {
-    test("10.1 Auto-hydrate table from JS to Rust and execute query", async () => {
+    test("10.1 Throws directly from Rust without JS auto-hydration", async () => {
       const pgNative = new PGLiteNative(":memory:", { native: true });
-
-      // Populate JS engine with a table
-      await (pgNative as any).getJsEngine().exec(`
-        CREATE TABLE "auto_test" ("id" SERIAL PRIMARY KEY, "val" TEXT)
-      `);
-      await (pgNative as any).getJsEngine().query(`
-        INSERT INTO "auto_test" ("val") VALUES ($1)
-      `, ["Hydrated Data"]);
-
-      // First query triggers auto-hydration to Rust
-      const res1 = await pgNative.query2(`SELECT * FROM "auto_test" WHERE "id" = $1`, [1]);
-      expect(res1.rows.length).toBe(1);
-      expect(res1.rows[0].val).toBe("Hydrated Data");
-
-      // Second query runs on pure Rust Native
-      const res2 = await pgNative.query2(`SELECT * FROM "auto_test" WHERE "id" = $1`, [1]);
-      expect(res2.rows.length).toBe(1);
-      expect(res2.rows[0].val).toBe("Hydrated Data");
+      expect(pgNative.query2(`SELECT * FROM "auto_test" WHERE "id" = $1`, [1])).rejects.toThrow(/Table auto_test not found/);
     });
   });
 
@@ -700,7 +683,7 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       expect(rows[0].total).toBe(150.0);
     });
 
-    test("15.2 Fallback for Subqueries in WHERE", async () => {
+    test("15.2 Subqueries in WHERE", async () => {
       await pglite.query(`INSERT INTO "orders" ("total", "status") VALUES ($1, $2)`, [50.0, "CANCELLED"]);
       
       const res = await pglite.query2(`
@@ -711,7 +694,7 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       expect(Number(res.rows[0].total)).toBe(300.5);
     });
 
-    test("15.3 Fallback for CTE (Common Table Expressions)", async () => {
+    test("15.3 CTE (Common Table Expressions)", async () => {
       const res = await pglite.query2(`
         WITH paid_orders AS (
           SELECT * FROM "orders" WHERE "status" = 'PAID'
@@ -996,5 +979,64 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       await engine2.close();
     });
   });
+
+  // ==========================================
+  // LEVEL 22: Catalog Introspection & Comments (Pure Native)
+  // ==========================================
+  describe("LEVEL 22: Schema Introspection & Comments (Pure Native)", () => {
+    test("22.1 Query system catalog with pg_class, obj_description, and json_agg", async () => {
+      const pglite = new PGLiteNative(":memory:", { native: true, fallback: false });
+
+      await pglite.exec(`CREATE TABLE "perf_table_1" (id SERIAL PRIMARY KEY, name TEXT DEFAULT 'unnamed', age INT)`);
+      await pglite.exec(`COMMENT ON TABLE perf_table_1 IS 'Table 1 comment'`);
+      await pglite.exec(`COMMENT ON COLUMN perf_table_1.name IS 'Name column'`);
+
+      const sql = `
+      SELECT
+        c.relname AS name,
+        obj_description(c.oid, 'pg_class') AS comment,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'name', a.attname,
+              'type', format_type(a.atttypid, a.atttypmod),
+              'nullable', NOT a.attnotnull,
+              'default', pg_get_expr(d.adbin, d.adrelid),
+              'comment', col_description(c.oid, a.attnum)
+            ) ORDER BY a.attnum
+          ) FILTER (WHERE a.attnum > 0),
+          '[]'::json
+        ) AS columns
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+      LEFT JOIN pg_attrdef d ON (a.attrelid = d.adrelid AND a.attnum = d.adnum)
+      WHERE n.nspname = $1
+        AND c.relkind IN ('r', 'v', 'm', 'p')
+      GROUP BY c.oid, c.relname
+      ORDER BY c.relname;
+      `;
+
+      const rows = await pglite.query(sql, ["public"]);
+      expect(rows.length).toBe(1);
+
+      const pt1 = rows[0];
+      expect(pt1.name).toBe("perf_table_1");
+      expect(pt1.comment).toBe("Table 1 comment");
+      expect(pt1.columns.length).toBe(3);
+
+      const idCol = pt1.columns.find((c: any) => c.name === "id");
+      expect(idCol).toBeDefined();
+      expect(idCol.nullable).toBe(false);
+
+      const nameCol = pt1.columns.find((c: any) => c.name === "name");
+      expect(nameCol).toBeDefined();
+      expect(nameCol.comment).toBe("Name column");
+      expect(nameCol.default).toContain("unnamed");
+
+      await pglite.close();
+    });
+  });
 });
+
 

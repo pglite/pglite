@@ -58,7 +58,31 @@ impl WalManager {
         }
 
         const WAL_MAGIC: &[u8; 4] = b"PGL1";
-        let wal_path = PathBuf::from(format!("{}.wal", db_path));
+        let rwal_path = PathBuf::from(format!("{}.rwal", db_path));
+        let legacy_wal_path = PathBuf::from(format!("{}.wal", db_path));
+
+        // Use .rwal by default. If it doesn't exist but legacy .wal exists with PGL1 magic, recover and migrate it.
+        let wal_path = if rwal_path.exists() {
+            rwal_path
+        } else if legacy_wal_path.exists() {
+            let has_pgl_magic = File::open(&legacy_wal_path).ok().and_then(|f| {
+                unsafe { memmap2::Mmap::map(&f).ok() }
+            }).map(|mmap| mmap.len() >= 4 && &mmap[0..4] == WAL_MAGIC).unwrap_or(false);
+
+            if has_pgl_magic {
+                let _ = std::fs::rename(&legacy_wal_path, &rwal_path);
+                if rwal_path.exists() {
+                    rwal_path
+                } else {
+                    legacy_wal_path
+                }
+            } else {
+                rwal_path
+            }
+        } else {
+            rwal_path
+        };
+
         let mut recovered_records: Vec<WalRecord> = Vec::new();
 
         // Zero-Copy WAL Recovery via Memory-Mapped File (mmap)
