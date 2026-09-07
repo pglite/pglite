@@ -2,23 +2,24 @@ import { LitePostgres as JSPostgres, QueryResult } from "./database";
 import { getNativeBinding, isNativeAvailable } from "./native-loader";
 
 function isComplexQuery(sql: string): boolean {
-  const upper = sql.toUpperCase();
   return (
-    upper.includes("(SELECT") ||
-    upper.includes("( SELECT") ||
-    upper.startsWith("WITH ") ||
-    upper.includes(" UNION ") ||
-    upper.includes(" OVER (") ||
-    upper.includes(" OVER(") ||
-    upper.includes(" INTERSECT ") ||
-    upper.includes(" EXCEPT ") ||
-    upper.includes(" GROUP BY ") ||
-    upper.includes(" HAVING ") ||
-    upper.includes("JSONB_AGG") ||
-    upper.includes("JSON_AGG") ||
-    upper.includes("ARRAY_AGG") ||
-    upper.includes("[]") ||
-    upper.includes("ARRAY[")
+    /\(\s*SELECT\b/i.test(sql) ||
+    /^\s*WITH\b/i.test(sql) ||
+    /\b(UNION|INTERSECT|EXCEPT)\b/i.test(sql) ||
+    /\bOVER\s*\(/i.test(sql) ||
+    /\bGROUP\s+BY\b/i.test(sql) ||
+    /\bHAVING\b/i.test(sql) ||
+    /\bON\s+CONFLICT\b/i.test(sql) ||
+    /\bTRUNCATE\b/i.test(sql) ||
+    /\b(JSONB_AGG|JSON_AGG|ARRAY_AGG|JSON_BUILD_OBJECT|JSONB_BUILD_OBJECT|JSON_BUILD_ARRAY|JSONB_BUILD_ARRAY|JSONB_SET|JSONB_EXTRACT|JSON_EXTRACT|STRING_AGG|DATE_PART|DATE_TRUNC|GEN_RANDOM_UUID|UUID_GENERATE_V4)\b/i.test(sql) ||
+    /\[\]/.test(sql) ||
+    /\bARRAY\[/i.test(sql) ||
+    /\bCASE\b/i.test(sql) ||
+    /\bCAST\s*\(/i.test(sql) ||
+    /::[a-zA-Z_]/.test(sql) ||
+    /^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT)\b/i.test(sql) ||
+    /SET\s+[^=]+=\s*[^,;]+[\+\-\*\/]/i.test(sql) ||
+    /\b(CONCAT|CONCAT_WS|LENGTH|TRIM|LTRIM|RTRIM|REPLACE|SUBSTRING|LEFT|RIGHT|LPAD|RPAD|INITCAP|REVERSE|STRPOS|SPLIT_PART|ROUND|CEIL|CEILING|FLOOR|ABS|POWER|SQRT|MOD|SIGN|DATE_PART|DATE_TRUNC)\s*\(/i.test(sql)
   );
 }
 
@@ -72,13 +73,24 @@ export class PGLiteNative {
   }
 
   private hydratedTables = new Set<string>();
+  private knownTables = new Set<string>();
   private writeQueue: Array<{ sql: string; params?: any[]; dbName?: string; isExec?: boolean }> = [];
   private flushTimer: any = null;
   private isFlushing = false;
   private readonly MAX_BATCH_SIZE = 50;
   private readonly FLUSH_INTERVAL_MS = 50;
 
+  private recordKnownTable(sql: string) {
+    const match = sql.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_"\.-]+)/i);
+    if (match) {
+      const raw = match[1].replace(/"/g, "");
+      const tbl = raw.includes(".") ? raw.split(".").pop()! : raw;
+      this.knownTables.add(tbl.toLowerCase());
+    }
+  }
+
   private queueBackgroundWrite(sql: string, params?: any, dbName?: string, isExec: boolean = false) {
+    this.recordKnownTable(sql);
     let p = Array.isArray(params) ? params : undefined;
     let db = typeof params === "string" ? params : dbName;
     this.writeQueue.push({ sql, params: p, dbName: db, isExec });
@@ -141,14 +153,27 @@ export class PGLiteNative {
         return false;
       }
 
+      let schemaCols: Record<string, string> = {};
+      try {
+        const tblMeta = (await (js as any).storage?.getTableAsync?.(tableName)) || 
+                        (await (js as any).storage?.getTableAsync?.(`public.${tableName}`)) ||
+                        (js as any).storage?.tables?.get(tableName) || 
+                        (js as any).storage?.tables?.get(tableName.toLowerCase());
+        if (tblMeta && tblMeta.columns) {
+          for (const col of tblMeta.columns) {
+            schemaCols[col.name.toLowerCase()] = col.dataType || col.data_type || "TEXT";
+          }
+        }
+      } catch {}
+
       const colDefs = res.fields.map((f: any) => {
         let typeStr = "TEXT";
         const colNameLower = (f.name || "").toLowerCase();
-        const dt = (f.data_type || "").toLowerCase();
+        const dt = (schemaCols[colNameLower] || f.data_type || "").toLowerCase();
 
-        if (colNameLower === "id" || colNameLower === "_id") {
+        if (colNameLower === "id" || colNameLower === "_id" || dt.includes("serial")) {
           typeStr = "SERIAL PRIMARY KEY";
-        } else if (dt.includes("int") || dt.includes("serial")) {
+        } else if (dt.includes("int")) {
           typeStr = "INT";
         } else if (dt.includes("float") || dt.includes("double") || dt.includes("numeric") || dt.includes("real")) {
           typeStr = "FLOAT";
@@ -195,14 +220,31 @@ export class PGLiteNative {
     }
   }
 
+  private handleFallbackWrite(sql: string, dbName?: string) {
+    const match = sql.trim().match(/(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|DROP\s+TABLE|ALTER\s+TABLE|TRUNCATE\s+TABLE|TRUNCATE)\s+([a-zA-Z0-9_"\.-]+)/i);
+    if (match) {
+      const rawTable = match[1].replace(/"/g, "");
+      const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
+      const key = `${dbName || "public"}.${tbl.toLowerCase()}`;
+      this.hydratedTables.delete(key);
+      this.knownTables.delete(tbl.toLowerCase());
+      try {
+        this.nativeInstance?.exec(`DROP TABLE IF EXISTS "${tbl}"`);
+      } catch {}
+    }
+  }
+
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
-    if (isComplexQuery(sql)) {
+    const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
+    if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
         await this.flushWriteQueue();
       }
+      this.handleFallbackWrite(sql, dbName);
       return this.getJsEngine().exec<T>(sql, params, dbName);
     }
 
+    this.recordKnownTable(sql);
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
@@ -248,18 +290,22 @@ export class PGLiteNative {
         }
         console.warn(`[PGLite Native Fallback] exec: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         await this.flushWriteQueue();
+        this.handleFallbackWrite(sql, dbName);
         return this.getJsEngine().exec<T>(sql, params, dbName);
       }
     }
     await this.flushWriteQueue();
+    this.handleFallbackWrite(sql, dbName);
     return this.getJsEngine().exec<T>(sql, params, dbName);
   }
 
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
-    if (isComplexQuery(sql)) {
+    const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
+    if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
         await this.flushWriteQueue();
       }
+      this.handleFallbackWrite(sql, dbName);
       return this.getJsEngine().exec2<T>(sql, params, dbName);
     }
 
@@ -305,10 +351,12 @@ export class PGLiteNative {
         }
         console.warn(`[PGLite Native Fallback] exec2: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         await this.flushWriteQueue();
+        this.handleFallbackWrite(sql, dbName);
         return this.getJsEngine().exec2<T>(sql, params, dbName);
       }
     }
     await this.flushWriteQueue();
+    this.handleFallbackWrite(sql, dbName);
     return this.getJsEngine().exec2<T>(sql, params, dbName);
   }
 
@@ -331,13 +379,16 @@ export class PGLiteNative {
   }
 
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
-    if (isComplexQuery(sql)) {
+    const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
+    if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
         await this.flushWriteQueue();
       }
+      this.handleFallbackWrite(sql, dbName);
       return this.getJsEngine().query<T>(sql, params, dbName);
     }
 
+    this.recordKnownTable(sql);
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
@@ -383,21 +434,26 @@ export class PGLiteNative {
         }
         console.warn(`[PGLite Native Fallback] query: ${currentErr?.message || currentErr} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         await this.flushWriteQueue();
+        this.handleFallbackWrite(sql, dbName);
         return this.getJsEngine().query<T>(sql, params, dbName);
       }
     }
     await this.flushWriteQueue();
+    this.handleFallbackWrite(sql, dbName);
     return this.getJsEngine().query<T>(sql, params, dbName);
   }
 
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
-    if (isComplexQuery(sql)) {
+    const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
+    if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
         await this.flushWriteQueue();
       }
+      this.handleFallbackWrite(sql, dbName);
       return this.getJsEngine().query2<T>(sql, params, dbName);
     }
 
+    this.recordKnownTable(sql);
     if (this.nativeInstance) {
       try {
         let p = Array.isArray(params) ? params : undefined;
@@ -444,21 +500,53 @@ export class PGLiteNative {
         const errMsg = currentErr?.message || String(currentErr);
         console.warn(`[PGLite Native Fallback] query2: ${errMsg} -> Falling back to JS. Query: ${sql.slice(0, 100)}`);
         await this.flushWriteQueue();
+        this.handleFallbackWrite(sql, dbName);
         return this.getJsEngine().query2<T>(sql, params, dbName);
       }
     }
     await this.flushWriteQueue();
+    this.handleFallbackWrite(sql, dbName);
     return this.getJsEngine().query2<T>(sql, params, dbName);
   }
 
   public async transaction<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {
     await this.flushWriteQueue();
-    return this.getJsEngine().transaction<T>(callback, dbName);
+    const result = await this.getJsEngine().transaction<T>(callback, dbName);
+    for (const tbl of this.knownTables) {
+      try {
+        this.nativeInstance?.exec(`DROP TABLE IF EXISTS "${tbl}"`);
+      } catch {}
+    }
+    for (const key of this.hydratedTables) {
+      const parts = key.split(".");
+      const tbl = parts[1] || parts[0];
+      try {
+        this.nativeInstance?.exec(`DROP TABLE IF EXISTS "${tbl}"`);
+      } catch {}
+    }
+    this.hydratedTables.clear();
+    this.knownTables.clear();
+    return result;
   }
 
   public async transaction2<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {
     await this.flushWriteQueue();
-    return this.getJsEngine().transaction2<T>(callback, dbName);
+    const result = await this.getJsEngine().transaction2<T>(callback, dbName);
+    for (const tbl of this.knownTables) {
+      try {
+        this.nativeInstance?.exec(`DROP TABLE IF EXISTS "${tbl}"`);
+      } catch {}
+    }
+    for (const key of this.hydratedTables) {
+      const parts = key.split(".");
+      const tbl = parts[1] || parts[0];
+      try {
+        this.nativeInstance?.exec(`DROP TABLE IF EXISTS "${tbl}"`);
+      } catch {}
+    }
+    this.hydratedTables.clear();
+    this.knownTables.clear();
+    return result;
   }
 
   public async close(): Promise<void> {

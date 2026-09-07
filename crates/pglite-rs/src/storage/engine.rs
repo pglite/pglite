@@ -39,6 +39,11 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub fn drop_table(&mut self, name: &str) -> bool {
+        let clean_name = name.to_lowercase();
+        self.tables.remove(&clean_name).is_some()
+    }
+
     pub fn get_table(&self, name: &str) -> Option<&Table> {
         let clean_name = name.to_lowercase();
         self.tables.get(&clean_name)

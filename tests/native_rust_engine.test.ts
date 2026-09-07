@@ -291,6 +291,21 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       expect(res[0].min).toBe(70.0);
       expect(res[0].max).toBe(95.5);
     });
+
+    test("5.4 COUNT(users.id) with table prefix and WHERE IS NULL / parameter", () => {
+      const res = db.query(
+        `SELECT COUNT(users.id) AS count FROM users WHERE users.email IS NULL AND users.is_active = $1`,
+        [true]
+      );
+      expect(res.length).toBe(1);
+      expect(res[0].count).toBe(1);
+    });
+
+    test("5.5 COUNT(DISTINCT username) with alias", () => {
+      const res = db.query(`SELECT COUNT(DISTINCT username) AS distinct_users FROM users`);
+      expect(res.length).toBe(1);
+      expect(res[0].distinct_users).toBe(4);
+    });
   });
 
   // ==========================================

@@ -2801,6 +2801,7 @@ export class StorageEngine {
     "INT2",
     "INT4",
     "INT8",
+    "FLOAT",
     "FLOAT4",
     "FLOAT8",
   ]);

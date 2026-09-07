@@ -75,6 +75,10 @@ impl Executor {
             return self.handle_create_table(trimmed);
         }
 
+        if upper.starts_with("DROP TABLE") {
+            return self.handle_drop_table(trimmed);
+        }
+
         if upper.starts_with("INSERT INTO") {
             return self.handle_insert(trimmed, params);
         }
@@ -101,6 +105,25 @@ impl Executor {
         }
 
         Err(format!("Unsupported SQL statement: {}", sql))
+    }
+
+    fn handle_drop_table(&mut self, sql: &str) -> Result<QueryResult, String> {
+        let after_drop = sql[10..].trim();
+        let mut table_name = after_drop.trim();
+        let if_exists = table_name.to_uppercase().starts_with("IF EXISTS ");
+        if if_exists {
+            table_name = table_name[10..].trim();
+        }
+        let table_name = table_name.trim_matches('"').trim_matches(';').trim().to_string();
+        self.storage.drop_table(&table_name);
+        self.plan_cache.clear();
+
+        Ok(QueryResult {
+            rows: vec![],
+            row_count: 0,
+            fields: vec![],
+            command: "DROP TABLE".to_string(),
+        })
     }
 
     fn handle_create_table(&mut self, sql: &str) -> Result<QueryResult, String> {
@@ -261,66 +284,58 @@ impl Executor {
         let mut param_cursor = 0;
         let mut inserted_rows = Vec::new();
 
-        // Split by groups "(...)"
-        let mut start_idx = None;
-        for (i, c) in values_part.char_indices() {
-            if c == '(' {
-                start_idx = Some(i + 1);
-            } else if c == ')' {
-                if let Some(s) = start_idx {
-                    let group = &values_part[s..i];
-                    let mut row = vec![Value::Null; num_table_cols];
-                    let mut col_ptr = 0;
+        let groups = extract_value_groups(values_part);
+        for group in groups {
+            let mut row = vec![Value::Null; num_table_cols];
+            let mut col_ptr = 0;
+            let tokens = split_comma_separated_tokens(group);
 
-                    for token in group.split(',') {
-                        let token = token.trim();
-                        if col_ptr >= col_indices.len() {
-                            break;
-                        }
-                        let target_idx = col_indices[col_ptr];
-
-                        let val = if token.starts_with('$') {
-                            if let Ok(p_num) = token[1..].parse::<usize>() {
-                                if p_num >= 1 && p_num <= params.len() {
-                                    params[p_num - 1].clone()
-                                } else if param_cursor < params.len() {
-                                    let v = params[param_cursor].clone();
-                                    param_cursor += 1;
-                                    v
-                                } else {
-                                    Value::Null
-                                }
-                            } else {
-                                Value::Null
-                            }
-                        } else if token.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
-                            || token.eq_ignore_ascii_case("NOW()")
-                            || token.to_uppercase().starts_with("CURRENT_TIMESTAMP") {
-                            Value::Text(get_current_timestamp())
-                        } else if token.eq_ignore_ascii_case("NULL") {
-                            Value::Null
-                        } else if token.eq_ignore_ascii_case("TRUE") {
-                            Value::Bool(true)
-                        } else if token.eq_ignore_ascii_case("FALSE") {
-                            Value::Bool(false)
-                        } else if token.starts_with('\'') && token.ends_with('\'') {
-                            Value::Text(token[1..token.len() - 1].to_string())
-                        } else if let Ok(int_val) = token.parse::<i64>() {
-                            Value::Int(int_val)
-                        } else if let Ok(flt_val) = token.parse::<f64>() {
-                            Value::Float(flt_val)
-                        } else {
-                            Value::Text(token.to_string())
-                        };
-
-                        row[target_idx] = val;
-                        col_ptr += 1;
-                    }
-
-                    inserted_rows.push(row);
-                    start_idx = None;
+            for token in tokens {
+                let token = token.trim();
+                if col_ptr >= col_indices.len() {
+                    break;
                 }
+                let target_idx = col_indices[col_ptr];
+
+                let val = if token.starts_with('$') {
+                    if let Ok(p_num) = token[1..].parse::<usize>() {
+                        if p_num >= 1 && p_num <= params.len() {
+                            params[p_num - 1].clone()
+                        } else if param_cursor < params.len() {
+                            let v = params[param_cursor].clone();
+                            param_cursor += 1;
+                            v
+                        } else {
+                            Value::Null
+                        }
+                    } else {
+                        Value::Null
+                    }
+                } else if token.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+                    || token.eq_ignore_ascii_case("NOW()")
+                    || token.to_uppercase().starts_with("CURRENT_TIMESTAMP") {
+                    Value::Text(get_current_timestamp())
+                } else if token.eq_ignore_ascii_case("NULL") {
+                    Value::Null
+                } else if token.eq_ignore_ascii_case("TRUE") {
+                    Value::Bool(true)
+                } else if token.eq_ignore_ascii_case("FALSE") {
+                    Value::Bool(false)
+                } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
+                    Value::Text(token[1..token.len() - 1].replace("''", "'"))
+                } else if let Ok(int_val) = token.parse::<i64>() {
+                    Value::Int(int_val)
+                } else if let Ok(flt_val) = token.parse::<f64>() {
+                    Value::Float(flt_val)
+                } else {
+                    Value::Text(token.to_string())
+                };
+
+                row[target_idx] = val;
+                col_ptr += 1;
             }
+
+            inserted_rows.push(row);
         }
 
         let count = inserted_rows.len();
@@ -387,7 +402,7 @@ impl Executor {
             // 2. Fast-Path: Point lookup by Primary Key (WHERE id = $1 or WHERE id = 123)
             if let Some(w) = clauses.where_clause {
                 let w_upper = w.to_uppercase();
-                if clauses.order_by_col.is_none() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
+                if clauses.order_by_specs.is_empty() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
                     if let Some(pk_idx) = table.pk_col_idx {
                         let pk_col_name = &table.columns[pk_idx].name;
                         if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
@@ -437,7 +452,7 @@ impl Executor {
 
             // 3. Fast-Path: Non-PK exact string lookup (WHERE name = $1 or WHERE name = '...')
             if let Some(w) = clauses.where_clause {
-                if clauses.order_by_col.is_none() && clauses.limit.is_none() {
+                if clauses.order_by_specs.is_empty() && clauses.limit.is_none() {
                     if let Some(eq_idx) = w.find('=') {
                         let left = w[..eq_idx].trim().trim_matches('"');
                         let right = w[eq_idx + 1..].trim();
@@ -535,52 +550,72 @@ impl Executor {
         };
 
         // 5. ORDER BY sorting
-        if let Some(order_col) = clauses.order_by_col {
-            let desc = clauses.order_by_desc;
-            if let Some(col_idx) = table.get_column_index(order_col) {
+        if !clauses.order_by_specs.is_empty() {
+            let resolved_order: Vec<(usize, bool)> = clauses.order_by_specs.iter()
+                .filter_map(|spec| {
+                    table.get_column_index(spec.col_name).map(|idx| (idx, spec.is_desc))
+                })
+                .collect();
+
+            if !resolved_order.is_empty() {
                 if matched_indices.len() > 10_000 {
                     matched_indices.par_sort_by(|&a, &b| {
-                        let va = &table.rows[a][col_idx];
-                        let vb = &table.rows[b][col_idx];
-                        if desc {
-                            vb.cmp_value(va)
-                        } else {
-                            va.cmp_value(vb)
+                        for &(col_idx, desc) in &resolved_order {
+                            let va = &table.rows[a][col_idx];
+                            let vb = &table.rows[b][col_idx];
+                            let ord = if desc {
+                                vb.cmp_value(va)
+                            } else {
+                                va.cmp_value(vb)
+                            };
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
+                            }
                         }
+                        std::cmp::Ordering::Equal
                     });
                 } else {
                     matched_indices.sort_by(|&a, &b| {
-                        let va = &table.rows[a][col_idx];
-                        let vb = &table.rows[b][col_idx];
-                        if desc {
-                            vb.cmp_value(va)
-                        } else {
-                            va.cmp_value(vb)
+                        for &(col_idx, desc) in &resolved_order {
+                            let va = &table.rows[a][col_idx];
+                            let vb = &table.rows[b][col_idx];
+                            let ord = if desc {
+                                vb.cmp_value(va)
+                            } else {
+                                va.cmp_value(vb)
+                            };
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
+                            }
                         }
+                        std::cmp::Ordering::Equal
                     });
                 }
             } else if let Some(jt) = joined_table_opt {
-                if let Some(j_col_idx) = jt.get_column_index(order_col) {
-                    if let Some(ref jc) = clauses.join_clause {
-                        if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
-                            matched_indices.sort_by(|&a, &b| {
-                                let get_val = |row_idx: usize| -> Option<&Value> {
-                                    let key = table.rows[row_idx].get(p_col_idx)?;
-                                    if let Some(pk) = key.as_i64() {
-                                        let j_row = jt.get_by_pk(pk)?;
-                                        j_row.get(j_col_idx)
+                if let Some(spec) = clauses.order_by_specs.first() {
+                    if let Some(j_col_idx) = jt.get_column_index(spec.col_name) {
+                        if let Some(ref jc) = clauses.join_clause {
+                            if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
+                                let desc = spec.is_desc;
+                                matched_indices.sort_by(|&a, &b| {
+                                    let get_val = |row_idx: usize| -> Option<&Value> {
+                                        let key = table.rows[row_idx].get(p_col_idx)?;
+                                        if let Some(pk) = key.as_i64() {
+                                            let j_row = jt.get_by_pk(pk)?;
+                                            j_row.get(j_col_idx)
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    let va = get_val(a).unwrap_or(&Value::Null);
+                                    let vb = get_val(b).unwrap_or(&Value::Null);
+                                    if desc {
+                                        vb.cmp_value(va)
                                     } else {
-                                        None
+                                        va.cmp_value(vb)
                                     }
-                                };
-                                let va = get_val(a).unwrap_or(&Value::Null);
-                                let vb = get_val(b).unwrap_or(&Value::Null);
-                                if desc {
-                                    vb.cmp_value(va)
-                                } else {
-                                    va.cmp_value(vb)
-                                }
-                            });
+                                });
+                            }
                         }
                     }
                 }
@@ -600,7 +635,11 @@ impl Executor {
         let projected_exprs = if select_clause.trim() == "*" {
             Vec::new()
         } else {
-            parse_projection(select_clause, table, joined_table_opt, params)
+            let exprs = parse_projection(select_clause, table, joined_table_opt, params);
+            if exprs.is_empty() {
+                return Err(format!("Unsupported projection clause: {}", select_clause));
+            }
+            exprs
         };
 
         let rows: Vec<serde_json::Value> = if !projected_exprs.is_empty() {
@@ -695,9 +734,11 @@ impl Executor {
             None
         };
 
-        let order_by_info = clauses.order_by_col.and_then(|col| {
-            table.get_column_index(clean_col_name(col)).map(|idx| (idx, clauses.order_by_desc))
-        });
+        let order_by_info = if let Some(spec) = clauses.order_by_specs.first() {
+            table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc))
+        } else {
+            None
+        };
 
         let plan_projections = if !projected_exprs.is_empty() {
             projected_exprs
@@ -929,6 +970,27 @@ impl Executor {
                         row_map.insert(spec.alias.clone(), json!(count));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
                     }
+                    AggFunc::Count(col_idx) => {
+                        let count = (0..table.rows.len())
+                            .filter(|&i| !table.is_deleted[i] && table.rows[i].get(*col_idx).map_or(false, |v| !v.is_null()))
+                            .count();
+                        row_map.insert(spec.alias.clone(), json!(count));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::CountDistinct(col_idx) => {
+                        let mut set = std::collections::HashSet::new();
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                if let Some(v) = table.rows[i].get(*col_idx) {
+                                    if !v.is_null() {
+                                        set.insert(format!("{:?}", v));
+                                    }
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), json!(set.len()));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
                     AggFunc::Sum(col_idx) => {
                         let (sum, _, _, _, _) = table.aggregate_stats(*col_idx);
                         row_map.insert(spec.alias.clone(), json!(sum));
@@ -972,6 +1034,25 @@ impl Executor {
                     AggFunc::CountStar => {
                         let count = matched_indices.len();
                         row_map.insert(spec.alias.clone(), json!(count));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::Count(col_idx) => {
+                        let count = matched_indices.iter()
+                            .filter(|&&i| table.rows[i].get(*col_idx).map_or(false, |v| !v.is_null()))
+                            .count();
+                        row_map.insert(spec.alias.clone(), json!(count));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::CountDistinct(col_idx) => {
+                        let mut set = std::collections::HashSet::new();
+                        for &i in &matched_indices {
+                            if let Some(v) = table.rows[i].get(*col_idx) {
+                                if !v.is_null() {
+                                    set.insert(format!("{:?}", v));
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), json!(set.len()));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
                     }
                     AggFunc::Sum(col_idx) => {
@@ -1252,12 +1333,17 @@ struct JoinClause<'a> {
     joined_join_col: &'a str,
 }
 
+#[derive(Clone, Debug)]
+struct OrderBySpec<'a> {
+    col_name: &'a str,
+    is_desc: bool,
+}
+
 struct SelectClauses<'a> {
     table_name: &'a str,
     join_clause: Option<JoinClause<'a>>,
     where_clause: Option<&'a str>,
-    order_by_col: Option<&'a str>,
-    order_by_desc: bool,
+    order_by_specs: Vec<OrderBySpec<'a>>,
     limit: Option<OperandTemplate>,
     offset: Option<OperandTemplate>,
 }
@@ -1458,7 +1544,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
     });
 
     let order_pos = find_top_level_keyword(after_from, "ORDER BY");
-    let (order_by_col, order_by_desc) = match order_pos {
+    let order_by_specs: Vec<OrderBySpec<'a>> = match order_pos {
         Some(o_idx) => {
             let after_o = &after_from[o_idx + 8..];
             let end_idx = [
@@ -1472,13 +1558,21 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
                 Some(e) => after_o[..e].trim(),
                 None => after_o.trim(),
             };
-            let mut parts = order_part.split_whitespace();
-            let raw_col = parts.next().unwrap_or("");
-            let col = clean_col_name(raw_col);
-            let desc = parts.next().map(|s| s.eq_ignore_ascii_case("DESC")).unwrap_or(false);
-            (if col.is_empty() { None } else { Some(col) }, desc)
+            order_part
+                .split(',')
+                .filter_map(|item| {
+                    let mut parts = item.trim().split_whitespace();
+                    let raw_col = parts.next()?;
+                    let col = clean_col_name(raw_col);
+                    if col.is_empty() {
+                        return None;
+                    }
+                    let desc = parts.next().map(|s| s.trim_matches(',').eq_ignore_ascii_case("DESC")).unwrap_or(false);
+                    Some(OrderBySpec { col_name: col, is_desc: desc })
+                })
+                .collect()
         }
-        None => (None, false),
+        None => Vec::new(),
     };
 
     let limit_pos = find_top_level_keyword(after_from, "LIMIT");
@@ -1518,8 +1612,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
         table_name,
         join_clause,
         where_clause,
-        order_by_col,
-        order_by_desc,
+        order_by_specs,
         limit,
         offset,
     }
@@ -1528,6 +1621,8 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
 #[derive(Clone, Debug)]
 enum AggFunc {
     CountStar,
+    Count(usize),
+    CountDistinct(usize),
     Sum(usize),
     Avg(usize),
     Min(usize),
@@ -1547,57 +1642,67 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
         let part_trim = part.trim();
         let upper = part_trim.to_uppercase();
 
-        if upper.contains("COUNT(*)") || upper.contains("COUNT(1)") {
-            let alias = if let Some(as_idx) = upper.find(" AS ") {
+        let get_alias = |default_alias: &str| -> String {
+            if let Some(as_idx) = upper.rfind(" AS ") {
                 part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
             } else {
-                "count".to_string()
-            };
-            specs.push(AggSpec { func: AggFunc::CountStar, alias });
+                default_alias.to_string()
+            }
+        };
+
+        if let Some(count_idx) = upper.find("COUNT(") {
+            if let Some(close_p) = upper[count_idx..].find(')') {
+                let inside = part_trim[count_idx + 6..count_idx + close_p].trim();
+                let upper_inside = inside.to_uppercase();
+                let alias = get_alias("count");
+
+                if upper_inside == "*" || upper_inside == "1" {
+                    specs.push(AggSpec { func: AggFunc::CountStar, alias });
+                } else if upper_inside.starts_with("DISTINCT ") {
+                    let raw_col = inside[9..].trim();
+                    let col_name = clean_col_name(raw_col);
+                    if let Some(col_idx) = table.get_column_index(col_name) {
+                        specs.push(AggSpec { func: AggFunc::CountDistinct(col_idx), alias });
+                    }
+                } else {
+                    let col_name = clean_col_name(inside);
+                    if let Some(col_idx) = table.get_column_index(col_name) {
+                        specs.push(AggSpec { func: AggFunc::Count(col_idx), alias });
+                    }
+                }
+            }
         } else if let Some(sum_idx) = upper.find("SUM(") {
             if let Some(close_p) = upper[sum_idx..].find(')') {
-                let col_name = part_trim[sum_idx + 4..sum_idx + close_p].trim().trim_matches('"');
-                let alias = if let Some(as_idx) = upper.find(" AS ") {
-                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
-                } else {
-                    "sum".to_string()
-                };
+                let raw_col = part_trim[sum_idx + 4..sum_idx + close_p].trim();
+                let col_name = clean_col_name(raw_col);
+                let alias = get_alias("sum");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Sum(col_idx), alias });
                 }
             }
         } else if let Some(avg_idx) = upper.find("AVG(") {
             if let Some(close_p) = upper[avg_idx..].find(')') {
-                let col_name = part_trim[avg_idx + 4..avg_idx + close_p].trim().trim_matches('"');
-                let alias = if let Some(as_idx) = upper.find(" AS ") {
-                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
-                } else {
-                    "avg".to_string()
-                };
+                let raw_col = part_trim[avg_idx + 4..avg_idx + close_p].trim();
+                let col_name = clean_col_name(raw_col);
+                let alias = get_alias("avg");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Avg(col_idx), alias });
                 }
             }
         } else if let Some(min_idx) = upper.find("MIN(") {
             if let Some(close_p) = upper[min_idx..].find(')') {
-                let col_name = part_trim[min_idx + 4..min_idx + close_p].trim().trim_matches('"');
-                let alias = if let Some(as_idx) = upper.find(" AS ") {
-                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
-                } else {
-                    "min".to_string()
-                };
+                let raw_col = part_trim[min_idx + 4..min_idx + close_p].trim();
+                let col_name = clean_col_name(raw_col);
+                let alias = get_alias("min");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Min(col_idx), alias });
                 }
             }
         } else if let Some(max_idx) = upper.find("MAX(") {
             if let Some(close_p) = upper[max_idx..].find(')') {
-                let col_name = part_trim[max_idx + 4..max_idx + close_p].trim().trim_matches('"');
-                let alias = if let Some(as_idx) = upper.find(" AS ") {
-                    part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
-                } else {
-                    "max".to_string()
-                };
+                let raw_col = part_trim[max_idx + 4..max_idx + close_p].trim();
+                let col_name = clean_col_name(raw_col);
+                let alias = get_alias("max");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Max(col_idx), alias });
                 }
@@ -1665,6 +1770,80 @@ pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut tokens = Vec::new();
+    let mut depth = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' && !in_dq {
+            in_sq = !in_sq;
+        } else if b == b'"' && !in_sq {
+            in_dq = !in_dq;
+        } else if !in_sq && !in_dq {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                if depth > 0 { depth -= 1; }
+            } else if depth == 0 && b == b',' {
+                tokens.push(s[start..i].trim());
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        let last = s[start..].trim();
+        if !last.is_empty() {
+            tokens.push(last);
+        }
+    }
+    tokens
+}
+
+fn extract_value_groups(values_part: &str) -> Vec<&str> {
+    let bytes = values_part.as_bytes();
+    let mut groups = Vec::new();
+    let mut depth = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut start_idx = None;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' && !in_dq {
+            in_sq = !in_sq;
+        } else if b == b'"' && !in_sq {
+            in_dq = !in_dq;
+        } else if !in_sq && !in_dq {
+            if b == b'(' {
+                if depth == 0 {
+                    start_idx = Some(i + 1);
+                }
+                depth += 1;
+            } else if b == b')' {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start_idx {
+                            groups.push(&values_part[s..i]);
+                            start_idx = None;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    groups
 }
 
 fn clean_col_name(raw: &str) -> &str {
