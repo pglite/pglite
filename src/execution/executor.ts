@@ -5139,6 +5139,41 @@ export class Executor {
       case "Binary": {
         const left = this.evaluateExprSync(storage, expr.left, row, params);
         const right = this.evaluateExprSync(storage, expr.right, row, params);
+
+        if (right && typeof right === "object" && right.__isAny) {
+          const arr: any[] = right.values;
+          switch (expr.operator) {
+            case "=": return arr.some((x: any) => x == left);
+            case "!=": return arr.some((x: any) => x != left);
+            case ">": return arr.some((x: any) => left > x);
+            case "<": return arr.some((x: any) => left < x);
+            case ">=": return arr.some((x: any) => left >= x);
+            case "<=": return arr.some((x: any) => left <= x);
+          }
+        }
+        if (left && typeof left === "object" && left.__isAny) {
+          const arr: any[] = left.values;
+          switch (expr.operator) {
+            case "=": return arr.some((x: any) => x == right);
+            case "!=": return arr.some((x: any) => x != right);
+            case ">": return arr.some((x: any) => x > right);
+            case "<": return arr.some((x: any) => x < right);
+            case ">=": return arr.some((x: any) => x >= right);
+            case "<=": return arr.some((x: any) => x <= right);
+          }
+        }
+        if (right && typeof right === "object" && right.__isAll) {
+          const arr: any[] = right.values;
+          switch (expr.operator) {
+            case "=": return arr.every((x: any) => x == left);
+            case "!=": return arr.every((x: any) => x != left);
+            case ">": return arr.every((x: any) => left > x);
+            case "<": return arr.every((x: any) => left < x);
+            case ">=": return arr.every((x: any) => left >= x);
+            case "<=": return arr.every((x: any) => left <= x);
+          }
+        }
+
         switch (expr.operator) {
           case "=":
             return left == right;
@@ -5518,6 +5553,12 @@ export class Executor {
           args.push(this.evaluateExprSync(storage, argExpr, row, params));
         }
 
+        if (fnName === "ANY") {
+          return { __isAny: true, values: Array.isArray(args[0]) ? args[0] : (args[0] == null ? [] : [args[0]]) };
+        }
+        if (fnName === "ALL") {
+          return { __isAll: true, values: Array.isArray(args[0]) ? args[0] : (args[0] == null ? [] : [args[0]]) };
+        }
         if (fnName === "VERSION") return "PostgreSQL 16.2 (LitePostgres)";
         if (
           fnName === "NOW" ||
@@ -5850,7 +5891,11 @@ export class Executor {
           const val = args[0];
           const format = args[1];
           if (val == null || format == null) return null;
-          const d = new Date(val);
+          let d = new Date(val);
+          if (isNaN(d.getTime()) && typeof val === "string" && /^\d{1,2}:\d{2}(:\d{2})?/.test(val.trim())) {
+            const timeStr = val.trim().length === 5 ? val.trim() + ":00" : val.trim();
+            d = new Date("1970-01-01T" + timeStr);
+          }
           if (isNaN(d.getTime())) return String(val);
           let result = String(format);
           const months = [
@@ -6042,6 +6087,41 @@ export class Executor {
       case "Binary": {
         const left = await this.evaluateExpr(storage, expr.left, row, params);
         const right = await this.evaluateExpr(storage, expr.right, row, params);
+
+        if (right && typeof right === "object" && right.__isAny) {
+          const arr: any[] = right.values;
+          switch (expr.operator) {
+            case "=": return arr.some((x: any) => x == left);
+            case "!=": return arr.some((x: any) => x != left);
+            case ">": return arr.some((x: any) => left > x);
+            case "<": return arr.some((x: any) => left < x);
+            case ">=": return arr.some((x: any) => left >= x);
+            case "<=": return arr.some((x: any) => left <= x);
+          }
+        }
+        if (left && typeof left === "object" && left.__isAny) {
+          const arr: any[] = left.values;
+          switch (expr.operator) {
+            case "=": return arr.some((x: any) => x == right);
+            case "!=": return arr.some((x: any) => x != right);
+            case ">": return arr.some((x: any) => x > right);
+            case "<": return arr.some((x: any) => x < right);
+            case ">=": return arr.some((x: any) => x >= right);
+            case "<=": return arr.some((x: any) => x <= right);
+          }
+        }
+        if (right && typeof right === "object" && right.__isAll) {
+          const arr: any[] = right.values;
+          switch (expr.operator) {
+            case "=": return arr.every((x: any) => x == left);
+            case "!=": return arr.every((x: any) => x != left);
+            case ">": return arr.every((x: any) => left > x);
+            case "<": return arr.every((x: any) => left < x);
+            case ">=": return arr.every((x: any) => left >= x);
+            case "<=": return arr.every((x: any) => left <= x);
+          }
+        }
+
         switch (expr.operator) {
           case "=":
             return left == right;
@@ -6477,6 +6557,12 @@ export class Executor {
           args.push(await this.evaluateExpr(storage, argExpr, row, params));
         }
 
+        if (fnName === "ANY") {
+          return { __isAny: true, values: Array.isArray(args[0]) ? args[0] : (args[0] == null ? [] : [args[0]]) };
+        }
+        if (fnName === "ALL") {
+          return { __isAll: true, values: Array.isArray(args[0]) ? args[0] : (args[0] == null ? [] : [args[0]]) };
+        }
         if (fnName === "VERSION") return "PostgreSQL 16.2 (LitePostgres)";
         if (
           fnName === "NOW" ||
@@ -6809,7 +6895,11 @@ export class Executor {
           const val = args[0];
           const format = args[1];
           if (val == null || format == null) return null;
-          const d = new Date(val);
+          let d = new Date(val);
+          if (isNaN(d.getTime()) && typeof val === "string" && /^\d{1,2}:\d{2}(:\d{2})?/.test(val.trim())) {
+            const timeStr = val.trim().length === 5 ? val.trim() + ":00" : val.trim();
+            d = new Date("1970-01-01T" + timeStr);
+          }
           if (isNaN(d.getTime())) return String(val);
           let result = String(format);
           const months = [

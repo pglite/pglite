@@ -996,5 +996,312 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       await engine2.close();
     });
   });
+
+  // ==========================================
+  // LEVEL 22: Native Rust Direct Complex WHERE & Nested Subquery Logic
+  // ==========================================
+  describe("LEVEL 22: Native Rust Direct Complex WHERE & Subqueries", () => {
+    test("22.1 Rust engine direct execution of AND (A = $1 OR B = $2)", () => {
+      const sql = `
+        SELECT "id", "username"
+        FROM "users"
+        WHERE ("score" >= $1 OR "username" = $2)
+        ORDER BY "id" ASC
+      `;
+      const rows = db.query(sql, [90.0, "bob"]);
+      expect(rows.length).toBe(2);
+      expect(rows[0].username).toBe("alice");
+      expect(rows[1].username).toBe("bob");
+    });
+
+    test("22.2 Rust engine point lookup with IS NOT NULL and boolean checks", () => {
+      const sql = `
+        SELECT "id", "username", "is_active"
+        FROM "users"
+        WHERE "is_active" = true AND "email" IS NOT NULL
+        ORDER BY "id" ASC
+      `;
+      const rows = db.query(sql);
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      expect(rows.every((r: any) => r.is_active === true)).toBe(true);
+    });
+  });
+
+  // ==========================================
+  // LEVEL 23: Native Rust Direct Exact User Scenario (ID 4 & ID 64)
+  // ==========================================
+  describe("LEVEL 23: Native Rust Direct User Scenario with Aliases and LEFT JOIN", () => {
+    beforeAll(() => {
+      db.exec(`
+        CREATE TABLE "user_regions" (
+          "id" SERIAL PRIMARY KEY,
+          "name" TEXT,
+          "deleted_at" TIMESTAMP
+        )
+      `);
+
+      db.exec(`
+        CREATE TABLE "system_users" (
+          "id" SERIAL PRIMARY KEY,
+          "username" TEXT,
+          "email" TEXT,
+          "full_name" TEXT,
+          "phone_number" TEXT,
+          "avatar_url" TEXT,
+          "region_id" INT,
+          "role" TEXT,
+          "is_active" BOOLEAN,
+          "start_work_date" TEXT,
+          "official_work_date" TEXT,
+          "date_of_birth" TEXT,
+          "created_at" TIMESTAMP,
+          "deleted_at" TIMESTAMP
+        )
+      `);
+
+      db.exec(`
+        CREATE TABLE "system_region_admins" (
+          "id" SERIAL PRIMARY KEY,
+          "user_id" INT,
+          "region_id" INT,
+          "deleted_at" TIMESTAMP
+        )
+      `);
+
+      db.exec(`INSERT INTO "user_regions" ("id", "name", "deleted_at") VALUES (3, 'hcm-fix-bug', NULL)`);
+
+      db.exec(`
+        INSERT INTO "system_users" (
+          "id", "username", "email", "full_name", "phone_number", "avatar_url",
+          "region_id", "role", "is_active", "start_work_date", "official_work_date",
+          "date_of_birth", "created_at", "deleted_at"
+        ) VALUES (4, 'vietduong', NULL, 'vietduong', NULL, NULL, 3, 'user', true, '2026-09-06', '2026-09-06', '2026-09-06', '2026-09-06 17:04:09.908', NULL)
+      `);
+
+      db.exec(`
+        INSERT INTO "system_users" (
+          "id", "username", "email", "full_name", "phone_number", "avatar_url",
+          "region_id", "role", "is_active", "start_work_date", "official_work_date",
+          "date_of_birth", "created_at", "deleted_at"
+        ) VALUES (64, 'vietduong1', NULL, 'Viet Dương 2', NULL, NULL, 3, 'user', false, NULL, NULL, NULL, '2026-09-07 18:17:08.393', NULL)
+      `);
+    });
+
+    test("23.1 Query 1: Direct region condition returns ID 64 and ID 4 in created_at DESC order", () => {
+      const q1 = `
+        SELECT
+          "system_users"."id",
+          "system_users"."username",
+          "system_users"."email",
+          "system_users"."full_name" AS "fullName",
+          "system_users"."phone_number" AS "phoneNumber",
+          "system_users"."avatar_url" AS "avatarUrl",
+          "system_users"."region_id" AS "regionId",
+          "system_users"."role",
+          "user_regions"."name" AS "regionName",
+          "system_users"."is_active" AS "isActive",
+          "system_users"."start_work_date" AS "startWorkDate",
+          "system_users"."official_work_date" AS "officialWorkDate",
+          "system_users"."date_of_birth" AS "dateOfBirth",
+          "system_users"."created_at" AS "createdAt"
+        FROM "system_users"
+        LEFT JOIN "user_regions" ON "user_regions"."id" = "system_users"."region_id"
+        WHERE "system_users"."deleted_at" IS NULL
+          AND ("system_users"."region_id" = 3)
+        ORDER BY "system_users"."created_at" DESC
+        LIMIT 10 OFFSET 0;
+      `;
+
+      const rows = db.query(q1);
+      expect(rows.length).toBe(2);
+      expect(rows[0].id).toBe(64);
+      expect(rows[0].username).toBe("vietduong1");
+      expect(rows[0].fullName).toBe("Viet Dương 2");
+      expect(rows[0].regionName).toBe("hcm-fix-bug");
+      expect(rows[0].isActive).toBe(false);
+
+      expect(rows[1].id).toBe(4);
+      expect(rows[1].username).toBe("vietduong");
+      expect(rows[1].fullName).toBe("vietduong");
+      expect(rows[1].regionName).toBe("hcm-fix-bug");
+      expect(rows[1].isActive).toBe(true);
+    });
+
+    test("23.2 Query 2: Direct region OR subquery condition directly on native engine", () => {
+      const q2 = `
+        SELECT
+          "system_users"."id",
+          "system_users"."username",
+          "system_users"."email",
+          "system_users"."full_name" AS "fullName",
+          "system_users"."phone_number" AS "phoneNumber",
+          "system_users"."avatar_url" AS "avatarUrl",
+          "system_users"."region_id" AS "regionId",
+          "system_users"."role",
+          "user_regions"."name" AS "regionName",
+          "system_users"."is_active" AS "isActive",
+          "system_users"."start_work_date" AS "startWorkDate",
+          "system_users"."official_work_date" AS "officialWorkDate",
+          "system_users"."date_of_birth" AS "dateOfBirth",
+          "system_users"."created_at" AS "createdAt"
+        FROM "system_users"
+        LEFT JOIN "user_regions" ON "user_regions"."id" = "system_users"."region_id"
+        WHERE "system_users"."deleted_at" IS NULL
+          AND (
+            "system_users"."region_id" = 3
+            OR "system_users"."id" IN (
+              SELECT "system_region_admins"."user_id"
+              FROM "system_region_admins"
+              WHERE "system_region_admins"."region_id" = 3
+                AND "system_region_admins"."deleted_at" IS NULL
+            )
+          )
+        ORDER BY "system_users"."created_at" DESC
+        LIMIT 10 OFFSET 0;
+      `;
+
+      const rows = db.query(q2);
+      expect(rows.length).toBe(2);
+      expect(rows[0].id).toBe(64);
+      expect(rows[0].fullName).toBe("Viet Dương 2");
+      expect(rows[1].id).toBe(4);
+      expect(rows[1].fullName).toBe("vietduong");
+    });
+  });
+
+  // ==========================================
+  // LEVEL 24: Native Rust Direct UPDATE Safety with Commas in Strings
+  // ==========================================
+  describe("LEVEL 24: Native Rust Direct UPDATE In-Place Safety", () => {
+    test("24.1 Update string containing multiple commas without losing other columns", () => {
+      db.exec(`
+        UPDATE "system_users"
+        SET "full_name" = '08B Cao Thắng, Phường Phan Thiết, Tỉnh Bình Thuận'
+        WHERE "id" = 64;
+      `);
+
+      const rows = db.query(`SELECT "id", "full_name", "username", "region_id" FROM "system_users" WHERE "id" = 64`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].full_name).toBe("08B Cao Thắng, Phường Phan Thiết, Tỉnh Bình Thuận");
+      expect(rows[0].username).toBe("vietduong1");
+      expect(rows[0].region_id).toBe(3);
+    });
+
+    test("24.2 Multi-column UPDATE preserving nullability and types", () => {
+      db.exec(`
+        UPDATE "system_users"
+        SET "is_active" = true, "email" = 'vietduong1@example.com'
+        WHERE "id" = 64;
+      `);
+
+      const rows = db.query(`SELECT "id", "is_active", "email", "full_name" FROM "system_users" WHERE "id" = 64`);
+      expect(rows.length).toBe(1);
+      expect(rows[0].is_active).toBe(true);
+      expect(rows[0].email).toBe("vietduong1@example.com");
+      expect(rows[0].full_name).toBe("08B Cao Thắng, Phường Phan Thiết, Tỉnh Bình Thuận");
+    });
+  });
+
+  // ==========================================
+  // LEVEL 25: Native Rust Direct Subqueries with Admin Assignment
+  // ==========================================
+  describe("LEVEL 25: Native Rust Direct Subquery Admin Ingestion", () => {
+    test("25.1 Admin in another region matching via subquery", () => {
+      db.exec(`
+        INSERT INTO "system_users" ("id", "username", "full_name", "region_id", "role", "is_active", "created_at", "deleted_at")
+        VALUES (99, 'admin_hcm', 'Admin Region 3', 1, 'admin', true, '2026-09-08 00:00:00', NULL);
+      `);
+
+      db.exec(`
+        INSERT INTO "system_region_admins" ("id", "user_id", "region_id", "deleted_at")
+        VALUES (1, 99, 3, NULL);
+      `);
+
+      const q = `
+        SELECT "id", "username", "full_name" AS "fullName"
+        FROM "system_users"
+        WHERE "deleted_at" IS NULL
+          AND (
+            "region_id" = 3
+            OR "id" IN (
+              SELECT "user_id" FROM "system_region_admins" WHERE "region_id" = 3 AND "deleted_at" IS NULL
+            )
+          )
+        ORDER BY "id" ASC;
+      `;
+
+      const rows = db.query(q);
+      // id 4 (direct 3), id 64 (direct 3), id 99 (admin of 3)
+      expect(rows.map((r: any) => r.id)).toEqual([4, 64, 99]);
+    });
+
+    test("25.2 Soft-deleted admin in subquery is excluded", () => {
+      db.exec(`
+        UPDATE "system_region_admins" SET "deleted_at" = '2026-09-08 01:00:00' WHERE "id" = 1;
+      `);
+
+      const q = `
+        SELECT "id"
+        FROM "system_users"
+        WHERE "deleted_at" IS NULL
+          AND (
+            "region_id" = 3
+            OR "id" IN (
+              SELECT "user_id" FROM "system_region_admins" WHERE "region_id" = 3 AND "deleted_at" IS NULL
+            )
+          )
+        ORDER BY "id" ASC;
+      `;
+
+      const rows = db.query(q);
+      // Only id 4 and 64 remain because 99's admin record is soft-deleted
+      expect(rows.map((r: any) => r.id)).toEqual([4, 64]);
+    });
+  });
+
+  // ==========================================
+  // LEVEL 26: Native Rust Direct Parameterized Queries
+  // ==========================================
+  describe("LEVEL 26: Native Rust Direct Parameterized Subquery & LIMIT/OFFSET", () => {
+    test("26.1 Parameterized $1 for region lookup", () => {
+      const q = `
+        SELECT "id", "username"
+        FROM "system_users"
+        WHERE "deleted_at" IS NULL AND "region_id" = $1
+        ORDER BY "id" ASC;
+      `;
+      const rows = db.query(q, [3]);
+      expect(rows.map((r: any) => r.id)).toEqual([4, 64]);
+    });
+
+    test("26.2 Parameterized LIMIT and OFFSET pagination", () => {
+      const q = `
+        SELECT "id"
+        FROM "system_users"
+        WHERE "deleted_at" IS NULL AND "region_id" = $1
+        ORDER BY "id" ASC
+        LIMIT 1 OFFSET 1;
+      `;
+      const rows = db.query(q, [3]);
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBe(64);
+    });
+  });
+
+  // ==========================================
+  // LEVEL 27: Native Rust Direct COUNT Aggregation
+  // ==========================================
+  describe("LEVEL 27: Native Rust Direct COUNT Aggregation", () => {
+    test("27.1 Aggregate COUNT with WHERE filtering", () => {
+      const q = `
+        SELECT COUNT(*) AS "totalUsers"
+        FROM "system_users"
+        WHERE "deleted_at" IS NULL AND "region_id" = 3;
+      `;
+      const rows = db.query(q);
+      expect(rows.length).toBe(1);
+      expect(Number(rows[0].totalUsers)).toBe(2);
+    });
+  });
 });
 

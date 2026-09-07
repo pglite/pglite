@@ -1,7 +1,131 @@
 import { LitePostgres as JSPostgres, QueryResult } from "./database";
 import { getNativeBinding, isNativeAvailable } from "./native-loader";
 
-function stripSqlComments(sql: string): string {
+export function normalizeNamedParams(
+  sql: string,
+  params?: any[] | Record<string, any> | null
+): { sql: string; params?: any[] } {
+  if (!params) {
+    return { sql, params: undefined };
+  }
+
+  let transformedSql = "";
+  const paramMap = new Map<string, number>();
+  let paramCounter = 0;
+  const positionalParams: any[] = [];
+
+  const isObjectParams = typeof params === "object" && !Array.isArray(params);
+  const isArrayParams = Array.isArray(params);
+
+  let inLineComment = false;
+  let inBlockComment = false;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  const len = sql.length;
+  let i = 0;
+
+  while (i < len) {
+    const ch = sql[i];
+    const nextCh = i + 1 < len ? sql[i + 1] : "";
+    const prevCh = i > 0 ? sql[i - 1] : "";
+
+    if (inLineComment) {
+      if (ch === "\n" || ch === "\r") {
+        inLineComment = false;
+      }
+      transformedSql += ch;
+      i++;
+    } else if (inBlockComment) {
+      if (ch === "*" && nextCh === "/") {
+        inBlockComment = false;
+        transformedSql += "*/";
+        i += 2;
+      } else {
+        transformedSql += ch;
+        i++;
+      }
+    } else if (inSingleQuote) {
+      transformedSql += ch;
+      if (ch === "'") {
+        if (nextCh === "'") {
+          transformedSql += "'";
+          i += 2;
+          continue;
+        }
+        inSingleQuote = false;
+      }
+      i++;
+    } else if (inDoubleQuote) {
+      transformedSql += ch;
+      if (ch === '"') {
+        inDoubleQuote = false;
+      }
+      i++;
+    } else {
+      if (ch === "-" && nextCh === "-") {
+        inLineComment = true;
+        transformedSql += "--";
+        i += 2;
+      } else if (ch === "/" && nextCh === "*") {
+        inBlockComment = true;
+        transformedSql += "/*";
+        i += 2;
+      } else if (ch === "'") {
+        inSingleQuote = true;
+        transformedSql += ch;
+        i++;
+      } else if (ch === '"') {
+        inDoubleQuote = true;
+        transformedSql += ch;
+        i++;
+      } else if (ch === ":" && prevCh !== ":" && nextCh !== ":" && /[a-zA-Z_]/.test(nextCh)) {
+        let end = i + 1;
+        while (end < len && /[a-zA-Z0-9_]/.test(sql[end])) {
+          end++;
+        }
+        const paramName = sql.slice(i + 1, end);
+
+        let index: number;
+        if (paramMap.has(paramName)) {
+          index = paramMap.get(paramName)!;
+        } else {
+          paramCounter++;
+          index = paramCounter;
+          paramMap.set(paramName, index);
+
+          if (isObjectParams) {
+            const obj = params as Record<string, any>;
+            let val = obj[paramName];
+            if (val === undefined) val = obj[paramName.toLowerCase()];
+            if (val === undefined) val = obj[paramName.toUpperCase()];
+            positionalParams.push(val);
+          } else if (isArrayParams) {
+            positionalParams.push((params as any[])[index - 1]);
+          }
+        }
+        transformedSql += `$${index}`;
+        i = end;
+      } else {
+        transformedSql += ch;
+        i++;
+      }
+    }
+  }
+
+  if (paramMap.size > 0) {
+    return {
+      sql: transformedSql,
+      params: isObjectParams || isArrayParams ? positionalParams : undefined,
+    };
+  }
+
+  return {
+    sql,
+    params: isArrayParams ? params : undefined,
+  };
+}
+
+export function stripSqlComments(sql: string): string {
   let result = "";
   let inLineComment = false;
   let inBlockComment = false;
@@ -65,12 +189,40 @@ function stripSqlComments(sql: string): string {
 function hasSubqueryInWhere(sql: string): boolean {
   let depth = 0;
   let inWhereOrHaving = false;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
   const len = sql.length;
 
   for (let i = 0; i < len; i++) {
     const ch = sql[i];
+    const nextCh = i + 1 < len ? sql[i + 1] : "";
+
+    if (inSingleQuote) {
+      if (ch === "'") {
+        if (nextCh === "'") {
+          i++;
+          continue;
+        }
+        inSingleQuote = false;
+      }
+      continue;
+    }
+    if (inDoubleQuote) {
+      if (ch === '"') inDoubleQuote = false;
+      continue;
+    }
+
+    if (ch === "'") {
+      inSingleQuote = true;
+      continue;
+    }
+    if (ch === '"') {
+      inDoubleQuote = true;
+      continue;
+    }
+
     if (ch === "(") {
-      if (depth === 0 && inWhereOrHaving) {
+      if (inWhereOrHaving) {
         const rest = sql.slice(i + 1).trimStart();
         if (/^SELECT\b/i.test(rest)) {
           return true;
@@ -83,6 +235,8 @@ function hasSubqueryInWhere(sql: string): boolean {
       const rest = sql.slice(i);
       if (/^\b(WHERE|HAVING)\b/i.test(rest)) {
         inWhereOrHaving = true;
+      } else if (/^\b(ORDER\s+BY|LIMIT|OFFSET|GROUP\s+BY|UNION|INTERSECT|EXCEPT)\b/i.test(rest)) {
+        inWhereOrHaving = false;
       }
     }
   }
@@ -328,6 +482,10 @@ export class PGLiteNative {
   }
 
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
+    const norm = normalizeNamedParams(sql, params);
+    sql = norm.sql;
+    if (norm.params !== undefined) params = norm.params;
+
     const stripped = stripSqlComments(sql).trim();
     if (stripped.includes(";")) {
       const stmts = stripped.split(";").map(s => s.trim()).filter(s => s.length > 0);
@@ -407,6 +565,10 @@ export class PGLiteNative {
   }
 
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    const norm = normalizeNamedParams(sql, params);
+    sql = norm.sql;
+    if (norm.params !== undefined) params = norm.params;
+
     const stripped = stripSqlComments(sql).trim();
     if (stripped.includes(";")) {
       const stmts = stripped.split(";").map(s => s.trim()).filter(s => s.length > 0);
@@ -478,7 +640,7 @@ export class PGLiteNative {
     }
     await this.flushWriteQueue();
     this.handleFallbackWrite(sql, dbName);
-    return this.getJsEngine().exec2<T>(sql, params, dbName);
+    return this.getJsEngine().query2<T>(sql, params, dbName);
   }
 
   private runNativeQuery<T = any>(sql: string, p?: any[], db?: string): T[] {
@@ -500,6 +662,10 @@ export class PGLiteNative {
   }
 
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
+    const norm = normalizeNamedParams(sql, params);
+    sql = norm.sql;
+    if (norm.params !== undefined) params = norm.params;
+
     const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
     if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
@@ -565,6 +731,9 @@ export class PGLiteNative {
   }
 
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    const norm = normalizeNamedParams(sql, params);
+    sql = norm.sql;
+    if (norm.params !== undefined) params = norm.params;
     const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
     if (inTx || isComplexQuery(sql)) {
       if (this.writeQueue.length > 0) {
