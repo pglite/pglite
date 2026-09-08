@@ -47,7 +47,7 @@
     "benchmark-ram": "bun run scripts/benchmark_ram_perf.ts",
     "benchmark:1000-users": "bun run scripts/benchmark_1000_users_ram.ts",
     "benchmark-sqlite": "bun run scripts/bun-sqlite-benchmark.ts",
-    "build:native": "RUSTFLAGS=\"-C link-arg=-undefined -C link-arg=dynamic_lookup\" cargo build --release --manifest-path crates/pglite-rs/Cargo.toml --lib && cp crates/pglite-rs/target/release/libpglite_rs.dylib crates/pglite-rs/pglite.node && cp crates/pglite-rs/target/release/libpglite_rs.dylib crates/pglite-rs/pglite.darwin-arm64.node && cp crates/pglite-rs/target/release/libpglite_rs.dylib pglite.node",
+    "build:native": "RUSTFLAGS=\"-C link-arg=-undefined -C link-arg=dynamic_lookup\" cargo build --release --manifest-path crates/pglite-rs/Cargo.toml --lib && cp crates/pglite-rs/target/release/libpglite_rs.dylib crates/pglite-rs/pglite.node && cp crates/pglite-rs/target/release/libpglite_rs.dylib crates/pglite-rs/pglite.darwin-arm64.node && cp crates/pglite-rs/target/release/libpglite_rs.dylib pglite.node && cp crates/pglite-rs/target/release/libpglite_rs.dylib pglite.darwin-arm64.node",
     "benchmark:rust": "cargo run --release --manifest-path crates/pglite-rs/Cargo.toml --bin benchmark --no-default-features",
     "benchmark:compare": "bun run scripts/benchmark_rust_vs_js.ts",
     "publish": "bun publish --access public"

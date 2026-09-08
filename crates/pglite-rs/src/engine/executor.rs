@@ -649,15 +649,28 @@ impl Executor {
     fn resolve_subqueries_in_where(&mut self, where_str: &str, params: &[Value]) -> Result<String, String> {
         let mut resolved = where_str.to_string();
         loop {
-            let upper = resolved.to_uppercase();
-            let select_marker = "(SELECT ";
-            let Some(pos) = upper.find(select_marker) else {
+            let mut found_start = None;
+            let bytes = resolved.as_bytes();
+            for i in 0..bytes.len() {
+                if bytes[i] == b'(' {
+                    let after = resolved[i + 1..].trim_start();
+                    let upper_after = after.to_uppercase();
+                    if upper_after.starts_with("SELECT ")
+                        || upper_after.starts_with("SELECT\n")
+                        || upper_after.starts_with("SELECT\r")
+                        || upper_after.starts_with("SELECT\t")
+                    {
+                        found_start = Some(i);
+                        break;
+                    }
+                }
+            }
+            let Some(pos) = found_start else {
                 break;
             };
             let start_inner = pos + 1;
             let mut depth = 1;
             let mut end_inner = None;
-            let bytes = resolved.as_bytes();
             for i in start_inner..bytes.len() {
                 if bytes[i] == b'(' {
                     depth += 1;
@@ -714,7 +727,7 @@ impl Executor {
                     serde_json::Value::Null => "NULL".to_string(),
                     _ => scalar_val.to_string(),
                 };
-                resolved = format!("{} {} {}", &resolved[..pos].trim_end(), replacement, &resolved[close_idx + 1..].trim_start());
+                resolved = format!("{}{}{}", &resolved[..pos], replacement, &resolved[close_idx + 1..]);
             }
         }
         Ok(resolved)
@@ -853,7 +866,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let (base_tbl_name, base_alias, base_subquery, joins) = parse_from_and_joins(from_joins_str)?;
 
         let resolved_where = if let Some(w) = where_opt {
-            if w.to_uppercase().contains("(SELECT ") {
+            let w_up = w.to_uppercase();
+            if w_up.contains("SELECT") && w_up.contains("FROM") {
                 Some(self.resolve_subqueries_in_where(&w, params)?)
             } else {
                 Some(w)
@@ -1971,7 +1985,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         let mut clauses = parse_select_clauses(after_from);
         let resolved_where_owner = if let Some(w) = clauses.where_clause {
-            if w.to_uppercase().contains("(SELECT ") {
+            let w_up = w.to_uppercase();
+            if w_up.contains("SELECT") && w_up.contains("FROM") {
                 Some(self.resolve_subqueries_in_where(w, params)?)
             } else {
                 None
@@ -2177,15 +2192,52 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
+        let projected_exprs = if select_clause.trim() == "*" {
+            Vec::new()
+        } else {
+            let exprs = parse_projection(
+                select_clause,
+                table,
+                clauses.table_alias,
+                joined_table_opt,
+                clauses.join_clause.as_ref().and_then(|j| j.joined_table_alias),
+                &self.storage,
+                params,
+            );
+            if exprs.is_empty() {
+                return Err(format!("Unsupported projection clause: {}", select_clause));
+            }
+            exprs
+        };
+
         // 5. ORDER BY sorting
         if !clauses.order_by_specs.is_empty() {
-            let resolved_order: Vec<(usize, bool)> = clauses.order_by_specs.iter()
-                .filter_map(|spec| {
-                    table.get_column_index(spec.col_name).map(|idx| (idx, spec.is_desc))
-                })
-                .collect();
+            let resolve_spec_name = |spec_name: &str| -> String {
+                for p in &projected_exprs {
+                    match p {
+                        ProjectedExpr::PrimaryCol { col_idx, alias } if alias.eq_ignore_ascii_case(spec_name) => {
+                            return table.columns[*col_idx].name.clone();
+                        }
+                        ProjectedExpr::Expr { expr_str, alias } if alias.eq_ignore_ascii_case(spec_name) => {
+                            return expr_str.clone();
+                        }
+                        _ => {}
+                    }
+                }
+                spec_name.to_string()
+            };
 
-            if !resolved_order.is_empty() {
+            let all_simple_cols = clauses.order_by_specs.iter()
+                .all(|spec| table.get_column_index(&resolve_spec_name(spec.col_name)).is_some());
+
+            if all_simple_cols {
+                let resolved_order: Vec<(usize, bool)> = clauses.order_by_specs.iter()
+                    .filter_map(|spec| {
+                        let actual_col = resolve_spec_name(spec.col_name);
+                        table.get_column_index(&actual_col).map(|idx| (idx, spec.is_desc))
+                    })
+                    .collect();
+
                 if matched_indices.len() > 10_000 {
                     matched_indices.par_sort_by(|&a, &b| {
                         for &(col_idx, desc) in &resolved_order {
@@ -2221,7 +2273,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 }
             } else if let Some(jt) = joined_table_opt {
                 if let Some(spec) = clauses.order_by_specs.first() {
-                    if let Some(j_col_idx) = jt.get_column_index(spec.col_name) {
+                    let actual_spec = resolve_spec_name(spec.col_name);
+                    if let Some(j_col_idx) = jt.get_column_index(&actual_spec) {
                         if let Some(ref jc) = clauses.join_clause {
                             if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
                                 let desc = spec.is_desc;
@@ -2247,6 +2300,23 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                     }
                 }
+            } else {
+                matched_indices.sort_by(|&a, &b| {
+                    for spec in &clauses.order_by_specs {
+                        let actual_expr = resolve_spec_name(spec.col_name);
+                        let va = eval_sql_expr(&actual_expr, &table.rows[a], Some(table), &[], None, params);
+                        let vb = eval_sql_expr(&actual_expr, &table.rows[b], Some(table), &[], None, params);
+                        let ord = if spec.is_desc {
+                            vb.cmp_value(&va)
+                        } else {
+                            va.cmp_value(&vb)
+                        };
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
             }
         }
 
@@ -2258,24 +2328,6 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             &matched_indices[offset..end]
         } else {
             &[]
-        };
-
-        let projected_exprs = if select_clause.trim() == "*" {
-            Vec::new()
-        } else {
-            let exprs = parse_projection(
-                select_clause,
-                table,
-                clauses.table_alias,
-                joined_table_opt,
-                clauses.join_clause.as_ref().and_then(|j| j.joined_table_alias),
-                &self.storage,
-                params,
-            );
-            if exprs.is_empty() {
-                return Err(format!("Unsupported projection clause: {}", select_clause));
-            }
-            exprs
         };
 
         let mut count_maps: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
@@ -2376,7 +2428,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 joined_table_opt,
                                 params,
                             );
-                            map.insert(alias.clone(), value_to_json(&v));
+                            if expr_str.to_uppercase().starts_with("JSONB_PRETTY(") || expr_str.to_uppercase().starts_with("JSON_PRETTY(") {
+                                map.insert(alias.clone(), serde_json::Value::String(v.as_str()));
+                            } else {
+                                map.insert(alias.clone(), value_to_json(&v));
+                            }
                         }
                     }
                 }
@@ -2440,50 +2496,90 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }).collect()
         };
 
-        let condition_templates = if let Some(w) = clauses.where_clause {
-            compile_condition_templates(w, table).unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let plan_opt = if let Some(w) = clauses.where_clause {
+            if let Ok(condition_templates) = compile_condition_templates(w, table) {
+                let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
+                    let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
+                    let j_idx = jt.get_column_index(clean_col_name(jc.joined_join_col)).unwrap_or(0);
+                    let is_pk = jt.pk_col_idx == Some(j_idx);
+                    Some(PlannedJoin {
+                        joined_table_name: jt.name.clone(),
+                        primary_join_col_idx: p_idx,
+                        joined_join_col_idx: j_idx,
+                        is_pk_join: is_pk,
+                    })
+                } else {
+                    None
+                };
 
-        let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
-            let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
-            let j_idx = jt.get_column_index(clean_col_name(jc.joined_join_col)).unwrap_or(0);
-            let is_pk = jt.pk_col_idx == Some(j_idx);
-            Some(PlannedJoin {
-                joined_table_name: jt.name.clone(),
-                primary_join_col_idx: p_idx,
-                joined_join_col_idx: j_idx,
-                is_pk_join: is_pk,
+                let order_by_info = if let Some(spec) = clauses.order_by_specs.first() {
+                    table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc))
+                } else {
+                    None
+                };
+
+                let plan_projections = if !projected_exprs.is_empty() {
+                    projected_exprs
+                } else {
+                    table.columns.iter().enumerate().map(|(i, c)| ProjectedExpr::PrimaryCol {
+                        col_idx: i,
+                        alias: c.name.clone(),
+                    }).collect()
+                };
+
+                Some(ExecutionPlan::GeneralSelect {
+                    table_name: table.name.clone(),
+                    join: planned_join,
+                    conditions: condition_templates,
+                    order_by: order_by_info,
+                    limit: clauses.limit,
+                    offset: clauses.offset,
+                    projections: plan_projections,
+                    fields: fields.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
+                let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
+                let j_idx = jt.get_column_index(clean_col_name(jc.joined_join_col)).unwrap_or(0);
+                let is_pk = jt.pk_col_idx == Some(j_idx);
+                Some(PlannedJoin {
+                    joined_table_name: jt.name.clone(),
+                    primary_join_col_idx: p_idx,
+                    joined_join_col_idx: j_idx,
+                    is_pk_join: is_pk,
+                })
+            } else {
+                None
+            };
+
+            let order_by_info = if let Some(spec) = clauses.order_by_specs.first() {
+                table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc))
+            } else {
+                None
+            };
+
+            let plan_projections = if !projected_exprs.is_empty() {
+                projected_exprs
+            } else {
+                table.columns.iter().enumerate().map(|(i, c)| ProjectedExpr::PrimaryCol {
+                    col_idx: i,
+                    alias: c.name.clone(),
+                }).collect()
+            };
+
+            Some(ExecutionPlan::GeneralSelect {
+                table_name: table.name.clone(),
+                join: planned_join,
+                conditions: vec![],
+                order_by: order_by_info,
+                limit: clauses.limit,
+                offset: clauses.offset,
+                projections: plan_projections,
+                fields: fields.clone(),
             })
-        } else {
-            None
-        };
-
-        let order_by_info = if let Some(spec) = clauses.order_by_specs.first() {
-            table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc))
-        } else {
-            None
-        };
-
-        let plan_projections = if !projected_exprs.is_empty() {
-            projected_exprs
-        } else {
-            table.columns.iter().enumerate().map(|(i, c)| ProjectedExpr::PrimaryCol {
-                col_idx: i,
-                alias: c.name.clone(),
-            }).collect()
-        };
-
-        let plan = ExecutionPlan::GeneralSelect {
-            table_name: table.name.clone(),
-            join: planned_join,
-            conditions: condition_templates,
-            order_by: order_by_info,
-            limit: clauses.limit,
-            offset: clauses.offset,
-            projections: plan_projections,
-            fields: fields.clone(),
         };
 
         Ok((QueryResult {
@@ -2491,7 +2587,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             rows,
             fields,
             command: "SELECT".to_string(),
-        }, Some(plan)))
+        }, plan_opt))
     }
 
     fn execute_select_plan(&self, plan: &ExecutionPlan, params: &[Value]) -> Result<QueryResult, String> {
@@ -2770,12 +2866,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         params: &[Value],
     ) -> Result<QueryResult, String> {
         let gb_str = clauses.group_by_clause.unwrap();
-        let group_cols: Vec<(usize, String)> = split_comma_separated_tokens(gb_str)
+        let group_tokens: Vec<String> = split_comma_separated_tokens(gb_str)
             .into_iter()
-            .filter_map(|c| {
-                let name = clean_col_name(c.trim());
-                table.get_column_index(name).map(|idx| (idx, name.to_string()))
-            })
+            .map(|c| c.trim().to_string())
             .collect();
 
         let where_expr = match clauses.where_clause {
@@ -2792,7 +2885,14 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         for row_idx in matched_indices {
             let row = &table.rows[row_idx];
-            let key_vals: Vec<Value> = group_cols.iter().map(|&(idx, _)| row.get(idx).cloned().unwrap_or(Value::Null)).collect();
+            let key_vals: Vec<Value> = group_tokens.iter().map(|tok| {
+                let name = clean_col_name(tok);
+                if let Some(idx) = table.get_column_index(name) {
+                    row.get(idx).cloned().unwrap_or(Value::Null)
+                } else {
+                    eval_sql_expr(tok, row, Some(table), &[], None, params)
+                }
+            }).collect();
             let key_str = key_vals.iter().map(|v| match v {
                 Value::Null => "\0null\0".to_string(),
                 Value::Bool(b) => format!("b:{}", b),
@@ -2893,12 +2993,24 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let c_idx = table.get_column_index(inner).ok_or_else(|| format!("Column {} not found", inner))?;
                 projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::ArrayAgg(c_idx)), col_idx: None, filter_expr });
                 fields.push(FieldInfo { name: alias, data_type: "array".to_string() });
+            } else if (upper_agg.starts_with("JSON_AGG(") || upper_agg.starts_with("JSONB_AGG(")) && upper_agg.ends_with(')') {
+                let is_jsonb = upper_agg.starts_with("JSONB_AGG(");
+                let prefix_len = if is_jsonb { 10 } else { 9 };
+                let inner = clean_col_name(&agg_expr[prefix_len..agg_expr.len() - 1]);
+                let c_idx = table.get_column_index(inner).ok_or_else(|| format!("Column {} not found", inner))?;
+                let func = if is_jsonb { AggFunc::JsonbAgg(c_idx) } else { AggFunc::JsonAgg(c_idx) };
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr });
+                fields.push(FieldInfo { name: alias, data_type: if is_jsonb { "jsonb".to_string() } else { "json".to_string() } });
             } else {
                 let col = clean_col_name(raw_expr);
-                let c_idx = table.get_column_index(col).ok_or_else(|| format!("Column {} not found", col))?;
-                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: None, col_idx: Some(c_idx), filter_expr: None });
-                let dt = format!("{:?}", table.columns[c_idx].data_type).to_lowercase();
-                fields.push(FieldInfo { name: alias, data_type: dt });
+                if let Some(c_idx) = table.get_column_index(col) {
+                    projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: None, col_idx: Some(c_idx), filter_expr: None });
+                    let dt = format!("{:?}", table.columns[c_idx].data_type).to_lowercase();
+                    fields.push(FieldInfo { name: alias, data_type: dt });
+                } else {
+                    projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: None, col_idx: None, filter_expr: None });
+                    fields.push(FieldInfo { name: alias, data_type: "text".to_string() });
+                }
             }
         }
 
@@ -2909,6 +3021,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 if let Some(c_idx) = proj.col_idx {
                     let v = r_indices.first().and_then(|&ri| table.rows[ri].get(c_idx)).unwrap_or(&Value::Null);
                     row_map.insert(proj.alias.clone(), value_to_json(v));
+                } else if proj.func.is_none() {
+                    let first_ri = r_indices.first().copied().unwrap_or(0);
+                    let row: &[Value] = if first_ri < table.rows.len() { &table.rows[first_ri] } else { &[] };
+                    let v = eval_sql_expr(&proj.name, row, Some(table), &[], None, params);
+                    row_map.insert(proj.alias.clone(), value_to_json(&v));
                 } else if let Some(ref func) = proj.func {
                     let target_indices: Vec<usize> = if let Some(ref f_expr) = proj.filter_expr {
                         r_indices.iter().copied().filter(|&ri| evaluate_where_expr(&table.rows[ri], Some(table), f_expr, params)).collect()
@@ -2976,6 +3093,35 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 let v = table.rows[ri].get(*c_idx).unwrap_or(&Value::Null);
                                 if !v.is_null() {
                                     arr.push(value_to_json(v));
+                                }
+                            }
+                            serde_json::Value::Array(arr)
+                        }
+                        AggFunc::JsonAgg(c_idx) | AggFunc::JsonbAgg(c_idx) => {
+                            let mut arr = Vec::new();
+                            for &ri in &target_indices {
+                                if let Some(v) = table.rows[ri].get(*c_idx) {
+                                    if !v.is_null() {
+                                        let j_val = match v {
+                                            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                                            _ => value_to_json(v),
+                                        };
+                                        arr.push(j_val);
+                                    }
+                                }
+                            }
+                            serde_json::Value::Array(arr)
+                        }
+                        AggFunc::JsonAggExpr(expr_str) | AggFunc::JsonbAggExpr(expr_str) => {
+                            let mut arr = Vec::new();
+                            for &ri in &target_indices {
+                                let v = eval_sql_expr(expr_str, &table.rows[ri], Some(table), &[], None, params);
+                                if !v.is_null() {
+                                    let j_val = match &v {
+                                        Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                                        _ => value_to_json(&v),
+                                    };
+                                    arr.push(j_val);
                                 }
                             }
                             serde_json::Value::Array(arr)
@@ -3164,6 +3310,41 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "array".to_string() });
                     }
+                    AggFunc::JsonAgg(col_idx) | AggFunc::JsonbAgg(col_idx) => {
+                        let mut arr = Vec::new();
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                if let Some(v) = table.rows[i].get(*col_idx) {
+                                    if !v.is_null() {
+                                        let j_val = match v {
+                                            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                                            _ => value_to_json(v),
+                                        };
+                                        arr.push(j_val);
+                                    }
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
+                    }
+                    AggFunc::JsonAggExpr(expr_str) | AggFunc::JsonbAggExpr(expr_str) => {
+                        let mut arr = Vec::new();
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                                if !v.is_null() {
+                                    let j_val = match &v {
+                                        Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                                        _ => value_to_json(&v),
+                                    };
+                                    arr.push(j_val);
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
+                    }
                 }
             }
         } else {
@@ -3243,6 +3424,37 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                         row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "array".to_string() });
+                    }
+                    AggFunc::JsonAgg(col_idx) | AggFunc::JsonbAgg(col_idx) => {
+                        let mut arr = Vec::new();
+                        for &i in &matched_indices {
+                            if let Some(v) = table.rows[i].get(*col_idx) {
+                                if !v.is_null() {
+                                    let j_val = match v {
+                                        Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                                        _ => value_to_json(v),
+                                    };
+                                    arr.push(j_val);
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
+                    }
+                    AggFunc::JsonAggExpr(expr_str) | AggFunc::JsonbAggExpr(expr_str) => {
+                        let mut arr = Vec::new();
+                        for &i in &matched_indices {
+                            let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                            if !v.is_null() {
+                                let j_val = match &v {
+                                    Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                                    _ => value_to_json(&v),
+                                };
+                                arr.push(j_val);
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
                     }
                 }
             }
@@ -4205,6 +4417,51 @@ fn eval_condition_on_row(row: &CombinedRow, cond_str: &str, params: &[Value]) ->
         return sql_like_match(&left.as_str(), &pattern_val.as_str(), false);
     }
 
+    // JSONB containment: @> and <@
+    if let Some(pos) = s.find(" @> ") {
+        let left = eval_operand_on_row(row, s[..pos].trim(), params);
+        let right = eval_operand_on_row(row, s[pos + 4..].trim(), params);
+        if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
+            return json_contains_check(&l, &r);
+        }
+        return false;
+    }
+    if let Some(pos) = s.find(" <@ ") {
+        let left = eval_operand_on_row(row, s[..pos].trim(), params);
+        let right = eval_operand_on_row(row, s[pos + 4..].trim(), params);
+        if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
+            return json_contains_check(&r, &l);
+        }
+        return false;
+    }
+    // JSONB key existence: ?|, ?&, ?
+    if let Some(pos) = find_top_level_op(s, "?|") {
+        let left = eval_operand_on_row(row, s[..pos].trim(), params);
+        let right = eval_operand_on_row(row, s[pos + 2..].trim(), params);
+        if let Some(l) = parse_val_to_json(&left) {
+            let keys = parse_str_or_json_keys(&right);
+            return keys.iter().any(|k| json_has_key_check(&l, k));
+        }
+        return false;
+    }
+    if let Some(pos) = find_top_level_op(s, "?&") {
+        let left = eval_operand_on_row(row, s[..pos].trim(), params);
+        let right = eval_operand_on_row(row, s[pos + 2..].trim(), params);
+        if let Some(l) = parse_val_to_json(&left) {
+            let keys = parse_str_or_json_keys(&right);
+            return !keys.is_empty() && keys.iter().all(|k| json_has_key_check(&l, k));
+        }
+        return false;
+    }
+    if let Some(pos) = find_top_level_op(s, "?") {
+        let left = eval_operand_on_row(row, s[..pos].trim(), params);
+        let right = eval_operand_on_row(row, s[pos + 1..].trim(), params);
+        if let Some(l) = parse_val_to_json(&left) {
+            return json_has_key_check(&l, &right.as_str());
+        }
+        return false;
+    }
+
     // Comparison operators: >=, <=, !=, <>, =, >, <
     let op_candidates = [">=", "<=", "!=", "<>", "=", ">", "<"];
     for op in op_candidates {
@@ -4235,6 +4492,38 @@ fn eval_operand_on_row(row: &CombinedRow, token: &str, params: &[Value]) -> Valu
     while t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
         t = t[1..t.len() - 1].trim();
     }
+    if let Some((op_idx, op)) = find_last_top_level_json_op(t) {
+        let left_op = eval_operand_on_row(row, &t[..op_idx], params);
+        let right_op = eval_operand_on_row(row, &t[op_idx + op.len()..], params);
+        let left_json = match &left_op {
+            Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s.trim()) {
+                Ok(v) => v,
+                Err(_) => serde_json::Value::String(s.to_string()),
+            },
+            _ => value_to_json(&left_op),
+        };
+        let right_json = match &right_op {
+            Value::Text(s) => serde_json::Value::String(s.to_string()),
+            _ => value_to_json(&right_op),
+        };
+        let res_json = eval_json_extract_serde(&left_json, &right_json, op);
+        return match res_json {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::String(s) => Value::text(s),
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::Float(f)
+                } else {
+                    Value::text(n.to_string())
+                }
+            }
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => Value::text(res_json.to_string()),
+        };
+    }
+
     if let Some(pipe_idx) = find_top_level_op(t, "||") {
         let left = eval_operand_on_row(row, &t[..pipe_idx], params);
         let right = eval_operand_on_row(row, &t[pipe_idx + 2..], params);
@@ -4512,6 +4801,93 @@ fn eval_joined_scalar_expr(
         return cast_json_val(val, &target_type);
     }
 
+    // 3.5 JSON extraction operators: ->, ->>, #>, #>>
+    if let Some((op_idx, op)) = find_last_top_level_json_op(t) {
+        let lhs_expr = &t[..op_idx].trim();
+        let rhs_expr = &t[op_idx + op.len()..].trim();
+        let lhs = eval_joined_scalar_expr(lhs_expr, row, params, storage);
+        let rhs = eval_joined_scalar_expr(rhs_expr, row, params, storage);
+        return eval_json_extract_serde(&lhs, &rhs, op);
+    }
+
+    // JSON Functions: JSON_EXTRACT_PATH, JSON_EXTRACT_PATH_TEXT, JSON_ARRAY_LENGTH, JSON_TYPEOF, JSONB_STRIP_NULLS
+    if (upper.starts_with("JSON_EXTRACT_PATH(") || upper.starts_with("JSONB_EXTRACT_PATH(")) && t.ends_with(')') {
+        let open_idx = t.find('(').unwrap();
+        let inner = &t[open_idx + 1..t.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let mut curr = eval_joined_scalar_expr(&args[0], row, params, storage);
+            for arg in &args[1..] {
+                let key = eval_joined_scalar_expr(arg, row, params, storage);
+                curr = eval_json_extract_serde(&curr, &key, "->");
+                if curr.is_null() {
+                    break;
+                }
+            }
+            return curr;
+        }
+    }
+    if (upper.starts_with("JSON_EXTRACT_PATH_TEXT(") || upper.starts_with("JSONB_EXTRACT_PATH_TEXT(")) && t.ends_with(')') {
+        let open_idx = t.find('(').unwrap();
+        let inner = &t[open_idx + 1..t.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let mut curr = eval_joined_scalar_expr(&args[0], row, params, storage);
+            let last_idx = args.len() - 1;
+            for (idx, arg) in args[1..].iter().enumerate() {
+                let key = eval_joined_scalar_expr(arg, row, params, storage);
+                let op = if idx + 1 == last_idx { "->>" } else { "->" };
+                curr = eval_json_extract_serde(&curr, &key, op);
+                if curr.is_null() {
+                    break;
+                }
+            }
+            return curr;
+        }
+    }
+    if (upper.starts_with("JSON_ARRAY_LENGTH(") || upper.starts_with("JSONB_ARRAY_LENGTH(")) && t.ends_with(')') {
+        let inner = &t[upper.find('(').unwrap() + 1..t.len() - 1];
+        let target = eval_joined_scalar_expr(inner, row, params, storage);
+        let parsed = match &target {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s.trim()).unwrap_or(serde_json::Value::Null),
+            _ => target,
+        };
+        if let serde_json::Value::Array(arr) = parsed {
+            return serde_json::json!(arr.len());
+        }
+        return serde_json::Value::Null;
+    }
+    if (upper.starts_with("JSON_TYPEOF(") || upper.starts_with("JSONB_TYPEOF(")) && t.ends_with(')') {
+        let inner = &t[upper.find('(').unwrap() + 1..t.len() - 1];
+        let target = eval_joined_scalar_expr(inner, row, params, storage);
+        let parsed = match &target {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s.trim()).unwrap_or(serde_json::Value::String(s.clone())),
+            _ => target,
+        };
+        let type_str = match parsed {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        return serde_json::Value::String(type_str.to_string());
+    }
+    if upper.starts_with("JSONB_STRIP_NULLS(") && t.ends_with(')') {
+        let inner = &t[18..t.len() - 1];
+        let target = eval_joined_scalar_expr(inner, row, params, storage);
+        let mut parsed = match &target {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s.trim()).unwrap_or(serde_json::Value::Null),
+            _ => target,
+        };
+        if let serde_json::Value::Object(ref mut map) = parsed {
+            map.retain(|_, v| !v.is_null());
+            return serde_json::Value::Object(map.clone());
+        }
+        return parsed;
+    }
+
     // 4. JSON_BUILD_OBJECT / JSONB_BUILD_OBJECT
     if (upper.starts_with("JSON_BUILD_OBJECT(") || upper.starts_with("JSONB_BUILD_OBJECT(")) && t.ends_with(')') {
         let open_idx = t.find('(').unwrap();
@@ -4526,6 +4902,49 @@ fn eval_joined_scalar_expr(
             }
         }
         return serde_json::Value::Object(map);
+    }
+
+    // JSON_BUILD_ARRAY / JSONB_BUILD_ARRAY
+    if (upper.starts_with("JSON_BUILD_ARRAY(") || upper.starts_with("JSONB_BUILD_ARRAY(")) && t.ends_with(')') {
+        let open_idx = t.find('(').unwrap();
+        let inner = &t[open_idx + 1..t.len() - 1];
+        let items: Vec<serde_json::Value> = split_function_args(inner)
+            .into_iter()
+            .map(|arg| eval_joined_scalar_expr(&arg, row, params, storage))
+            .collect();
+        return serde_json::Value::Array(items);
+    }
+
+    // JSONB_PRETTY
+    if upper.starts_with("JSONB_PRETTY(") && t.ends_with(')') {
+        let inner = &t[13..t.len() - 1];
+        let v = eval_joined_scalar_expr(inner, row, params, storage);
+        return serde_json::Value::String(serde_json::to_string_pretty(&v).unwrap_or_default());
+    }
+
+    // JSONB_SET
+    if (upper.starts_with("JSONB_SET(") || upper.starts_with("JSON_SET(")) && t.ends_with(')') {
+        let open_idx = t.find('(').unwrap();
+        let inner = &t[open_idx + 1..t.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 3 {
+            let target_val = eval_joined_scalar_expr(&args[0], row, params, storage);
+            let path_val = eval_joined_scalar_expr(&args[1], row, params, storage);
+            let new_val = eval_joined_scalar_expr(&args[2], row, params, storage);
+            let create_missing = if args.len() >= 4 {
+                let cm_val = eval_joined_scalar_expr(&args[3], row, params, storage);
+                cm_val.as_bool().unwrap_or(true)
+            } else {
+                true
+            };
+            let mut target_json = match &target_val {
+                serde_json::Value::String(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(target_val.clone()),
+                _ => target_val.clone(),
+            };
+            let keys = parse_json_path_keys(&path_val);
+            jsonb_set_serde(&mut target_json, &keys, &new_val, create_missing);
+            return target_json;
+        }
     }
 
     // 5. ARRAY[...]
@@ -5130,17 +5549,23 @@ struct OrderBySpec<'a> {
 }
 
 fn parse_order_by_specs<'a>(order_part: &'a str) -> Vec<OrderBySpec<'a>> {
-    order_part
-        .split(',')
+    split_comma_separated_tokens(order_part)
+        .into_iter()
         .filter_map(|item| {
-            let mut parts = item.trim().split_whitespace();
-            let raw_col = parts.next()?;
+            let item_trimmed = item.trim();
+            let upper = item_trimmed.to_uppercase();
+            let (raw_col, desc) = if upper.ends_with(" DESC") {
+                (item_trimmed[..item_trimmed.len() - 5].trim(), true)
+            } else if upper.ends_with(" ASC") {
+                (item_trimmed[..item_trimmed.len() - 4].trim(), false)
+            } else {
+                (item_trimmed, false)
+            };
             let col = clean_col_name(raw_col);
             if col.is_empty() {
                 return None;
             }
-            let desc = parts.next().map(|s| s.trim_matches(',').eq_ignore_ascii_case("DESC")).unwrap_or(false);
-            Some(OrderBySpec { col_name: col, is_desc: desc })
+            Some(OrderBySpec { col_name: raw_col, is_desc: desc })
         })
         .collect()
 }
@@ -5618,6 +6043,10 @@ enum AggFunc {
     Min(usize),
     Max(usize),
     ArrayAgg(usize),
+    JsonAgg(usize),
+    JsonbAgg(usize),
+    JsonAggExpr(String),
+    JsonbAggExpr(String),
 }
 
 struct AggSpec {
@@ -5696,6 +6125,33 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
                 let alias = get_alias("max");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Max(col_idx), alias });
+                }
+            }
+        } else if let Some(j_idx) = upper.find("JSON_AGG(").or_else(|| upper.find("JSONB_AGG(")) {
+            let is_jsonb = upper[j_idx..].starts_with("JSONB_AGG(");
+            let prefix_len = if is_jsonb { 10 } else { 9 };
+            let after_j = &part_trim[j_idx + prefix_len..];
+            let mut depth = 1;
+            let mut close_idx = None;
+            for (idx, ch) in after_j.char_indices() {
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(close_p) = close_idx {
+                let raw_col = after_j[..close_p].trim();
+                let col_name = clean_col_name(raw_col);
+                let alias = get_alias(if is_jsonb { "jsonb_agg" } else { "json_agg" });
+                if let Some(col_idx) = table.get_column_index(col_name) {
+                    specs.push(AggSpec { func: if is_jsonb { AggFunc::JsonbAgg(col_idx) } else { AggFunc::JsonAgg(col_idx) }, alias });
+                } else {
+                    specs.push(AggSpec { func: if is_jsonb { AggFunc::JsonbAggExpr(raw_col.to_string()) } else { AggFunc::JsonAggExpr(raw_col.to_string()) }, alias });
                 }
             }
         }
@@ -6336,6 +6792,9 @@ fn parse_operand_template(token: &str) -> OperandTemplate {
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
         return OperandTemplate::Literal(Value::text(&t[1..t.len() - 1]));
     }
+    if let Ok(i) = t.parse::<i64>() {
+        return OperandTemplate::Literal(Value::Int(i));
+    }
     if let Ok(f) = t.parse::<f64>() {
         return OperandTemplate::Number(f);
     }
@@ -6497,7 +6956,7 @@ fn parse_single_condition(
     while is_fully_enclosed_in_parens(s) {
         s = s[1..s.len() - 1].trim();
     }
-    if s.contains("->") {
+    if s.contains("->") || s.contains("@>") || s.contains("<@") || s.contains('?') || s.contains("#>") {
         return Err("Custom JSON condition".to_string());
     }
     let upper = s.to_uppercase();
@@ -6983,6 +7442,29 @@ fn evaluate_assignment_val(
         return dt_val;
     }
 
+    let upper = s.to_uppercase();
+    if upper.starts_with("JSONB_SET(")
+        || upper.starts_with("JSON_SET(")
+        || upper.starts_with("JSON_BUILD_OBJECT(")
+        || upper.starts_with("JSONB_BUILD_OBJECT(")
+        || upper.starts_with("JSON_BUILD_ARRAY(")
+        || upper.starts_with("JSONB_BUILD_ARRAY(")
+        || upper.starts_with("JSONB_STRIP_NULLS(")
+        || upper.starts_with("CONCAT(")
+        || upper.starts_with("CONCAT_WS(")
+        || upper.starts_with("REPLACE(")
+        || upper.starts_with("SUBSTRING(")
+        || upper.starts_with("LOWER(")
+        || upper.starts_with("UPPER(")
+        || upper.starts_with("TRIM(")
+        || upper.starts_with("COALESCE(")
+        || upper.starts_with("CASE")
+        || s.contains("->")
+        || s.contains("||")
+    {
+        return eval_sql_expr(s, row, Some(table), &[], None, params);
+    }
+
     let is_quoted = (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"'));
     if !is_quoted {
         for op in ['*', '/', '+', '-'] {
@@ -7225,10 +7707,66 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
                     i += 1;
                     continue;
                 }
+                if op == "?" && i + 1 < len && (s_bytes[i + 1] == b'|' || s_bytes[i + 1] == b'&') {
+                    i += 2;
+                    continue;
+                }
                 return Some(i);
             }
         }
         i += 1;
+    }
+    None
+}
+
+fn find_top_level_math_op(s: &str, ops: &[char]) -> Option<(usize, char)> {
+    let mut in_single_quote = false;
+    let mut depth: i32 = 0;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    
+    let mut i = (len as isize) - 1;
+    while i >= 0 {
+        let idx = i as usize;
+        let b = bytes[idx];
+        if b == b'\'' {
+            in_single_quote = !in_single_quote;
+        } else if !in_single_quote {
+            if b == b')' || b == b']' {
+                depth += 1;
+            } else if b == b'(' || b == b'[' {
+                depth = (depth - 1).max(0);
+            } else if depth == 0 {
+                let ch = b as char;
+                if ops.contains(&ch) {
+                    if ch == '-' {
+                        if idx + 1 < len && bytes[idx + 1] == b'>' {
+                            i -= 1;
+                            continue;
+                        }
+                        if idx == 0 {
+                            i -= 1;
+                            continue;
+                        }
+                        let prev_non_space = s[..idx].trim_end();
+                        if prev_non_space.ends_with(|c: char| "+-*/=<>!%^&|,".contains(c)) {
+                            i -= 1;
+                            continue;
+                        }
+                    }
+                    if ch == '*' {
+                        let prev_non_space = s[..idx].trim_end();
+                        let next_non_space = s[idx + 1..].trim_start();
+                        if prev_non_space.is_empty() || next_non_space.is_empty() {
+                            i -= 1;
+                            continue;
+                        }
+                    }
+                    return Some((idx, ch));
+                }
+            }
+        }
+        i -= 1;
     }
     None
 }
@@ -7252,9 +7790,9 @@ fn find_last_top_level_json_op(s: &str) -> Option<(usize, &'static str)> {
             i += 1;
             continue;
         }
-        if b == b'(' {
+        if b == b'(' || b == b'[' {
             depth += 1;
-        } else if b == b')' {
+        } else if b == b')' || b == b']' {
             depth = depth.saturating_sub(1);
         } else if depth == 0 {
             if i + 3 <= len && &s_bytes[i..i + 3] == b"->>" {
@@ -7265,6 +7803,14 @@ fn find_last_top_level_json_op(s: &str) -> Option<(usize, &'static str)> {
                 last_match = Some((i, "->"));
                 i += 2;
                 continue;
+            } else if i + 3 <= len && &s_bytes[i..i + 3] == b"#>>" {
+                last_match = Some((i, "#>>"));
+                i += 3;
+                continue;
+            } else if i + 2 <= len && &s_bytes[i..i + 2] == b"#>" {
+                last_match = Some((i, "#>"));
+                i += 2;
+                continue;
             }
         }
         i += 1;
@@ -7272,53 +7818,260 @@ fn find_last_top_level_json_op(s: &str) -> Option<(usize, &'static str)> {
     last_match
 }
 
+fn parse_val_to_json(v: &Value) -> Option<serde_json::Value> {
+    match v {
+        Value::Text(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                serde_json::from_str(trimmed).ok()
+            } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+                let unquoted = &trimmed[1..trimmed.len() - 1];
+                if unquoted.starts_with('{') || unquoted.starts_with('[') {
+                    serde_json::from_str(unquoted).ok()
+                } else {
+                    Some(serde_json::Value::String(unquoted.to_string()))
+                }
+            } else {
+                Some(serde_json::Value::String(trimmed.to_string()))
+            }
+        }
+        Value::Null => None,
+        Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
+        Value::Int(i) => Some(serde_json::Value::Number((*i).into())),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
+    }
+}
+
+fn parse_json_path_keys(rhs_val: &serde_json::Value) -> Vec<String> {
+    match rhs_val {
+        serde_json::Value::Array(arr) => arr.iter().filter_map(|x| match x {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }).collect(),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim().trim_matches('\'').trim_matches('"').trim();
+            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                arr.iter().filter_map(|x| match x {
+                    serde_json::Value::String(st) => Some(st.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                }).collect()
+            } else {
+                let inner = trimmed.trim_matches('{').trim_matches('}').trim_matches('[').trim_matches(']');
+                inner.split(',').map(|p| p.trim().trim_matches('\'').trim_matches('"').to_string()).filter(|p| !p.is_empty()).collect()
+            }
+        }
+        _ => vec![],
+    }
+}
+
+fn parse_str_or_json_keys(v: &Value) -> Vec<String> {
+    match v {
+        Value::Text(s) => {
+            let val = serde_json::Value::String(s.to_string());
+            parse_json_path_keys(&val)
+        }
+        _ => {
+            let val = value_to_json(v);
+            parse_json_path_keys(&val)
+        }
+    }
+}
+
+fn json_contains_check(target: &serde_json::Value, contained: &serde_json::Value) -> bool {
+    match (target, contained) {
+        (serde_json::Value::Object(t_map), serde_json::Value::Object(c_map)) => {
+            for (k, c_v) in c_map {
+                if let Some(t_v) = t_map.get(k) {
+                    if !json_contains_check(t_v, c_v) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+        (serde_json::Value::Array(t_arr), serde_json::Value::Array(c_arr)) => {
+            for c_elem in c_arr {
+                if !t_arr.iter().any(|t_elem| json_contains_check(t_elem, c_elem)) {
+                    return false;
+                }
+            }
+            true
+        }
+        (serde_json::Value::Array(t_arr), _) => {
+            t_arr.iter().any(|t_elem| json_contains_check(t_elem, contained))
+        }
+        _ => target == contained,
+    }
+}
+
+fn json_has_key_check(target: &serde_json::Value, key: &str) -> bool {
+    let clean_key = key.trim().trim_matches('\'').trim_matches('"');
+    match target {
+        serde_json::Value::Object(map) => map.contains_key(clean_key),
+        serde_json::Value::Array(arr) => arr.iter().any(|x| match x {
+            serde_json::Value::String(s) => s == clean_key,
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+fn jsonb_set_serde(target: &mut serde_json::Value, path: &[String], new_val: &serde_json::Value, create_missing: bool) {
+    if path.is_empty() {
+        *target = new_val.clone();
+        return;
+    }
+    let key = &path[0];
+    if path.len() == 1 {
+        match target {
+            serde_json::Value::Object(map) => {
+                if create_missing || map.contains_key(key) {
+                    map.insert(key.clone(), new_val.clone());
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                if let Ok(idx) = key.parse::<usize>() {
+                    if idx < arr.len() {
+                        arr[idx] = new_val.clone();
+                    } else if create_missing && idx == arr.len() {
+                        arr.push(new_val.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else {
+        match target {
+            serde_json::Value::Object(map) => {
+                if let Some(next) = map.get_mut(key) {
+                    jsonb_set_serde(next, &path[1..], new_val, create_missing);
+                } else if create_missing {
+                    let mut next = serde_json::Value::Object(serde_json::Map::new());
+                    jsonb_set_serde(&mut next, &path[1..], new_val, create_missing);
+                    map.insert(key.clone(), next);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                if let Ok(idx) = key.parse::<usize>() {
+                    if let Some(next) = arr.get_mut(idx) {
+                        jsonb_set_serde(next, &path[1..], new_val, create_missing);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn eval_json_extract_serde(lhs: &serde_json::Value, rhs: &serde_json::Value, op: &str) -> serde_json::Value {
+    let parsed_lhs = match lhs {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v) => v,
+                    Err(_) => return serde_json::Value::Null,
+                }
+            } else {
+                return serde_json::Value::Null;
+            }
+        }
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => lhs.clone(),
+        _ => return serde_json::Value::Null,
+    };
+
+    if op == "#>" || op == "#>>" {
+        let keys = parse_json_path_keys(rhs);
+        let mut curr = &parsed_lhs;
+        for k in &keys {
+            match curr {
+                serde_json::Value::Object(map) => {
+                    if let Some(next) = map.get(k) {
+                        curr = next;
+                    } else {
+                        return serde_json::Value::Null;
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    if let Ok(idx) = k.parse::<usize>() {
+                        if let Some(next) = arr.get(idx) {
+                            curr = next;
+                        } else {
+                            return serde_json::Value::Null;
+                        }
+                    } else {
+                        return serde_json::Value::Null;
+                    }
+                }
+                _ => return serde_json::Value::Null,
+            }
+        }
+        if op == "#>>" {
+            match curr {
+                serde_json::Value::Null => serde_json::Value::Null,
+                serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
+                _ => serde_json::Value::String(curr.to_string()),
+            }
+        } else {
+            curr.clone()
+        }
+    } else {
+        // op is -> or ->>
+        let key_str = match rhs {
+            serde_json::Value::String(s) => s.trim().trim_matches('\'').trim_matches('"').to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => json_val_to_str(rhs).trim().trim_matches('\'').trim_matches('"').to_string(),
+        };
+
+        let target = match &parsed_lhs {
+            serde_json::Value::Object(map) => map.get(&key_str),
+            serde_json::Value::Array(arr) => {
+                if let Ok(idx) = key_str.parse::<usize>() {
+                    arr.get(idx)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        match target {
+            Some(v) => {
+                if op == "->>" {
+                    match v {
+                        serde_json::Value::Null => serde_json::Value::Null,
+                        serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
+                        _ => serde_json::Value::String(v.to_string()),
+                    }
+                } else {
+                    v.clone()
+                }
+            }
+            None => serde_json::Value::Null,
+        }
+    }
+}
+
 fn eval_json_extract(
     lhs: &Value,
     rhs_key: &str,
     as_text: bool,
 ) -> Value {
-    let raw_str = match lhs {
-        Value::Text(s) => s.as_str(),
-        _ => return Value::Null,
+    let lhs_json = match lhs {
+        Value::Text(s) => serde_json::Value::String(s.to_string()),
+        _ => value_to_json(lhs),
     };
-    let trimmed = raw_str.trim();
-    if trimmed.is_empty() {
-        return Value::Null;
-    }
-    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => return Value::Null,
-    };
-
-    let clean_key = rhs_key.trim().trim_matches('\'').trim_matches('"');
-    let target_val = match &parsed {
-        serde_json::Value::Object(map) => map.get(clean_key),
-        serde_json::Value::Array(arr) => {
-            if let Ok(idx) = clean_key.parse::<usize>() {
-                arr.get(idx)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    match target_val {
-        Some(v) => {
-            if as_text {
-                match v {
-                    serde_json::Value::Null => Value::Null,
-                    serde_json::Value::String(s) => Value::text(s),
-                    _ => Value::text(v.to_string()),
-                }
-            } else {
-                match v {
-                    serde_json::Value::Null => Value::Null,
-                    _ => Value::text(v.to_string()),
-                }
-            }
-        }
-        None => Value::Null,
+    let rhs_json = serde_json::Value::String(rhs_key.to_string());
+    let op = if as_text { "->>" } else { "->" };
+    let res = eval_json_extract_serde(&lhs_json, &rhs_json, op);
+    match res {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::String(s) => Value::text(s),
+        _ => Value::text(res.to_string()),
     }
 }
 
@@ -7330,7 +8083,193 @@ fn evaluate_custom_condition(
     joined_table: Option<&crate::storage::table::Table>,
     params: &[Value],
 ) -> bool {
-    let trimmed = cond.trim();
+    let mut trimmed = cond.trim();
+    while trimmed.starts_with('(') && trimmed.ends_with(')') && is_fully_enclosed_in_parens(trimmed) {
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
+    let upper = trimmed.to_uppercase();
+
+    if trimmed.eq_ignore_ascii_case("TRUE") || trimmed == "1 = 1" || trimmed == "1=1" {
+        return true;
+    }
+    if trimmed.eq_ignore_ascii_case("FALSE") || trimmed == "1 = 0" || trimmed == "1=0" {
+        return false;
+    }
+
+    // Check top-level OR
+    if let Some(or_idx) = find_top_level_keyword(trimmed, "OR") {
+        let left = &trimmed[..or_idx];
+        let right = &trimmed[or_idx + 2..];
+        return evaluate_custom_condition(left, primary_row, primary_table, joined_row, joined_table, params)
+            || evaluate_custom_condition(right, primary_row, primary_table, joined_row, joined_table, params);
+    }
+
+    // Check top-level AND
+    if let Some(and_idx) = find_top_level_keyword(trimmed, "AND") {
+        let left = &trimmed[..and_idx];
+        let right = &trimmed[and_idx + 3..];
+        return evaluate_custom_condition(left, primary_row, primary_table, joined_row, joined_table, params)
+            && evaluate_custom_condition(right, primary_row, primary_table, joined_row, joined_table, params);
+    }
+
+    // Check NOT
+    if upper.starts_with("NOT ") {
+        return !evaluate_custom_condition(&trimmed[4..], primary_row, primary_table, joined_row, joined_table, params);
+    }
+
+    // IS NOT NULL / IS NULL
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS NOT NULL") {
+        let left_str = trimmed[..pos].trim();
+        let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        return !val.is_null();
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS NULL") {
+        let left_str = trimmed[..pos].trim();
+        let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        return val.is_null();
+    }
+
+    // NOT BETWEEN ... AND ...
+    if let Some(pos) = find_top_level_keyword(trimmed, "NOT BETWEEN") {
+        let left_str = trimmed[..pos].trim();
+        let right_str = trimmed[pos + 11..].trim();
+        if let Some(and_pos) = find_top_level_keyword(right_str, "AND") {
+            let b_start_str = right_str[..and_pos].trim();
+            let b_end_str = right_str[and_pos + 3..].trim();
+            let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            let start_val = eval_sql_expr(b_start_str, primary_row, primary_table, joined_row, joined_table, params);
+            let end_val = eval_sql_expr(b_end_str, primary_row, primary_table, joined_row, joined_table, params);
+            let within = val.cmp_value(&start_val) >= std::cmp::Ordering::Equal && val.cmp_value(&end_val) <= std::cmp::Ordering::Equal;
+            return !within;
+        }
+    }
+
+    // BETWEEN ... AND ...
+    if let Some(pos) = find_top_level_keyword(trimmed, "BETWEEN") {
+        let left_str = trimmed[..pos].trim();
+        let right_str = trimmed[pos + 7..].trim();
+        if let Some(and_pos) = find_top_level_keyword(right_str, "AND") {
+            let b_start_str = right_str[..and_pos].trim();
+            let b_end_str = right_str[and_pos + 3..].trim();
+            let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            let start_val = eval_sql_expr(b_start_str, primary_row, primary_table, joined_row, joined_table, params);
+            let end_val = eval_sql_expr(b_end_str, primary_row, primary_table, joined_row, joined_table, params);
+            return val.cmp_value(&start_val) >= std::cmp::Ordering::Equal && val.cmp_value(&end_val) <= std::cmp::Ordering::Equal;
+        }
+    }
+
+    // NOT IN (...)
+    if let Some(pos) = find_top_level_keyword(trimmed, "NOT IN") {
+        let left_str = trimmed[..pos].trim();
+        let right_str = trimmed[pos + 6..].trim();
+        if right_str.starts_with('(') && right_str.ends_with(')') {
+            let v_left = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            if v_left.is_null() {
+                return false;
+            }
+            let inside = &right_str[1..right_str.len() - 1];
+            let tokens = split_comma_separated_tokens(inside);
+            let mut matches_any = false;
+            for tok in tokens {
+                let v_item = eval_sql_expr(tok, primary_row, primary_table, joined_row, joined_table, params);
+                if v_left.is_equal(&v_item) {
+                    matches_any = true;
+                    break;
+                }
+            }
+            return !matches_any;
+        }
+    }
+
+    // IN (...)
+    if let Some(pos) = find_top_level_keyword(trimmed, "IN") {
+        let left_str = trimmed[..pos].trim();
+        let right_str = trimmed[pos + 2..].trim();
+        if right_str.starts_with('(') && right_str.ends_with(')') {
+            let v_left = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            if v_left.is_null() {
+                return false;
+            }
+            let inside = &right_str[1..right_str.len() - 1];
+            let tokens = split_comma_separated_tokens(inside);
+            for tok in tokens {
+                let v_item = eval_sql_expr(tok, primary_row, primary_table, joined_row, joined_table, params);
+                if v_left.is_equal(&v_item) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    // NOT ILIKE / NOT LIKE
+    if let Some(pos) = find_top_level_keyword(trimmed, "NOT ILIKE") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pattern_val = eval_sql_expr(trimmed[pos + 9..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return !sql_like_match(&left.as_str(), &pattern_val.as_str(), true);
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "NOT LIKE") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pattern_val = eval_sql_expr(trimmed[pos + 8..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return !sql_like_match(&left.as_str(), &pattern_val.as_str(), false);
+    }
+
+    // ILIKE / LIKE
+    if let Some(pos) = find_top_level_keyword(trimmed, "ILIKE") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pattern_val = eval_sql_expr(trimmed[pos + 5..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return sql_like_match(&left.as_str(), &pattern_val.as_str(), true);
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "LIKE") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pattern_val = eval_sql_expr(trimmed[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return sql_like_match(&left.as_str(), &pattern_val.as_str(), false);
+    }
+
+    // JSONB containment: @> and <@
+    if let Some(pos) = trimmed.find(" @> ") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(trimmed[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
+            return json_contains_check(&l, &r);
+        }
+        return false;
+    }
+    if let Some(pos) = trimmed.find(" <@ ") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(trimmed[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
+            return json_contains_check(&r, &l);
+        }
+        return false;
+    }
+    if let Some(pos) = find_top_level_op(trimmed, "?|") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(trimmed[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if let Some(l) = parse_val_to_json(&left) {
+            let keys = parse_str_or_json_keys(&right);
+            return keys.iter().any(|k| json_has_key_check(&l, k));
+        }
+        return false;
+    }
+    if let Some(pos) = find_top_level_op(trimmed, "?&") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(trimmed[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if let Some(l) = parse_val_to_json(&left) {
+            let keys = parse_str_or_json_keys(&right);
+            return !keys.is_empty() && keys.iter().all(|k| json_has_key_check(&l, k));
+        }
+        return false;
+    }
+    if let Some(pos) = find_top_level_op(trimmed, "?") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(trimmed[pos + 1..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if let Some(l) = parse_val_to_json(&left) {
+            return json_has_key_check(&l, &right.as_str());
+        }
+        return false;
+    }
+
     for op in [">=", "<=", "!=", "<>", ">", "<", "="] {
         if let Some(op_pos) = find_top_level_op(trimmed, op) {
             let left_str = trimmed[..op_pos].trim();
@@ -7406,33 +8345,157 @@ fn eval_sql_expr(
         return cast_val(val, &target_type);
     }
 
-    // JSON extraction operators: ->> (as text) and -> (as json)
+    // JSON extraction operators: ->>, ->, #>>, #>
     if let Some((op_idx, op)) = find_last_top_level_json_op(s) {
         let lhs_expr = &s[..op_idx].trim();
         let rhs_expr = &s[op_idx + op.len()..].trim();
         let lhs = eval_sql_expr(lhs_expr, primary_row, primary_table, joined_row, joined_table, params);
         let rhs = eval_sql_expr(rhs_expr, primary_row, primary_table, joined_row, joined_table, params);
-        let as_text = op == "->>";
-        return eval_json_extract(&lhs, &rhs.as_str(), as_text);
+        let lhs_json = match &lhs {
+            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+            _ => value_to_json(&lhs),
+        };
+        let rhs_json = serde_json::Value::String(rhs.as_str());
+        let res = eval_json_extract_serde(&lhs_json, &rhs_json, op);
+        return match res {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::String(st) => Value::text(st),
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::Float(f)
+                } else {
+                    Value::text(n.to_string())
+                }
+            }
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => Value::text(res.to_string()),
+        };
     }
 
-    // JSON_EXTRACT and JSONB_EXTRACT
-    if (upper.starts_with("JSON_EXTRACT(") || upper.starts_with("JSONB_EXTRACT(")) && s.ends_with(')') {
+    // JSON Functions: JSON_EXTRACT_PATH_TEXT, JSONB_EXTRACT_PATH_TEXT, JSON_EXTRACT_PATH, JSONB_EXTRACT_PATH
+    if (upper.starts_with("JSON_EXTRACT_PATH_TEXT(") || upper.starts_with("JSONB_EXTRACT_PATH_TEXT(")) && s.ends_with(')') {
         let open_idx = s.find('(').unwrap();
         let inner = &s[open_idx + 1..s.len() - 1];
         let args = split_function_args(inner);
         if !args.is_empty() {
-            let mut current = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let curr = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let mut curr_json = match &curr {
+                Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                _ => value_to_json(&curr),
+            };
             for arg in &args[1..] {
                 let key = eval_sql_expr(arg, primary_row, primary_table, joined_row, joined_table, params);
-                current = eval_json_extract(&current, &key.as_str(), false);
-                if current.is_null() {
+                let key_str = key.as_str();
+                curr_json = match curr_json {
+                    serde_json::Value::Object(map) => map.get(&key_str).cloned().unwrap_or(serde_json::Value::Null),
+                    serde_json::Value::Array(arr) => {
+                        if let Ok(idx) = key_str.parse::<usize>() {
+                            arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                if curr_json.is_null() {
                     break;
                 }
             }
-            return current;
+            return match curr_json {
+                serde_json::Value::Null => Value::Null,
+                serde_json::Value::String(st) => Value::text(st),
+                _ => Value::text(curr_json.to_string()),
+            };
+        }
+    }
+    if (upper.starts_with("JSON_EXTRACT_PATH(") || upper.starts_with("JSONB_EXTRACT_PATH(")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let curr = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let mut curr_json = match &curr {
+                Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                _ => value_to_json(&curr),
+            };
+            for arg in &args[1..] {
+                let key = eval_sql_expr(arg, primary_row, primary_table, joined_row, joined_table, params);
+                let key_str = key.as_str();
+                curr_json = match curr_json {
+                    serde_json::Value::Object(map) => map.get(&key_str).cloned().unwrap_or(serde_json::Value::Null),
+                    serde_json::Value::Array(arr) => {
+                        if let Ok(idx) = key_str.parse::<usize>() {
+                            arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                if curr_json.is_null() {
+                    break;
+                }
+            }
+            return match curr_json {
+                serde_json::Value::Null => Value::Null,
+                serde_json::Value::String(st) => Value::text(serde_json::to_string(&st).unwrap_or(st)),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        Value::Int(i)
+                    } else if let Some(f) = n.as_f64() {
+                        Value::Float(f)
+                    } else {
+                        Value::text(n.to_string())
+                    }
+                }
+                serde_json::Value::Bool(b) => Value::Bool(b),
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => Value::text(serde_json::to_string(&curr_json).unwrap_or_default()),
+            };
+        }
+    }
+    if (upper.starts_with("JSON_ARRAY_LENGTH(") || upper.starts_with("JSONB_ARRAY_LENGTH(")) && s.ends_with(')') {
+        let inner = &s[upper.find('(').unwrap() + 1..s.len() - 1];
+        let target = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        let target_json = match &target {
+            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::Null),
+            _ => value_to_json(&target),
+        };
+        if let serde_json::Value::Array(arr) = target_json {
+            return Value::Int(arr.len() as i64);
         }
         return Value::Null;
+    }
+    if (upper.starts_with("JSON_TYPEOF(") || upper.starts_with("JSONB_TYPEOF(")) && s.ends_with(')') {
+        let inner = &s[upper.find('(').unwrap() + 1..s.len() - 1];
+        let target = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        let target_json = match &target {
+            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+            _ => value_to_json(&target),
+        };
+        let type_str = match target_json {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        return Value::text(type_str);
+    }
+    if upper.starts_with("JSONB_STRIP_NULLS(") && s.ends_with(')') {
+        let inner = &s[18..s.len() - 1];
+        let target = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        let target_json = match &target {
+            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::Null),
+            _ => value_to_json(&target),
+        };
+        if let serde_json::Value::Object(mut map) = target_json {
+            map.retain(|_, v| !v.is_null());
+            return Value::text(serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default());
+        }
+        return target;
     }
 
     // JSON_BUILD_OBJECT and JSONB_BUILD_OBJECT
@@ -7452,6 +8515,66 @@ fn eval_sql_expr(
         }
         let json_obj = serde_json::Value::Object(map);
         return Value::text(serde_json::to_string(&json_obj).unwrap_or_default());
+    }
+
+    // JSON_BUILD_ARRAY and JSONB_BUILD_ARRAY
+    if (upper.starts_with("JSON_BUILD_ARRAY(") || upper.starts_with("JSONB_BUILD_ARRAY(")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let items: Vec<serde_json::Value> = split_function_args(inner)
+            .into_iter()
+            .map(|arg| {
+                let v = eval_sql_expr(&arg, primary_row, primary_table, joined_row, joined_table, params);
+                value_to_json(&v)
+            })
+            .collect();
+        let arr = serde_json::Value::Array(items);
+        return Value::text(serde_json::to_string(&arr).unwrap_or_default());
+    }
+
+    // JSONB_PRETTY
+    if upper.starts_with("JSONB_PRETTY(") && s.ends_with(')') {
+        let inner = &s[13..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        let v_json = match &v {
+            Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(value_to_json(&v)),
+            _ => value_to_json(&v),
+        };
+        return Value::text(serde_json::to_string_pretty(&v_json).unwrap_or_default());
+    }
+
+    // JSONB_SET
+    if (upper.starts_with("JSONB_SET(") || upper.starts_with("JSON_SET(")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 3 {
+            let target_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let path_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let new_val_raw = eval_sql_expr(&args[2], primary_row, primary_table, joined_row, joined_table, params);
+            let create_missing = if args.len() >= 4 {
+                let cm_val = eval_sql_expr(&args[3], primary_row, primary_table, joined_row, joined_table, params);
+                cm_val.as_bool().unwrap_or(true)
+            } else {
+                true
+            };
+
+            let mut target_json = match &target_val {
+                Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(value_to_json(&target_val)),
+                _ => value_to_json(&target_val),
+            };
+            let path_json = match &path_val {
+                Value::Text(st) => serde_json::Value::String(st.to_string()),
+                _ => value_to_json(&path_val),
+            };
+            let keys = parse_json_path_keys(&path_json);
+            let new_json = match &new_val_raw {
+                Value::Text(st) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or(serde_json::Value::String(st.to_string())),
+                _ => value_to_json(&new_val_raw),
+            };
+            jsonb_set_serde(&mut target_json, &keys, &new_json, create_missing);
+            return Value::text(serde_json::to_string(&target_json).unwrap_or_default());
+        }
     }
 
     // ARRAY[...]
@@ -7476,6 +8599,18 @@ fn eval_sql_expr(
     }
 
     // 4. Built-in Functions: CONCAT, CONCAT_WS, LENGTH, TRIM, REPLACE, SUBSTRING, REVERSE
+    if upper.starts_with("UPPER(") && s.ends_with(')') {
+        let inner = &s[6..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        return Value::text(v.as_str().to_uppercase());
+    }
+
+    if upper.starts_with("LOWER(") && s.ends_with(')') {
+        let inner = &s[6..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        return Value::text(v.as_str().to_lowercase());
+    }
+
     if upper.starts_with("CONCAT(") && s.ends_with(')') {
         let inner = &s[7..s.len() - 1];
         let args = split_function_args(inner);
@@ -7707,20 +8842,49 @@ fn eval_sql_expr(
         }
     }
 
-    // 8. Column resolution
+    // 8. Math binary operations (+, -)
+    if let Some((op_idx, op)) = find_top_level_math_op(s, &['+', '-']) {
+        let lhs_str = s[..op_idx].trim();
+        let rhs_str = s[op_idx + 1..].trim();
+        let lhs = eval_sql_expr(lhs_str, primary_row, primary_table, joined_row, joined_table, params);
+        let rhs = eval_sql_expr(rhs_str, primary_row, primary_table, joined_row, joined_table, params);
+        if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
+            let res = if op == '+' { l_num + r_num } else { l_num - r_num };
+            return if res.fract() == 0.0 { Value::Int(res as i64) } else { Value::Float(res) };
+        }
+    }
+
+    // 9. Math binary operations (*, /, %)
+    if let Some((op_idx, op)) = find_top_level_math_op(s, &['*', '/', '%']) {
+        let lhs_str = s[..op_idx].trim();
+        let rhs_str = s[op_idx + 1..].trim();
+        let lhs = eval_sql_expr(lhs_str, primary_row, primary_table, joined_row, joined_table, params);
+        let rhs = eval_sql_expr(rhs_str, primary_row, primary_table, joined_row, joined_table, params);
+        if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
+            let res = match op {
+                '*' => l_num * r_num,
+                '/' => if r_num != 0.0 { l_num / r_num } else { 0.0 },
+                '%' => if r_num != 0.0 { l_num % r_num } else { 0.0 },
+                _ => 0.0,
+            };
+            return if res.fract() == 0.0 { Value::Int(res as i64) } else { Value::Float(res) };
+        }
+    }
+
+    // 10. Column resolution
     let clean = clean_col_name(s);
     if let Some(pt) = primary_table {
-        if let Some(idx) = pt.get_column_index(clean) {
+        if let Some(idx) = pt.get_column_index(clean).or_else(|| pt.get_column_index(s)) {
             return primary_row.get(idx).cloned().unwrap_or(Value::Null);
         }
     }
     if let Some(jt) = joined_table {
-        if let Some(idx) = jt.get_column_index(clean) {
+        if let Some(idx) = jt.get_column_index(clean).or_else(|| jt.get_column_index(s)) {
             return joined_row.get(idx).cloned().unwrap_or(Value::Null);
         }
     }
 
-    // 9. Fallback to literal or parameter
+    // 11. Fallback to literal or parameter
     parse_value(s, params)
 }
 

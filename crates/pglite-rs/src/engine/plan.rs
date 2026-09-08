@@ -128,11 +128,11 @@ pub fn evaluate_planned_condition(row: &[Value], cond: &ConditionTemplate, param
     match &cond.op {
         ColOpTemplate::Eq(opnd) => {
             let target = resolve_operand(opnd, params);
-            val == &target
+            val.is_equal(&target)
         }
         ColOpTemplate::NotEq(opnd) => {
             let target = resolve_operand(opnd, params);
-            val != &target
+            !val.is_equal(&target)
         }
         ColOpTemplate::LowerEq(opnd) => {
             let target_str = resolve_operand(opnd, params).as_text().unwrap_or_default().to_lowercase();
