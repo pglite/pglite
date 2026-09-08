@@ -62,6 +62,64 @@ function stripSqlComments(sql: string): string {
   return result;
 }
 
+function sanitizeParamValue(v: any): any {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date) {
+    return isNaN(v.getTime()) ? null : v.toISOString();
+  }
+  return v;
+}
+
+function normalizeQueryParams(sql: string, params: any): { sql: string; params: any[] | undefined } {
+  sql = stripSqlComments(sql);
+  if (!params) return { sql, params: undefined };
+
+  if (Array.isArray(params)) {
+    const sanitizedParams = params.map(sanitizeParamValue);
+    const paramNames: string[] = [];
+    const regex = /(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    let match;
+    while ((match = regex.exec(sql)) !== null) {
+      if (!paramNames.includes(match[1])) {
+        paramNames.push(match[1]);
+      }
+    }
+    if (paramNames.length > 0) {
+      let replacedSql = sql;
+      paramNames.forEach((name, idx) => {
+        const nameRegex = new RegExp(`(?<!:):${name}\\b`, "g");
+        replacedSql = replacedSql.replace(nameRegex, `$${idx + 1}`);
+      });
+      return { sql: replacedSql, params: sanitizedParams };
+    }
+    return { sql, params: sanitizedParams };
+  }
+
+  if (typeof params === "object") {
+    const paramNames: string[] = [];
+    const regex = /(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    let match;
+    while ((match = regex.exec(sql)) !== null) {
+      if (!paramNames.includes(match[1])) {
+        paramNames.push(match[1]);
+      }
+    }
+    if (paramNames.length > 0) {
+      let replacedSql = sql;
+      const paramArray: any[] = [];
+      paramNames.forEach((name, idx) => {
+        const raw = params[name];
+        paramArray.push(sanitizeParamValue(raw !== undefined ? raw : null));
+        const nameRegex = new RegExp(`(?<!:):${name}\\b`, "g");
+        replacedSql = replacedSql.replace(nameRegex, `$${idx + 1}`);
+      });
+      return { sql: replacedSql, params: paramArray };
+    }
+  }
+
+  return { sql, params: undefined };
+}
+
 function splitStatements(sql: string): string[] {
   const stripped = stripSqlComments(sql).trim();
   const stmts: string[] = [];
@@ -188,6 +246,23 @@ export class PGLiteNative {
       const binding = getNativeBinding();
       if (binding && binding.LitePostgresNative) {
         try {
+          if (filepath !== ":memory:") {
+            const fs = require("fs");
+            const rwalPath = filepath + ".rwal";
+            const v2RwalPath = filepath + ".v2.rwal";
+            // If source JS DB exists and old WAL has PGL1, back it up to allow pristine PGL2 re-hydration
+            if (fs.existsSync(filepath) && fs.existsSync(rwalPath) && !fs.existsSync(v2RwalPath)) {
+              try {
+                const buf = Buffer.alloc(4);
+                const fd = fs.openSync(rwalPath, "r");
+                fs.readSync(fd, buf, 0, 4, 0);
+                fs.closeSync(fd);
+                if (buf.toString("utf8") === "PGL1") {
+                  fs.renameSync(rwalPath, rwalPath + ".v1.bak");
+                }
+              } catch {}
+            }
+          }
           this.nativeInstance = new binding.LitePostgresNative(filepath);
         } catch (err) {
           console.warn("[PGLiteNative] Failed to initialize native engine:", err);
@@ -280,25 +355,25 @@ export class PGLiteNative {
       const stat = fs.statSync(this.filepath);
       if (stat.size === 0) return;
 
+      const v2RwalPath = this.filepath + ".v2.rwal";
       const rwalPath = this.filepath + ".rwal";
-      if (fs.existsSync(rwalPath)) {
-        const rwalStat = fs.statSync(rwalPath);
-        if (rwalStat.size > 4) {
-          return;
-        }
-      }
-
       const legacyWal = this.filepath + ".wal";
-      if (fs.existsSync(legacyWal)) {
-        try {
-          const buf = Buffer.alloc(4);
-          const fd = fs.openSync(legacyWal, "r");
-          fs.readSync(fd, buf, 0, 4, 0);
-          fs.closeSync(fd);
-          if (buf.toString("utf8") === "PGL1") {
-            return;
-          }
-        } catch {}
+
+      for (const p of [v2RwalPath, rwalPath, legacyWal]) {
+        if (fs.existsSync(p)) {
+          try {
+            const s = fs.statSync(p);
+            if (s.size > 4) {
+              const buf = Buffer.alloc(4);
+              const fd = fs.openSync(p, "r");
+              fs.readSync(fd, buf, 0, 4, 0);
+              fs.closeSync(fd);
+              if (buf.toString("utf8") === "PGL2") {
+                return;
+              }
+            }
+          } catch {}
+        }
       }
 
       let adapter: any;
@@ -388,6 +463,8 @@ export class PGLiteNative {
                   const v = row[k];
                   if (v === null || v === undefined) return "NULL";
                   if (typeof v === "number" || typeof v === "boolean") return String(v);
+                  if (v instanceof Date) return isNaN(v.getTime()) ? "NULL" : `'${v.toISOString()}'`;
+                  if (typeof v === "object") return `'${JSON.stringify(v).replace(/'/g, "''")}'`;
                   return `'${String(v).replace(/'/g, "''")}'`;
                 }).join(", ");
                 try {
@@ -485,6 +562,7 @@ export class PGLiteNative {
             const v = row[k];
             if (v === null || v === undefined) return "NULL";
             if (typeof v === "number" || typeof v === "boolean") return String(v);
+            if (v instanceof Date) return isNaN(v.getTime()) ? "NULL" : `'${v.toISOString()}'`;
             if (typeof v === "object") return `'${JSON.stringify(v).replace(/'/g, "''")}'`;
             return `'${String(v).replace(/'/g, "''")}'`;
           }).join(", ");
@@ -562,6 +640,9 @@ export class PGLiteNative {
   }
 
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
+    const normalized = normalizeQueryParams(sql, params);
+    sql = normalized.sql;
+    params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
@@ -649,6 +730,9 @@ export class PGLiteNative {
   }
 
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    const normalized = normalizeQueryParams(sql, params);
+    sql = normalized.sql;
+    params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
@@ -736,6 +820,9 @@ export class PGLiteNative {
   }
 
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
+    const normalized = normalizeQueryParams(sql, params);
+    sql = normalized.sql;
+    params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
     if (this.nativeInstance) {
       if (!this.allowFallback) {
@@ -801,6 +888,9 @@ export class PGLiteNative {
   }
 
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    const normalized = normalizeQueryParams(sql, params);
+    sql = normalized.sql;
+    params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
     if (this.nativeInstance) {
       if (!this.allowFallback) {

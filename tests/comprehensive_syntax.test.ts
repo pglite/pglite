@@ -931,4 +931,271 @@ describe("Comprehensive SQL Syntax Test Suite (Unified PGLite & JS Fallback)", (
       expect(res[1].admin_count).toBe(1);
     });
   });
+
+  // ==========================================
+  // SECTION 22: UNICODE / VIETNAMESE CHARACTERS & DATE SAFETY
+  // ==========================================
+  describe("22. Unicode / Vietnamese Strings & Room Queries", () => {
+    test("22.1 SELECT * FROM rooms with Vietnamese text and ORDER BY created_at DESC", async () => {
+      await db.exec(`
+        CREATE TABLE rooms_unicode_test (
+          id TEXT PRIMARY KEY,
+          name TEXT,
+          amenities TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          deleted_at TIMESTAMP
+        );
+      `);
+
+      await db.exec(`
+        INSERT INTO rooms_unicode_test (id, name, amenities, created_at, deleted_at) VALUES
+        ('r1', 'Phòng Deluxe', 'Wifi,Điều hòa,Ban công,Tắm nước nóng,Ban công', '2026-09-08 10:00:00', NULL),
+        ('r2', 'Phòng Standard', 'Wifi,Tắm nước nóng', '2026-09-08 09:00:00', NULL),
+        ('r3', 'Phòng Đã Xóa', 'Wifi', '2026-09-08 08:00:00', '2026-09-08 09:00:00');
+      `);
+
+      const res = await db.query(`
+        SELECT * FROM rooms_unicode_test
+        WHERE deleted_at IS NULL
+        ORDER BY created_at DESC;
+      `);
+
+      expect(res.length).toBe(2);
+      expect(res[0].id).toBe("r1");
+      expect(res[0].amenities).toBe("Wifi,Điều hòa,Ban công,Tắm nước nóng,Ban công");
+      expect(res[0].name).toBe("Phòng Deluxe");
+      expect(res[1].id).toBe("r2");
+      expect(res[1].amenities).toBe("Wifi,Tắm nước nóng");
+    });
+
+    test("22.2 CREATE TABLE services with NUMERIC(10, 2) and full text fields", async () => {
+      await db.exec(`
+        CREATE TABLE services (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          category VARCHAR(50),
+          description TEXT,
+          price NUMERIC(10, 2) NOT NULL,
+          duration_minutes INT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          deleted_at TIMESTAMP
+        );
+      `);
+
+      await db.exec(`
+        INSERT INTO services (name, category, description, price, duration_minutes, created_at, deleted_at) VALUES
+        ('Massage Body', 'spa', 'Massage thư giãn toàn thân theo phong cách Thụy Điển.', 900000, 90, '2026-09-08 08:00:00', NULL),
+        ('Yoga Biển', 'activity', 'Lớp yoga bình minh trên bãi biển.', 350000, 60, '2026-09-08 09:00:00', NULL),
+        ('Thiền Hoàng Hôn', 'wellness', 'Buổi thiền với sự dẫn dắt của chuyên gia.', 300000, 60, '2026-09-08 10:00:00', NULL);
+      `);
+
+      const res = await db.query(`
+        SELECT * FROM services
+        WHERE deleted_at IS NULL
+        ORDER BY created_at DESC;
+      `);
+
+      expect(res.length).toBe(3);
+      expect(res[0].name).toBe("Thiền Hoàng Hôn");
+      expect(res[0].category).toBe("wellness");
+      expect(res[0].description).toBe("Buổi thiền với sự dẫn dắt của chuyên gia.");
+      expect(res[0].price).toBe(300000);
+      expect(res[0].duration_minutes).toBe(60);
+
+      expect(res[1].name).toBe("Yoga Biển");
+      expect(res[1].category).toBe("activity");
+
+      expect(res[2].name).toBe("Massage Body");
+      expect(res[2].category).toBe("spa");
+
+      // Verify no phantom columns like "2)" exist
+      const keys = Object.keys(res[0]);
+      expect(keys).not.toContain("2)");
+      expect(keys.sort()).toEqual(["id", "name", "category", "description", "price", "duration_minutes", "created_at", "deleted_at"].sort());
+    });
+
+    test("22.3 SELECT *, (SELECT COUNT(id) FROM daily_rhythm_templates) AS total with compound WHERE and LIMIT/OFFSET", async () => {
+      await db.exec(`
+        CREATE TABLE daily_rhythm_templates (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          description TEXT,
+          is_active BOOLEAN DEFAULT true,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          deleted_at TIMESTAMP
+        );
+      `);
+
+      await db.exec(`
+        INSERT INTO daily_rhythm_templates (name, description, is_active, created_at, deleted_at) VALUES
+        ('Morning Routine', 'Morning meditation keyword and stretching', true, '2026-09-08 07:00:00', NULL),
+        ('Afternoon Focus', 'Deep work keyword session', true, '2026-09-08 13:00:00', NULL),
+        ('Evening Routine', 'Bedtime relaxation without match', true, '2026-09-08 21:00:00', NULL),
+        ('Inactive Routine', 'Keyword match but inactive', false, '2026-09-08 10:00:00', NULL),
+        ('Deleted Routine', 'Keyword match but deleted', true, '2026-09-08 08:00:00', '2026-09-08 09:00:00');
+      `);
+
+      const res = await db.query(`
+        SELECT *,
+               (SELECT COUNT(id) FROM daily_rhythm_templates) AS total
+        FROM daily_rhythm_templates
+        WHERE deleted_at IS NULL
+          AND (name ILIKE '%keyword%' OR description ILIKE '%keyword%')
+          AND is_active = true
+        ORDER BY created_at DESC
+        LIMIT 10 OFFSET 0;
+      `);
+
+      expect(res.length).toBe(2);
+      expect(res[0].name).toBe("Afternoon Focus");
+      expect(res[0].total).toBe(5); // 5 total rows in daily_rhythm_templates
+      expect(res[1].name).toBe("Morning Routine");
+      expect(res[1].total).toBe(5);
+    });
+
+    test("22.4 pg_constraint complex introspection query", async () => {
+      const sql = `
+        SELECT
+          nsp.nspname AS schema_name,
+          rel.relname AS table_name,
+          con.conname AS constraint_name,
+          CASE con.contype
+            WHEN 'f' THEN 'FOREIGN KEY'
+            WHEN 'p' THEN 'PRIMARY KEY'
+            WHEN 'u' THEN 'UNIQUE'
+            WHEN 'c' THEN 'CHECK'
+            ELSE con.contype::text
+          END AS constraint_type,
+          rnsp.nspname AS referenced_table_schema,
+          rrel.relname AS referenced_table_name,
+          ARRAY_AGG(att2.attname ORDER BY ucols.ordinality) FILTER (WHERE att2.attname IS NOT NULL) AS column_names,
+          ARRAY_AGG(att1.attname ORDER BY rcols.ordinality) FILTER (WHERE att1.attname IS NOT NULL) AS referenced_columns
+        FROM pg_constraint con
+          INNER JOIN pg_class rel ON rel.oid = con.conrelid
+          INNER JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+          LEFT JOIN pg_class rrel ON rrel.oid = con.confrelid
+          LEFT JOIN pg_namespace rnsp ON rnsp.oid = rrel.relnamespace
+          LEFT JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS ucols(attnum, ordinality) ON TRUE
+          LEFT JOIN pg_attribute att2 ON att2.attnum = ucols.attnum AND att2.attrelid = con.conrelid
+          LEFT JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS rcols(attnum, ordinality) ON TRUE
+          LEFT JOIN pg_attribute att1 ON att1.attnum = rcols.attnum AND att1.attrelid = con.confrelid
+        WHERE nsp.nspname = $1
+          AND con.contype IN ('f', 'p', 'u')
+        GROUP BY nsp.nspname, rel.relname, con.conname, con.contype, rnsp.nspname, rrel.relname
+        ORDER BY rel.relname, constraint_type;
+      `;
+
+      const res = await db.query(sql, ["public"]);
+      expect(Array.isArray(res)).toBe(true);
+      expect(res.length).toBeGreaterThan(0);
+      const pkRow = res.find(r => r.table_name === "users" || r.table_name === "departments");
+      expect(pkRow).toBeDefined();
+      expect(pkRow.constraint_type).toBe("PRIMARY KEY");
+    });
+
+    test("22.5 information_schema.columns column definition introspection query", async () => {
+      const sql = `
+        SELECT 
+          cols.table_schema AS schema_name,
+          cols.table_name,
+          cols.column_name,
+          cols.data_type,
+          cols.udt_name,
+          cols.is_nullable,
+          cols.column_default,
+          NULL AS constraint_type,
+          col_description(
+            (quote_ident(cols.table_schema) || '.' || quote_ident(cols.table_name))::regclass::oid,
+            cols.ordinal_position
+          ) AS comment
+        FROM information_schema.columns cols
+        WHERE cols.table_schema = $1
+          AND cols.table_schema NOT IN ('information_schema', 'pg_catalog')
+        ORDER BY cols.table_name, cols.ordinal_position
+      `;
+
+      const res = await db.query(sql, ["public"]);
+      expect(Array.isArray(res)).toBe(true);
+      expect(res.length).toBeGreaterThan(0);
+      const userCols = res.filter(r => r.table_name === "users");
+      expect(userCols.length).toBe(10);
+      const usernameCol = userCols.find(c => c.column_name === "username");
+      expect(usernameCol).toBeDefined();
+      expect(usernameCol.data_type).toBe("text");
+    });
+
+    test("22.6 Bookings INNER JOIN retreat_programs with named parameter, IN list, comments, and ORDER BY ASC", async () => {
+      await db.exec(`
+        CREATE TABLE retreat_programs (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          location_name VARCHAR(255),
+          duration_days INT
+        );
+
+        CREATE TABLE bookings (
+          id SERIAL PRIMARY KEY,
+          user_id INT NOT NULL,
+          program_id INT NOT NULL,
+          check_in_date DATE NOT NULL,
+          check_in_status VARCHAR(50) NOT NULL,
+          deleted_at TIMESTAMP
+        );
+      `);
+
+      await db.exec(`
+        INSERT INTO retreat_programs (id, name, location_name, duration_days) VALUES
+        (101, 'Thiền Chữa Lành 3 Ngày', 'Đà Lạt', 3),
+        (102, 'Yoga & Detox Bãi Biển', 'Phú Quốc', 5);
+
+        INSERT INTO bookings (id, user_id, program_id, check_in_date, check_in_status, deleted_at) VALUES
+        (1, 99, 101, '2026-09-15', 'pending', NULL),
+        (2, 99, 102, '2026-09-10', 'checked_in', NULL),
+        (3, 99, 101, '2026-09-20', 'cancelled', NULL),
+        (4, 99, 101, '2026-09-05', 'checked_in', '2026-09-06 00:00:00'),
+        (5, 88, 102, '2026-09-12', 'pending', NULL);
+      `);
+
+      const sql = `
+        SELECT b.id,
+               rp.id AS program_id,
+               rp.name,
+               rp.location_name,
+               rp.duration_days,
+               b.check_in_date,
+               b.check_in_status
+        FROM bookings b
+        INNER JOIN retreat_programs rp ON rp.id = b.program_id
+        WHERE b.user_id = :userId
+          AND b.check_in_status IN ('pending', 'checked_in')
+          AND b.deleted_at IS NULL
+          -- [Chỉ khi có truyền bookingId]
+          -- AND b.id = :bookingId
+        ORDER BY b.check_in_date ASC;
+      `;
+
+      const res = await db.query(sql, { userId: 99 });
+      expect(res.length).toBe(2);
+
+      // Earliest check_in_date first (2026-09-10 before 2026-09-15)
+      expect(res[0].id).toBe(2);
+      expect(res[0].program_id).toBe(102);
+      expect(res[0].name).toBe("Yoga & Detox Bãi Biển");
+      expect(res[0].location_name).toBe("Phú Quốc");
+      expect(res[0].duration_days).toBe(5);
+      expect(res[0].check_in_status).toBe("checked_in");
+
+      expect(res[1].id).toBe(1);
+      expect(res[1].program_id).toBe(101);
+      expect(res[1].name).toBe("Thiền Chữa Lành 3 Ngày");
+      expect(res[1].location_name).toBe("Đà Lạt");
+      expect(res[1].duration_days).toBe(3);
+      expect(res[1].check_in_status).toBe("pending");
+    });
+  });
 });
+
+
+
+
+

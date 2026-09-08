@@ -214,7 +214,7 @@ pub fn project_row_planned(
 }
 
 #[inline(always)]
-fn value_to_json(val: &Value) -> serde_json::Value {
+pub fn value_to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -222,6 +222,14 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => serde_json::Value::String(s.to_string()),
+        Value::Text(s) => {
+            let trimmed = s.trim();
+            if (trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return val;
+                }
+            }
+            serde_json::Value::String(s.to_string())
+        }
     }
 }

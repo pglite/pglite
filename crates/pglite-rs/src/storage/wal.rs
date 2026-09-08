@@ -4,6 +4,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+pub const WAL_MAGIC: &[u8; 4] = b"PGL2";
+pub const WAL_MAGIC_V1: &[u8; 4] = b"PGL1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecord {
     Begin,
@@ -29,6 +32,24 @@ pub enum WalRecord {
     Delete {
         table: String,
         pk: i64,
+    },
+    CommentOnTable {
+        table: String,
+        comment: Option<String>,
+    },
+    CommentOnColumn {
+        table: String,
+        column: String,
+        comment: Option<String>,
+    },
+    AlterTableAddColumn {
+        table: String,
+        column: ColumnDef,
+        default_val: Value,
+    },
+    AlterTableDropColumn {
+        table: String,
+        column: String,
     },
 }
 
@@ -57,17 +78,19 @@ impl WalManager {
             };
         }
 
-        const WAL_MAGIC: &[u8; 4] = b"PGL1";
+        let v2_rwal_path = PathBuf::from(format!("{}.v2.rwal", db_path));
         let rwal_path = PathBuf::from(format!("{}.rwal", db_path));
         let legacy_wal_path = PathBuf::from(format!("{}.wal", db_path));
 
-        // Use .rwal by default. If it doesn't exist but legacy .wal exists with PGL1 magic, recover and migrate it.
-        let wal_path = if rwal_path.exists() {
+        // Use .v2.rwal or .rwal. If legacy .wal exists with PGL magic, recover and migrate it.
+        let wal_path = if v2_rwal_path.exists() {
+            v2_rwal_path
+        } else if rwal_path.exists() {
             rwal_path
         } else if legacy_wal_path.exists() {
             let has_pgl_magic = File::open(&legacy_wal_path).ok().and_then(|f| {
                 unsafe { memmap2::Mmap::map(&f).ok() }
-            }).map(|mmap| mmap.len() >= 4 && &mmap[0..4] == WAL_MAGIC).unwrap_or(false);
+            }).map(|mmap| mmap.len() >= 4 && (&mmap[0..4] == WAL_MAGIC || &mmap[0..4] == WAL_MAGIC_V1)).unwrap_or(false);
 
             if has_pgl_magic {
                 let _ = std::fs::rename(&legacy_wal_path, &rwal_path);
@@ -89,7 +112,7 @@ impl WalManager {
         if let Ok(file) = File::open(&wal_path) {
             if file.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
-                    if mmap.len() >= 4 && &mmap[0..4] == WAL_MAGIC {
+                    if mmap.len() >= 4 && (&mmap[0..4] == WAL_MAGIC || &mmap[0..4] == WAL_MAGIC_V1) {
                         // High-Speed Binary Zero-Copy Stream Deserialization
                         let mut cursor = 4;
                         while cursor + 4 <= mmap.len() {

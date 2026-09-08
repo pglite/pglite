@@ -10,7 +10,45 @@ pub enum DataType {
     Boolean,
     Numeric,
     Timestamp,
+    Date,
+    Time,
     Jsonb,
+}
+
+impl DataType {
+    pub fn from_sql_str(type_def: &str) -> Self {
+        let cleaned = type_def.trim().trim_matches('"');
+        let upper = cleaned.to_uppercase();
+        let first_word = upper.split_whitespace().next().unwrap_or("");
+        let base_type = first_word.split('(').next().unwrap_or(first_word).trim_matches(';');
+
+        match base_type {
+            "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => DataType::Serial,
+            "BIGINT" | "INT8" => DataType::BigInt,
+            "INT" | "INTEGER" | "INT4" | "SMALLINT" | "INT2" => DataType::Integer,
+            "BOOL" | "BOOLEAN" => DataType::Boolean,
+            "NUMERIC" | "DECIMAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "REAL" | "MONEY" => DataType::Numeric,
+            "TIMESTAMP" | "TIMESTAMPTZ" => DataType::Timestamp,
+            "DATE" => DataType::Date,
+            "TIME" | "TIMETZ" => DataType::Time,
+            "JSONB" | "JSON" => DataType::Jsonb,
+            _ => {
+                if upper.starts_with("TIMESTAMP") {
+                    DataType::Timestamp
+                } else if upper.starts_with("TIME ") || upper.starts_with("TIME(") {
+                    DataType::Time
+                } else if upper.starts_with("DATE") {
+                    DataType::Date
+                } else if upper.starts_with("JSONB") || upper.starts_with("JSON") {
+                    DataType::Jsonb
+                } else if upper.starts_with("DOUBLE") {
+                    DataType::Numeric
+                } else {
+                    DataType::Text
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

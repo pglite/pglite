@@ -29,31 +29,104 @@ impl StorageEngine {
             wal,
         };
 
+        let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
+
         // Replay WAL records recovered via zero-copy mmap
         let records = engine.wal.buffer.clone();
         for record in records {
             match record {
                 WalRecord::CreateTable { name, columns } => {
                     let clean = name.to_lowercase();
+                    table_hist_cols.insert(clean.clone(), columns.iter().map(|c| c.name.clone()).collect());
                     engine.tables.insert(clean, Table::new(name, columns));
                 }
                 WalRecord::DropTable { name } => {
                     let clean = name.to_lowercase();
+                    table_hist_cols.remove(&clean);
                     engine.tables.remove(&clean);
                 }
                 WalRecord::Insert { table, row } => {
-                    if let Some(t) = engine.get_table_mut(&table) {
+                    let clean = table.to_lowercase();
+                    if let Some(t) = engine.get_table_mut(&clean) {
+                        let hist_cols = table_hist_cols.get(&clean);
+                        if let Some(h_cols) = hist_cols {
+                            if row.len() > t.columns.len() && row.len() <= h_cols.len() {
+                                let mut aligned_row = Vec::with_capacity(t.columns.len());
+                                for col in &t.columns {
+                                    if let Some(h_idx) = h_cols.iter().position(|h| h.eq_ignore_ascii_case(&col.name)) {
+                                        if h_idx < row.len() {
+                                            aligned_row.push(row[h_idx].clone());
+                                        } else {
+                                            aligned_row.push(Value::Null);
+                                        }
+                                    } else {
+                                        aligned_row.push(Value::Null);
+                                    }
+                                }
+                                t.insert(aligned_row);
+                                continue;
+                            }
+                        }
                         t.insert(row);
                     }
                 }
                 WalRecord::Update { table, pk, col_idx, new_val } => {
-                    if let Some(t) = engine.get_table_mut(&table) {
-                        t.update_by_pk(pk, col_idx, new_val);
+                    let clean = table.to_lowercase();
+                    if let Some(t) = engine.get_table_mut(&clean) {
+                        let hist_cols = table_hist_cols.get(&clean);
+                        let target_col_idx = if let Some(h_cols) = hist_cols {
+                            if h_cols.len() > t.columns.len() && col_idx < h_cols.len() {
+                                t.get_column_index(&h_cols[col_idx]).unwrap_or(col_idx)
+                            } else {
+                                col_idx
+                            }
+                        } else {
+                            col_idx
+                        };
+                        t.update_by_pk(pk, target_col_idx, new_val);
                     }
                 }
                 WalRecord::Delete { table, pk } => {
-                    if let Some(t) = engine.get_table_mut(&table) {
+                    let clean = table.to_lowercase();
+                    if let Some(t) = engine.get_table_mut(&clean) {
                         t.delete_by_pk(pk);
+                    }
+                }
+                WalRecord::CommentOnTable { table, comment } => {
+                    let clean = table.to_lowercase();
+                    if let Some(t) = engine.get_table_mut(&clean) {
+                        t.comment = comment;
+                    }
+                }
+                WalRecord::CommentOnColumn { table, column, comment } => {
+                    let clean = table.to_lowercase();
+                    if let Some(t) = engine.get_table_mut(&clean) {
+                        if let Some(c) = t.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&column)) {
+                            c.comment = comment;
+                        }
+                    }
+                }
+                WalRecord::AlterTableAddColumn { table, column, default_val } => {
+                    let clean = table.to_lowercase();
+                    table_hist_cols.entry(clean.clone()).or_default().push(column.name.clone());
+                    if let Some(t) = engine.get_table_mut(&clean) {
+                        if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&column.name)) {
+                            t.columns.push(column);
+                            for row in &mut t.rows {
+                                row.push(default_val.clone());
+                            }
+                        }
+                    }
+                }
+                WalRecord::AlterTableDropColumn { table, column } => {
+                    let clean = table.to_lowercase();
+                    if let Some(h_cols) = table_hist_cols.get_mut(&clean) {
+                        if let Some(pos) = h_cols.iter().position(|h| h.eq_ignore_ascii_case(&column)) {
+                            h_cols.remove(pos);
+                        }
+                    }
+                    if let Some(t) = engine.get_table_mut(&clean) {
+                        t.drop_column(&column);
                     }
                 }
                 _ => {}

@@ -2,8 +2,10 @@ import { expect, test, describe, beforeAll, afterAll } from "bun:test";
 const { LitePostgresNative } = require("../crates/pglite-rs/pglite.node");
 import { PGLiteNative } from "../src/native";
 import { unlinkSync, existsSync } from "fs";
+import * as path from "path";
 
 const TEST_DB_FILE = "test_native_engine.db";
+const TEST_DIR = path.resolve(__dirname, "../tmp_test");
 
 function cleanFiles(prefix: string) {
   for (const ext of ["", ".wal", ".rwal", ".lock"]) {
@@ -1037,6 +1039,512 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       await pglite.close();
     });
   });
+
+  describe("LEVEL 23: Production Booking Query & Implicit Join Aggregation", () => {
+    test("23.1 Complex Booking Query with INNER JOIN, IN (...), OR with Parentheses, Named Parameters (:param), Double Quoted Aliases, Comments, and LIMIT 1", async () => {
+      const dbPath = path.join(TEST_DIR, "test_level_23_booking");
+      cleanFiles(dbPath);
+      const pglite = new PGLiteNative(dbPath);
+
+      await pglite.exec(`
+        CREATE TABLE users (
+          id INT PRIMARY KEY,
+          username TEXT,
+          full_name TEXT,
+          role TEXT,
+          avatar_url TEXT,
+          status TEXT,
+          phone_number TEXT,
+          deleted_at TEXT
+        );
+        CREATE TABLE bookings (
+          id INT PRIMARY KEY,
+          user_id INT,
+          program_id INT,
+          booking_code TEXT,
+          full_name TEXT,
+          check_in_status TEXT,
+          phone_number TEXT,
+          deleted_at TEXT
+        );
+      `);
+
+      await pglite.exec(`
+        INSERT INTO users VALUES
+          (1, 'alice', 'Alice Nguyen', 'customer', 'http://avatar1.png', 'active', '0901112222', NULL),
+          (2, 'bob', 'Bob Tran', 'customer', 'http://avatar2.png', 'active', '0903334444', NULL),
+          (3, 'charlie', 'Charlie Pham', 'customer', 'http://avatar3.png', 'active', '0905556666', '2026-09-01');
+        INSERT INTO bookings VALUES
+          (101, 1, 10, 'BK_CONFIRMED', 'Alice Nguyen', 'pending', '0901112222', NULL),
+          (102, 2, 10, 'BK_CANCELLED', 'Bob Tran', 'cancelled', '0903334444', NULL),
+          (103, 1, 20, 'BK_CHECKED_IN', 'Alice Nguyen', 'checked_in', '0988888888', NULL);
+      `);
+
+      const querySql = `
+        SELECT
+          b.id            AS "bookingId",
+          b.program_id    AS "programId",
+          b.full_name     AS "bookingFullName",
+          u.id,
+          u.username,
+          u.full_name,
+          u.role,
+          u.avatar_url,
+          u.status,
+          u.phone_number
+        FROM bookings b
+        INNER JOIN users u ON u.id = b.user_id
+        WHERE b.booking_code = :bookingCode
+          AND b.deleted_at   IS NULL
+          AND u.deleted_at   IS NULL
+          AND b.check_in_status IN ('pending', 'checked_in', 'completed')
+          AND (u.phone_number = :phoneNumber OR b.phone_number = :phoneNumber)   -- (chỉ khi có phone)
+        LIMIT 1;
+      `;
+
+      // Test 1: Calling with object parameters { bookingCode, phoneNumber }
+      const resObj = await pglite.query(querySql, {
+        bookingCode: "BK_CONFIRMED",
+        phoneNumber: "0901112222",
+      });
+
+      expect(resObj.length).toBe(1);
+      expect(resObj[0].bookingId).toBe(101);
+      expect(resObj[0].programId).toBe(10);
+      expect(resObj[0].bookingFullName).toBe("Alice Nguyen");
+      expect(resObj[0].id).toBe(1);
+      expect(resObj[0].username).toBe("alice");
+      expect(resObj[0].full_name).toBe("Alice Nguyen");
+      expect(resObj[0].role).toBe("customer");
+      expect(resObj[0].avatar_url).toBe("http://avatar1.png");
+      expect(resObj[0].status).toBe("active");
+      expect(resObj[0].phone_number).toBe("0901112222");
+
+      // Test 2: Calling with array parameters ['BK_CONFIRMED', '0901112222']
+      const resArr = await pglite.query(querySql, ["BK_CONFIRMED", "0901112222"]);
+      expect(resArr.length).toBe(1);
+      expect(resArr[0].bookingId).toBe(101);
+
+      // Test 3: Filter out cancelled status even if code matches
+      const resCancelled = await pglite.query(querySql, {
+        bookingCode: "BK_CANCELLED",
+        phoneNumber: "0903334444",
+      });
+      expect(resCancelled.length).toBe(0);
+
+      // Test 4: OR condition where b.phone_number matches even if u.phone_number differs
+      const resDiffPhone = await pglite.query(querySql, {
+        bookingCode: "BK_CHECKED_IN",
+        phoneNumber: "0988888888",
+      });
+      expect(resDiffPhone.length).toBe(1);
+      expect(resDiffPhone[0].bookingId).toBe(103);
+
+      await pglite.close();
+    });
+
+    test("23.2 Implicit Aggregation without GROUP BY in JOIN Query (COUNT/SUM)", async () => {
+      const dbPath = path.join(TEST_DIR, "test_level_23_aggregate");
+      const pglite = new PGLiteNative(dbPath);
+
+      await pglite.exec(`
+        CREATE TABLE schools (id INT PRIMARY KEY, name TEXT);
+        CREATE TABLE classes (id INT PRIMARY KEY, school_id INT, name TEXT, deleted_at TEXT);
+      `);
+
+      await pglite.exec(`
+        INSERT INTO schools VALUES (1, 'School A'), (2, 'School B');
+        INSERT INTO classes VALUES
+          (10, 1, 'Class 1A', NULL),
+          (11, 1, 'Class 1B', NULL),
+          (12, 2, 'Class 2A', NULL),
+          (13, 1, 'Class Deleted', '2026-09-01');
+      `);
+
+      // Query user asked: SELECT COUNT(c.id) AS count FROM classes c INNER JOIN schools s ...
+      const res = await pglite.query(`
+        SELECT COUNT(c.id) AS count
+        FROM classes AS c
+        INNER JOIN schools AS s ON s.id = c.school_id
+        WHERE c.deleted_at IS NULL;
+      `);
+
+      expect(res.length).toBe(1);
+      expect(res[0].count).toBe(3);
+
+      // When 0 rows match: must return exactly 1 row with count = 0
+      const resZero = await pglite.query(`
+        SELECT COUNT(c.id) AS count
+        FROM classes AS c
+        INNER JOIN schools AS s ON s.id = c.school_id
+        WHERE c.deleted_at = '9999-99-99';
+      `);
+
+      expect(resZero.length).toBe(1);
+      expect(resZero[0].count).toBe(0);
+
+      await pglite.close();
+    });
+
+    test("23.3 NOT IN Filtering in JOIN Query", async () => {
+      const dbPath = path.join(TEST_DIR, "test_level_23_notin");
+      const pglite = new PGLiteNative(dbPath);
+
+      await pglite.exec(`
+        CREATE TABLE categories (id INT PRIMARY KEY, name TEXT);
+        CREATE TABLE items (id INT PRIMARY KEY, cat_id INT, status TEXT);
+      `);
+
+      await pglite.exec(`
+        INSERT INTO categories VALUES (1, 'Electronics');
+        INSERT INTO items VALUES
+          (1, 1, 'active'),
+          (2, 1, 'pending'),
+          (3, 1, 'archived'),
+          (4, 1, 'deleted');
+      `);
+
+      const res = await pglite.query(`
+        SELECT i.id, i.status
+        FROM items i
+        INNER JOIN categories c ON c.id = i.cat_id
+        WHERE i.status NOT IN ('archived', 'deleted')
+        ORDER BY i.id ASC;
+      `);
+
+      expect(res.length).toBe(2);
+      expect(res[0].id).toBe(1);
+      expect(res[1].id).toBe(2);
+
+      await pglite.close();
+    });
+  });
+
+  // ==========================================
+  // LEVEL 24: Complex Production Query with LATERAL Join, Derived Tables, and Aggregate FILTER
+  // ==========================================
+  describe("LEVEL 24: Lateral Joins, Derived Tables, BTRIM & Aggregate FILTER", () => {
+    test("24.1 Full production query matching user specification on native Rust engine", async () => {
+      const dbPath = path.join(TEST_DIR, "test_level_24_production_query");
+      const pglite = new PGLiteNative(dbPath);
+
+      await pglite.exec(`
+        CREATE TABLE bookings (
+          id INT PRIMARY KEY,
+          booking_code TEXT,
+          check_in_date TEXT,
+          program_id INT,
+          check_out_date TEXT,
+          room_info TEXT,
+          room_id INT,
+          check_in_status TEXT,
+          phone_number TEXT,
+          user_id INT,
+          payment_status TEXT,
+          paid_amount NUMERIC,
+          payment_method TEXT,
+          deleted_at TEXT
+        );
+
+        CREATE TABLE retreat_programs (
+          id INT PRIMARY KEY,
+          name TEXT,
+          thumbnail_url TEXT
+        );
+
+        CREATE TABLE users (
+          id INT PRIMARY KEY,
+          full_name TEXT
+        );
+
+        CREATE TABLE rooms (
+          id INT PRIMARY KEY,
+          name TEXT,
+          room_type TEXT,
+          price_per_night NUMERIC,
+          images TEXT,
+          amenities TEXT,
+          description TEXT,
+          capacity INT,
+          area_sqm NUMERIC
+        );
+
+        CREATE TABLE intake_forms (
+          id INT PRIMARY KEY,
+          booking_id INT,
+          status TEXT
+        );
+
+        CREATE TABLE user_checklists (
+          id INT PRIMARY KEY,
+          booking_id INT,
+          is_completed BOOLEAN
+        );
+      `);
+
+      await pglite.exec(`
+        INSERT INTO retreat_programs VALUES (10, 'Retreat 1', 'thumb.jpg');
+        INSERT INTO users VALUES (20, 'Nguyen Thanh Son');
+        INSERT INTO rooms VALUES (30, 'Ocean Suite', 'deluxe', 250.0, 'img.jpg', 'wifi', 'Sea view', 2, 45.0);
+
+        INSERT INTO bookings VALUES (
+          1, 'WK-4993WV', '2026-09-10', 10, '2026-09-15', 'Deluxe Room', 30,
+          'pending', '0901234567', 20, 'paid', 500.0, 'credit_card', NULL
+        );
+
+        INSERT INTO bookings VALUES (
+          2, 'WK-EMPTY01', '2026-09-11', 10, '2026-09-16', 'Empty Room', 30,
+          'pending', '0909999999', 20, 'paid', 500.0, 'cash', NULL
+        );
+
+        INSERT INTO intake_forms VALUES (1, 1, 'draft');
+        INSERT INTO intake_forms VALUES (2, 1, 'completed');
+
+        INSERT INTO user_checklists VALUES (1, 1, true);
+        INSERT INTO user_checklists VALUES (2, 1, false);
+      `);
+
+      const query = `
+        SELECT
+          b.id,
+          b.booking_code,
+          b.check_in_date,
+          b.program_id,
+          b.check_out_date,
+          b.room_info,
+          b.room_id,
+          b.check_in_status,
+          b.phone_number,
+          b.user_id,
+          b.payment_status,
+          b.paid_amount,
+          b.payment_method,
+          p.name AS program_name,
+          p.thumbnail_url,
+          u.full_name AS user_name,
+          r.name AS room_name,
+          r.room_type,
+          r.price_per_night AS room_price,
+          r.images AS room_images,
+          r.amenities AS room_amenities,
+          r.description AS room_description,
+          r.capacity AS room_capacity,
+          r.area_sqm AS room_area,
+          i.status AS intake_status,
+          COALESCE(c.checklist_total, 0) AS checklist_total,
+          COALESCE(c.checklist_done, 0) AS checklist_done
+        FROM bookings AS b
+        LEFT JOIN retreat_programs AS p ON p.id = b.program_id
+        LEFT JOIN users AS u ON u.id = b.user_id
+        LEFT JOIN rooms AS r ON r.id = b.room_id
+        LEFT JOIN LATERAL (
+          SELECT status
+          FROM intake_forms
+          WHERE booking_id = b.id
+          ORDER BY id DESC
+          LIMIT 1
+        ) AS i ON true
+        LEFT JOIN (
+          SELECT
+            booking_id,
+            COUNT(id) AS checklist_total,
+            COUNT(id) FILTER (WHERE is_completed = $2) AS checklist_done
+          FROM user_checklists
+          GROUP BY booking_id
+        ) AS c ON c.booking_id = b.id
+        WHERE btrim(upper(b.booking_code)) = $3 AND b.deleted_at IS NULL;
+      `;
+
+      // Test 1: Match booking 1 with lateral intake form and checklist counts
+      const res1 = await pglite.query(query, ['dummy', true, 'WK-4993WV']);
+      expect(res1.length).toBe(1);
+      const r1 = res1[0];
+      expect(r1.id).toBe(1);
+      expect(r1.booking_code).toBe('WK-4993WV');
+      expect(r1.program_name).toBe('Retreat 1');
+      expect(r1.user_name).toBe('Nguyen Thanh Son');
+      expect(r1.room_name).toBe('Ocean Suite');
+      expect(r1.intake_status).toBe('completed');
+      expect(Number(r1.checklist_total)).toBe(2);
+      expect(Number(r1.checklist_done)).toBe(1);
+
+      // Test 2: Match booking 2 with null lateral and 0 checklists via COALESCE
+      const res2 = await pglite.query(query, ['dummy', true, 'WK-EMPTY01']);
+      expect(res2.length).toBe(1);
+      const r2 = res2[0];
+      expect(r2.id).toBe(2);
+      expect(r2.booking_code).toBe('WK-EMPTY01');
+      expect(r2.intake_status).toBeNull();
+      expect(Number(r2.checklist_total)).toBe(0);
+      expect(Number(r2.checklist_done)).toBe(0);
+
+      // Test 3: BTRIM case sensitivity / whitespace trimming
+      const res3 = await pglite.query(query, ['dummy', true, 'WK-4993WV']);
+      expect(res3.length).toBe(1);
+
+      await pglite.close();
+    });
+  });
+
+  // ==========================================
+  // LEVEL 25: Table Wildcards, Left Join with Compound ON, ILIKE Concatenation & Named Parameters
+  // ==========================================
+  describe("LEVEL 25: Table Wildcards, Left Join with Compound ON, ILIKE Concatenation & Named Params", () => {
+    test("25.1 Aftercare contents query with table wildcard (ac.*), compound ON, ILIKE || and comments", async () => {
+      const dbPath = path.join(TEST_DIR, "test_level_25_aftercare");
+      const pglite = new PGLiteNative(dbPath);
+
+      await pglite.exec(`
+        CREATE TABLE aftercare_contents (
+          id INT PRIMARY KEY,
+          title TEXT,
+          description TEXT,
+          body_text TEXT,
+          category TEXT,
+          status TEXT,
+          deleted_at TEXT,
+          created_at TEXT
+        );
+
+        CREATE TABLE user_aftercare_progress (
+          id INT PRIMARY KEY,
+          aftercare_id INT,
+          user_id INT,
+          is_favorite BOOLEAN,
+          is_completed BOOLEAN,
+          is_saved_offline BOOLEAN
+        );
+      `);
+
+      await pglite.exec(`
+        INSERT INTO aftercare_contents VALUES 
+          (1, 'Hướng dẫn chăm sóc 1', 'Mô tả chi tiết', 'Nội dung bài viết', 'Da liễu', 'published', NULL, '2026-09-01 10:00:00'),
+          (2, 'Bài viết nháp', 'Mô tả nháp', 'Nội dung', 'Da liễu', 'draft', NULL, '2026-09-02 10:00:00'),
+          (3, 'Hướng dẫn đã xóa', 'Mô tả', 'Nội dung', 'Da liễu', 'published', '2026-09-03', '2026-09-03 10:00:00');
+
+        INSERT INTO user_aftercare_progress VALUES
+          (101, 1, 99, true, false, true);
+      `);
+
+      const query = `
+        SELECT ac.*,
+               uap.is_favorite,
+               uap.is_completed,
+               uap.is_saved_offline
+        FROM aftercare_contents ac
+        LEFT JOIN user_aftercare_progress uap
+               ON uap.aftercare_id = ac.id
+              AND uap.user_id = :userId        -- (chỉ khi đã đăng nhập)
+        WHERE ac.status = 'published'
+          AND ac.deleted_at IS NULL
+          AND (ac.title       ILIKE '%' || :search || '%'      -- (chỉ khi có search)
+            OR ac.description ILIKE '%' || :search || '%'
+            OR ac.body_text   ILIKE '%' || :search || '%')
+          AND ac.category ILIKE '%' || :category || '%'         -- (chỉ khi category khác 'Tất cả')
+        ORDER BY ac.created_at DESC;
+      `;
+
+      // 1. With logged-in user 99: receives progress fields
+      const resUser = await pglite.query(query, { userId: 99, search: 'chăm sóc', category: 'Da liễu' });
+      expect(resUser.length).toBe(1);
+      const rowUser = resUser[0];
+      expect(rowUser.id).toBe(1);
+      expect(rowUser.title).toBe('Hướng dẫn chăm sóc 1');
+      expect(rowUser.category).toBe('Da liễu');
+      expect(rowUser.is_favorite).toBe(true);
+      expect(rowUser.is_completed).toBe(false);
+      expect(rowUser.is_saved_offline).toBe(true);
+
+      // 2. With another user 88: receives null progress fields
+      const resNoUser = await pglite.query(query, { userId: 88, search: 'chăm sóc', category: 'Da liễu' });
+      expect(resNoUser.length).toBe(1);
+      const rowNoUser = resNoUser[0];
+      expect(rowNoUser.id).toBe(1);
+      expect(rowNoUser.is_favorite).toBeNull();
+      expect(rowNoUser.is_completed).toBeNull();
+      expect(rowNoUser.is_saved_offline).toBeNull();
+
+      // 3. Search non-matching term: returns 0 rows
+      const resNoMatch = await pglite.query(query, { userId: 99, search: 'không tồn tại', category: 'Da liễu' });
+      expect(resNoMatch.length).toBe(0);
+
+      await pglite.close();
+    });
+  });
+
+  // ==========================================
+  // LEVEL 26: PGL2 WAL Persistence of Comments & Schema Alterations Across Reboots
+  // ==========================================
+  describe("LEVEL 26: PGL2 WAL Persistence of Comments & Schema Alterations Across Reboots", () => {
+    const PERSIST_DB = "test_pgl2_comments.db";
+
+    beforeAll(() => {
+      cleanFiles(PERSIST_DB);
+    });
+
+    afterAll(() => {
+      cleanFiles(PERSIST_DB);
+    });
+
+    test("26.1 Persist COMMENT ON TABLE, COMMENT ON COLUMN, and ALTER TABLE in PGL2 WAL and restore upon reopen", async () => {
+      cleanFiles(PERSIST_DB);
+      // 1. First boot: create table, add comments, alter table
+      const pglite1 = new PGLiteNative(PERSIST_DB, { native: true, fallback: false });
+      await pglite1.exec(`CREATE TABLE "services" (id SERIAL PRIMARY KEY, name TEXT NOT NULL, price NUMERIC(10, 2))`);
+      await pglite1.exec(`COMMENT ON TABLE "services" IS 'Bảng dịch vụ y tế'`);
+      await pglite1.exec(`COMMENT ON COLUMN "services"."name" IS 'Tên dịch vụ chi tiết'`);
+      await pglite1.exec(`ALTER TABLE "services" ADD COLUMN description TEXT DEFAULT 'Chưa có mô tả'`);
+      await pglite1.exec(`COMMENT ON COLUMN "services"."description" IS 'Mô tả dịch vụ'`);
+
+      await pglite1.exec(`INSERT INTO "services" (name, price) VALUES ('Khám da liễu', 250000)`);
+      await pglite1.flush();
+      await pglite1.close();
+
+      // 2. Second boot: re-open from PGL2 WAL and verify table comments, column comments, and altered column data
+      const pglite2 = new PGLiteNative(PERSIST_DB, { native: true, fallback: false });
+      
+      const catRows = await pglite2.query(`
+        SELECT
+          c.relname AS name,
+          obj_description(c.oid, 'pg_class') AS comment,
+          COALESCE(
+            json_agg(
+              json_build_object(
+                'name', a.attname,
+                'comment', col_description(c.oid, a.attnum)
+              ) ORDER BY a.attnum
+            ) FILTER (WHERE a.attnum > 0),
+            '[]'::json
+          ) AS columns
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        WHERE n.nspname = 'public' AND c.relname = 'services'
+        GROUP BY c.oid, c.relname;
+      `, ["public"]);
+
+      expect(catRows.length).toBe(1);
+      const svc = catRows[0];
+      expect(svc.name).toBe("services");
+      expect(svc.comment).toBe("Bảng dịch vụ y tế");
+
+      const nameCol = svc.columns.find((c: any) => c.name === "name");
+      expect(nameCol).toBeDefined();
+      expect(nameCol.comment).toBe("Tên dịch vụ chi tiết");
+
+      const descCol = svc.columns.find((c: any) => c.name === "description");
+      expect(descCol).toBeDefined();
+      expect(descCol.comment).toBe("Mô tả dịch vụ");
+
+      const dataRows = await pglite2.query(`SELECT * FROM "services"`);
+      expect(dataRows.length).toBe(1);
+      expect(dataRows[0].name).toBe("Khám da liễu");
+      expect(dataRows[0].description).toBe("Chưa có mô tả");
+
+      await pglite2.close();
+    });
+  });
 });
+
 
 

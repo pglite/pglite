@@ -17,7 +17,17 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn new(name: String, mut columns: Vec<ColumnDef>) -> Self {
+    pub fn new(name: String, columns: Vec<ColumnDef>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped_columns = Vec::with_capacity(columns.len());
+        for col in columns {
+            let lower = col.name.to_lowercase();
+            if seen.insert(lower) {
+                deduped_columns.push(col);
+            }
+        }
+        let mut columns = deduped_columns;
+
         let pk_col_idx = columns.iter().position(|c| c.is_primary_key)
             .or_else(|| columns.iter().position(|c| c.data_type == crate::types::DataType::Serial))
             .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("id")))
@@ -43,9 +53,31 @@ impl Table {
     }
 
     pub fn insert(&mut self, mut row: Vec<Value>) -> i64 {
-        // Ensure row has slots for all table columns
+        // Ensure row has slots for all table columns and populate default values
         while row.len() < self.columns.len() {
-            row.push(Value::Null);
+            let col_idx = row.len();
+            let def_val = if let Some(def_str) = &self.columns[col_idx].default_value {
+                let trimmed = def_str.trim();
+                if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+                    Value::text(&trimmed[1..trimmed.len() - 1])
+                } else if let Ok(n) = trimmed.parse::<i64>() {
+                    Value::Int(n)
+                } else if let Ok(f) = trimmed.parse::<f64>() {
+                    Value::Float(f)
+                } else if trimmed.eq_ignore_ascii_case("TRUE") {
+                    Value::Bool(true)
+                } else if trimmed.eq_ignore_ascii_case("FALSE") {
+                    Value::Bool(false)
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+            row.push(def_val);
+        }
+        if row.len() > self.columns.len() {
+            row.truncate(self.columns.len());
         }
 
         // Handle SERIAL / Primary Key auto-increment for all ID types
@@ -154,6 +186,24 @@ impl Table {
         self.columns
             .iter()
             .position(|c| c.name.to_lowercase() == clean)
+    }
+
+    pub fn drop_column(&mut self, name: &str) -> bool {
+        let clean = name.trim_matches('"').to_lowercase();
+        if let Some(pos) = self.columns.iter().position(|c| c.name.to_lowercase() == clean) {
+            self.columns.remove(pos);
+            for row in &mut self.rows {
+                if pos < row.len() {
+                    row.remove(pos);
+                }
+            }
+            self.pk_col_idx = self.columns.iter().position(|c| c.is_primary_key)
+                .or_else(|| self.columns.iter().position(|c| c.data_type == crate::types::DataType::Serial))
+                .or_else(|| self.columns.iter().position(|c| c.name.eq_ignore_ascii_case("id")))
+                .or_else(|| self.columns.iter().position(|c| c.name.eq_ignore_ascii_case("_id")));
+            return true;
+        }
+        false
     }
 
     pub fn find_first_by_col(&self, col_idx: usize, target: &Value) -> Option<&Vec<Value>> {

@@ -19,12 +19,8 @@ function run(cmd: string, cwd = ROOT_DIR, env = {}) {
 }
 
 try {
-  // 1. Build TypeScript and generate JS bundle + types
-  console.log("\n📦 [1/4] Building TypeScript bundle & type declarations...");
-  run("bun build src/index.ts src/adapters/node.ts src/adapters/browser.ts --outdir dist --target node && tsc");
-
-  // 2. Build macOS Native Addon (darwin-arm64)
-  console.log("\n🍎 [2/4] Building macOS Native Rust Addon (arm64)...");
+  // 1. Build macOS Native Addon (darwin-arm64)
+  console.log("\n🍎 [1/4] Building macOS Native Rust Addon (arm64)...");
   run(
     "cargo build --release --manifest-path crates/pglite-rs/Cargo.toml --lib",
     ROOT_DIR,
@@ -38,11 +34,12 @@ try {
     copyFileSync(macDylib, join(DIST_DIR, "pglite.darwin-arm64.node"));
     copyFileSync(macDylib, join(DIST_DIR, "pglite.node"));
     copyFileSync(macDylib, join(ROOT_DIR, "pglite.node"));
+    copyFileSync(macDylib, join(ROOT_DIR, "pglite.darwin-arm64.node"));
     console.log("  ✓ Generated pglite.darwin-arm64.node & pglite.node");
   }
 
-  // 3. Cross-compile Linux x86_64 Native Addon
-  console.log("\n🐧 [3/4] Cross-compiling Linux Native Rust Addon (x86_64-unknown-linux-gnu)...");
+  // 2. Cross-compile Linux x86_64 Native Addon
+  console.log("\n🐧 [2/4] Cross-compiling Linux Native Rust Addon (x86_64-unknown-linux-gnu)...");
   if (existsSync(ZIG_SCRIPT)) {
     chmodSync(ZIG_SCRIPT, 0o755);
   }
@@ -58,6 +55,10 @@ try {
     copyFileSync(linuxSo, join(DIST_DIR, "pglite.linux-x64.node"));
     console.log("  ✓ Generated pglite.linux-x64.node");
   }
+
+  // 3. Build TypeScript and generate JS bundle + types (after native binaries are generated)
+  console.log("\n📦 [3/4] Building TypeScript bundle & type declarations...");
+  run("bun build src/index.ts src/adapters/node.ts src/adapters/browser.ts --outdir dist --target node && tsc");
 
   // 4. Sync Native Addons to NATA backend if present
   console.log("\n🔗 [4/4] Synchronizing Native Addons to NATA backend...");
