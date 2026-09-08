@@ -815,7 +815,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
             let token: String = chars[start..i].iter().collect();
             let clean_token = token.replace('"', "").to_lowercase();
-            if clean_token.contains('.') && row.values.contains_key(&clean_token) {
+            if clean_token.contains('.') && row.contains_key(&clean_token) {
                 let val = row.get_val(&clean_token);
                 match val {
                     Value::Null => out.push_str("NULL"),
@@ -896,21 +896,53 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
-        let (base_table_columns, mut current_rows) = {
-            let base_table = self.storage.get_table(&base_tbl_name).ok_or_else(|| format!("Table {} not found", base_tbl_name))?;
-            let base_keys = TablePrecomputedKeys::new(base_table, base_alias.as_deref());
-            let mut rows: Vec<CombinedRow> = Vec::with_capacity(base_table.active_count);
-            for (r_idx, r) in base_table.rows.iter().enumerate() {
-                if !base_table.is_deleted[r_idx] {
-                    let mut comb = CombinedRow::new();
-                    comb.add_table_fast(&base_keys, r);
-                    rows.push(comb);
-                }
-            }
-            (base_table.columns.clone(), rows)
-        };
+        let mut all_tables_meta: Vec<(&crate::storage::table::Table, Option<&str>)> = Vec::new();
+        let base_table = self.storage.get_table(&base_tbl_name).ok_or_else(|| format!("Table {} not found", base_tbl_name))?;
+        all_tables_meta.push((base_table, base_alias.as_deref()));
 
         for j in &joins {
+            if let Some(jt) = self.storage.get_table(&j.table_name) {
+                all_tables_meta.push((jt, j.alias.as_deref()));
+            }
+        }
+
+        let joined_schema = std::sync::Arc::new(JoinedSchema::new(&all_tables_meta));
+        let pushdown = plan_predicate_pushdown(resolved_where.as_deref(), &all_tables_meta, &joins);
+        let base_table_columns = base_table.columns.clone();
+
+        let can_early_limit = group_opt.is_none() 
+            && having_opt.is_none() 
+            && order_specs.is_empty() 
+            && !select_clause.to_uppercase().starts_with("DISTINCT ")
+            && !select_clause.to_uppercase().contains("COUNT(")
+            && !select_clause.to_uppercase().contains("SUM(")
+            && !select_clause.to_uppercase().contains("AVG(")
+            && !select_clause.to_uppercase().contains("MIN(")
+            && !select_clause.to_uppercase().contains("MAX(")
+            && !select_clause.to_uppercase().contains("OVER(");
+
+        let mut current_rows: Vec<CombinedRow> = Vec::with_capacity(base_table.active_count);
+        for (r_idx, r) in base_table.rows.iter().enumerate() {
+            if !base_table.is_deleted[r_idx] {
+                let comb = CombinedRow::from_base_row(joined_schema.clone(), r);
+                let mut pass = true;
+                for pred in &pushdown.base_predicates {
+                    if !eval_condition_on_row(&comb, pred, params) {
+                        pass = false;
+                        break;
+                    }
+                }
+                if pass {
+                    current_rows.push(comb);
+                }
+            }
+        }
+
+        for (j_idx, j) in joins.iter().enumerate() {
+            if current_rows.is_empty() {
+                break;
+            }
+
             if j.is_lateral {
                 let sub_sql = j.subquery.as_ref().unwrap();
                 let alias = j.alias.as_deref().unwrap_or(&j.table_name);
@@ -927,9 +959,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             for field in &sub_res.fields {
                                 let col_name = field.name.to_lowercase();
                                 let val = obj.get(&field.name).map(Self::json_to_engine_value).unwrap_or(Value::Null);
-                                candidate.values.insert(format!("{}.{}", alias.to_lowercase(), col_name), val.clone());
-                                if !candidate.values.contains_key(&col_name) {
-                                    candidate.values.insert(col_name, val);
+                                candidate.insert_extra(format!("{}.{}", alias.to_lowercase(), col_name), val.clone());
+                                if !candidate.contains_key(&col_name) {
+                                    candidate.insert_extra(col_name, val);
                                 }
                             }
                         }
@@ -947,9 +979,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         let mut null_comb = base_comb.clone();
                         for field in &sub_res.fields {
                             let col_name = field.name.to_lowercase();
-                            null_comb.values.insert(format!("{}.{}", alias.to_lowercase(), col_name), Value::Null);
-                            if !null_comb.values.contains_key(&col_name) {
-                                null_comb.values.insert(col_name, Value::Null);
+                            null_comb.insert_extra(format!("{}.{}", alias.to_lowercase(), col_name), Value::Null);
+                            if !null_comb.contains_key(&col_name) {
+                                null_comb.insert_extra(col_name, Value::Null);
                             }
                         }
                         next_rows.push(null_comb);
@@ -961,7 +993,6 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
 
             let j_table = self.storage.get_table(&j.table_name).ok_or_else(|| format!("Table {} not found", j.table_name))?;
-            let precomputed_keys = TablePrecomputedKeys::new(j_table, j.alias.as_deref());
 
             let maybe_equi = if let Some(ref cond) = j.on_condition {
                 parse_equi_join_candidate(cond, &j.table_name, j.alias.as_deref(), j_table)
@@ -971,47 +1002,130 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             let mut next_rows = Vec::with_capacity(current_rows.len());
 
+            let filter_preds = &pushdown.joined_table_predicates[j_idx];
+            let table_offset = joined_schema.table_offsets.get(j_idx + 1).cloned().unwrap_or(0);
+
             if let Some(equi) = maybe_equi {
-                // Hash Join: Build hash table on j_table's right_col_idx
-                let mut right_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
-                for (jr_idx, jr) in j_table.rows.iter().enumerate() {
-                    if !j_table.is_deleted[jr_idx] {
-                        if let Some(val) = jr.get(equi.right_col_idx) {
-                            right_hash_map.entry(value_to_join_key(val)).or_default().push(jr_idx);
-                        }
+                if current_rows.len() * 2 < j_table.rows.len() {
+                    // Adaptive Hash Join: Build hash table on current_rows (much smaller!), Probe j_table
+                    let mut left_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
+                    for (base_idx, base_comb) in current_rows.iter().enumerate() {
+                        let left_val = eval_operand_on_row(base_comb, &equi.left_expr, params);
+                        left_hash_map.entry(value_to_join_key(&left_val)).or_default().push(base_idx);
                     }
-                }
 
-                // Probe phase: match against current_rows
-                for base_comb in &current_rows {
-                    let mut match_count = 0;
-                    let left_val = eval_operand_on_row(base_comb, &equi.left_expr, params);
+                    let mut matched_left_counts = if j.kind == JoinKind::Left {
+                        vec![0usize; current_rows.len()]
+                    } else {
+                        Vec::new()
+                    };
 
-                    let key = value_to_join_key(&left_val);
-                    if let Some(matched_indices) = right_hash_map.get(&key) {
-                        for &jr_idx in matched_indices {
-                            let jr = &j_table.rows[jr_idx];
-
-                            if let Some(ref res_cond) = equi.residual_cond {
-                                let mut candidate = base_comb.clone();
-                                candidate.add_table_fast(&precomputed_keys, jr);
-                                if eval_condition_on_row(&candidate, res_cond, params) {
-                                    next_rows.push(candidate);
-                                    match_count += 1;
+                    for (jr_idx, jr) in j_table.rows.iter().enumerate() {
+                        if !j_table.is_deleted[jr_idx] {
+                            if !filter_preds.is_empty() {
+                                let mut test_comb = CombinedRow::new_with_schema(joined_schema.clone());
+                                test_comb.values.resize(table_offset, Value::Null);
+                                test_comb.values.extend_from_slice(jr);
+                                let mut pass = true;
+                                for p in filter_preds {
+                                    if !eval_condition_on_row(&test_comb, p, params) {
+                                        pass = false;
+                                        break;
+                                    }
                                 }
-                            } else {
-                                let mut matched_comb = base_comb.clone();
-                                matched_comb.add_table_fast(&precomputed_keys, jr);
-                                next_rows.push(matched_comb);
-                                match_count += 1;
+                                if !pass {
+                                    continue;
+                                }
+                            }
+
+                            if let Some(val) = jr.get(equi.right_col_idx) {
+                                let key = value_to_join_key(val);
+                                if let Some(base_indices) = left_hash_map.get(&key) {
+                                    for &base_idx in base_indices {
+                                        let base_comb = &current_rows[base_idx];
+                                        if let Some(ref res_cond) = equi.residual_cond {
+                                            let candidate = base_comb.with_joined_table(jr);
+                                            if eval_condition_on_row(&candidate, res_cond, params) {
+                                                next_rows.push(candidate);
+                                                if j.kind == JoinKind::Left {
+                                                    matched_left_counts[base_idx] += 1;
+                                                }
+                                            }
+                                        } else {
+                                            let matched_comb = base_comb.with_joined_table(jr);
+                                            next_rows.push(matched_comb);
+                                            if j.kind == JoinKind::Left {
+                                                matched_left_counts[base_idx] += 1;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
 
-                    if match_count == 0 && j.kind == JoinKind::Left {
-                        let mut null_comb = base_comb.clone();
-                        null_comb.add_null_table_fast(&precomputed_keys);
-                        next_rows.push(null_comb);
+                    if j.kind == JoinKind::Left {
+                        for (base_idx, &count) in matched_left_counts.iter().enumerate() {
+                            if count == 0 {
+                                let null_comb = current_rows[base_idx].with_null_table(j_table.columns.len());
+                                next_rows.push(null_comb);
+                            }
+                        }
+                    }
+                } else {
+                    // Standard Hash Join: Build hash table on j_table's right_col_idx
+                    let mut right_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
+                    for (jr_idx, jr) in j_table.rows.iter().enumerate() {
+                        if !j_table.is_deleted[jr_idx] {
+                            if !filter_preds.is_empty() {
+                                let mut test_comb = CombinedRow::new_with_schema(joined_schema.clone());
+                                test_comb.values.resize(table_offset, Value::Null);
+                                test_comb.values.extend_from_slice(jr);
+                                let mut pass = true;
+                                for p in filter_preds {
+                                    if !eval_condition_on_row(&test_comb, p, params) {
+                                        pass = false;
+                                        break;
+                                    }
+                                }
+                                if !pass {
+                                    continue;
+                                }
+                            }
+                            if let Some(val) = jr.get(equi.right_col_idx) {
+                                right_hash_map.entry(value_to_join_key(val)).or_default().push(jr_idx);
+                            }
+                        }
+                    }
+
+                    // Probe phase: match against current_rows
+                    for base_comb in &current_rows {
+                        let mut match_count = 0;
+                        let left_val = eval_operand_on_row(base_comb, &equi.left_expr, params);
+
+                        let key = value_to_join_key(&left_val);
+                        if let Some(matched_indices) = right_hash_map.get(&key) {
+                            for &jr_idx in matched_indices {
+                                let jr = &j_table.rows[jr_idx];
+
+                                if let Some(ref res_cond) = equi.residual_cond {
+                                    let candidate = base_comb.with_joined_table(jr);
+                                    if eval_condition_on_row(&candidate, res_cond, params) {
+                                        next_rows.push(candidate);
+                                        match_count += 1;
+                                    }
+                                } else {
+                                    let matched_comb = base_comb.with_joined_table(jr);
+                                    next_rows.push(matched_comb);
+                                    match_count += 1;
+                                }
+                            }
+                        }
+
+                        if match_count == 0 && j.kind == JoinKind::Left {
+                            let null_comb = base_comb.with_null_table(j_table.columns.len());
+                            next_rows.push(null_comb);
+                        }
                     }
                 }
             } else {
@@ -1020,8 +1134,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     let mut match_count = 0;
                     for (jr_idx, jr) in j_table.rows.iter().enumerate() {
                         if !j_table.is_deleted[jr_idx] {
-                            let mut candidate = base_comb.clone();
-                            candidate.add_table_fast(&precomputed_keys, jr);
+                            if !filter_preds.is_empty() {
+                                let mut test_comb = CombinedRow::new_with_schema(joined_schema.clone());
+                                test_comb.values.resize(table_offset, Value::Null);
+                                test_comb.values.extend_from_slice(jr);
+                                let mut pass = true;
+                                for p in filter_preds {
+                                    if !eval_condition_on_row(&test_comb, p, params) {
+                                        pass = false;
+                                        break;
+                                    }
+                                }
+                                if !pass {
+                                    continue;
+                                }
+                            }
+                            let candidate = base_comb.with_joined_table(jr);
                             let matches = match &j.on_condition {
                                 Some(cond) => eval_condition_on_row(&candidate, cond, params),
                                 None => true,
@@ -1033,9 +1161,27 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                     }
                     if match_count == 0 && j.kind == JoinKind::Left {
-                        let mut null_comb = base_comb.clone();
-                        null_comb.add_null_table_fast(&precomputed_keys);
+                        let null_comb = base_comb.with_null_table(j_table.columns.len());
                         next_rows.push(null_comb);
+                    }
+                }
+            }
+
+            // Intermediate predicate filtering right after this join step
+            if let Some(preds) = pushdown.intermediate_predicates.get(j_idx + 1) {
+                for pred in preds {
+                    next_rows.retain(|r| eval_condition_on_row(r, pred, params));
+                }
+            }
+
+            // Early LIMIT optimization
+            if can_early_limit && j_idx + 1 == joins.len() {
+                if let Some(lim) = limit_opt {
+                    let target = lim + offset_opt.unwrap_or(0);
+                    if next_rows.len() >= target {
+                        next_rows.truncate(target);
+                        current_rows = next_rows;
+                        break;
                     }
                 }
             }
@@ -1043,8 +1189,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             current_rows = next_rows;
         }
 
-        if let Some(ref w) = resolved_where {
-            current_rows.retain(|r| eval_condition_on_row(r, w, params));
+        for rem in &pushdown.remaining_where {
+            current_rows.retain(|r| eval_condition_on_row(r, rem, params));
         }
 
         let mut final_json_rows: Vec<serde_json::Value> = Vec::new();
@@ -3768,88 +3914,302 @@ struct ParsedJoin {
 }
 
 #[derive(Clone, Debug)]
-struct TablePrecomputedKeys {
-    col_keys: Vec<(String, Option<String>, String)>,
+struct JoinedSchema {
+    col_map: std::collections::HashMap<String, usize>,
+    table_offsets: Vec<usize>,
+    total_cols: usize,
 }
 
-impl TablePrecomputedKeys {
-    fn new(table: &crate::storage::table::Table, alias: Option<&str>) -> Self {
-        let tbl_name_lower = table.name.to_lowercase();
-        let alias_lower = alias.map(|a| a.to_lowercase());
-        let mut col_keys = Vec::with_capacity(table.columns.len());
-        for col in &table.columns {
-            let col_name_lower = col.name.to_lowercase();
-            let full_tbl = format!("{}.{}", tbl_name_lower, col_name_lower);
-            let alias_tbl = alias_lower.as_ref().map(|a| format!("{}.{}", a, col_name_lower));
-            col_keys.push((full_tbl, alias_tbl, col_name_lower));
+impl JoinedSchema {
+    fn new(tables: &[(&crate::storage::table::Table, Option<&str>)]) -> Self {
+        let mut col_map = std::collections::HashMap::new();
+        let mut table_offsets = Vec::with_capacity(tables.len());
+        let mut offset = 0;
+
+        for (table, alias) in tables {
+            table_offsets.push(offset);
+            let tbl_name_lower = table.name.to_lowercase();
+            let alias_lower = alias.map(|a| a.to_lowercase());
+
+            for (col_idx, col) in table.columns.iter().enumerate() {
+                let slot = offset + col_idx;
+                let col_name_lower = col.name.to_lowercase();
+
+                let full_tbl = format!("{}.{}", tbl_name_lower, col_name_lower);
+                col_map.insert(full_tbl, slot);
+
+                if let Some(ref a_key) = alias_lower {
+                    let alias_tbl = format!("{}.{}", a_key, col_name_lower);
+                    col_map.insert(alias_tbl, slot);
+                }
+
+                col_map.entry(col_name_lower).or_insert(slot);
+            }
+            offset += table.columns.len();
         }
-        Self { col_keys }
+
+        Self {
+            col_map,
+            table_offsets,
+            total_cols: offset,
+        }
+    }
+
+    #[inline(always)]
+    fn get_slot(&self, key: &str) -> Option<usize> {
+        let clean = key.trim().replace('"', "");
+        let lower = clean.to_lowercase();
+        if let Some(&idx) = self.col_map.get(&lower) {
+            return Some(idx);
+        }
+        if let Some(dot_idx) = lower.rfind('.') {
+            let col_only = &lower[dot_idx + 1..];
+            if let Some(&idx) = self.col_map.get(col_only) {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 
 #[derive(Clone, Debug)]
 struct CombinedRow {
-    values: std::collections::HashMap<String, Value>,
+    values: Vec<Value>,
+    schema: std::sync::Arc<JoinedSchema>,
+    extra: Option<std::collections::HashMap<String, Value>>,
 }
 
 impl CombinedRow {
-    fn new() -> Self {
+    #[inline(always)]
+    fn new_with_schema(schema: std::sync::Arc<JoinedSchema>) -> Self {
         Self {
-            values: std::collections::HashMap::new(),
+            values: Vec::with_capacity(schema.total_cols),
+            schema,
+            extra: None,
         }
     }
 
-    fn add_table_fast(&mut self, keys: &TablePrecomputedKeys, row: &[Value]) {
-        for (i, (full_tbl, alias_tbl, col_only)) in keys.col_keys.iter().enumerate() {
-            let val = row.get(i).cloned().unwrap_or(Value::Null);
-            self.values.insert(full_tbl.clone(), val.clone());
-            if let Some(ref a_key) = alias_tbl {
-                self.values.insert(a_key.clone(), val.clone());
-            }
-            if !self.values.contains_key(col_only) {
-                self.values.insert(col_only.clone(), val);
-            }
+    #[inline(always)]
+    fn from_base_row(schema: std::sync::Arc<JoinedSchema>, base_row: &[Value]) -> Self {
+        let mut values = Vec::with_capacity(schema.total_cols);
+        values.extend_from_slice(base_row);
+        Self {
+            values,
+            schema,
+            extra: None,
         }
     }
 
-    fn add_null_table_fast(&mut self, keys: &TablePrecomputedKeys) {
-        for (full_tbl, alias_tbl, col_only) in &keys.col_keys {
-            self.values.insert(full_tbl.clone(), Value::Null);
-            if let Some(ref a_key) = alias_tbl {
-                self.values.insert(a_key.clone(), Value::Null);
-            }
-            if !self.values.contains_key(col_only) {
-                self.values.insert(col_only.clone(), Value::Null);
-            }
+    #[inline(always)]
+    fn with_joined_table(&self, joined_row: &[Value]) -> Self {
+        let mut values = Vec::with_capacity(self.schema.total_cols);
+        values.extend_from_slice(&self.values);
+        values.extend_from_slice(joined_row);
+        Self {
+            values,
+            schema: self.schema.clone(),
+            extra: self.extra.clone(),
         }
     }
 
-    #[allow(dead_code)]
-    fn add_table(&mut self, table: &crate::storage::table::Table, row: &[Value], alias: Option<&str>) {
-        let keys = TablePrecomputedKeys::new(table, alias);
-        self.add_table_fast(&keys, row);
+    #[inline(always)]
+    fn with_null_table(&self, num_cols: usize) -> Self {
+        let mut values = Vec::with_capacity(self.schema.total_cols);
+        values.extend_from_slice(&self.values);
+        values.resize(values.len() + num_cols, Value::Null);
+        Self {
+            values,
+            schema: self.schema.clone(),
+            extra: self.extra.clone(),
+        }
     }
 
-    #[allow(dead_code)]
-    fn add_null_table(&mut self, table: &crate::storage::table::Table, alias: Option<&str>) {
-        let keys = TablePrecomputedKeys::new(table, alias);
-        self.add_null_table_fast(&keys);
-    }
-
+    #[inline(always)]
     fn get_val(&self, key: &str) -> Value {
-        let clean = key.trim().replace('"', "");
-        let lower = clean.to_lowercase();
-        if let Some(v) = self.values.get(&lower) {
-            return v.clone();
-        }
-        if let Some(dot_idx) = lower.rfind('.') {
-            let col_only = &lower[dot_idx + 1..];
-            if let Some(v) = self.values.get(col_only) {
+        if let Some(ref extra) = self.extra {
+            let clean = key.trim().replace('"', "");
+            let lower = clean.to_lowercase();
+            if let Some(v) = extra.get(&lower) {
                 return v.clone();
             }
+            if let Some(dot_idx) = lower.rfind('.') {
+                let col_only = &lower[dot_idx + 1..];
+                if let Some(v) = extra.get(col_only) {
+                    return v.clone();
+                }
+            }
+        }
+        if let Some(slot) = self.schema.get_slot(key) {
+            return self.values.get(slot).cloned().unwrap_or(Value::Null);
         }
         Value::Null
     }
+
+    #[inline(always)]
+    fn insert_extra(&mut self, key: String, val: Value) {
+        if self.extra.is_none() {
+            self.extra = Some(std::collections::HashMap::new());
+        }
+        if let Some(ref mut map) = self.extra {
+            map.insert(key, val);
+        }
+    }
+
+    #[inline(always)]
+    fn contains_key(&self, key: &str) -> bool {
+        if let Some(ref extra) = self.extra {
+            let clean = key.trim().replace('"', "");
+            let lower = clean.to_lowercase();
+            if extra.contains_key(&lower) {
+                return true;
+            }
+        }
+        self.schema.get_slot(key).is_some()
+    }
+}
+
+fn extract_identifiers_from_condition(cond: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let bytes = cond.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        let b = bytes[i];
+        if b == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != b'\'' {
+                i += 1;
+            }
+            if i < n { i += 1; }
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' || b == b'"' {
+            let start = i;
+            while i < n {
+                let cb = bytes[i];
+                if cb.is_ascii_alphanumeric() || cb == b'_' || cb == b'.' || cb == b'"' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let s = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+            let clean = s.trim_matches('"').to_string();
+            let upper = clean.to_uppercase();
+            if !matches!(upper.as_str(), 
+                "AND" | "OR" | "NOT" | "IS" | "NULL" | "TRUE" | "FALSE" | "LIKE" | "ILIKE" | 
+                "IN" | "BETWEEN" | "EXISTS" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" | 
+                "CAST" | "AS" | "LOWER" | "UPPER" | "LENGTH" | "TRIM" | "SUBSTRING" | 
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "SELECT" | "FROM" | "WHERE"
+            ) {
+                tokens.push(clean);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    tokens
+}
+
+#[derive(Clone, Debug)]
+struct PushdownPlan {
+    base_predicates: Vec<String>,
+    joined_table_predicates: Vec<Vec<String>>,
+    intermediate_predicates: Vec<Vec<String>>,
+    remaining_where: Vec<String>,
+}
+
+fn plan_predicate_pushdown(
+    where_str: Option<&str>,
+    all_tables: &[(&crate::storage::table::Table, Option<&str>)],
+    joins: &[ParsedJoin],
+) -> PushdownPlan {
+    let mut plan = PushdownPlan {
+        base_predicates: Vec::new(),
+        joined_table_predicates: vec![Vec::new(); joins.len()],
+        intermediate_predicates: vec![Vec::new(); joins.len() + 1],
+        remaining_where: Vec::new(),
+    };
+
+    let Some(w) = where_str else {
+        return plan;
+    };
+
+    let clauses = split_top_level_and(w);
+    for clause in clauses {
+        let c_str = clause.trim().to_string();
+        if c_str.is_empty() {
+            continue;
+        }
+
+        let tokens = extract_identifiers_from_condition(&c_str);
+        if tokens.is_empty() {
+            plan.remaining_where.push(c_str);
+            continue;
+        }
+
+        let mut referenced_tables = Vec::new();
+        let mut unknown_token = false;
+
+        for tok in &tokens {
+            let clean = tok.to_lowercase();
+            if let Some(dot_idx) = clean.find('.') {
+                let prefix = &clean[..dot_idx];
+                let mut matched = false;
+                for (t_idx, (tbl, alias)) in all_tables.iter().enumerate() {
+                    if tbl.name.eq_ignore_ascii_case(prefix)
+                        || alias.map(|a| a.trim_matches('"').eq_ignore_ascii_case(prefix)).unwrap_or(false)
+                    {
+                        if !referenced_tables.contains(&t_idx) {
+                            referenced_tables.push(t_idx);
+                        }
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    unknown_token = true;
+                }
+            } else {
+                let mut matched_count = 0;
+                for (t_idx, (tbl, _)) in all_tables.iter().enumerate() {
+                    if tbl.columns.iter().any(|col| col.name.eq_ignore_ascii_case(&clean)) {
+                        matched_count += 1;
+                        if !referenced_tables.contains(&t_idx) {
+                            referenced_tables.push(t_idx);
+                        }
+                    }
+                }
+                if matched_count == 0 && !clean.starts_with('$') && clean.parse::<f64>().is_err() {
+                    unknown_token = true;
+                }
+            }
+        }
+
+        if unknown_token || referenced_tables.is_empty() {
+            plan.remaining_where.push(c_str);
+            continue;
+        }
+
+        if referenced_tables.len() == 1 {
+            let t_idx = referenced_tables[0];
+            if t_idx == 0 {
+                plan.base_predicates.push(c_str);
+            } else {
+                let j_idx = t_idx - 1;
+                if joins[j_idx].kind == JoinKind::Inner {
+                    plan.joined_table_predicates[j_idx].push(c_str.clone());
+                    plan.intermediate_predicates[t_idx].push(c_str);
+                } else {
+                    plan.intermediate_predicates[t_idx].push(c_str);
+                }
+            }
+        } else {
+            let max_table_idx = *referenced_tables.iter().max().unwrap();
+            plan.intermediate_predicates[max_table_idx].push(c_str);
+        }
+    }
+
+    plan
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
