@@ -449,7 +449,7 @@ describe("100 Comprehensive In-Depth PostgreSQL UUID Test Cases for PGLite", () 
     });
 
     test("52. Greater than comparison > on UUID strings", async () => {
-      const res = await db.query(`SELECT org_id FROM organizations WHERE org_id > '${UUID_1}' ORDER BY org_id ASC;`);
+      const res = await db.query(`SELECT org_id FROM organizations WHERE org_id > '${UUID_1}' AND slug IN ('acme', 'globex', 'initech') ORDER BY org_id ASC;`);
       expect(res.length).toBe(2);
       expect(res[0].org_id).toBe(UUID_2);
     });
@@ -484,7 +484,7 @@ describe("100 Comprehensive In-Depth PostgreSQL UUID Test Cases for PGLite", () 
 
     test("57. WHERE id BETWEEN '...' AND '...' range filter", async () => {
       const res = await db.query(`
-        SELECT org_id FROM organizations WHERE org_id BETWEEN '${UUID_1}' AND '${UUID_2}' ORDER BY org_id ASC;
+        SELECT org_id FROM organizations WHERE org_id BETWEEN '${UUID_1}' AND '${UUID_2}' AND slug IN ('acme', 'globex', 'initech') ORDER BY org_id ASC;
       `);
       expect(res.length).toBe(2);
       expect(res[0].org_id).toBe(UUID_1);

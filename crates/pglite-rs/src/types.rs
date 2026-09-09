@@ -93,7 +93,8 @@ impl Value {
         match self {
             Value::Int(i) => Some(*i),
             Value::Float(f) => Some(*f as i64),
-            Value::Text(s) => s.parse::<i64>().ok(),
+            Value::Bool(b) => Some(if *b { 1 } else { 0 }),
+            Value::Text(s) => s.trim().parse::<i64>().ok(),
             _ => None,
         }
     }
@@ -102,9 +103,10 @@ impl Value {
         match self {
             Value::Bool(b) => Some(*b),
             Value::Int(i) => Some(*i != 0),
-            Value::Text(s) => match s.to_lowercase().as_str() {
-                "true" | "t" | "1" => Some(true),
-                "false" | "f" | "0" => Some(false),
+            Value::Float(f) => Some(*f != 0.0),
+            Value::Text(s) => match s.trim().to_lowercase().as_str() {
+                "true" | "t" | "1" | "yes" | "y" | "on" => Some(true),
+                "false" | "f" | "0" | "no" | "n" | "off" => Some(false),
                 _ => None,
             },
             _ => None,
@@ -115,7 +117,8 @@ impl Value {
         match self {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
-            Value::Text(s) => s.parse::<f64>().ok(),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Value::Text(s) => s.trim().parse::<f64>().ok(),
             _ => None,
         }
     }
@@ -171,6 +174,16 @@ impl Value {
                 } else {
                     false
                 }
+            }
+            (Value::Bool(a), Value::Text(b)) | (Value::Text(b), Value::Bool(a)) => {
+                if let Some(b_val) = Value::Text(b.clone()).as_bool() {
+                    *a == b_val
+                } else {
+                    false
+                }
+            }
+            (Value::Bool(a), Value::Int(b)) | (Value::Int(b), Value::Bool(a)) => {
+                (*a && *b != 0) || (!*a && *b == 0)
             }
             _ => false,
         }
@@ -338,4 +351,9 @@ fn extract_bytes_from_str(s: &str) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+#[inline]
+pub fn generate_uuid_v4() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
