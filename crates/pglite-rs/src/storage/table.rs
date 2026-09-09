@@ -58,7 +58,10 @@ impl Table {
             let col_idx = row.len();
             let def_val = if let Some(def_str) = &self.columns[col_idx].default_value {
                 let trimmed = def_str.trim();
-                if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+                let up = trimmed.to_uppercase();
+                if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
+                    Value::text(uuid::Uuid::new_v4().to_string())
+                } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
                     Value::text(&trimmed[1..trimmed.len() - 1])
                 } else if let Ok(n) = trimmed.parse::<i64>() {
                     Value::Int(n)
@@ -69,8 +72,10 @@ impl Table {
                 } else if trimmed.eq_ignore_ascii_case("FALSE") {
                     Value::Bool(false)
                 } else {
-                    Value::Null
+                    Value::text(trimmed)
                 }
+            } else if self.columns[col_idx].data_type == crate::types::DataType::Uuid {
+                Value::Null
             } else {
                 Value::Null
             };
@@ -80,9 +85,12 @@ impl Table {
             row.truncate(self.columns.len());
         }
 
-        // Handle SERIAL / Primary Key auto-increment for all ID types
+        // Handle SERIAL / Primary Key auto-increment for integer/serial ID types or UUID
         let mut assigned_pk = 0;
         if let Some(pk_idx) = self.pk_col_idx {
+            let is_uuid_col = self.columns[pk_idx].data_type == crate::types::DataType::Uuid
+                || self.columns[pk_idx].default_value.as_ref().map(|d| d.to_uppercase().contains("UUID")).unwrap_or(false);
+
             let is_missing_or_null = match row.get(pk_idx) {
                 None | Some(Value::Null) => true,
                 Some(Value::Text(s)) if s.trim().is_empty() => true,
@@ -90,9 +98,13 @@ impl Table {
             };
 
             if is_missing_or_null {
-                assigned_pk = self.auto_increment;
-                self.auto_increment += 1;
-                row[pk_idx] = Value::Int(assigned_pk);
+                if is_uuid_col {
+                    row[pk_idx] = Value::text(uuid::Uuid::new_v4().to_string());
+                } else {
+                    assigned_pk = self.auto_increment;
+                    self.auto_increment += 1;
+                    row[pk_idx] = Value::Int(assigned_pk);
+                }
             } else if let Some(val) = row.get(pk_idx) {
                 if let Some(v) = val.as_i64() {
                     assigned_pk = v;

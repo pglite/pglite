@@ -36,6 +36,7 @@ export class JITCompiler {
         if (j.type !== "LEFT" && j.type !== "INNER" && j.type !== undefined) return false;
         if (!j.tableName || j.stmt || j.fn || j.lateral) return false;
         if (!j.on || j.on.type !== "Binary" || j.on.operator !== "=") return false;
+        if (j.on.left.type !== "Identifier" || j.on.right.type !== "Identifier") return false;
         if (!this.canCompileExpr(j.on.left) || !this.canCompileExpr(j.on.right)) return false;
       }
     }
@@ -62,7 +63,7 @@ export class JITCompiler {
         return this.canCompileExpr(expr.expr);
       case "Binary":
         return (
-          ["=", "!=", ">", "<", ">=", "<=", "+", "-", "*", "/", "%", "||"].includes(
+          ["=", "!=", "<>", ">", "<", ">=", "<=", "+", "-", "*", "/", "%", "||"].includes(
             expr.operator,
           ) &&
           this.canCompileExpr(expr.left) &&
@@ -98,6 +99,7 @@ export class JITCompiler {
           "CONCAT",
           "ABS",
           "ROUND",
+          "TRUNC",
           "FLOOR",
           "CEIL",
           "CEILING",
@@ -239,6 +241,16 @@ export class JITCompiler {
           case "Parameter":
             return `params[${expr.index - 1}]`;
           case "Identifier": {
+            const upper = expr.name.toUpperCase();
+            if (upper === "CURRENT_TIMESTAMP" || upper === "NOW" || upper === "LOCALTIMESTAMP") {
+              return `new Date().toISOString()`;
+            }
+            if (upper === "CURRENT_DATE") {
+              return `new Date().toISOString().split("T")[0]`;
+            }
+            if (upper === "CURRENT_TIME" || upper === "LOCALTIME") {
+              return `new Date().toISOString().split("T")[1]`;
+            }
             if (expr.name.includes(".")) {
               const parts = expr.name.split(".");
               const tbl = parts[0]!;
@@ -254,9 +266,12 @@ export class JITCompiler {
             const left = compileExprStr(expr.left);
             const right = compileExprStr(expr.right);
             if (expr.operator === "=") return `(${left} == ${right})`;
-            if (expr.operator === "!=") return `(${left} != ${right})`;
+            if (expr.operator === "!=" || expr.operator === "<>") return `(${left} != ${right})`;
             if (expr.operator === "||") {
               return `((${left} == null || ${right} == null) ? null : (String(${left}) + String(${right})))`;
+            }
+            if (["+", "-", "*", "/", "%"].includes(expr.operator)) {
+              return `((${left} == null || ${right} == null) ? null : (${left} ${expr.operator} ${right}))`;
             }
             return `(${left} ${expr.operator} ${right})`;
           }
@@ -266,10 +281,22 @@ export class JITCompiler {
             const op = expr.operator === "AND" ? "&&" : "||";
             return `(${left} ${op} ${right})`;
           }
-          case "Not":
-            return `(!${compileExprStr(expr.expr)})`;
-          case "IsNull":
-            return `(${compileExprStr(expr.expr)} == null)`;
+          case "Not": {
+            const inner = compileExprStr(expr.expr);
+            return `(${inner} == null ? null : !(${inner}))`;
+          }
+          case "IsNull": {
+            const inner = compileExprStr(expr.expr);
+            if ((expr as any).checkType === "TRUE") {
+              return expr.not ? `(${inner} !== true)` : `(${inner} === true)`;
+            }
+            if ((expr as any).checkType === "FALSE") {
+              return expr.not ? `(${inner} !== false)` : `(${inner} === false)`;
+            }
+            return expr.not
+              ? `(${inner} != null)`
+              : `(${inner} == null)`;
+          }
           case "Cast": {
             const dt = (expr.dataType || "").toUpperCase();
             const inner = compileExprStr(expr.expr);
@@ -312,7 +339,16 @@ export class JITCompiler {
               return `((${args[0]}) != null ? Math.abs(Number(${args[0]})) : null)`;
             }
             if (fn === "ROUND") {
+              if (args.length > 1) {
+                return `((${args[0]}) != null ? Math.round(Number(${args[0]}) * Math.pow(10, Math.floor(Number(${args[1]} || 0)))) / Math.pow(10, Math.floor(Number(${args[1]} || 0))) : null)`;
+              }
               return `((${args[0]}) != null ? Math.round(Number(${args[0]})) : null)`;
+            }
+            if (fn === "TRUNC") {
+              if (args.length > 1) {
+                return `((${args[0]}) != null ? Math.trunc(Number(${args[0]}) * Math.pow(10, Math.floor(Number(${args[1]} || 0)))) / Math.pow(10, Math.floor(Number(${args[1]} || 0))) : null)`;
+              }
+              return `((${args[0]}) != null ? Math.trunc(Number(${args[0]})) : null)`;
             }
             if (fn === "FLOOR") {
               return `((${args[0]}) != null ? Math.floor(Number(${args[0]})) : null)`;

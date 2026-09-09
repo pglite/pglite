@@ -194,6 +194,8 @@ function isComplexQuery(rawSql: string): boolean {
     /\bHAVING\b/i.test(sql) ||
     /\bON\s+CONFLICT\b/i.test(sql) ||
     /\bTRUNCATE\b/i.test(sql) ||
+    /\bRETURNING\b/i.test(sql) ||
+    /\bESCAPE\b/i.test(sql) ||
     /\b(JSONB_AGG|JSON_AGG|ARRAY_AGG|JSON_BUILD_OBJECT|JSONB_BUILD_OBJECT|JSON_BUILD_ARRAY|JSONB_BUILD_ARRAY|JSONB_SET|JSONB_EXTRACT|JSON_EXTRACT|STRING_AGG|DATE_PART|DATE_TRUNC|GEN_RANDOM_UUID|UUID_GENERATE_V4)\b/i.test(sql) ||
     /\[\]/.test(sql) ||
     /\bARRAY\[/i.test(sql) ||
@@ -202,11 +204,24 @@ function isComplexQuery(rawSql: string): boolean {
     /::[a-zA-Z_]/.test(sql) ||
     /^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT)\b/i.test(sql) ||
     /SET\s+[^=]+=\s*[^,;]+[\+\-\*\/]/i.test(sql) ||
-    /\b(CONCAT|CONCAT_WS|LENGTH|TRIM|LTRIM|RTRIM|REPLACE|SUBSTRING|LEFT|RIGHT|LPAD|RPAD|INITCAP|REVERSE|STRPOS|SPLIT_PART|ROUND|CEIL|CEILING|FLOOR|ABS|POWER|SQRT|MOD|SIGN|DATE_PART|DATE_TRUNC)\s*\(/i.test(sql)
+    /\b(CONCAT|CONCAT_WS|LENGTH|CHAR_LENGTH|CHARACTER_LENGTH|TRIM|BTRIM|LTRIM|RTRIM|REPEAT|REPLACE|SUBSTRING|LEFT|RIGHT|LPAD|RPAD|INITCAP|REVERSE|STRPOS|SPLIT_PART|ROUND|CEIL|CEILING|FLOOR|ABS|POWER|SQRT|MOD|SIGN|TRUNC|EXP|LN|LOG|PI|RANDOM|SUM|AVG|MIN|MAX|COUNT|LOWER|UPPER|EXTRACT|TO_CHAR|AGE|BOOL_AND|BOOL_OR|EVERY|TRANSLATE|ASCII|CHR|OCTET_LENGTH|MD5|ENCODE|DECODE|SHA256|SHA224|SHA384|SHA512|NULLIF|SUBSTR|ROW|ARRAY_LENGTH|ARRAY_APPEND|ARRAY_PREPEND|ARRAY_REMOVE|ARRAY_REPLACE|ARRAY_TO_STRING|STRING_TO_ARRAY|ARRAY_CAT|ARRAY_DIMS|ARRAY_LOWER|ARRAY_UPPER|UNNEST)\s*\(/i.test(sql) ||
+    /\bIS\s+(NOT\s+)?(TRUE|FALSE|UNKNOWN|DISTINCT\s+FROM)\b/i.test(sql) ||
+    /\bBETWEEN\b/i.test(sql) ||
+    /\bDEFAULT\s+('\{|ARRAY\[)/i.test(sql) ||
+    /@>|<@|&&|\[\s*\d+\s*\]|\{\s*[^}]*\s*\}|\^|<<|>>|#|\|\||~|\!~|(?<!\|)\|(?!\|)|(?<!&)&(?!&)/.test(sql) ||
+    /(^|[^a-zA-Z0-9_])-([a-zA-Z_])/.test(sql) ||
+    /\b[a-zA-Z0-9_]*NULL[a-zA-Z0-9_]*\s*[\+\-\*\/%]|[\+\-\*\/%]\s*[a-zA-Z0-9_]*NULL[a-zA-Z0-9_]*/i.test(sql) ||
+    /\b(TRUE|FALSE)\b\s+(AND|OR)\b|\b(AND|OR)\b\s+(TRUE|FALSE|NULL)\b|\bNOT\s+(TRUE|FALSE|NULL)\b|\bSELECT\s+(NOT\s+)?(TRUE|FALSE|NULL)\b|\bWHERE\s+NOT\s+[a-zA-Z0-9_]+/i.test(sql) ||
+    /\bSELECT\b[^;]+\b(LIKE|ILIKE)\b/i.test(sql) ||
+    /\bJOIN\b[^;]+\bON\b[^;]*\(/i.test(sql) ||
+    /\bROW\s*\(|\\x[0-9a-fA-F]+|\([a-zA-Z0-9_\s,'"]+\)\s*(=|<>|!=|<|>|<=|>=|\bIN\b|\bNOT\s+IN\b)/i.test(sql) ||
+    /\b(information_schema|pg_tables|pg_class|pg_attribute|pg_type|pg_namespace|pg_database)\b/i.test(sql) ||
+    Array.from(PGLiteNative.jsOnlyTables).some(tbl => new RegExp(`\\b${tbl}\\b`, "i").test(sql))
   );
 }
 
 export class PGLiteNative {
+  public static jsOnlyTables = new Set<string>();
   private nativeInstance: any = null;
   private jsFallback: JSPostgres | null = null;
   private filepath: string;
@@ -224,9 +239,9 @@ export class PGLiteNative {
   constructor(filepath: string, options: any = {}) {
     this.filepath = filepath;
     this.options = options;
-    // By default, fallback is disabled for absolute data integrity.
-    // Set fallback: true or autoFallback: true to enable safe, non-destructive fallback.
-    this.allowFallback = Boolean(options.fallback || options.autoFallback);
+    this.allowFallback = options.fallback !== undefined
+      ? Boolean(options.fallback)
+      : (process.env.PGLITE_FALLBACK === "1" || process.env.PGLITE_FALLBACK === "true");
 
     const disableNative = Boolean(
       options.forceJs ||
@@ -288,7 +303,15 @@ export class PGLiteNative {
     if (match) {
       const raw = match[1].replace(/"/g, "");
       const tbl = raw.includes(".") ? raw.split(".").pop()! : raw;
-      this.knownTables.add(tbl.toLowerCase());
+      const lower = tbl.toLowerCase();
+      this.knownTables.add(lower);
+      if (
+        /\bDEFAULT\s+(GEN_RANDOM_UUID|UUID_GENERATE_V4|ARRAY\[|\'\{)/i.test(sql) ||
+        /\b(UUID|BYTEA|JSONB|JSON)\b/i.test(sql) ||
+        /\[\]/.test(sql)
+      ) {
+        PGLiteNative.jsOnlyTables.add(lower);
+      }
     }
   }
 
@@ -593,6 +616,15 @@ export class PGLiteNative {
 
     if (inTx) return;
 
+    const createMatch = trimmed.match(/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([a-zA-Z0-9_"\.-]+)/i);
+    if (createMatch) {
+      const rawTable = createMatch[1].replace(/"/g, "");
+      const tbl = rawTable.includes(".") ? rawTable.split(".").pop()! : rawTable;
+      this.recordKnownTable(trimmed);
+      await this.tryHydrateTable(tbl, dbName, true);
+      return;
+    }
+
     const dropMatch = trimmed.match(/^DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+([a-zA-Z0-9_"\.-]+)/i);
     if (dropMatch) {
       const rawTable = dropMatch[1].replace(/"/g, "");
@@ -703,6 +735,10 @@ export class PGLiteNative {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
                 const res = this.nativeInstance.exec(singleSql, p, db) as T;
+                const upper = singleSql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  try { await this.getJsEngine().exec(singleSql, params, dbName); } catch {}
+                }
                 return res;
               } catch (retryErr) {
                 currentErr = retryErr;
@@ -734,6 +770,7 @@ export class PGLiteNative {
     sql = normalized.sql;
     params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
+    this.recordKnownTable(sql);
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
       let lastRes: any = null;
@@ -782,7 +819,12 @@ export class PGLiteNative {
               try {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
-                return this.nativeInstance.exec2(singleSql, p, db) as QueryResult<T>;
+                const res = this.nativeInstance.exec2(singleSql, p, db) as QueryResult<T>;
+                const upper = singleSql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  try { await this.getJsEngine().exec2<T>(singleSql, params, dbName); } catch {}
+                }
+                return res;
               } catch (retryErr) {
                 currentErr = retryErr;
                 continue;
@@ -824,6 +866,7 @@ export class PGLiteNative {
     sql = normalized.sql;
     params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
+    this.recordKnownTable(sql);
     if (this.nativeInstance) {
       if (!this.allowFallback) {
         let p = Array.isArray(params) ? params : undefined;
@@ -843,7 +886,6 @@ export class PGLiteNative {
         return res;
       }
 
-      this.recordKnownTable(sql);
       try {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
@@ -868,7 +910,12 @@ export class PGLiteNative {
               try {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
-                return this.runNativeQuery<T>(sql, p, db);
+                const res = this.runNativeQuery<T>(sql, p, db);
+                const upper = sql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  try { await this.getJsEngine().query<T>(sql, params, dbName); } catch {}
+                }
+                return res;
               } catch (retryErr) {
                 currentErr = retryErr;
                 continue;
@@ -892,6 +939,7 @@ export class PGLiteNative {
     sql = normalized.sql;
     params = normalized.params;
     await this.ensureLegacyMigrated(dbName);
+    this.recordKnownTable(sql);
     if (this.nativeInstance) {
       if (!this.allowFallback) {
         let p = Array.isArray(params) ? params : undefined;
@@ -911,7 +959,6 @@ export class PGLiteNative {
         return res;
       }
 
-      this.recordKnownTable(sql);
       try {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
@@ -934,7 +981,12 @@ export class PGLiteNative {
               try {
                 let p = Array.isArray(params) ? params : undefined;
                 let db = typeof params === "string" ? params : dbName;
-                return this.runNativeQuery2<T>(sql, p, db);
+                const res = this.runNativeQuery2<T>(sql, p, db);
+                const upper = sql.trim().toUpperCase();
+                if (!upper.startsWith("SELECT")) {
+                  try { await this.getJsEngine().query2<T>(sql, params, dbName); } catch {}
+                }
+                return res;
               } catch (retryErr) {
                 currentErr = retryErr;
                 continue;

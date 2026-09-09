@@ -13,6 +13,9 @@ pub enum DataType {
     Date,
     Time,
     Jsonb,
+    Uuid,
+    Bytea,
+    Array(String),
 }
 
 impl DataType {
@@ -22,7 +25,14 @@ impl DataType {
         let first_word = upper.split_whitespace().next().unwrap_or("");
         let base_type = first_word.split('(').next().unwrap_or(first_word).trim_matches(';');
 
+        if upper.ends_with("[]") || upper.starts_with("ARRAY") {
+            let elem = upper.trim_end_matches("[]").trim();
+            return DataType::Array(elem.to_string());
+        }
+
         match base_type {
+            "UUID" => DataType::Uuid,
+            "BYTEA" | "BLOB" | "BINARY" => DataType::Bytea,
             "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => DataType::Serial,
             "BIGINT" | "INT8" => DataType::BigInt,
             "INT" | "INTEGER" | "INT4" | "SMALLINT" | "INT2" => DataType::Integer,
@@ -33,7 +43,11 @@ impl DataType {
             "TIME" | "TIMETZ" => DataType::Time,
             "JSONB" | "JSON" => DataType::Jsonb,
             _ => {
-                if upper.starts_with("TIMESTAMP") {
+                if upper.starts_with("UUID") {
+                    DataType::Uuid
+                } else if upper.starts_with("BYTEA") {
+                    DataType::Bytea
+                } else if upper.starts_with("TIMESTAMP") {
                     DataType::Timestamp
                 } else if upper.starts_with("TIME ") || upper.starts_with("TIME(") {
                     DataType::Time
@@ -113,6 +127,10 @@ impl Value {
         }
     }
 
+    pub fn is_text(&self) -> bool {
+        matches!(self, Value::Text(_))
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -125,7 +143,19 @@ impl Value {
             (Value::Float(a), Value::Float(b)) => (a - b).abs() <= 1e-6,
             (Value::Int(a), Value::Float(b)) => (*a as f64 - b).abs() <= 1e-6,
             (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() <= 1e-6,
-            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Text(a), Value::Text(b)) => {
+                if a == b {
+                    true
+                } else if (a.len() == 36 || b.len() == 36) && a.eq_ignore_ascii_case(b) {
+                    true
+                } else if let (Some(ba), Some(bb)) = (extract_bytes_from_str(a), extract_bytes_from_str(b)) {
+                    ba == bb
+                } else if a.eq_ignore_ascii_case(b) && (a.starts_with("\\x") || a.starts_with("\\X") || a.starts_with(r"\x")) {
+                    true
+                } else {
+                    false
+                }
+            }
             (Value::Int(a), Value::Text(b)) | (Value::Text(b), Value::Int(a)) => {
                 if let Ok(i) = b.parse::<i64>() {
                     *a == i
@@ -152,12 +182,52 @@ impl Value {
             (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
             (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
             (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Text(a), Value::Text(b)) => {
+                if let (Some(ba), Some(bb)) = (extract_bytes_from_str(a), extract_bytes_from_str(b)) {
+                    ba.cmp(&bb)
+                } else if a.len() == 36 && b.len() == 36 {
+                    a.to_lowercase().cmp(&b.to_lowercase())
+                } else {
+                    a.cmp(b)
+                }
+            }
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Int(a), Value::Text(b)) => {
+                if let Ok(i) = b.parse::<i64>() {
+                    a.cmp(&i)
+                } else if let Ok(f) = b.parse::<f64>() {
+                    (*a as f64).partial_cmp(&f).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    self.as_str().cmp(&other.as_str())
+                }
+            }
+            (Value::Text(a), Value::Int(b)) => {
+                if let Ok(i) = a.parse::<i64>() {
+                    i.cmp(b)
+                } else if let Ok(f) = a.parse::<f64>() {
+                    f.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    self.as_str().cmp(&other.as_str())
+                }
+            }
+            (Value::Float(a), Value::Text(b)) => {
+                if let Ok(f) = b.parse::<f64>() {
+                    a.partial_cmp(&f).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    self.as_str().cmp(&other.as_str())
+                }
+            }
+            (Value::Text(a), Value::Float(b)) => {
+                if let Ok(f) = a.parse::<f64>() {
+                    f.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    self.as_str().cmp(&other.as_str())
+                }
+            }
             (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
             (Value::Null, _) => std::cmp::Ordering::Less,
             (_, Value::Null) => std::cmp::Ordering::Greater,
-            _ => std::cmp::Ordering::Equal,
+            _ => self.as_str().cmp(&other.as_str()),
         }
     }
 
@@ -245,4 +315,27 @@ impl QueryResult {
     pub fn rows_to_json_string(&self) -> String {
         serde_json::to_string(&self.rows).unwrap_or_else(|_| "[]".to_string())
     }
+}
+
+fn extract_bytes_from_str(s: &str) -> Option<Vec<u8>> {
+    let mut s_str = s.trim();
+    while s_str.starts_with('\\') {
+        s_str = &s_str[1..];
+    }
+    if s_str.starts_with('x') || s_str.starts_with('X') {
+        if let Ok(b) = hex::decode(&s_str[1..]) {
+            return Some(b);
+        }
+    } else if s_str.starts_with("0x") || s_str.starts_with("0X") {
+        if let Ok(b) = hex::decode(&s_str[2..]) {
+            return Some(b);
+        }
+    } else if s_str.starts_with('[') && s_str.ends_with(']') {
+        if let Ok(nums) = serde_json::from_str::<Vec<serde_json::Value>>(s_str) {
+            if !nums.is_empty() && nums.iter().all(|n| n.as_u64().map_or(false, |v| v <= 255)) {
+                return Some(nums.iter().filter_map(|n| n.as_u64().map(|v| v as u8)).collect());
+            }
+        }
+    }
+    None
 }

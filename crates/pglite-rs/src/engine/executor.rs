@@ -37,6 +37,21 @@ impl Executor {
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = strip_sql_comments(sql);
         let normalized_sql = normalize_named_sql_params(&clean_sql);
+
+        let stmts = split_sql_statements(&normalized_sql);
+        if stmts.len() > 1 {
+            let mut last_res = QueryResult {
+                rows: vec![],
+                row_count: 0,
+                fields: vec![],
+                command: String::new(),
+            };
+            for stmt in stmts {
+                last_res = self.execute(&stmt, params)?;
+            }
+            return Ok(last_res);
+        }
+
         let trimmed = normalized_sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
         let upper = trimmed.to_uppercase();
 
@@ -300,7 +315,7 @@ impl Executor {
 
             let (default_val, default_str) = if let Some(def_pos) = after_add.to_uppercase().find("DEFAULT") {
                 let def_str = after_add[def_pos + 7..].trim();
-                (parse_value(def_str, &[]), Some(def_str.to_string()))
+                (eval_sql_expr(def_str, &[], None, &[], None, &[]), Some(def_str.to_string()))
             } else {
                 (Value::Null, None)
             };
@@ -330,7 +345,12 @@ impl Executor {
 
                 table.columns.push(col_def.clone());
                 for row in &mut table.rows {
-                    row.push(default_val.clone());
+                    let cell = if let Some(ref expr_str) = col_def.default_value {
+                        eval_sql_expr(expr_str, &[], None, &[], None, &[])
+                    } else {
+                        default_val.clone()
+                    };
+                    row.push(cell);
                 }
             }
 
@@ -646,6 +666,47 @@ impl Executor {
         self.handle_cte(&cte_sql, params)
     }
 
+fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let target_lower = target.to_lowercase();
+    let mut i = 0;
+    let mut in_str = false;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_str = !in_str;
+            result.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        if in_str {
+            result.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        if i + target.len() <= bytes.len() {
+            let slice = &sql[i..i + target.len()];
+            if slice.to_lowercase() == target_lower {
+                let prev_ok = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+                let next_idx = i + target.len();
+                let next_ok = next_idx >= bytes.len() || (!bytes[next_idx].is_ascii_alphanumeric() && bytes[next_idx] != b'_');
+                if prev_ok && next_ok {
+                    result.push_str(replacement);
+                    i += target.len();
+                    continue;
+                }
+            }
+        }
+
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
+}
+
     fn resolve_subqueries_in_where(&mut self, where_str: &str, params: &[Value]) -> Result<String, String> {
         let mut resolved = where_str.to_string();
         loop {
@@ -687,21 +748,34 @@ impl Executor {
             };
 
             let sub_sql = &resolved[start_inner..close_idx];
-            let sub_res = self.execute(sub_sql, params)?;
+            let sub_res = match self.execute(sub_sql, params) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
 
             let before = resolved[..pos].trim_end();
             if before.to_uppercase().ends_with("IN") {
                 let mut items = Vec::new();
                 for r in sub_res.rows {
                     if let serde_json::Value::Object(map) = r {
-                        if let Some(first_val) = map.values().next() {
-                            match first_val {
-                                serde_json::Value::Number(n) => items.push(n.to_string()),
-                                serde_json::Value::String(s) => items.push(format!("'{}'", s.replace('\'', "''"))),
-                                serde_json::Value::Bool(b) => items.push(b.to_string()),
-                                serde_json::Value::Null => items.push("NULL".to_string()),
-                                _ => items.push(first_val.to_string()),
-                            }
+                        if map.len() > 1 {
+                            let tuple_items: Vec<String> = map.values().map(|val| match val {
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Null => "NULL".to_string(),
+                                _ => val.to_string(),
+                            }).collect();
+                            items.push(format!("({})", tuple_items.join(", ")));
+                        } else if let Some(first_val) = map.values().next() {
+                            let str_item = match first_val {
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                serde_json::Value::Null => "NULL".to_string(),
+                                _ => first_val.to_string(),
+                            };
+                            items.push(str_item);
                         }
                     }
                 }
@@ -711,6 +785,11 @@ impl Executor {
                     items.join(", ")
                 };
                 resolved = format!("{}({}){}", &resolved[..pos], replacement, &resolved[close_idx + 1..]);
+            } else if before.to_uppercase().ends_with("EXISTS") {
+                let exists = !sub_res.rows.is_empty();
+                let exists_pos = before.to_uppercase().rfind("EXISTS").unwrap();
+                let replacement = if exists { "TRUE" } else { "FALSE" };
+                resolved = format!("{}{}{}", &resolved[..exists_pos], replacement, &resolved[close_idx + 1..]);
             } else {
                 let scalar_val = sub_res.rows.first().and_then(|r| {
                     if let serde_json::Value::Object(map) = r {
@@ -731,6 +810,38 @@ impl Executor {
             }
         }
         Ok(resolved)
+    }
+
+    fn resolve_correlated_subqueries_in_where(
+        &mut self,
+        where_str: &str,
+        table_name: &str,
+        columns: &[crate::types::ColumnDef],
+        row: &[Value],
+        alias: Option<&str>,
+        params: &[Value],
+    ) -> String {
+        let mut resolved = where_str.to_string();
+        for (col_idx, col) in columns.iter().enumerate() {
+            let val = row.get(col_idx).unwrap_or(&Value::Null);
+            let val_sql = match val {
+                Value::Null => "NULL".to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Int(i) => i.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            };
+            if let Some(a) = alias {
+                let pattern = format!("{}.{}", a, col.name);
+                resolved = Self::replace_identifier_token(&resolved, &pattern, &val_sql);
+            }
+            let pattern_tbl = format!("{}.{}", table_name, col.name);
+            resolved = Self::replace_identifier_token(&resolved, &pattern_tbl, &val_sql);
+        }
+        if let Ok(res) = self.resolve_subqueries_in_where(&resolved, params) {
+            return res;
+        }
+        resolved
     }
 
 fn json_to_engine_value(v: &serde_json::Value) -> Value {
@@ -1740,7 +1851,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         for name in table_names {
             if let Some(table) = self.storage.tables.get(&name) {
                 let cols_json: Vec<serde_json::Value> = table.columns.iter().map(|col| {
-                    let type_str = match col.data_type {
+                    let type_str = match &col.data_type {
                         DataType::Integer => "integer",
                         DataType::BigInt => "bigint",
                         DataType::Serial => "integer",
@@ -1751,6 +1862,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         DataType::Date => "date",
                         DataType::Time => "time without time zone",
                         DataType::Jsonb => "jsonb",
+                        DataType::Uuid => "uuid",
+                        DataType::Bytea => "bytea",
+                        DataType::Array(_) => "ARRAY",
                     };
                     serde_json::json!({
                         "name": col.name,
@@ -1877,7 +1991,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         for name in table_names {
             if let Some(table) = self.storage.tables.get(&name) {
                 for (pos, col) in table.columns.iter().enumerate() {
-                    let (data_type, udt_name) = match col.data_type {
+                    let (data_type, udt_name) = match &col.data_type {
                         DataType::Integer => ("integer", "int4"),
                         DataType::BigInt => ("bigint", "int8"),
                         DataType::Serial => ("integer", "int4"),
@@ -1888,6 +2002,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         DataType::Date => ("date", "date"),
                         DataType::Time => ("time without time zone", "time"),
                         DataType::Jsonb => ("jsonb", "jsonb"),
+                        DataType::Uuid => ("uuid", "uuid"),
+                        DataType::Bytea => ("bytea", "bytea"),
+                        DataType::Array(_) => ("ARRAY", "ARRAY"),
                     };
 
                     let default_val = col.default_value.clone().or_else(|| {
@@ -1914,9 +2031,41 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
-        let row_count = rows.len();
+        let mut filtered_rows = rows;
+        let up_sql = _sql.to_uppercase();
+        if let Some(w_idx) = up_sql.find("WHERE ") {
+            let where_part = &_sql[w_idx + 6..];
+            if let Some(tbl_match) = extract_literal_after_key(where_part, "table_name") {
+                filtered_rows.retain(|r| r.get("table_name").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case(&tbl_match)).unwrap_or(false));
+            }
+            if let Some(col_match) = extract_literal_after_key(where_part, "column_name") {
+                filtered_rows.retain(|r| r.get("column_name").and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case(&col_match)).unwrap_or(false));
+            }
+        }
+
+        let projected_rows = if !up_sql.starts_with("SELECT *") {
+            let from_idx = up_sql.find(" FROM ").unwrap_or(_sql.len());
+            let select_part = &_sql[6..from_idx].trim();
+            let req_cols: Vec<String> = split_comma_separated_tokens(select_part)
+                .into_iter()
+                .map(|c| clean_col_name(c).to_string())
+                .collect();
+            filtered_rows.into_iter().map(|r| {
+                let mut map = serde_json::Map::new();
+                for col in &req_cols {
+                    if let Some(val) = r.get(col) {
+                        map.insert(col.clone(), val.clone());
+                    }
+                }
+                serde_json::Value::Object(map)
+            }).collect()
+        } else {
+            filtered_rows
+        };
+
+        let row_count = projected_rows.len();
         Ok(QueryResult {
-            rows,
+            rows: projected_rows,
             row_count,
             fields,
             command: "SELECT".to_string(),
@@ -1972,7 +2121,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             let mut row = vec![Value::Null; num_table_cols];
             for (i, def_opt) in col_defaults.iter().enumerate() {
                 if let Some(def_str) = def_opt {
-                    if let Some(dt_val) = eval_date_time_keyword(def_str) {
+                    let up = def_str.trim().to_uppercase();
+                    if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
+                        row[i] = Value::text(uuid::Uuid::new_v4().to_string());
+                    } else if let Some(dt_val) = eval_date_time_keyword(def_str) {
                         row[i] = dt_val;
                     } else if def_str.starts_with('\'') && def_str.ends_with('\'') && def_str.len() >= 2 {
                         row[i] = Value::text(&def_str[1..def_str.len() - 1]);
@@ -1984,6 +2136,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         row[i] = Value::Bool(true);
                     } else if def_str.eq_ignore_ascii_case("FALSE") {
                         row[i] = Value::Bool(false);
+                    } else {
+                        row[i] = eval_sql_expr(def_str, &[], None, &[], None, params);
                     }
                 }
             }
@@ -2011,6 +2165,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     } else {
                         Value::Null
                     }
+                } else if token.eq_ignore_ascii_case("DEFAULT") {
+                    if let Some(def_str) = col_defaults.get(target_idx).and_then(|d| d.as_ref()) {
+                        let up = def_str.trim().to_uppercase();
+                        if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
+                            Value::text(uuid::Uuid::new_v4().to_string())
+                        } else {
+                            eval_sql_expr(def_str, &[], None, &[], None, params)
+                        }
+                    } else {
+                        Value::Null
+                    }
                 } else if let Some(dt_val) = eval_date_time_keyword(token) {
                     dt_val
                 } else if token.eq_ignore_ascii_case("NULL") {
@@ -2026,7 +2191,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 } else if let Ok(flt_val) = token.parse::<f64>() {
                     Value::Float(flt_val)
                 } else {
-                    Value::text(token)
+                    eval_sql_expr(token, &[], None, &[], None, params)
                 };
 
                 row[target_idx] = val;
@@ -2150,13 +2315,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             return Ok((self.handle_group_by_query(table, select_clause, &clauses, params)?, None));
         }
 
-        let joined_table_opt = if let Some(ref jc) = clauses.join_clause {
-            let jt = self.storage.get_table(jc.joined_table_name)
-                .ok_or_else(|| format!("Table {} not found", jc.joined_table_name))?;
-            Some(jt)
-        } else {
-            None
-        };
+
 
         // 1. Check if SELECT has aggregate functions (COUNT, SUM, AVG, MIN, MAX)
         let agg_specs = if !select_clause.to_uppercase().contains("SELECT") {
@@ -2175,11 +2334,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let w_upper = w.to_uppercase();
                 if clauses.order_by_specs.is_empty() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
                     if let Some(pk_idx) = table.pk_col_idx {
-                        let pk_col_name = &table.columns[pk_idx].name;
-                        if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
-                           w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
-                           w_upper.starts_with("ID =") {
-                            let val_part = w.split('=').nth(1).unwrap().trim();
+                        let is_int_pk = matches!(table.columns[pk_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial);
+                        if is_int_pk {
+                            let pk_col_name = &table.columns[pk_idx].name;
+                            if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
+                               w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
+                               w_upper.starts_with("ID =") {
+                                let val_part = w.split('=').nth(1).unwrap().trim();
                             let (param_idx, literal_pk, target_id) = if val_part.starts_with('$') {
                                 let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
                                 let tid = params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -2219,6 +2380,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                     }
                 }
+            }
 
                 // 3. Fast-Path: Non-PK exact string lookup (WHERE name = $1 or WHERE name = '...')
                 if clauses.order_by_specs.is_empty() && clauses.limit.is_none() {
@@ -2286,36 +2448,81 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             None
         };
 
-        let mut matched_indices: Vec<usize> = if let Some(target_pk) = pk_target {
-            if let Some(&row_idx) = table.pk_index.get(&target_pk) {
-                let matches = match &where_expr {
-                    Some(expr) => evaluate_where_expr(&table.rows[row_idx], Some(table), expr, params),
-                    None => true,
-                };
-                if !table.is_deleted[row_idx] && matches {
-                    vec![row_idx]
+        let has_correlated = clauses.where_clause.map_or(false, |w| {
+            let u = w.to_uppercase();
+            u.contains("SELECT") && u.contains("FROM")
+        });
+
+        let mut matched_indices: Vec<usize> = if has_correlated {
+            let raw_where = clauses.where_clause.unwrap().to_string();
+            let (table_name, columns, active_rows) = {
+                let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
+                let active: Vec<(usize, Vec<Value>)> = table.rows.iter().enumerate()
+                    .filter(|(i, _)| !table.is_deleted[*i])
+                    .map(|(i, r)| (i, r.clone()))
+                    .collect();
+                (table.name.clone(), table.columns.clone(), active)
+            };
+            let alias = clauses.table_alias;
+            let mut matched = Vec::new();
+            for (i, r) in active_rows {
+                let resolved_row_where = self.resolve_correlated_subqueries_in_where(
+                    &raw_where,
+                    &table_name,
+                    &columns,
+                    &r,
+                    alias,
+                    params,
+                );
+                let table_ref = self.storage.get_table(clauses.table_name);
+                if evaluate_custom_condition(&resolved_row_where, &r, table_ref, &[], None, params) {
+                    matched.push(i);
+                }
+            }
+            matched
+        } else {
+            let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
+            if let Some(target_pk) = pk_target {
+                if let Some(&row_idx) = table.pk_index.get(&target_pk) {
+                    let matches = match &where_expr {
+                        Some(expr) => evaluate_where_expr(&table.rows[row_idx], Some(table), expr, params),
+                        None => true,
+                    };
+                    if !table.is_deleted[row_idx] && matches {
+                        vec![row_idx]
+                    } else {
+                        vec![]
+                    }
                 } else {
                     vec![]
                 }
+            } else if where_expr.is_none() {
+                (0..total_rows)
+                    .into_par_iter()
+                    .filter(|&i| !table.is_deleted[i])
+                    .collect()
+            } else if total_rows > 20_000 {
+                let expr_ref = where_expr.as_ref().unwrap();
+                (0..total_rows)
+                    .into_par_iter()
+                    .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], Some(table), expr_ref, params))
+                    .collect()
             } else {
-                vec![]
+                let expr_ref = where_expr.as_ref().unwrap();
+                (0..total_rows)
+                    .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], Some(table), expr_ref, params))
+                    .collect()
             }
-        } else if where_expr.is_none() {
-            (0..total_rows)
-                .into_par_iter()
-                .filter(|&i| !table.is_deleted[i])
-                .collect()
-        } else if total_rows > 20_000 {
-            let expr_ref = where_expr.as_ref().unwrap();
-            (0..total_rows)
-                .into_par_iter()
-                .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], Some(table), expr_ref, params))
-                .collect()
+        };
+
+        let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
+
+        let joined_table_opt = if let Some(ref jc) = clauses.join_clause {
+            let jt = self.storage.get_table(jc.joined_table_name)
+                .ok_or_else(|| format!("Table {} not found", jc.joined_table_name))?;
+            Some(jt)
         } else {
-            let expr_ref = where_expr.as_ref().unwrap();
-            (0..total_rows)
-                .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], Some(table), expr_ref, params))
-                .collect()
+            None
         };
 
         if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
@@ -3115,24 +3322,44 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr });
                 fields.push(FieldInfo { name: alias, data_type: "int8".to_string() });
             } else if upper_agg.starts_with("SUM(") && upper_agg.ends_with(')') {
-                let inner = clean_col_name(&agg_expr[4..agg_expr.len() - 1]);
-                let c_idx = table.get_column_index(inner).ok_or_else(|| format!("Column {} not found", inner))?;
-                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::Sum(c_idx)), col_idx: None, filter_expr });
+                let raw_inner = agg_expr[4..agg_expr.len() - 1].trim();
+                let inner = clean_col_name(raw_inner);
+                let func = if let Some(c_idx) = table.get_column_index(inner) {
+                    AggFunc::Sum(c_idx)
+                } else {
+                    AggFunc::SumExpr(raw_inner.to_string())
+                };
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr });
                 fields.push(FieldInfo { name: alias, data_type: "numeric".to_string() });
             } else if upper_agg.starts_with("AVG(") && upper_agg.ends_with(')') {
-                let inner = clean_col_name(&agg_expr[4..agg_expr.len() - 1]);
-                let c_idx = table.get_column_index(inner).ok_or_else(|| format!("Column {} not found", inner))?;
-                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::Avg(c_idx)), col_idx: None, filter_expr });
+                let raw_inner = agg_expr[4..agg_expr.len() - 1].trim();
+                let inner = clean_col_name(raw_inner);
+                let func = if let Some(c_idx) = table.get_column_index(inner) {
+                    AggFunc::Avg(c_idx)
+                } else {
+                    AggFunc::AvgExpr(raw_inner.to_string())
+                };
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr });
                 fields.push(FieldInfo { name: alias, data_type: "float8".to_string() });
             } else if upper_agg.starts_with("MIN(") && upper_agg.ends_with(')') {
-                let inner = clean_col_name(&agg_expr[4..agg_expr.len() - 1]);
-                let c_idx = table.get_column_index(inner).ok_or_else(|| format!("Column {} not found", inner))?;
-                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::Min(c_idx)), col_idx: None, filter_expr });
+                let raw_inner = agg_expr[4..agg_expr.len() - 1].trim();
+                let inner = clean_col_name(raw_inner);
+                let func = if let Some(c_idx) = table.get_column_index(inner) {
+                    AggFunc::Min(c_idx)
+                } else {
+                    AggFunc::MinExpr(raw_inner.to_string())
+                };
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr });
                 fields.push(FieldInfo { name: alias, data_type: "numeric".to_string() });
             } else if upper_agg.starts_with("MAX(") && upper_agg.ends_with(')') {
-                let inner = clean_col_name(&agg_expr[4..agg_expr.len() - 1]);
-                let c_idx = table.get_column_index(inner).ok_or_else(|| format!("Column {} not found", inner))?;
-                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::Max(c_idx)), col_idx: None, filter_expr });
+                let raw_inner = agg_expr[4..agg_expr.len() - 1].trim();
+                let inner = clean_col_name(raw_inner);
+                let func = if let Some(c_idx) = table.get_column_index(inner) {
+                    AggFunc::Max(c_idx)
+                } else {
+                    AggFunc::MaxExpr(raw_inner.to_string())
+                };
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr });
                 fields.push(FieldInfo { name: alias, data_type: "numeric".to_string() });
             } else if upper_agg.starts_with("ARRAY_AGG(") && upper_agg.ends_with(')') {
                 let inner = clean_col_name(&agg_expr[10..agg_expr.len() - 1]);
@@ -3214,24 +3441,67 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             if count > 0 { json!(sum / count as f64) } else { serde_json::Value::Null }
                         }
                         AggFunc::Min(c_idx) => {
-                            let mut min = f64::MAX;
-                            let mut found = false;
-                            for &ri in &target_indices {
-                                if let Some(f) = table.rows[ri].get(*c_idx).and_then(|v| v.as_f64()) {
-                                    if f < min { min = f; found = true; }
+                            let is_numeric = matches!(table.columns[*c_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial | DataType::Numeric);
+                            if is_numeric {
+                                let mut min = f64::MAX;
+                                let mut found = false;
+                                for &ri in &target_indices {
+                                    if let Some(f) = table.rows[ri].get(*c_idx).and_then(|v| v.as_f64()) {
+                                        if f < min { min = f; found = true; }
+                                    }
                                 }
+                                if found { json!(min) } else { serde_json::Value::Null }
+                            } else {
+                                let mut min_val: Option<Value> = None;
+                                for &ri in &target_indices {
+                                    if let Some(v) = table.rows[ri].get(*c_idx) {
+                                        if !v.is_null() {
+                                            min_val = match min_val {
+                                                None => Some(v.clone()),
+                                                Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Less { Some(v.clone()) } else { Some(cur) },
+                                            };
+                                        }
+                                    }
+                                }
+                                min_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null)
                             }
-                            if found { json!(min) } else { serde_json::Value::Null }
                         }
                         AggFunc::Max(c_idx) => {
-                            let mut max = f64::MIN;
-                            let mut found = false;
+                            let is_numeric = matches!(table.columns[*c_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial | DataType::Numeric);
+                            if is_numeric {
+                                let mut max = f64::MIN;
+                                let mut found = false;
+                                for &ri in &target_indices {
+                                    if let Some(f) = table.rows[ri].get(*c_idx).and_then(|v| v.as_f64()) {
+                                        if f > max { max = f; found = true; }
+                                    }
+                                }
+                                if found { json!(max) } else { serde_json::Value::Null }
+                            } else {
+                                let mut max_val: Option<Value> = None;
+                                for &ri in &target_indices {
+                                    if let Some(v) = table.rows[ri].get(*c_idx) {
+                                        if !v.is_null() {
+                                            max_val = match max_val {
+                                                None => Some(v.clone()),
+                                                Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Greater { Some(v.clone()) } else { Some(cur) },
+                                            };
+                                        }
+                                    }
+                                }
+                                max_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null)
+                            }
+                        }
+                        AggFunc::StringAgg(c_idx, delim) => {
+                            let mut parts = Vec::new();
                             for &ri in &target_indices {
-                                if let Some(f) = table.rows[ri].get(*c_idx).and_then(|v| v.as_f64()) {
-                                    if f > max { max = f; found = true; }
+                                if let Some(v) = table.rows[ri].get(*c_idx) {
+                                    if !v.is_null() {
+                                        parts.push(v.as_str());
+                                    }
                                 }
                             }
-                            if found { json!(max) } else { serde_json::Value::Null }
+                            serde_json::Value::String(parts.join(delim))
                         }
                         AggFunc::ArrayAgg(c_idx) => {
                             let mut arr = Vec::new();
@@ -3271,6 +3541,54 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 }
                             }
                             serde_json::Value::Array(arr)
+                        }
+                        AggFunc::SumExpr(expr_str) => {
+                            let mut sum = 0.0;
+                            for &ri in &target_indices {
+                                let v = eval_sql_expr(expr_str, &table.rows[ri], Some(table), &[], None, params);
+                                if let Some(f) = v.as_f64() {
+                                    sum += f;
+                                }
+                            }
+                            json!(sum)
+                        }
+                        AggFunc::AvgExpr(expr_str) => {
+                            let mut sum = 0.0;
+                            let mut count = 0;
+                            for &ri in &target_indices {
+                                let v = eval_sql_expr(expr_str, &table.rows[ri], Some(table), &[], None, params);
+                                if let Some(f) = v.as_f64() {
+                                    sum += f;
+                                    count += 1;
+                                }
+                            }
+                            if count > 0 { json!(sum / count as f64) } else { serde_json::Value::Null }
+                        }
+                        AggFunc::MinExpr(expr_str) => {
+                            let mut min_val: Option<Value> = None;
+                            for &ri in &target_indices {
+                                let v = eval_sql_expr(expr_str, &table.rows[ri], Some(table), &[], None, params);
+                                if !v.is_null() {
+                                    min_val = match min_val {
+                                        None => Some(v.clone()),
+                                        Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Less { Some(v.clone()) } else { Some(cur) },
+                                    };
+                                }
+                            }
+                            min_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null)
+                        }
+                        AggFunc::MaxExpr(expr_str) => {
+                            let mut max_val: Option<Value> = None;
+                            for &ri in &target_indices {
+                                let v = eval_sql_expr(expr_str, &table.rows[ri], Some(table), &[], None, params);
+                                if !v.is_null() {
+                                    max_val = match max_val {
+                                        None => Some(v.clone()),
+                                        Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Greater { Some(v.clone()) } else { Some(cur) },
+                                    };
+                                }
+                            }
+                            max_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null)
                         }
                     };
                     row_map.insert(proj.alias.clone(), v_json);
@@ -3433,14 +3751,67 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "float8".to_string() });
                     }
                     AggFunc::Min(col_idx) => {
-                        let (_, _, min, _, _) = table.aggregate_stats(*col_idx);
-                        row_map.insert(spec.alias.clone(), json!(min));
-                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        let is_numeric = matches!(table.columns[*col_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial | DataType::Numeric);
+                        if is_numeric {
+                            let (_, _, min, _, _) = table.aggregate_stats(*col_idx);
+                            row_map.insert(spec.alias.clone(), json!(min));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        } else {
+                            let mut min_val: Option<Value> = None;
+                            for i in 0..table.rows.len() {
+                                if !table.is_deleted[i] {
+                                    if let Some(v) = table.rows[i].get(*col_idx) {
+                                        if !v.is_null() {
+                                            min_val = match min_val {
+                                                None => Some(v.clone()),
+                                                Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Less { Some(v.clone()) } else { Some(cur) },
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            row_map.insert(spec.alias.clone(), min_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "text".to_string() });
+                        }
                     }
                     AggFunc::Max(col_idx) => {
-                        let (_, _, _, max, _) = table.aggregate_stats(*col_idx);
-                        row_map.insert(spec.alias.clone(), json!(max));
-                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        let is_numeric = matches!(table.columns[*col_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial | DataType::Numeric);
+                        if is_numeric {
+                            let (_, _, _, max, _) = table.aggregate_stats(*col_idx);
+                            row_map.insert(spec.alias.clone(), json!(max));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        } else {
+                            let mut max_val: Option<Value> = None;
+                            for i in 0..table.rows.len() {
+                                if !table.is_deleted[i] {
+                                    if let Some(v) = table.rows[i].get(*col_idx) {
+                                        if !v.is_null() {
+                                            max_val = match max_val {
+                                                None => Some(v.clone()),
+                                                Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Greater { Some(v.clone()) } else { Some(cur) },
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            row_map.insert(spec.alias.clone(), max_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "text".to_string() });
+                        }
+                    }
+                    AggFunc::StringAgg(col_idx, delim) => {
+                        let mut parts = Vec::new();
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                if let Some(v) = table.rows[i].get(*col_idx) {
+                                    if !v.is_null() {
+                                        parts.push(v.as_str());
+                                    }
+                                }
+                            }
+                        }
+                        let joined = parts.join(delim);
+                        row_map.insert(spec.alias.clone(), serde_json::Value::String(joined));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "text".to_string() });
                     }
                     AggFunc::ArrayAgg(col_idx) => {
                         let mut arr = Vec::new();
@@ -3490,6 +3861,65 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                         row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
+                    }
+                    AggFunc::SumExpr(expr_str) => {
+                        let sum: f64 = (0..table.rows.len())
+                            .filter(|&i| !table.is_deleted[i])
+                            .filter_map(|i| {
+                                let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                                v.as_f64()
+                            })
+                            .sum();
+                        row_map.insert(spec.alias.clone(), json!(sum));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::AvgExpr(expr_str) => {
+                        let mut count = 0;
+                        let mut sum: f64 = 0.0;
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                                if let Some(f) = v.as_f64() {
+                                    sum += f;
+                                    count += 1;
+                                }
+                            }
+                        }
+                        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                        row_map.insert(spec.alias.clone(), json!(avg));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "float8".to_string() });
+                    }
+                    AggFunc::MinExpr(expr_str) => {
+                        let mut min_val: Option<Value> = None;
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                                if !v.is_null() {
+                                    min_val = match min_val {
+                                        None => Some(v.clone()),
+                                        Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Less { Some(v.clone()) } else { Some(cur) },
+                                    };
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), min_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::MaxExpr(expr_str) => {
+                        let mut max_val: Option<Value> = None;
+                        for i in 0..table.rows.len() {
+                            if !table.is_deleted[i] {
+                                let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                                if !v.is_null() {
+                                    max_val = match max_val {
+                                        None => Some(v.clone()),
+                                        Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Greater { Some(v.clone()) } else { Some(cur) },
+                                    };
+                                }
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), max_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
                     }
                 }
             }
@@ -3548,16 +3978,63 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "float8".to_string() });
                     }
                     AggFunc::Min(col_idx) => {
-                        let min: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).fold(f64::INFINITY, f64::min);
-                        let final_min = if min.is_infinite() { 0.0 } else { min };
-                        row_map.insert(spec.alias.clone(), json!(final_min));
-                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        let is_numeric = matches!(table.columns[*col_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial | DataType::Numeric);
+                        if is_numeric {
+                            let min: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).fold(f64::INFINITY, f64::min);
+                            let final_min = if min.is_infinite() { 0.0 } else { min };
+                            row_map.insert(spec.alias.clone(), json!(final_min));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        } else {
+                            let mut min_val: Option<Value> = None;
+                            for &i in &matched_indices {
+                                if let Some(v) = table.rows[i].get(*col_idx) {
+                                    if !v.is_null() {
+                                        min_val = match min_val {
+                                            None => Some(v.clone()),
+                                            Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Less { Some(v.clone()) } else { Some(cur) },
+                                        };
+                                    }
+                                }
+                            }
+                            row_map.insert(spec.alias.clone(), min_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "text".to_string() });
+                        }
                     }
                     AggFunc::Max(col_idx) => {
-                        let max: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).fold(f64::NEG_INFINITY, f64::max);
-                        let final_max = if max.is_infinite() { 0.0 } else { max };
-                        row_map.insert(spec.alias.clone(), json!(final_max));
-                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        let is_numeric = matches!(table.columns[*col_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial | DataType::Numeric);
+                        if is_numeric {
+                            let max: f64 = matched_indices.iter().filter_map(|&i| table.rows[i].get(*col_idx).and_then(|v| v.as_f64())).fold(f64::NEG_INFINITY, f64::max);
+                            let final_max = if max.is_infinite() { 0.0 } else { max };
+                            row_map.insert(spec.alias.clone(), json!(final_max));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                        } else {
+                            let mut max_val: Option<Value> = None;
+                            for &i in &matched_indices {
+                                if let Some(v) = table.rows[i].get(*col_idx) {
+                                    if !v.is_null() {
+                                        max_val = match max_val {
+                                            None => Some(v.clone()),
+                                            Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Greater { Some(v.clone()) } else { Some(cur) },
+                                        };
+                                    }
+                                }
+                            }
+                            row_map.insert(spec.alias.clone(), max_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                            fields.push(FieldInfo { name: spec.alias.clone(), data_type: "text".to_string() });
+                        }
+                    }
+                    AggFunc::StringAgg(col_idx, delim) => {
+                        let mut parts = Vec::new();
+                        for &i in &matched_indices {
+                            if let Some(v) = table.rows[i].get(*col_idx) {
+                                if !v.is_null() {
+                                    parts.push(v.as_str());
+                                }
+                            }
+                        }
+                        let joined = parts.join(delim);
+                        row_map.insert(spec.alias.clone(), serde_json::Value::String(joined));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "text".to_string() });
                     }
                     AggFunc::ArrayAgg(col_idx) => {
                         let mut arr = Vec::new();
@@ -3602,6 +4079,56 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
                     }
+                    AggFunc::SumExpr(expr_str) => {
+                        let sum: f64 = matched_indices.iter().filter_map(|&i| {
+                            let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                            v.as_f64()
+                        }).sum();
+                        row_map.insert(spec.alias.clone(), json!(sum));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::AvgExpr(expr_str) => {
+                        let mut count = 0;
+                        let mut sum: f64 = 0.0;
+                        for &i in &matched_indices {
+                            let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                            if let Some(f) = v.as_f64() {
+                                sum += f;
+                                count += 1;
+                            }
+                        }
+                        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                        row_map.insert(spec.alias.clone(), json!(avg));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "float8".to_string() });
+                    }
+                    AggFunc::MinExpr(expr_str) => {
+                        let mut min_val: Option<Value> = None;
+                        for &i in &matched_indices {
+                            let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                            if !v.is_null() {
+                                min_val = match min_val {
+                                    None => Some(v.clone()),
+                                    Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Less { Some(v.clone()) } else { Some(cur) },
+                                };
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), min_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
+                    AggFunc::MaxExpr(expr_str) => {
+                        let mut max_val: Option<Value> = None;
+                        for &i in &matched_indices {
+                            let v = eval_sql_expr(expr_str, &table.rows[i], Some(table), &[], None, params);
+                            if !v.is_null() {
+                                max_val = match max_val {
+                                    None => Some(v.clone()),
+                                    Some(cur) => if v.cmp_value(&cur) == std::cmp::Ordering::Greater { Some(v.clone()) } else { Some(cur) },
+                                };
+                            }
+                        }
+                        row_map.insert(spec.alias.clone(), max_val.as_ref().map(|v| value_to_json(v)).unwrap_or(serde_json::Value::Null));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: "numeric".to_string() });
+                    }
                 }
             }
         }
@@ -3641,6 +4168,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let mut row_count = 0;
         let mut returned_rows = Vec::new();
 
+        let resolved_where = if let Some(w) = where_clause {
+            let w_up = w.to_uppercase();
+            if w_up.contains("SELECT") && w_up.contains("FROM") {
+                Some(self.resolve_subqueries_in_where(w, params)?)
+            } else {
+                Some(w.to_string())
+            }
+        } else {
+            None
+        };
+
         let fields = {
             let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
 
@@ -3659,7 +4197,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
 
             // Parse WHERE conditions
-            let where_expr = if let Some(w) = where_clause {
+            let where_expr = if let Some(ref w) = resolved_where {
                 if !w.is_empty() {
                     Some(parse_where_expr(w, table, params)?)
                 } else {
@@ -3808,10 +4346,21 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let mut returned_rows = Vec::new();
         let mut deleted_pks = Vec::new();
 
+        let resolved_where = if let Some(w) = where_clause {
+            let w_up = w.to_uppercase();
+            if w_up.contains("SELECT") && w_up.contains("FROM") {
+                Some(self.resolve_subqueries_in_where(w, params)?)
+            } else {
+                Some(w.to_string())
+            }
+        } else {
+            None
+        };
+
         let fields = {
             let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-            
-            let where_expr = if let Some(w) = where_clause {
+
+            let where_expr = if let Some(ref w) = resolved_where {
                 if !w.is_empty() {
                     Some(parse_where_expr(w, table, params)?)
                 } else {
@@ -4482,7 +5031,11 @@ fn parse_from_and_joins(s: &str) -> Result<(String, Option<String>, Option<Strin
         if depth == 0 {
             let rest = &s[i..];
             let upper = rest.to_uppercase();
-            if upper.starts_with("CROSS JOIN ") {
+            if b == b',' {
+                positions.push((i, 1, JoinKind::Cross));
+                i += 1;
+                continue;
+            } else if upper.starts_with("CROSS JOIN ") {
                 positions.push((i, 11, JoinKind::Cross));
                 i += 11;
                 continue;
@@ -4777,22 +5330,31 @@ fn eval_condition_on_row(row: &CombinedRow, cond_str: &str, params: &[Value]) ->
         return sql_like_match(&left.as_str(), &pattern_val.as_str(), false);
     }
 
-    // JSONB containment: @> and <@
+    // JSONB / Array containment: @> and <@
     if let Some(pos) = s.find(" @> ") {
         let left = eval_operand_on_row(row, s[..pos].trim(), params);
         let right = eval_operand_on_row(row, s[pos + 4..].trim(), params);
         if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
-            return json_contains_check(&l, &r);
+            if json_contains_check(&l, &r) {
+                return true;
+            }
         }
-        return false;
+        return array_contains_check(&left, &right);
     }
     if let Some(pos) = s.find(" <@ ") {
         let left = eval_operand_on_row(row, s[..pos].trim(), params);
         let right = eval_operand_on_row(row, s[pos + 4..].trim(), params);
         if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
-            return json_contains_check(&r, &l);
+            if json_contains_check(&r, &l) {
+                return true;
+            }
         }
-        return false;
+        return array_contains_check(&right, &left);
+    }
+    if let Some(pos) = find_top_level_op(s, "&&") {
+        let left = eval_operand_on_row(row, s[..pos].trim(), params);
+        let right = eval_operand_on_row(row, s[pos + 2..].trim(), params);
+        return array_overlap_check(&left, &right);
     }
     // JSONB key existence: ?|, ?&, ?
     if let Some(pos) = find_top_level_op(s, "?|") {
@@ -4850,7 +5412,16 @@ fn eval_condition_on_row(row: &CombinedRow, cond_str: &str, params: &[Value]) ->
 fn eval_operand_on_row(row: &CombinedRow, token: &str, params: &[Value]) -> Value {
     let mut t = token.trim();
     while t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
-        t = t[1..t.len() - 1].trim();
+        let inside = t[1..t.len() - 1].trim();
+        if split_comma_separated_tokens(inside).len() > 1 {
+            break;
+        }
+        t = inside;
+    }
+    if let Some(colon_pos) = find_last_top_level_op(t, "::") {
+        let target_type = t[colon_pos + 2..].trim();
+        let val = eval_operand_on_row(row, &t[..colon_pos], params);
+        return cast_val(val, target_type);
     }
     if let Some((op_idx, op)) = find_last_top_level_json_op(t) {
         let left_op = eval_operand_on_row(row, &t[..op_idx], params);
@@ -4887,7 +5458,17 @@ fn eval_operand_on_row(row: &CombinedRow, token: &str, params: &[Value]) -> Valu
     if let Some(pipe_idx) = find_top_level_op(t, "||") {
         let left = eval_operand_on_row(row, &t[..pipe_idx], params);
         let right = eval_operand_on_row(row, &t[pipe_idx + 2..], params);
-        return Value::text(format!("{}{}", left.as_str(), right.as_str()));
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
+        let l_s = left.as_str();
+        let r_s = right.as_str();
+        if l_s.starts_with("\\x") || r_s.starts_with("\\x") {
+            let mut combined = get_raw_bytes(&left);
+            combined.extend(get_raw_bytes(&right));
+            return Value::text(format!("\\x{}", hex::encode(combined)));
+        }
+        return Value::text(format!("{}{}", l_s, r_s));
     }
     if t.starts_with('$') {
         if let Ok(idx) = t[1..].parse::<usize>() {
@@ -4907,6 +5488,23 @@ fn eval_operand_on_row(row: &CombinedRow, token: &str, params: &[Value]) -> Valu
         return Value::text(&t[1..t.len() - 1]);
     }
     let upper = t.to_uppercase();
+    if upper.starts_with("ARRAY[") && t.ends_with(']') {
+        let inside = &t[6..t.len() - 1].trim();
+        if inside.is_empty() {
+            return Value::text("[]");
+        }
+        let items: Vec<serde_json::Value> = split_comma_separated_tokens(inside)
+            .into_iter()
+            .map(|tok| {
+                let v = eval_operand_on_row(row, &tok, params);
+                value_to_json(&v)
+            })
+            .collect();
+        return Value::text(serde_json::to_string(&items).unwrap_or_default());
+    }
+    if upper == "GEN_RANDOM_UUID()" || upper == "UUID_GENERATE_V4()" {
+        return Value::text(uuid::Uuid::new_v4().to_string());
+    }
     if upper.starts_with("LOWER(") && t.ends_with(')') {
         let inner = &t[6..t.len() - 1];
         let val = eval_operand_on_row(row, inner, params);
@@ -5626,7 +6224,72 @@ fn eval_group_aggregate_expr(
         return if count > 0 { serde_json::json!(total / (count as f64)) } else { serde_json::Value::Null };
     }
 
-    // 5. ARRAY_AGG(col)
+    // 5. MIN(col)
+    if upper.starts_with("MIN(") && t.ends_with(')') {
+        let inner = t[4..t.len() - 1].trim();
+        let mut min_val: Option<Value> = None;
+        for &ri in row_indices {
+            let v = all_rows[ri].get_val(inner);
+            if !v.is_null() {
+                if let Some(ref curr_min) = min_val {
+                    if v.cmp_value(curr_min) == std::cmp::Ordering::Less {
+                        min_val = Some(v);
+                    }
+                } else {
+                    min_val = Some(v);
+                }
+            }
+        }
+        return min_val.map(|v| value_to_json(&v)).unwrap_or(serde_json::Value::Null);
+    }
+
+    // 6. MAX(col)
+    if upper.starts_with("MAX(") && t.ends_with(')') {
+        let inner = t[4..t.len() - 1].trim();
+        let mut max_val: Option<Value> = None;
+        for &ri in row_indices {
+            let v = all_rows[ri].get_val(inner);
+            if !v.is_null() {
+                if let Some(ref curr_max) = max_val {
+                    if v.cmp_value(curr_max) == std::cmp::Ordering::Greater {
+                        max_val = Some(v);
+                    }
+                } else {
+                    max_val = Some(v);
+                }
+            }
+        }
+        return max_val.map(|v| value_to_json(&v)).unwrap_or(serde_json::Value::Null);
+    }
+
+    // 7. STRING_AGG(col, delim)
+    if upper.starts_with("STRING_AGG(") && t.ends_with(')') {
+        let inner = &t[11..t.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let col = &args[0];
+            let delim = if args.len() >= 2 {
+                let d_val = parse_value(&args[1], params);
+                d_val.as_str()
+            } else {
+                ",".to_string()
+            };
+            let mut parts = Vec::new();
+            for &ri in row_indices {
+                let v = all_rows[ri].get_val(col);
+                if !v.is_null() {
+                    parts.push(v.as_str());
+                }
+            }
+            return if parts.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(parts.join(&delim))
+            };
+        }
+    }
+
+    // 8. ARRAY_AGG(col)
     if upper.starts_with("ARRAY_AGG(") && t.ends_with(')') {
         let inner = t[10..t.len() - 1].trim();
         let mut arr = Vec::new();
@@ -5705,7 +6368,7 @@ fn has_top_level_join(after_from: &str) -> bool {
         None => after_from,
     };
 
-    find_top_level_keyword(from_part, "JOIN").is_some()
+    find_top_level_keyword(from_part, "JOIN").is_some() || split_comma_separated_tokens(from_part).len() > 1
 }
 
 fn sort_json_rows(rows: &mut [serde_json::Value], specs: &[OrderBySpec]) {
@@ -6402,7 +7065,12 @@ enum AggFunc {
     Avg(usize),
     Min(usize),
     Max(usize),
+    SumExpr(String),
+    AvgExpr(String),
+    MinExpr(String),
+    MaxExpr(String),
     ArrayAgg(usize),
+    StringAgg(usize, String),
     JsonAgg(usize),
     JsonbAgg(usize),
     JsonAggExpr(String),
@@ -6458,6 +7126,8 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
                 let alias = get_alias("sum");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Sum(col_idx), alias });
+                } else {
+                    specs.push(AggSpec { func: AggFunc::SumExpr(raw_col.to_string()), alias });
                 }
             }
         } else if let Some(avg_idx) = upper.find("AVG(") {
@@ -6467,6 +7137,8 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
                 let alias = get_alias("avg");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Avg(col_idx), alias });
+                } else {
+                    specs.push(AggSpec { func: AggFunc::AvgExpr(raw_col.to_string()), alias });
                 }
             }
         } else if let Some(min_idx) = upper.find("MIN(") {
@@ -6476,6 +7148,8 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
                 let alias = get_alias("min");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Min(col_idx), alias });
+                } else {
+                    specs.push(AggSpec { func: AggFunc::MinExpr(raw_col.to_string()), alias });
                 }
             }
         } else if let Some(max_idx) = upper.find("MAX(") {
@@ -6485,15 +7159,16 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
                 let alias = get_alias("max");
                 if let Some(col_idx) = table.get_column_index(col_name) {
                     specs.push(AggSpec { func: AggFunc::Max(col_idx), alias });
+                } else {
+                    specs.push(AggSpec { func: AggFunc::MaxExpr(raw_col.to_string()), alias });
                 }
             }
-        } else if let Some(j_idx) = upper.find("JSON_AGG(").or_else(|| upper.find("JSONB_AGG(")) {
-            let is_jsonb = upper[j_idx..].starts_with("JSONB_AGG(");
-            let prefix_len = if is_jsonb { 10 } else { 9 };
-            let after_j = &part_trim[j_idx + prefix_len..];
+        } else if let Some(a_idx) = upper.find("ARRAY_AGG(") {
+            let prefix_len = 10;
+            let after_a = &part_trim[a_idx + prefix_len..];
             let mut depth = 1;
             let mut close_idx = None;
-            for (idx, ch) in after_j.char_indices() {
+            for (idx, ch) in after_a.char_indices() {
                 if ch == '(' {
                     depth += 1;
                 } else if ch == ')' {
@@ -6505,13 +7180,62 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
                 }
             }
             if let Some(close_p) = close_idx {
-                let raw_col = after_j[..close_p].trim();
+                let raw_col = after_a[..close_p].trim();
                 let col_name = clean_col_name(raw_col);
-                let alias = get_alias(if is_jsonb { "jsonb_agg" } else { "json_agg" });
+                let alias = get_alias("array_agg");
                 if let Some(col_idx) = table.get_column_index(col_name) {
-                    specs.push(AggSpec { func: if is_jsonb { AggFunc::JsonbAgg(col_idx) } else { AggFunc::JsonAgg(col_idx) }, alias });
+                    specs.push(AggSpec { func: AggFunc::ArrayAgg(col_idx), alias });
+                }
+            }
+        } else if let Some(s_idx) = upper.find("STRING_AGG(") {
+            let prefix_len = 11;
+            let after_s = &part_trim[s_idx + prefix_len..];
+            let mut depth = 1;
+            let mut close_idx = None;
+            for (idx, ch) in after_s.char_indices() {
+                if ch == '(' {
+                    depth += 1;
+                } else if ch == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if let Some(close_p) = close_idx {
+                let inside = after_s[..close_p].trim();
+                let args = split_comma_separated_tokens(inside);
+                if args.len() >= 2 {
+                    let col_name = clean_col_name(args[0].trim());
+                    let delim_raw = args[1].trim();
+                    let delim = delim_raw.trim_matches('\'').to_string();
+                    let alias = get_alias("string_agg");
+                    if let Some(col_idx) = table.get_column_index(col_name) {
+                        specs.push(AggSpec { func: AggFunc::StringAgg(col_idx, delim), alias });
+                    }
+                }
+            }
+        } else if let Some(j_idx) = upper.find("JSON_AGG(") {
+            if let Some(close_p) = upper[j_idx..].find(')') {
+                let inside = part_trim[j_idx + 9..j_idx + close_p].trim();
+                let alias = get_alias("json_agg");
+                let clean_col = clean_col_name(inside);
+                if let Some(col_idx) = table.get_column_index(clean_col) {
+                    specs.push(AggSpec { func: AggFunc::JsonAgg(col_idx), alias });
                 } else {
-                    specs.push(AggSpec { func: if is_jsonb { AggFunc::JsonbAggExpr(raw_col.to_string()) } else { AggFunc::JsonAggExpr(raw_col.to_string()) }, alias });
+                    specs.push(AggSpec { func: AggFunc::JsonAggExpr(inside.to_string()), alias });
+                }
+            }
+        } else if let Some(j_idx) = upper.find("JSONB_AGG(") {
+            if let Some(close_p) = upper[j_idx..].find(')') {
+                let inside = part_trim[j_idx + 10..j_idx + close_p].trim();
+                let alias = get_alias("jsonb_agg");
+                let clean_col = clean_col_name(inside);
+                if let Some(col_idx) = table.get_column_index(clean_col) {
+                    specs.push(AggSpec { func: AggFunc::JsonbAgg(col_idx), alias });
+                } else {
+                    specs.push(AggSpec { func: AggFunc::JsonbAggExpr(inside.to_string()), alias });
                 }
             }
         }
@@ -6529,11 +7253,11 @@ enum ColOp {
     TrimUpperEq(String),
     TrimLowerEq(String),
     TrimEq(String),
-    Gt(f64),
-    Lt(f64),
-    Gte(f64),
-    Lte(f64),
-    Between(f64, f64),
+    Gt(Value),
+    Lt(Value),
+    Gte(Value),
+    Lte(Value),
+    Between(Value, Value),
     In(Vec<Value>),
     IsNull,
     IsNotNull,
@@ -6602,9 +7326,9 @@ fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
         } else if b == b'"' && !in_sq {
             in_dq = !in_dq;
         } else if !in_sq && !in_dq {
-            if b == b'(' {
+            if b == b'(' || b == b'[' || b == b'{' {
                 depth += 1;
-            } else if b == b')' {
+            } else if b == b')' || b == b']' || b == b'}' {
                 if depth > 0 { depth -= 1; }
             } else if depth == 0 && b == b',' {
                 tokens.push(s[start..i].trim());
@@ -6620,6 +7344,78 @@ fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
         }
     }
     tokens
+}
+
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut current = String::new();
+    let mut in_str = false;
+    let mut depth: i32 = 0;
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b == b'\'' {
+            in_str = !in_str;
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if in_str {
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'(' || b == b'[' {
+            depth += 1;
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b')' || b == b']' {
+            depth = depth.saturating_sub(1);
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if depth == 0 && b == b';' {
+            if !current.trim().is_empty() {
+                stmts.push(current.trim().to_string());
+                current.clear();
+            }
+            i += 1;
+            continue;
+        }
+        current.push(b as char);
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        stmts.push(current.trim().to_string());
+    }
+    stmts
+}
+
+fn extract_literal_after_key(where_str: &str, key: &str) -> Option<String> {
+    let up = where_str.to_uppercase();
+    if let Some(idx) = up.find(&key.to_uppercase()) {
+        let rest = where_str[idx + key.len()..].trim();
+        if rest.starts_with('=') {
+            let after_eq = rest[1..].trim();
+            if after_eq.starts_with('\'') {
+                if let Some(close_q) = after_eq[1..].find('\'') {
+                    return Some(after_eq[1..1 + close_q].to_string());
+                }
+            } else {
+                let tok = after_eq.split_whitespace().next().unwrap_or("").trim_matches(';').trim_matches('\'');
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn extract_value_groups(values_part: &str) -> Vec<&str> {
@@ -6664,6 +7460,9 @@ fn clean_col_name(raw: &str) -> &str {
     let mut s = raw.trim();
     while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
         s = s[1..s.len() - 1].trim();
+    }
+    if let Some(colon_pos) = s.rfind("::") {
+        s = s[..colon_pos].trim();
     }
     if let Some(dot_idx) = s.rfind('.') {
         s[dot_idx + 1..].trim().trim_matches('"')
@@ -7051,25 +7850,59 @@ fn eval_date_time_keyword(token: &str) -> Option<Value> {
 fn split_where_conditions(w: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
-    let tokens: Vec<&str> = w.split_whitespace().collect();
+    let bytes = w.as_bytes();
+    let len = bytes.len();
+    let mut in_str = false;
+    let mut depth: i32 = 0;
     let mut i = 0;
-    while i < tokens.len() {
-        if tokens[i].eq_ignore_ascii_case("AND") {
-            if current.to_uppercase().contains("BETWEEN") && !current.to_uppercase().contains(" AND ") {
-                current.push(' ');
-                current.push_str(tokens[i]);
-            } else {
-                if !current.trim().is_empty() {
-                    parts.push(current.trim().to_string());
-                    current.clear();
+
+    while i < len {
+        let b = bytes[i];
+        if b == b'\'' {
+            in_str = !in_str;
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if in_str {
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'(' || b == b'[' {
+            depth += 1;
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b')' || b == b']' {
+            depth = depth.saturating_sub(1);
+            current.push(b as char);
+            i += 1;
+            continue;
+        }
+
+        if depth == 0 && i + 3 <= len && w[i..i + 3].eq_ignore_ascii_case("AND") {
+            let is_word_start = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')' || bytes[i - 1] == b']';
+            let is_word_end = i + 3 == len || bytes[i + 3].is_ascii_whitespace() || bytes[i + 3] == b'(' || bytes[i + 3] == b'[';
+            if is_word_start && is_word_end {
+                let cur_upper = current.to_uppercase();
+                if cur_upper.contains("BETWEEN") && !cur_upper.contains(" AND ") {
+                    current.push_str("AND");
+                    i += 3;
+                    continue;
+                } else {
+                    if !current.trim().is_empty() {
+                        parts.push(current.trim().to_string());
+                        current.clear();
+                    }
+                    i += 3;
+                    continue;
                 }
             }
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(tokens[i]);
         }
+
+        current.push(b as char);
         i += 1;
     }
     if !current.trim().is_empty() {
@@ -7094,15 +7927,68 @@ fn parse_number(token: &str, params: &[Value]) -> Result<f64, String> {
 fn parse_value(token: &str, params: &[Value]) -> Value {
     let mut t = token.trim();
     while is_fully_enclosed_in_parens(t) {
-        t = t[1..t.len() - 1].trim();
+        let inside = t[1..t.len() - 1].trim();
+        if split_comma_separated_tokens(inside).len() > 1 {
+            break;
+        }
+        t = inside;
+    }
+    if let Some(colon_pos) = find_last_top_level_op(t, "::") {
+        let target_type = t[colon_pos + 2..].trim();
+        let val = parse_value(&t[..colon_pos], params);
+        return cast_val(val, target_type);
     }
     if let Some(pipe_idx) = find_top_level_op(t, "||") {
         let left = parse_value(&t[..pipe_idx], params);
         let right = parse_value(&t[pipe_idx + 2..], params);
-        return Value::text(format!("{}{}", left.as_str(), right.as_str()));
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
+        let l_s = left.as_str();
+        let r_s = right.as_str();
+        if l_s.starts_with("\\x") || r_s.starts_with("\\x") {
+            let mut combined = get_raw_bytes(&left);
+            combined.extend(get_raw_bytes(&right));
+            return Value::text(format!("\\x{}", hex::encode(combined)));
+        }
+        return Value::text(format!("{}{}", l_s, r_s));
     }
     if let Some(dt_val) = eval_date_time_keyword(t) {
         return dt_val;
+    }
+    let upper = t.to_uppercase();
+    if upper.starts_with("ARRAY[") && t.ends_with(']') {
+        let inside = &t[6..t.len() - 1].trim();
+        if inside.is_empty() {
+            return Value::text("[]");
+        }
+        let items: Vec<serde_json::Value> = split_comma_separated_tokens(inside)
+            .into_iter()
+            .map(|tok| {
+                let v = parse_value(&tok, params);
+                value_to_json(&v)
+            })
+            .collect();
+        return Value::text(serde_json::to_string(&items).unwrap_or_default());
+    }
+    if upper.starts_with("LOWER(") && t.ends_with(')') {
+        let inner = &t[6..t.len() - 1];
+        let val = parse_value(inner, params);
+        return Value::text(val.as_str().to_lowercase());
+    }
+    if upper.starts_with("UPPER(") && t.ends_with(')') {
+        let inner = &t[6..t.len() - 1];
+        let val = parse_value(inner, params);
+        return Value::text(val.as_str().to_uppercase());
+    }
+    if (upper.starts_with("TRIM(") || upper.starts_with("BTRIM(")) && t.ends_with(')') {
+        let open_p = t.find('(').unwrap();
+        let inner = &t[open_p + 1..t.len() - 1];
+        let val = parse_value(inner, params);
+        return Value::text(val.as_str().trim().to_string());
+    }
+    if upper == "GEN_RANDOM_UUID()" || upper == "UUID_GENERATE_V4()" {
+        return Value::text(uuid::Uuid::new_v4().to_string());
     }
     if t.starts_with('$') {
         if let Ok(p_idx) = t[1..].parse::<usize>() {
@@ -7134,6 +8020,21 @@ fn parse_operand_template(token: &str) -> OperandTemplate {
     let mut t = token.trim();
     while is_fully_enclosed_in_parens(t) {
         t = t[1..t.len() - 1].trim();
+    }
+    if let Some(colon_pos) = find_last_top_level_op(t, "::") {
+        t = t[..colon_pos].trim();
+    }
+    while is_fully_enclosed_in_parens(t) {
+        t = t[1..t.len() - 1].trim();
+    }
+    let upper = t.to_uppercase();
+    if upper.starts_with("LOWER(") && t.ends_with(')') {
+        let inner = t[6..t.len() - 1].trim().trim_matches('\'');
+        return OperandTemplate::Literal(Value::text(inner.to_lowercase()));
+    }
+    if upper.starts_with("UPPER(") && t.ends_with(')') {
+        let inner = t[6..t.len() - 1].trim().trim_matches('\'');
+        return OperandTemplate::Literal(Value::text(inner.to_uppercase()));
     }
     if t.starts_with('$') {
         if let Ok(p_idx) = t[1..].parse::<usize>() {
@@ -7338,8 +8239,8 @@ fn parse_single_condition(
         let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
         let min_token = rest[..and_idx].trim();
         let max_token = rest[and_idx + 5..].trim();
-        let min_val = parse_number(min_token, params)?;
-        let max_val = parse_number(max_token, params)?;
+        let min_val = parse_value(min_token, params);
+        let max_val = parse_value(max_token, params);
         return Ok(Condition { col_idx, op: ColOp::Between(min_val, max_val) });
     }
     if let Some(in_idx) = upper.find(" IN ") {
@@ -7407,26 +8308,26 @@ fn parse_single_condition(
     if let Some(op_idx) = s.find(">=") {
         let col_name = clean_col_name(&s[..op_idx]);
         let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-        let num = parse_number(&s[op_idx + 2..], params)?;
-        return Ok(Condition { col_idx, op: ColOp::Gte(num) });
+        let val = parse_value(&s[op_idx + 2..], params);
+        return Ok(Condition { col_idx, op: ColOp::Gte(val) });
     }
     if let Some(op_idx) = s.find("<=") {
         let col_name = clean_col_name(&s[..op_idx]);
         let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-        let num = parse_number(&s[op_idx + 2..], params)?;
-        return Ok(Condition { col_idx, op: ColOp::Lte(num) });
+        let val = parse_value(&s[op_idx + 2..], params);
+        return Ok(Condition { col_idx, op: ColOp::Lte(val) });
     }
     if let Some(op_idx) = s.find('>') {
         let col_name = clean_col_name(&s[..op_idx]);
         let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-        let num = parse_number(&s[op_idx + 1..], params)?;
-        return Ok(Condition { col_idx, op: ColOp::Gt(num) });
+        let val = parse_value(&s[op_idx + 1..], params);
+        return Ok(Condition { col_idx, op: ColOp::Gt(val) });
     }
     if let Some(op_idx) = s.find('<') {
         let col_name = clean_col_name(&s[..op_idx]);
         let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-        let num = parse_number(&s[op_idx + 1..], params)?;
-        return Ok(Condition { col_idx, op: ColOp::Lt(num) });
+        let val = parse_value(&s[op_idx + 1..], params);
+        return Ok(Condition { col_idx, op: ColOp::Lt(val) });
     }
     if let Some(op_idx) = s.find('=') {
         let left_raw = s[..op_idx].trim();
@@ -7497,11 +8398,11 @@ fn parse_single_condition(
         }
     }
 
-    if let Some(col_idx) = table.get_column_index(clean_col_name(s)) {
+    if let Some(col_idx) = table.get_column_index(s) {
         return Ok(Condition { col_idx, op: ColOp::Eq(Value::Bool(true)) });
     }
 
-    Err(format!("Unsupported condition syntax: {}", s))
+    Err(format!("Unsupported condition: {}", s))
 }
 
 fn extract_single_pk_eq(expr: &WhereExpr, pk_idx: usize) -> Option<i64> {
@@ -7515,8 +8416,8 @@ fn extract_single_pk_eq(expr: &WhereExpr, pk_idx: usize) -> Option<i64> {
             None
         }
         WhereExpr::And(list) => {
-            for item in list {
-                if let Some(pk) = extract_single_pk_eq(item, pk_idx) {
+            for e in list {
+                if let Some(pk) = extract_single_pk_eq(e, pk_idx) {
                     return Some(pk);
                 }
             }
@@ -7576,12 +8477,12 @@ fn evaluate_single_condition(row: &[Value], cond: &Condition) -> bool {
             Value::Int(i) => i.to_string() == *target,
             _ => false,
         },
-        ColOp::Gt(threshold) => val.as_f64().map(|f| f > *threshold).unwrap_or(false),
-        ColOp::Gte(threshold) => val.as_f64().map(|f| f >= *threshold).unwrap_or(false),
-        ColOp::Lt(threshold) => val.as_f64().map(|f| f < *threshold).unwrap_or(false),
-        ColOp::Lte(threshold) => val.as_f64().map(|f| f <= *threshold).unwrap_or(false),
+        ColOp::Gt(threshold) => val.cmp_value(threshold) == std::cmp::Ordering::Greater,
+        ColOp::Gte(threshold) => val.cmp_value(threshold) != std::cmp::Ordering::Less,
+        ColOp::Lt(threshold) => val.cmp_value(threshold) == std::cmp::Ordering::Less,
+        ColOp::Lte(threshold) => val.cmp_value(threshold) != std::cmp::Ordering::Greater,
         ColOp::Between(min_val, max_val) => {
-            val.as_f64().map(|f| f >= *min_val && f <= *max_val).unwrap_or(false)
+            val.cmp_value(min_val) != std::cmp::Ordering::Less && val.cmp_value(max_val) != std::cmp::Ordering::Greater
         }
         ColOp::In(list) => list.iter().any(|item| val == item),
         ColOp::Like(pattern) => match val {
@@ -7636,6 +8537,161 @@ fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
 }
 
 #[inline(always)]
+fn parse_pg_array_to_json(trimmed: &str) -> Option<serde_json::Value> {
+    if trimmed == "{}" {
+        return Some(serde_json::Value::Array(vec![]));
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let inside = &trimmed[1..trimmed.len() - 1].trim();
+        if inside.is_empty() {
+            return Some(serde_json::Value::Array(vec![]));
+        }
+        // If it has colons at top-level, it's a JSON object, not a PG array
+        let mut in_quote = false;
+        let mut has_colon = false;
+        for c in inside.chars() {
+            if c == '"' || c == '\'' {
+                in_quote = !in_quote;
+            } else if c == ':' && !in_quote {
+                has_colon = true;
+                break;
+            }
+        }
+        if has_colon {
+            return None;
+        }
+
+        let tokens = split_comma_separated_tokens(inside);
+        let mut items = Vec::with_capacity(tokens.len());
+        for tok in tokens {
+            let t = tok.trim();
+            if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+                items.push(serde_json::Value::String(t[1..t.len() - 1].replace("\\\"", "\"")));
+            } else if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+                items.push(serde_json::Value::String(t[1..t.len() - 1].replace("''", "'")));
+            } else if let Ok(i) = t.parse::<i64>() {
+                items.push(serde_json::Value::Number(i.into()));
+            } else if let Ok(f) = t.parse::<f64>() {
+                if let Some(n) = serde_json::Number::from_f64(f) {
+                    items.push(serde_json::Value::Number(n));
+                } else {
+                    items.push(serde_json::Value::String(t.to_string()));
+                }
+            } else if t.eq_ignore_ascii_case("TRUE") || t.eq_ignore_ascii_case("T") {
+                items.push(serde_json::Value::Bool(true));
+            } else if t.eq_ignore_ascii_case("FALSE") || t.eq_ignore_ascii_case("F") {
+                items.push(serde_json::Value::Bool(false));
+            } else if t.eq_ignore_ascii_case("NULL") {
+                items.push(serde_json::Value::Null);
+            } else {
+                items.push(serde_json::Value::String(t.to_string()));
+            }
+        }
+        return Some(serde_json::Value::Array(items));
+    }
+    None
+}
+
+fn get_raw_bytes(val: &Value) -> Vec<u8> {
+    match val {
+        Value::Text(s) => {
+            let s_str = s.as_str();
+            if s_str.starts_with("\\x") || s_str.starts_with("\\X") {
+                hex::decode(&s_str[2..]).unwrap_or_else(|_| s_str.as_bytes().to_vec())
+            } else if s_str.starts_with("0x") || s_str.starts_with("0X") {
+                hex::decode(&s_str[2..]).unwrap_or_else(|_| s_str.as_bytes().to_vec())
+            } else {
+                s_str.as_bytes().to_vec()
+            }
+        }
+        Value::Int(i) => i.to_string().into_bytes(),
+        Value::Float(f) => f.to_string().into_bytes(),
+        Value::Bool(b) => (if *b { "true" } else { "false" }).as_bytes().to_vec(),
+        Value::Null => Vec::new(),
+    }
+}
+
+fn regex_match(text: &str, pat: &str, case_insensitive: bool) -> bool {
+    let pattern = if case_insensitive {
+        format!("(?i){}", pat)
+    } else {
+        pat.to_string()
+    };
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        re.is_match(text)
+    } else {
+        false
+    }
+}
+
+fn json_to_value(j: &serde_json::Value) -> Value {
+    match j {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::text(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => Value::text(s),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::text(j.to_string()),
+    }
+}
+
+fn val_to_array_items(val: &Value) -> Vec<Value> {
+    match val {
+        Value::Text(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('(') && trimmed.ends_with(')') {
+                let inside = &trimmed[1..trimmed.len() - 1].trim();
+                let tokens = split_comma_separated_tokens(inside);
+                if tokens.len() > 1 {
+                    return tokens.into_iter().map(|tok| parse_value(&tok, &[])).collect();
+                }
+            }
+            if let Some(serde_json::Value::Array(arr)) = parse_pg_array_to_json(trimmed) {
+                return arr.into_iter().map(|item| json_to_value(&item)).collect();
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return arr.into_iter().map(|item| json_to_value(&item)).collect();
+                }
+            }
+            vec![val.clone()]
+        }
+        _ => vec![val.clone()],
+    }
+}
+
+fn array_contains_check(container: &Value, subset: &Value) -> bool {
+    let c_items = val_to_array_items(container);
+    let s_items = val_to_array_items(subset);
+    s_items.iter().all(|s| c_items.iter().any(|c| c.is_equal(s)))
+}
+
+fn array_overlap_check(a: &Value, b: &Value) -> bool {
+    let a_items = val_to_array_items(a);
+    let b_items = val_to_array_items(b);
+    a_items.iter().any(|item_a| b_items.iter().any(|item_b| item_a.is_equal(item_b)))
+}
+
+fn cmp_composite_tuples(left: &Value, right: &Value) -> std::cmp::Ordering {
+    let l_items = val_to_array_items(left);
+    let r_items = val_to_array_items(right);
+    for i in 0..l_items.len().min(r_items.len()) {
+        let ord = l_items[i].cmp_value(&r_items[i]);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    l_items.len().cmp(&r_items.len())
+}
+
+#[inline(always)]
 fn value_to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
@@ -7646,7 +8702,15 @@ fn value_to_json(val: &Value) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null),
         Value::Text(s) => {
             let trimmed = s.trim();
-            if (trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+            if let Some(arr_val) = parse_pg_array_to_json(trimmed) {
+                return arr_val;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return val;
+                }
+            }
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     return val;
                 }
@@ -7668,6 +8732,15 @@ fn row_to_json(table: &crate::storage::table::Table, row: &[Value]) -> serde_jso
                     continue;
                 }
             }
+        } else if col.data_type == crate::types::DataType::Bytea {
+            if v.is_null() {
+                map.insert(col.name.clone(), serde_json::Value::Null);
+            } else {
+                let raw = get_raw_bytes(v);
+                let json_arr: Vec<serde_json::Value> = raw.into_iter().map(|b| serde_json::json!(b)).collect();
+                map.insert(col.name.clone(), serde_json::Value::Array(json_arr));
+            }
+            continue;
         } else if col.data_type == crate::types::DataType::Date {
             match v {
                 Value::Text(s) => {
@@ -7930,8 +9003,22 @@ fn coerce_update_val(col_def: &crate::types::ColumnDef, val: Value) -> Value {
 }
 
 fn cast_val(val: Value, target_type: &str) -> Value {
+    if val.is_null() {
+        return Value::Null;
+    }
     let tt = target_type.trim().to_uppercase();
-    if tt.starts_with("INT") || tt == "BIGINT" || tt == "SERIAL" {
+    if tt.ends_with("[]") || tt.starts_with("ARRAY") {
+        let items = val_to_array_items(&val);
+        let inner_type = tt.trim_end_matches("[]").trim_start_matches("ARRAY").trim();
+        let casted_items: Vec<serde_json::Value> = items
+            .into_iter()
+            .map(|item| {
+                let c = if inner_type.is_empty() { item } else { cast_val(item, inner_type) };
+                value_to_json(&c)
+            })
+            .collect();
+        Value::text(serde_json::to_string(&casted_items).unwrap_or_default())
+    } else if tt.starts_with("INT") || tt == "BIGINT" || tt == "SERIAL" {
         if let Some(i) = val.as_i64() {
             Value::Int(i)
         } else {
@@ -7947,6 +9034,12 @@ fn cast_val(val: Value, target_type: &str) -> Value {
         }
     } else if tt.starts_with("BOOL") {
         Value::Bool(val.as_bool().unwrap_or(false))
+    } else if tt.starts_with("UUID") {
+        Value::text(val.as_str())
+    } else if tt.starts_with("BYTEA") {
+        let raw = get_raw_bytes(&val);
+        let items: Vec<serde_json::Value> = raw.iter().map(|&b| serde_json::json!(b)).collect();
+        Value::text(serde_json::to_string(&items).unwrap_or_default())
     } else {
         val
     }
@@ -8040,9 +9133,9 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
             i += 1;
             continue;
         }
-        if b == b'(' {
+        if b == b'(' || b == b'[' {
             depth += 1;
-        } else if b == b')' {
+        } else if b == b')' || b == b']' {
             depth = depth.saturating_sub(1);
         }
         if depth == 0 && b == b'-' && i + 1 < len && s_bytes[i + 1] == b'>' {
@@ -8071,12 +9164,63 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
                     i += 2;
                     continue;
                 }
+                if op == "~" && i > 0 && s_bytes[i - 1] == b'!' {
+                    i += 1;
+                    continue;
+                }
+                if op == "~" && i + 1 < len && s_bytes[i + 1] == b'*' {
+                    i += 2;
+                    continue;
+                }
+                if op == "!~" && i + 2 < len && s_bytes[i + 2] == b'*' {
+                    i += 3;
+                    continue;
+                }
+                if op == "=" && i > 0 && (s_bytes[i - 1] == b'!' || s_bytes[i - 1] == b'<' || s_bytes[i - 1] == b'>') {
+                    i += 1;
+                    continue;
+                }
                 return Some(i);
             }
         }
         i += 1;
     }
     None
+}
+
+fn find_last_top_level_op(s: &str, op: &str) -> Option<usize> {
+    let mut in_str = false;
+    let mut depth: i32 = 0;
+    let op_bytes = op.as_bytes();
+    let s_bytes = s.as_bytes();
+    let len = s_bytes.len();
+    let mut last_pos = None;
+
+    let mut i = 0;
+    while i < len {
+        let b = s_bytes[i];
+        if b == b'\'' {
+            in_str = !in_str;
+            i += 1;
+            continue;
+        }
+        if in_str {
+            i += 1;
+            continue;
+        }
+        if b == b'(' || b == b'[' {
+            depth += 1;
+        } else if b == b')' || b == b']' {
+            depth = depth.saturating_sub(1);
+        }
+        if depth == 0 && i + op_bytes.len() <= len {
+            if &s_bytes[i..i + op_bytes.len()] == op_bytes {
+                last_pos = Some(i);
+            }
+        }
+        i += 1;
+    }
+    last_pos
 }
 
 fn find_top_level_math_op(s: &str, ops: &[char]) -> Option<(usize, char)> {
@@ -8456,6 +9600,35 @@ fn evaluate_custom_condition(
         return false;
     }
 
+    // NOT BETWEEN ... AND ...
+    if let Some(pos) = find_top_level_keyword(trimmed, "NOT BETWEEN") {
+        let left_str = trimmed[..pos].trim();
+        let right_str = trimmed[pos + 11..].trim();
+        if let Some(and_pos) = find_top_level_keyword(right_str, "AND") {
+            let b_start_str = right_str[..and_pos].trim();
+            let b_end_str = right_str[and_pos + 3..].trim();
+            let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            let start_val = eval_sql_expr(b_start_str, primary_row, primary_table, joined_row, joined_table, params);
+            let end_val = eval_sql_expr(b_end_str, primary_row, primary_table, joined_row, joined_table, params);
+            let within = val.cmp_value(&start_val) != std::cmp::Ordering::Less && val.cmp_value(&end_val) != std::cmp::Ordering::Greater;
+            return !within;
+        }
+    }
+
+    // BETWEEN ... AND ...
+    if let Some(pos) = find_top_level_keyword(trimmed, "BETWEEN") {
+        let left_str = trimmed[..pos].trim();
+        let right_str = trimmed[pos + 7..].trim();
+        if let Some(and_pos) = find_top_level_keyword(right_str, "AND") {
+            let b_start_str = right_str[..and_pos].trim();
+            let b_end_str = right_str[and_pos + 3..].trim();
+            let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            let start_val = eval_sql_expr(b_start_str, primary_row, primary_table, joined_row, joined_table, params);
+            let end_val = eval_sql_expr(b_end_str, primary_row, primary_table, joined_row, joined_table, params);
+            return val.cmp_value(&start_val) != std::cmp::Ordering::Less && val.cmp_value(&end_val) != std::cmp::Ordering::Greater;
+        }
+    }
+
     // Check top-level OR
     if let Some(or_idx) = find_top_level_keyword(trimmed, "OR") {
         let left = &trimmed[..or_idx];
@@ -8477,7 +9650,7 @@ fn evaluate_custom_condition(
         return !evaluate_custom_condition(&trimmed[4..], primary_row, primary_table, joined_row, joined_table, params);
     }
 
-    // IS NOT NULL / IS NULL
+    // IS NOT NULL / IS NULL / IS TRUE / IS FALSE
     if let Some(pos) = find_top_level_keyword(trimmed, "IS NOT NULL") {
         let left_str = trimmed[..pos].trim();
         let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
@@ -8488,34 +9661,39 @@ fn evaluate_custom_condition(
         let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
         return val.is_null();
     }
-
-    // NOT BETWEEN ... AND ...
-    if let Some(pos) = find_top_level_keyword(trimmed, "NOT BETWEEN") {
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS NOT DISTINCT FROM") {
         let left_str = trimmed[..pos].trim();
-        let right_str = trimmed[pos + 11..].trim();
-        if let Some(and_pos) = find_top_level_keyword(right_str, "AND") {
-            let b_start_str = right_str[..and_pos].trim();
-            let b_end_str = right_str[and_pos + 3..].trim();
-            let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
-            let start_val = eval_sql_expr(b_start_str, primary_row, primary_table, joined_row, joined_table, params);
-            let end_val = eval_sql_expr(b_end_str, primary_row, primary_table, joined_row, joined_table, params);
-            let within = val.cmp_value(&start_val) >= std::cmp::Ordering::Equal && val.cmp_value(&end_val) <= std::cmp::Ordering::Equal;
-            return !within;
-        }
+        let right_str = trimmed[pos + 19..].trim();
+        let left = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(right_str, primary_row, primary_table, joined_row, joined_table, params);
+        return left.is_equal(&right) || (left.is_null() && right.is_null());
     }
-
-    // BETWEEN ... AND ...
-    if let Some(pos) = find_top_level_keyword(trimmed, "BETWEEN") {
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS DISTINCT FROM") {
         let left_str = trimmed[..pos].trim();
-        let right_str = trimmed[pos + 7..].trim();
-        if let Some(and_pos) = find_top_level_keyword(right_str, "AND") {
-            let b_start_str = right_str[..and_pos].trim();
-            let b_end_str = right_str[and_pos + 3..].trim();
-            let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
-            let start_val = eval_sql_expr(b_start_str, primary_row, primary_table, joined_row, joined_table, params);
-            let end_val = eval_sql_expr(b_end_str, primary_row, primary_table, joined_row, joined_table, params);
-            return val.cmp_value(&start_val) >= std::cmp::Ordering::Equal && val.cmp_value(&end_val) <= std::cmp::Ordering::Equal;
-        }
+        let right_str = trimmed[pos + 16..].trim();
+        let left = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(right_str, primary_row, primary_table, joined_row, joined_table, params);
+        return !(left.is_equal(&right) || (left.is_null() && right.is_null()));
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS NOT TRUE") {
+        let left_str = trimmed[..pos].trim();
+        let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        return val.as_bool() != Some(true);
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS TRUE") {
+        let left_str = trimmed[..pos].trim();
+        let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        return val.as_bool() == Some(true);
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS NOT FALSE") {
+        let left_str = trimmed[..pos].trim();
+        let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        return val.as_bool() != Some(false);
+    }
+    if let Some(pos) = find_top_level_keyword(trimmed, "IS FALSE") {
+        let left_str = trimmed[..pos].trim();
+        let val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+        return val.as_bool() == Some(false);
     }
 
     // NOT IN (...)
@@ -8532,7 +9710,7 @@ fn evaluate_custom_condition(
             let mut matches_any = false;
             for tok in tokens {
                 let v_item = eval_sql_expr(tok, primary_row, primary_table, joined_row, joined_table, params);
-                if v_left.is_equal(&v_item) {
+                if v_left.is_equal(&v_item) || cmp_composite_tuples(&v_left, &v_item) == std::cmp::Ordering::Equal {
                     matches_any = true;
                     break;
                 }
@@ -8554,7 +9732,7 @@ fn evaluate_custom_condition(
             let tokens = split_comma_separated_tokens(inside);
             for tok in tokens {
                 let v_item = eval_sql_expr(tok, primary_row, primary_table, joined_row, joined_table, params);
-                if v_left.is_equal(&v_item) {
+                if v_left.is_equal(&v_item) || cmp_composite_tuples(&v_left, &v_item) == std::cmp::Ordering::Equal {
                     return true;
                 }
             }
@@ -8586,23 +9764,57 @@ fn evaluate_custom_condition(
         return sql_like_match(&left.as_str(), &pattern_val.as_str(), false);
     }
 
-    // JSONB containment: @> and <@
+    // Regex Operators: !~*, !~, ~*, ~
+    if let Some(pos) = find_top_level_op(trimmed, "!~*") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pat = eval_sql_expr(trimmed[pos + 3..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return !regex_match(&left.as_str(), &pat.as_str(), true);
+    }
+    if let Some(pos) = find_top_level_op(trimmed, "!~") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pat = eval_sql_expr(trimmed[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return !regex_match(&left.as_str(), &pat.as_str(), false);
+    }
+    if let Some(pos) = find_top_level_op(trimmed, "~*") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pat = eval_sql_expr(trimmed[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return regex_match(&left.as_str(), &pat.as_str(), true);
+    }
+    if let Some(pos) = find_top_level_op(trimmed, "~") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let pat = eval_sql_expr(trimmed[pos + 1..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return regex_match(&left.as_str(), &pat.as_str(), false);
+    }
+
+    // Array / JSONB containment: @> and <@
     if let Some(pos) = trimmed.find(" @> ") {
         let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(trimmed[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
         if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
-            return json_contains_check(&l, &r);
+            if json_contains_check(&l, &r) {
+                return true;
+            }
         }
-        return false;
+        return array_contains_check(&left, &right);
     }
     if let Some(pos) = trimmed.find(" <@ ") {
         let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(trimmed[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
         if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
-            return json_contains_check(&r, &l);
+            if json_contains_check(&r, &l) {
+                return true;
+            }
         }
-        return false;
+        return array_contains_check(&right, &left);
     }
+
+    // Array overlap: &&
+    if let Some(pos) = find_top_level_op(trimmed, "&&") {
+        let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        let right = eval_sql_expr(trimmed[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        return array_overlap_check(&left, &right);
+    }
+
     if let Some(pos) = find_top_level_op(trimmed, "?|") {
         let left = eval_sql_expr(trimmed[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(trimmed[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
@@ -8627,28 +9839,30 @@ fn evaluate_custom_condition(
         if let Some(l) = parse_val_to_json(&left) {
             return json_has_key_check(&l, &right.as_str());
         }
-        return false;
     }
 
-    for op in [">=", "<=", "!=", "<>", ">", "<", "="] {
-        if let Some(op_pos) = find_top_level_op(trimmed, op) {
-            let left_str = trimmed[..op_pos].trim();
-            let right_str = trimmed[op_pos + op.len()..].trim();
-            let left_val = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
-            let right_val = eval_sql_expr(right_str, primary_row, primary_table, joined_row, joined_table, params);
+    // Comparison operators: >=, <=, !=, <>, =, >, <
+    let op_candidates = [">=", "<=", "!=", "<>", "=", ">", "<"];
+    for op in op_candidates {
+        if let Some(idx) = find_top_level_op(trimmed, op) {
+            let left_str = trimmed[..idx].trim();
+            let right_str = trimmed[idx + op.len()..].trim();
+            let v_left = eval_sql_expr(left_str, primary_row, primary_table, joined_row, joined_table, params);
+            let v_right = eval_sql_expr(right_str, primary_row, primary_table, joined_row, joined_table, params);
 
-            let ord = left_val.cmp_value(&right_val);
+            let ord = cmp_composite_tuples(&v_left, &v_right);
             return match op {
-                ">=" => ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal,
-                "<=" => ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal,
-                ">" => ord == std::cmp::Ordering::Greater,
-                "<" => ord == std::cmp::Ordering::Less,
-                "=" => ord == std::cmp::Ordering::Equal,
-                "!=" | "<>" => ord != std::cmp::Ordering::Equal,
+                ">=" => ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal || v_left.cmp_value(&v_right) != std::cmp::Ordering::Less,
+                "<=" => ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal || v_left.cmp_value(&v_right) != std::cmp::Ordering::Greater,
+                "!=" | "<>" => !v_left.is_equal(&v_right) && ord != std::cmp::Ordering::Equal,
+                "=" => v_left.is_equal(&v_right) || ord == std::cmp::Ordering::Equal,
+                ">" => ord == std::cmp::Ordering::Greater || (v_left.cmp_value(&v_right) == std::cmp::Ordering::Greater && !v_left.is_equal(&v_right)),
+                "<" => ord == std::cmp::Ordering::Less || (v_left.cmp_value(&v_right) == std::cmp::Ordering::Less && !v_left.is_equal(&v_right)),
                 _ => false,
             };
         }
     }
+
     false
 }
 
@@ -8662,9 +9876,366 @@ fn eval_sql_expr(
 ) -> Value {
     let mut s = expr.trim();
     while s.starts_with('(') && s.ends_with(')') && is_fully_enclosed_in_parens(s) {
-        s = s[1..s.len() - 1].trim();
+        let inside = s[1..s.len() - 1].trim();
+        if split_comma_separated_tokens(inside).len() > 1 {
+            break;
+        }
+        s = inside;
     }
     let upper = s.to_uppercase();
+
+    // 0. UUID generation functions
+    if upper == "GEN_RANDOM_UUID()" || upper == "UUID_GENERATE_V4()" {
+        return Value::text(uuid::Uuid::new_v4().to_string());
+    }
+
+    // Boolean comparison expression in projection: e.g. (ROW(1, 2) < ROW(1, 3)), a = b, x IS NOT NULL
+    let is_comparison = find_top_level_op(s, "=").is_some()
+        || find_top_level_op(s, "<").is_some()
+        || find_top_level_op(s, ">").is_some()
+        || find_top_level_op(s, "<=").is_some()
+        || find_top_level_op(s, ">=").is_some()
+        || find_top_level_op(s, "<>").is_some()
+        || find_top_level_op(s, "!=").is_some()
+        || find_top_level_keyword(s, "IS NOT DISTINCT FROM").is_some()
+        || find_top_level_keyword(s, "IS DISTINCT FROM").is_some()
+        || find_top_level_keyword(s, "IS NULL").is_some()
+        || find_top_level_keyword(s, "IS NOT NULL").is_some()
+        || find_top_level_keyword(s, "IN").is_some()
+        || find_top_level_keyword(s, "NOT IN").is_some()
+        || find_top_level_keyword(s, "BETWEEN").is_some()
+        || find_top_level_keyword(s, "NOT BETWEEN").is_some();
+
+    if is_comparison {
+        if s.contains("NULL") && !upper.contains("IS DISTINCT FROM") && !upper.contains("IS NOT DISTINCT FROM") && !upper.contains("IS NULL") && !upper.contains("IS NOT NULL") {
+            if upper.contains("ROW(") || s.contains('(') {
+                let has_raw_null = s.split(&[',', '(', ')'][..]).any(|tok| tok.trim().eq_ignore_ascii_case("NULL"));
+                if has_raw_null {
+                    return Value::Null;
+                }
+            }
+        }
+        return Value::Bool(evaluate_custom_condition(s, primary_row, primary_table, joined_row, joined_table, params));
+    }
+
+    if upper.starts_with("SELECT ") {
+        let sub = &s[7..].trim();
+        return eval_sql_expr(sub, primary_row, primary_table, joined_row, joined_table, params);
+    }
+
+    // ROW(...) constructor
+    if upper.starts_with("ROW(") && s.ends_with(')') {
+        let inner = &s[4..s.len() - 1].trim();
+        if inner.is_empty() {
+            return Value::text("[]");
+        }
+        let items: Vec<serde_json::Value> = split_function_args(inner)
+            .into_iter()
+            .map(|arg| {
+                let v = eval_sql_expr(&arg, primary_row, primary_table, joined_row, joined_table, params);
+                value_to_json(&v)
+            })
+            .collect();
+        return Value::text(serde_json::to_string(&items).unwrap_or_default());
+    }
+
+    // Anonymous tuple: (10, 20, 30)
+    if s.starts_with('(') && s.ends_with(')') && !upper.starts_with("SELECT") {
+        let inner = &s[1..s.len() - 1].trim();
+        let args = split_function_args(inner);
+        if args.len() > 1 {
+            let items: Vec<serde_json::Value> = args
+                .into_iter()
+                .map(|arg| {
+                    let v = eval_sql_expr(&arg, primary_row, primary_table, joined_row, joined_table, params);
+                    value_to_json(&v)
+                })
+                .collect();
+            return Value::text(serde_json::to_string(&items).unwrap_or_default());
+        }
+    }
+
+    // Cryptographic Hashes: MD5, SHA256, SHA224, SHA384, SHA512
+    if (upper.starts_with("MD5(") || upper.starts_with("MD5 ")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() { return Value::Null; }
+        use md5::Digest;
+        let mut hasher = md5::Md5::new();
+        let raw = get_raw_bytes(&v);
+        hasher.update(&raw);
+        return Value::text(hex::encode(hasher.finalize()));
+    }
+
+    if (upper.starts_with("SHA256(") || upper.starts_with("SHA256 ")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() { return Value::Null; }
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        let raw = get_raw_bytes(&v);
+        hasher.update(&raw);
+        return Value::text(hex::encode(hasher.finalize()));
+    }
+
+    if (upper.starts_with("SHA224(") || upper.starts_with("SHA224 ")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() { return Value::Null; }
+        use sha2::Digest;
+        let mut hasher = sha2::Sha224::new();
+        let raw = get_raw_bytes(&v);
+        hasher.update(&raw);
+        return Value::text(hex::encode(hasher.finalize()));
+    }
+
+    if (upper.starts_with("SHA384(") || upper.starts_with("SHA384 ")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() { return Value::Null; }
+        use sha2::Digest;
+        let mut hasher = sha2::Sha384::new();
+        let raw = get_raw_bytes(&v);
+        hasher.update(&raw);
+        return Value::text(hex::encode(hasher.finalize()));
+    }
+
+    if (upper.starts_with("SHA512(") || upper.starts_with("SHA512 ")) && s.ends_with(')') {
+        let open_idx = s.find('(').unwrap();
+        let inner = &s[open_idx + 1..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() { return Value::Null; }
+        use sha2::Digest;
+        let mut hasher = sha2::Sha512::new();
+        let raw = get_raw_bytes(&v);
+        hasher.update(&raw);
+        return Value::text(hex::encode(hasher.finalize()));
+    }
+
+    // Binary Encodings: ENCODE, DECODE, OCTET_LENGTH
+    if upper.starts_with("ENCODE(") && s.ends_with(')') {
+        let inner = &s[7..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let data_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let fmt_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            if data_val.is_null() || fmt_val.is_null() { return Value::Null; }
+            let raw = get_raw_bytes(&data_val);
+            let fmt = fmt_val.as_str().to_lowercase();
+            return match fmt.as_str() {
+                "hex" => Value::text(hex::encode(raw)),
+                "base64" => {
+                    use base64::Engine;
+                    Value::text(base64::engine::general_purpose::STANDARD.encode(&raw))
+                }
+                "escape" => Value::text(String::from_utf8_lossy(&raw).to_string()),
+                _ => Value::text(hex::encode(raw)),
+            };
+        }
+    }
+
+    if upper.starts_with("DECODE(") && s.ends_with(')') {
+        let inner = &s[7..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let data_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let fmt_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            if data_val.is_null() || fmt_val.is_null() { return Value::Null; }
+            let data_s = data_val.as_str();
+            let fmt = fmt_val.as_str().to_lowercase();
+            let bytes = match fmt.as_str() {
+                "hex" => hex::decode(data_s.trim()).unwrap_or_default(),
+                "base64" => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.decode(data_s.trim()).unwrap_or_default()
+                }
+                _ => data_s.into_bytes(),
+            };
+            let bin_str: String = bytes.iter().map(|&b| b as char).collect();
+            return Value::text(bin_str);
+        }
+    }
+
+    if upper.starts_with("OCTET_LENGTH(") && s.ends_with(')') {
+        let inner = &s[13..s.len() - 1];
+        let v = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() { return Value::Null; }
+        let raw = get_raw_bytes(&v);
+        return Value::Int(raw.len() as i64);
+    }
+
+    // Array Functions: ARRAY_LENGTH, ARRAY_APPEND, ARRAY_PREPEND, ARRAY_REMOVE, ARRAY_REPLACE, ARRAY_TO_STRING, STRING_TO_ARRAY, ARRAY_CAT, ARRAY_DIMS, ARRAY_LOWER, ARRAY_UPPER
+    if upper.starts_with("ARRAY_LENGTH(") && s.ends_with(')') {
+        let inner = &s[13..s.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            if arr_val.is_null() { return Value::Null; }
+            let items = val_to_array_items(&arr_val);
+            return Value::Int(items.len() as i64);
+        }
+    }
+
+    if upper.starts_with("ARRAY_APPEND(") && s.ends_with(')') {
+        let inner = &s[13..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let elem_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let mut items = val_to_array_items(&arr_val);
+            items.push(elem_val);
+            let json_arr: Vec<serde_json::Value> = items.iter().map(|v| value_to_json(v)).collect();
+            return Value::text(serde_json::to_string(&json_arr).unwrap_or_default());
+        }
+    }
+
+    if upper.starts_with("ARRAY_PREPEND(") && s.ends_with(')') {
+        let inner = &s[14..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let elem_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let arr_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let mut items = vec![elem_val];
+            items.extend(val_to_array_items(&arr_val));
+            let json_arr: Vec<serde_json::Value> = items.iter().map(|v| value_to_json(v)).collect();
+            return Value::text(serde_json::to_string(&json_arr).unwrap_or_default());
+        }
+    }
+
+    if upper.starts_with("ARRAY_REMOVE(") && s.ends_with(')') {
+        let inner = &s[13..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let elem_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let mut items = val_to_array_items(&arr_val);
+            items.retain(|item| !item.is_equal(&elem_val));
+            let json_arr: Vec<serde_json::Value> = items.iter().map(|v| value_to_json(v)).collect();
+            return Value::text(serde_json::to_string(&json_arr).unwrap_or_default());
+        }
+    }
+
+    if upper.starts_with("ARRAY_REPLACE(") && s.ends_with(')') {
+        let inner = &s[14..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 3 {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let from_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let to_val = eval_sql_expr(&args[2], primary_row, primary_table, joined_row, joined_table, params);
+            let mut items = val_to_array_items(&arr_val);
+            for item in &mut items {
+                if item.is_equal(&from_val) {
+                    *item = to_val.clone();
+                }
+            }
+            let json_arr: Vec<serde_json::Value> = items.iter().map(|v| value_to_json(v)).collect();
+            return Value::text(serde_json::to_string(&json_arr).unwrap_or_default());
+        }
+    }
+
+    if upper.starts_with("ARRAY_TO_STRING(") && s.ends_with(')') {
+        let inner = &s[16..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let delim_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let null_str = if args.len() >= 3 {
+                eval_sql_expr(&args[2], primary_row, primary_table, joined_row, joined_table, params).as_str()
+            } else {
+                String::new()
+            };
+            let items = val_to_array_items(&arr_val);
+            let mut parts = Vec::new();
+            for item in items {
+                if item.is_null() {
+                    if args.len() >= 3 {
+                        parts.push(null_str.clone());
+                    }
+                } else {
+                    parts.push(item.as_str());
+                }
+            }
+            return Value::text(parts.join(&delim_val.as_str()));
+        }
+    }
+
+    if upper.starts_with("STRING_TO_ARRAY(") && s.ends_with(')') {
+        let inner = &s[16..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let str_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let delim_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let delim = delim_val.as_str();
+            let raw_str = str_val.as_str();
+            let parts: Vec<serde_json::Value> = if delim.is_empty() {
+                raw_str.chars().map(|c| serde_json::Value::String(c.to_string())).collect()
+            } else {
+                raw_str.split(&delim).map(|p| serde_json::Value::String(p.to_string())).collect()
+            };
+            return Value::text(serde_json::to_string(&parts).unwrap_or_default());
+        }
+    }
+
+    if upper.starts_with("ARRAY_CAT(") && s.ends_with(')') {
+        let inner = &s[10..s.len() - 1];
+        let args = split_function_args(inner);
+        if args.len() >= 2 {
+            let a_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let b_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            let mut items = val_to_array_items(&a_val);
+            items.extend(val_to_array_items(&b_val));
+            let json_arr: Vec<serde_json::Value> = items.iter().map(|v| value_to_json(v)).collect();
+            return Value::text(serde_json::to_string(&json_arr).unwrap_or_default());
+        }
+    }
+
+    if upper.starts_with("ARRAY_DIMS(") && s.ends_with(')') {
+        let inner = &s[11..s.len() - 1];
+        let arr_val = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+        let items = val_to_array_items(&arr_val);
+        return Value::text(format!("[1:{}]", items.len()));
+    }
+
+    if upper.starts_with("ARRAY_LOWER(") && s.ends_with(')') {
+        let inner = &s[12..s.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let items = val_to_array_items(&arr_val);
+            return if items.is_empty() { Value::Null } else { Value::Int(1) };
+        }
+    }
+
+    if upper.starts_with("ARRAY_UPPER(") && s.ends_with(')') {
+        let inner = &s[12..s.len() - 1];
+        let args = split_function_args(inner);
+        if !args.is_empty() {
+            let arr_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let items = val_to_array_items(&arr_val);
+            return if items.is_empty() { Value::Null } else { Value::Int(items.len() as i64) };
+        }
+    }
+
+    // Array indexing: col[1] or expr[1]
+    if let Some(open_bracket) = s.rfind('[') {
+        if s.ends_with(']') && open_bracket > 0 {
+            let col_part = s[..open_bracket].trim();
+            let idx_part = s[open_bracket + 1..s.len() - 1].trim();
+            if let Ok(idx_1based) = idx_part.parse::<usize>() {
+                let col_val = eval_sql_expr(col_part, primary_row, primary_table, joined_row, joined_table, params);
+                let items = val_to_array_items(&col_val);
+                if idx_1based >= 1 && idx_1based <= items.len() {
+                    return items[idx_1based - 1].clone();
+                } else {
+                    return Value::Null;
+                }
+            }
+        }
+    }
 
     // 1. CASE WHEN ... THEN ... ELSE ... END
     if upper.starts_with("CASE") && upper.ends_with("END") {
@@ -8698,7 +10269,7 @@ fn eval_sql_expr(
             return cast_val(val, &target_type);
         }
     }
-    if let Some(colon_pos) = s.rfind("::") {
+    if let Some(colon_pos) = find_last_top_level_op(s, "::") {
         let target_expr = s[..colon_pos].trim();
         let target_type = s[colon_pos + 2..].trim().to_uppercase();
         let val = eval_sql_expr(target_expr, primary_row, primary_table, joined_row, joined_table, params);
@@ -8955,7 +10526,17 @@ fn eval_sql_expr(
     if let Some(pipe_idx) = find_top_level_op(s, "||") {
         let lhs = eval_sql_expr(&s[..pipe_idx], primary_row, primary_table, joined_row, joined_table, params);
         let rhs = eval_sql_expr(&s[pipe_idx + 2..], primary_row, primary_table, joined_row, joined_table, params);
-        return Value::text(format!("{}{}", lhs.as_str(), rhs.as_str()));
+        if lhs.is_null() || rhs.is_null() {
+            return Value::Null;
+        }
+        let l_s = lhs.as_str();
+        let r_s = rhs.as_str();
+        if l_s.starts_with("\\x") || r_s.starts_with("\\x") {
+            let mut combined = get_raw_bytes(&lhs);
+            combined.extend(get_raw_bytes(&rhs));
+            return Value::text(format!("\\x{}", hex::encode(combined)));
+        }
+        return Value::text(format!("{}{}", l_s, r_s));
     }
 
     // 4. Built-in Functions: CONCAT, CONCAT_WS, LENGTH, TRIM, REPLACE, SUBSTRING, REVERSE
@@ -9033,11 +10614,13 @@ fn eval_sql_expr(
         }
     }
 
-    if upper.starts_with("SUBSTRING(") && s.ends_with(')') {
-        let inner = &s[10..s.len() - 1];
+    if (upper.starts_with("SUBSTRING(") || upper.starts_with("SUBSTR(")) && s.ends_with(')') {
+        let open_p = s.find('(').unwrap();
+        let inner = &s[open_p + 1..s.len() - 1];
         let args = split_function_args(inner);
         if args.len() >= 2 {
             let base = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            if base.is_null() { return Value::Null; }
             let start = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params).as_i64().unwrap_or(1);
             let length = if args.len() >= 3 {
                 eval_sql_expr(&args[2], primary_row, primary_table, joined_row, joined_table, params).as_i64()
@@ -9045,6 +10628,16 @@ fn eval_sql_expr(
                 None
             };
             let base_s = base.as_str();
+            if base_s.starts_with("\\x") {
+                let raw = get_raw_bytes(&base);
+                let start_idx = if start > 0 { (start as usize).saturating_sub(1) } else { 0 };
+                let sliced: Vec<u8> = if let Some(len) = length {
+                    raw.into_iter().skip(start_idx).take(len.max(0) as usize).collect()
+                } else {
+                    raw.into_iter().skip(start_idx).collect()
+                };
+                return Value::text(format!("\\x{}", hex::encode(sliced)));
+            }
             let chars: Vec<char> = base_s.chars().collect();
             let start_idx = if start > 0 { (start as usize).saturating_sub(1) } else { 0 };
             let sub: String = if let Some(len) = length {

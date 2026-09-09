@@ -2915,8 +2915,8 @@ export class StorageEngine {
       let isBool = col!._isBool;
       if (isNum === undefined) {
         const dt = col!.dataType.toUpperCase();
-        col!._isNumeric = isNum = this.isNumericType(dt);
-        col!._isBool = isBool = dt.startsWith("BOOL");
+        col!._isNumeric = isNum = this.isNumericType(dt) && !dt.endsWith("[]");
+        col!._isBool = isBool = (dt === "BOOL" || dt === "BOOLEAN");
         col!._isJson = dt.includes("JSON") || dt.endsWith("[]");
       }
 
@@ -3192,8 +3192,8 @@ export class StorageEngine {
       let isJson = col!._isJson;
       if (isNum === undefined) {
         const dt = col!.dataType.toUpperCase();
-        col!._isNumeric = isNum = this.isNumericType(dt);
-        col!._isBool = isBool = dt.startsWith("BOOL");
+        col!._isNumeric = isNum = this.isNumericType(dt) && !dt.endsWith("[]");
+        col!._isBool = isBool = (dt === "BOOL" || dt === "BOOLEAN");
         col!._isJson = isJson = dt.includes("JSON") || dt.endsWith("[]");
       }
 

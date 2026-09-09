@@ -108,14 +108,14 @@ export class Lexer {
       }
 
       const threeChar = this.input.slice(this.pos, this.pos + 3);
-      if (threeChar === '->>') {
+      if (threeChar === '->>' || threeChar === '!~*') {
         tokens.push({ type: "SYMBOL", value: threeChar });
         this.pos += 3;
         continue;
       }
 
       const twoChar = this.input.slice(this.pos, this.pos + 2);
-      if (['>=', '<=', '!=', '::', '||', '->', '~*', '!~', '#>', '#-', '@>', '&&'].includes(twoChar)) {
+      if (['>=', '<=', '!=', '<>', '::', '||', '->', '~*', '!~', '#>', '#-', '@>', '<@', '&&', '<<', '>>'].includes(twoChar)) {
         tokens.push({ type: "SYMBOL", value: twoChar });
         this.pos += 2;
         continue;
@@ -130,7 +130,7 @@ export class Lexer {
         }
       }
 
-      if (/[=><*+,();\/.:;[\]|!~?\-]/.test(char)) {
+      if (/[=><*+,();\/.:;[\]|!~?\-%&#^]/.test(char)) {
         tokens.push({ type: "SYMBOL", value: char });
         this.pos++;
         continue;

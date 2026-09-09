@@ -19,12 +19,14 @@ export type Expr =
   | { type: 'Like'; left: Expr; right: Expr; not?: boolean; escapeStr?: string; ilike?: boolean }
   | { type: 'Alias'; expr: Expr; alias: string }
   | { type: 'Subquery'; stmt: Statement }
-  | { type: 'IsNull'; expr: Expr; not: boolean }
+  | { type: 'IsNull'; expr: Expr; not: boolean; checkType?: 'NULL' | 'TRUE' | 'FALSE' | 'UNKNOWN' }
+  | { type: 'IsDistinctFrom'; left: Expr; right: Expr; not: boolean }
   | { type: 'Cast'; expr: Expr; dataType: string }
   | { type: 'Case'; cases: { when: Expr; then: Expr }[]; elseExpr?: Expr }
   | { type: 'Array'; elements: Expr[] }
   | { type: 'Interval'; value: string }
   | { type: 'Extract'; field: string; source: Expr }
+  | { type: 'Subscript'; expr: Expr; index: Expr }
   | { type: 'Exists'; stmt: Statement };
 
 export interface OnConflict {

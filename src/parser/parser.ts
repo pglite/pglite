@@ -282,7 +282,7 @@ export class Parser {
 
   private parseCondition(): Expr {
     let left = this.parseAdditive();
-    const ops = ['=', '>', '<', '>=', '<=', '!=', '->', '->>', '#>', '#-', '@>', '?', '&&', '~', '~*', '!~'];
+    const ops = ['=', '>', '<', '>=', '<=', '!=', '<>', '->', '->>', '#>', '#-', '@>', '<@', '?', '&&', '~', '~*', '!~', '!~*'];
     if (ops.includes(this.current()?.value || "") || this.match('KEYWORD', 'LIKE') || this.match('KEYWORD', 'ILIKE')) {
       const opToken = this.consume();
       const op = opToken.value.toUpperCase();
@@ -357,15 +357,42 @@ export class Parser {
         this.consume();
         not = true;
       }
+      if (this.match('KEYWORD', 'NULL')) {
+        this.consume();
+        return { type: 'IsNull', expr: left, not, checkType: 'NULL' };
+      } else if (this.match('KEYWORD', 'TRUE') || (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'TRUE')) {
+        this.consume();
+        return { type: 'IsNull', expr: left, not, checkType: 'TRUE' };
+      } else if (this.match('KEYWORD', 'FALSE') || (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'FALSE')) {
+        this.consume();
+        return { type: 'IsNull', expr: left, not, checkType: 'FALSE' };
+      } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'UNKNOWN') {
+        this.consume();
+        return { type: 'IsNull', expr: left, not, checkType: 'UNKNOWN' };
+      } else if (this.matchIdentifier() && this.current()?.value.toUpperCase() === 'DISTINCT') {
+        this.consume(); // DISTINCT
+        this.consume('KEYWORD', 'FROM');
+        const right = this.parseAdditive();
+        return { type: 'IsDistinctFrom', left, right, not };
+      }
       this.consume('KEYWORD', 'NULL');
-      return { type: 'IsNull', expr: left, not };
+      return { type: 'IsNull', expr: left, not, checkType: 'NULL' };
     }
     return left;
   }
 
   private parseAdditive(): Expr {
     let left = this.parseMultiplicative();
-    while (this.match('SYMBOL', '+') || this.match('SYMBOL', '-') || this.match('SYMBOL', '||')) {
+    while (
+      this.match('SYMBOL', '+') ||
+      this.match('SYMBOL', '-') ||
+      this.match('SYMBOL', '||') ||
+      this.match('SYMBOL', '&') ||
+      this.match('SYMBOL', '|') ||
+      this.match('SYMBOL', '#') ||
+      this.match('SYMBOL', '<<') ||
+      this.match('SYMBOL', '>>')
+    ) {
       const op = this.consume().value;
       const right = this.parseMultiplicative();
       left = { type: 'Binary', left, operator: op, right };
@@ -375,7 +402,12 @@ export class Parser {
 
   private parseMultiplicative(): Expr {
     let left = this.parsePrimary();
-    while (this.match('SYMBOL', '*') || this.match('SYMBOL', '/')) {
+    while (
+      this.match('SYMBOL', '*') ||
+      this.match('SYMBOL', '/') ||
+      this.match('SYMBOL', '%') ||
+      this.match('SYMBOL', '^')
+    ) {
       const op = this.consume().value;
       const right = this.parsePrimary();
       left = { type: 'Binary', left, operator: op, right };
@@ -384,14 +416,39 @@ export class Parser {
   }
 
   private parsePrimary(): Expr {
-    return this.handleCast(this.parsePrimaryBase());
+    let expr = this.parsePrimaryBase();
+    while (this.match('SYMBOL', '[')) {
+      this.consume('SYMBOL', '[');
+      const index = this.parseExpr();
+      this.consume('SYMBOL', ']');
+      expr = { type: 'Subscript', expr, index };
+    }
+    return this.handleCast(expr);
   }
 
   private parsePrimaryBase(): Expr {
     if (this.match('SYMBOL', '-')) {
       this.consume();
-      const num = this.consume('NUMBER');
-      return { type: 'Literal', value: -Number(num.value) };
+      if (this.match('NUMBER')) {
+        const num = this.consume('NUMBER');
+        return { type: 'Literal', value: -Number(num.value) };
+      }
+      const operand = this.parsePrimary();
+      return { type: 'Binary', left: { type: 'Literal', value: 0 }, operator: '-', right: operand };
+    }
+    if ((this.match('KEYWORD', 'ROW') || this.match('IDENTIFIER', 'ROW')) && this.tokens[this.pos + 1]?.value === '(') {
+      this.consume();
+      this.consume('SYMBOL', '(');
+      const args: any[] = [];
+      if (!this.match('SYMBOL', ')')) {
+        args.push(this.parseExpr());
+        while (this.match('SYMBOL', ',')) {
+          this.consume();
+          args.push(this.parseExpr());
+        }
+      }
+      this.consume('SYMBOL', ')');
+      return { type: 'Call', fnName: 'ROW', args };
     }
     if (this.match('SYMBOL', '(')) {
       this.consume();
@@ -400,9 +457,22 @@ export class Parser {
         this.consume('SYMBOL', ')');
         return { type: 'Subquery', stmt };
       }
-      const expr = this.parseExpr();
+      if (this.match('SYMBOL', ')')) {
+        this.consume();
+        return { type: 'Call', fnName: 'ROW', args: [] };
+      }
+      const firstExpr = this.parseExpr();
+      if (this.match('SYMBOL', ',')) {
+        const args = [firstExpr];
+        while (this.match('SYMBOL', ',')) {
+          this.consume();
+          args.push(this.parseExpr());
+        }
+        this.consume('SYMBOL', ')');
+        return { type: 'Call', fnName: 'ROW', args };
+      }
       this.consume('SYMBOL', ')');
-      return expr;
+      return firstExpr;
     }
     if (this.match('KEYWORD', 'NULL')) {
       this.consume();
