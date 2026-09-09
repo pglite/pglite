@@ -28,10 +28,16 @@ impl Table {
         }
         let mut columns = deduped_columns;
 
-        let pk_col_idx = columns.iter().position(|c| c.is_primary_key)
-            .or_else(|| columns.iter().position(|c| c.data_type == crate::types::DataType::Serial))
-            .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("id")))
-            .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("_id")));
+        let pk_count = columns.iter().filter(|c| c.is_primary_key).count();
+        let pk_col_idx = if pk_count == 1 {
+            columns.iter().position(|c| c.is_primary_key)
+        } else if pk_count > 1 {
+            None
+        } else {
+            columns.iter().position(|c| c.data_type == crate::types::DataType::Serial)
+                .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("id")))
+                .or_else(|| columns.iter().position(|c| c.name.eq_ignore_ascii_case("_id")))
+        };
 
         // Ensure the detected PK column is marked as primary key
         if let Some(idx) = pk_col_idx {

@@ -57,7 +57,7 @@ impl Executor {
         let trimmed = normalized_sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
         let upper = trimmed.to_uppercase();
 
-        if upper.starts_with("BEGIN") {
+        if upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION") {
             self.storage.begin_transaction();
             return Ok(QueryResult {
                 rows: vec![],
@@ -67,7 +67,7 @@ impl Executor {
             });
         }
 
-        if upper.starts_with("COMMIT") {
+        if upper.starts_with("COMMIT") || upper == "END" {
             self.storage.commit();
             return Ok(QueryResult {
                 rows: vec![],
@@ -77,13 +77,65 @@ impl Executor {
             });
         }
 
-        if upper.starts_with("ROLLBACK") {
+        if upper.starts_with("SAVEPOINT") {
+            let sp_name = trimmed["SAVEPOINT".len()..].trim().trim_matches(';');
+            self.storage.savepoint(sp_name);
+            return Ok(QueryResult {
+                rows: vec![],
+                row_count: 0,
+                fields: vec![],
+                command: "SAVEPOINT".to_string(),
+            });
+        }
+
+        if upper.starts_with("ROLLBACK TO") || upper.starts_with("ROLLBACK WORK TO") || upper.starts_with("ROLLBACK TRANSACTION TO") {
+            let after = if upper.starts_with("ROLLBACK WORK TO") {
+                &trimmed["ROLLBACK WORK TO".len()..]
+            } else if upper.starts_with("ROLLBACK TRANSACTION TO") {
+                &trimmed["ROLLBACK TRANSACTION TO".len()..]
+            } else {
+                &trimmed["ROLLBACK TO".len()..]
+            };
+            let sp_name = after.trim();
+            let sp_name = if sp_name.to_uppercase().starts_with("SAVEPOINT ") {
+                &sp_name[10..]
+            } else {
+                sp_name
+            }.trim().trim_matches(';');
+            self.storage.rollback_to_savepoint(sp_name);
+            return Ok(QueryResult {
+                rows: vec![],
+                row_count: 0,
+                fields: vec![],
+                command: "ROLLBACK".to_string(),
+            });
+        }
+
+        if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
             self.storage.rollback();
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
                 fields: vec![],
                 command: "ROLLBACK".to_string(),
+            });
+        }
+
+        if upper.starts_with("RELEASE") {
+            let after = if upper.starts_with("RELEASE WORK SAVEPOINT") {
+                &trimmed["RELEASE WORK SAVEPOINT".len()..]
+            } else if upper.starts_with("RELEASE SAVEPOINT") {
+                &trimmed["RELEASE SAVEPOINT".len()..]
+            } else {
+                &trimmed["RELEASE".len()..]
+            };
+            let sp_name = after.trim().trim_matches(';');
+            self.storage.release_savepoint(sp_name);
+            return Ok(QueryResult {
+                rows: vec![],
+                row_count: 0,
+                fields: vec![],
+                command: "RELEASE".to_string(),
             });
         }
 
@@ -95,7 +147,13 @@ impl Executor {
             return self.handle_alter_table(trimmed);
         }
 
-        if upper.starts_with("WITH ") {
+        let is_with = if upper.starts_with("WITH") {
+            let rest = &trimmed[4..];
+            rest.is_empty() || rest.chars().next().map(|c| c.is_whitespace()).unwrap_or(false)
+        } else {
+            false
+        };
+        if is_with {
             return self.handle_cte(trimmed, params);
         }
 
@@ -528,92 +586,249 @@ impl Executor {
     }
 
     fn handle_cte(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let without_with = sql.trim()[4..].trim();
+        let mut without_with = sql.trim()[4..].trim();
+        let is_recursive = if without_with.to_uppercase().starts_with("RECURSIVE") {
+            let rest = &without_with[9..];
+            if rest.is_empty() || rest.chars().next().map(|c| c.is_whitespace()).unwrap_or(false) {
+                without_with = rest.trim();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let mut i = 0;
         let mut created_tables: Vec<String> = Vec::new();
 
         while i < without_with.len() {
-            let as_pos = match find_top_level_keyword(&without_with[i..], "AS") {
-                Some(p) => i + p,
+            let cur_slice = &without_with[i..];
+            let as_pos = match find_top_level_keyword(cur_slice, "AS") {
+                Some(p) => p,
                 None => break,
             };
-            let cte_name = clean_table_name(without_with[i..as_pos].trim()).to_string();
-            let after_as = without_with[as_pos + 2..].trim();
-            if !after_as.starts_with('(') {
-                return Err("Expected ( after AS in CTE definition".to_string());
-            }
+            let cte_head = cur_slice[..as_pos].trim();
+            let (cte_name, explicit_cols) = if let Some(p_idx) = cte_head.find('(') {
+                if let Some(close_idx) = cte_head.rfind(')') {
+                    let name = clean_table_name(cte_head[..p_idx].trim()).to_string();
+                    let cols_str = &cte_head[p_idx + 1..close_idx];
+                    let cols: Vec<String> = cols_str.split(',').map(|s| clean_col_name(s.trim()).to_string()).collect();
+                    (name, Some(cols))
+                } else {
+                    (clean_table_name(cte_head).to_string(), None)
+                }
+            } else {
+                (clean_table_name(cte_head).to_string(), None)
+            };
 
-            let mut depth = 0;
-            let mut in_str = false;
-            let mut end_paren = None;
-            for (idx, ch) in after_as.char_indices() {
-                match ch {
-                    '\'' => in_str = !in_str,
-                    '(' if !in_str => depth += 1,
-                    ')' if !in_str => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end_paren = Some(idx);
+            let after_as_offset = as_pos + 2;
+            let after_as_raw = &cur_slice[after_as_offset..];
+            let lparen_rel = match after_as_raw.find('(') {
+                Some(p) => p,
+                None => return Err("Expected ( after AS in CTE definition".to_string()),
+            };
+            let open_paren_idx = after_as_offset + lparen_rel;
+            let close_paren_idx = match find_matching_paren(cur_slice, open_paren_idx) {
+                Some(p) => p,
+                None => return Err("Unmatched parenthesis in CTE definition".to_string()),
+            };
+
+            let cte_query = cur_slice[open_paren_idx + 1..close_paren_idx].trim();
+
+            if is_recursive {
+                let (union_pos, is_all, kw_len) = if let Some(pos) = find_top_level_keyword(cte_query, "UNION ALL") {
+                    (Some(pos), true, 9)
+                } else if let Some(pos) = find_top_level_keyword(cte_query, "UNION") {
+                    (Some(pos), false, 5)
+                } else {
+                    (None, false, 0)
+                };
+
+                if let Some(u_pos) = union_pos {
+                    let non_rec_sql = cte_query[..u_pos].trim();
+                    let rec_sql = cte_query[u_pos + kw_len..].trim();
+
+                    let base_res = self.execute(non_rec_sql, params)?;
+                    let mut cols = Vec::new();
+                    for (c_i, f) in base_res.fields.iter().enumerate() {
+                        let name = if let Some(ref exp) = explicit_cols {
+                            exp.get(c_i).cloned().unwrap_or_else(|| f.name.clone())
+                        } else {
+                            f.name.clone()
+                        };
+                        cols.push(crate::types::ColumnDef {
+                            name,
+                            data_type: crate::types::DataType::from_sql_str(&f.data_type),
+                            is_primary_key: false,
+                            is_nullable: true,
+                            default_value: None,
+                            comment: None,
+                        });
+                    }
+
+                    let row_from_json = |r_json: &serde_json::Value, cols: &[crate::types::ColumnDef], query_fields: &[FieldInfo]| -> Vec<Value> {
+                        let mut row = Vec::new();
+                        for (c_i, col) in cols.iter().enumerate() {
+                            let field_name = query_fields.get(c_i).map(|f| f.name.as_str());
+                            let val_opt = r_json.get(&col.name).or_else(|| field_name.and_then(|fn_str| r_json.get(fn_str)));
+                            let v = match val_opt {
+                                Some(serde_json::Value::Null) | None => Value::Null,
+                                Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
+                                Some(serde_json::Value::Number(num)) => {
+                                    if let Some(i) = num.as_i64() {
+                                        Value::Int(i)
+                                    } else if let Some(f) = num.as_f64() {
+                                        Value::Float(f)
+                                    } else {
+                                        Value::Null
+                                    }
+                                }
+                                Some(serde_json::Value::String(s)) => Value::text(s),
+                                Some(other) => Value::text(other.to_string()),
+                            };
+                            row.push(v);
+                        }
+                        row
+                    };
+
+                    let mut accumulated_rows: Vec<Vec<Value>> = Vec::new();
+                    let mut working_rows: Vec<Vec<Value>> = Vec::new();
+
+                    for r_json in base_res.rows {
+                        let r = row_from_json(&r_json, &cols, &base_res.fields);
+                        accumulated_rows.push(r.clone());
+                        working_rows.push(r);
+                    }
+
+                    let mut iteration = 0;
+                    while !working_rows.is_empty() && iteration < 1000 {
+                        iteration += 1;
+                        let mut working_table = crate::storage::table::Table::new(cte_name.clone(), cols.clone());
+                        for r in &working_rows {
+                            working_table.insert(r.clone());
+                        }
+                        self.storage.tables.insert(cte_name.to_lowercase(), working_table);
+
+                        let rec_res = match self.execute(rec_sql, params) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                self.storage.tables.remove(&cte_name.to_lowercase());
+                                return Err(e);
+                            }
+                        };
+
+                        if rec_res.rows.is_empty() {
                             break;
                         }
-                    }
-                    _ => {}
-                }
-            }
 
-            let end_idx = end_paren.ok_or("Unmatched parenthesis in CTE definition")?;
-            let cte_query = after_as[1..end_idx].trim();
-
-            let res = self.execute(cte_query, params)?;
-
-            let mut cols = Vec::new();
-            for f in &res.fields {
-                cols.push(crate::types::ColumnDef {
-                    name: f.name.clone(),
-                    data_type: crate::types::DataType::from_sql_str(&f.data_type),
-                    is_primary_key: false,
-                    is_nullable: true,
-                    default_value: None,
-                    comment: None,
-                });
-            }
-
-            let mut rows = Vec::new();
-            for r_json in res.rows {
-                let mut row = Vec::new();
-                for col in &cols {
-                    let v = match r_json.get(&col.name) {
-                        Some(serde_json::Value::Null) | None => Value::Null,
-                        Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
-                        Some(serde_json::Value::Number(num)) => {
-                            if let Some(i) = num.as_i64() {
-                                Value::Int(i)
-                            } else if let Some(f) = num.as_f64() {
-                                Value::Float(f)
-                            } else {
-                                Value::Null
+                        let mut next_working_rows = Vec::new();
+                        for r_json in rec_res.rows {
+                            let r = row_from_json(&r_json, &cols, &rec_res.fields);
+                            if !is_all {
+                                if accumulated_rows.iter().any(|acc| acc == &r) {
+                                    continue;
+                                }
                             }
+                            accumulated_rows.push(r.clone());
+                            next_working_rows.push(r);
                         }
-                        Some(serde_json::Value::String(s)) => Value::text(s),
-                        Some(other) => Value::text(other.to_string()),
-                    };
-                    row.push(v);
+
+                        working_rows = next_working_rows;
+                    }
+
+                    let mut full_cte_table = crate::storage::table::Table::new(cte_name.clone(), cols);
+                    for r in accumulated_rows {
+                        full_cte_table.insert(r);
+                    }
+                    self.storage.tables.insert(cte_name.to_lowercase(), full_cte_table);
+                    created_tables.push(cte_name);
+                } else {
+                    let res = self.execute(cte_query, params)?;
+                    let mut cols = Vec::new();
+                    for (c_i, f) in res.fields.iter().enumerate() {
+                        let name = if let Some(ref exp) = explicit_cols {
+                            exp.get(c_i).cloned().unwrap_or_else(|| f.name.clone())
+                        } else {
+                            f.name.clone()
+                        };
+                        cols.push(crate::types::ColumnDef {
+                            name,
+                            data_type: crate::types::DataType::from_sql_str(&f.data_type),
+                            is_primary_key: false,
+                            is_nullable: true,
+                            default_value: None,
+                            comment: None,
+                        });
+                    }
+                    let mut rows = Vec::new();
+                    for r_json in res.rows {
+                        let mut row = Vec::new();
+                        for (c_i, col) in cols.iter().enumerate() {
+                            let f_name = &res.fields[c_i].name;
+                            let v = match r_json.get(&col.name).or_else(|| r_json.get(f_name)) {
+                                Some(serde_json::Value::Null) | None => Value::Null,
+                                Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
+                                Some(serde_json::Value::Number(num)) => {
+                                    if let Some(i) = num.as_i64() { Value::Int(i) } else if let Some(f) = num.as_f64() { Value::Float(f) } else { Value::Null }
+                                }
+                                Some(serde_json::Value::String(s)) => Value::text(s),
+                                Some(other) => Value::text(other.to_string()),
+                            };
+                            row.push(v);
+                        }
+                        rows.push(row);
+                    }
+                    let mut cte_table = crate::storage::table::Table::new(cte_name.clone(), cols);
+                    for r in rows { cte_table.insert(r); }
+                    self.storage.tables.insert(cte_name.to_lowercase(), cte_table);
+                    created_tables.push(cte_name);
                 }
-                rows.push(row);
+            } else {
+                let res = self.execute(cte_query, params)?;
+                let mut cols = Vec::new();
+                for (c_i, f) in res.fields.iter().enumerate() {
+                    let name = if let Some(ref exp) = explicit_cols {
+                        exp.get(c_i).cloned().unwrap_or_else(|| f.name.clone())
+                    } else {
+                        f.name.clone()
+                    };
+                    cols.push(crate::types::ColumnDef {
+                        name,
+                        data_type: crate::types::DataType::from_sql_str(&f.data_type),
+                        is_primary_key: false,
+                        is_nullable: true,
+                        default_value: None,
+                        comment: None,
+                    });
+                }
+                let mut rows = Vec::new();
+                for r_json in res.rows {
+                    let mut row = Vec::new();
+                    for (c_i, col) in cols.iter().enumerate() {
+                        let f_name = &res.fields[c_i].name;
+                        let v = match r_json.get(&col.name).or_else(|| r_json.get(f_name)) {
+                            Some(serde_json::Value::Null) | None => Value::Null,
+                            Some(serde_json::Value::Bool(b)) => Value::Bool(*b),
+                            Some(serde_json::Value::Number(num)) => {
+                                if let Some(i) = num.as_i64() { Value::Int(i) } else if let Some(f) = num.as_f64() { Value::Float(f) } else { Value::Null }
+                            }
+                            Some(serde_json::Value::String(s)) => Value::text(s),
+                            Some(other) => Value::text(other.to_string()),
+                        };
+                        row.push(v);
+                    }
+                    rows.push(row);
+                }
+                let mut cte_table = crate::storage::table::Table::new(cte_name.clone(), cols);
+                for r in rows { cte_table.insert(r); }
+                self.storage.tables.insert(cte_name.to_lowercase(), cte_table);
+                created_tables.push(cte_name);
             }
 
-            let mut cte_table = crate::storage::table::Table::new(cte_name.clone(), cols);
-            for r in rows {
-                cte_table.insert(r);
-            }
-
-            self.storage.tables.insert(cte_name.to_lowercase(), cte_table);
-            created_tables.push(cte_name);
-
-            let rest_after_paren = after_as[end_idx + 1..].trim();
+            let rest_after_paren = cur_slice[close_paren_idx + 1..].trim_start();
             if rest_after_paren.starts_with(',') {
-                let comma_pos = without_with.len() - rest_after_paren.len();
-                i = comma_pos + 1;
+                let after_comma = rest_after_paren[1..].trim_start();
+                i = without_with.len() - after_comma.len();
             } else {
                 let main_query = rest_after_paren;
                 let main_res = self.execute(main_query, params);
@@ -3136,7 +3351,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }).collect()
         };
 
-        let plan_opt = if let Some(w) = clauses.where_clause {
+        let plan_opt = if select_clause.to_uppercase().contains(" OVER") || select_clause.to_uppercase().contains(" OVER(") {
+            None
+        } else if let Some(w) = clauses.where_clause {
             if let Ok(condition_templates) = compile_condition_templates(w, table) {
                 let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
                     let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
@@ -4930,7 +5147,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                         if in_tx {
                             for (col_idx, old_val) in old_vals {
-                                undo_restores.push((target_pk, col_idx, old_val));
+                                undo_restores.push((row_idx, col_idx, old_val));
                             }
                         }
                     }
@@ -4963,10 +5180,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             for (col_idx, new_val) in &updates {
                                 wal_updates.push((pk, *col_idx, new_val.clone()));
                             }
-                            if in_tx {
-                                for (col_idx, old_val) in old_vals {
-                                    undo_restores.push((pk, col_idx, old_val));
-                                }
+                        }
+                        if in_tx {
+                            for (col_idx, old_val) in old_vals {
+                                undo_restores.push((i, col_idx, old_val));
                             }
                         }
                     }
@@ -4989,10 +5206,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             });
         }
         if in_tx {
-            for (pk, col_idx, old_val) in undo_restores {
+            for (row_idx, col_idx, old_val) in undo_restores {
                 self.storage.tx_undo_log.push(UndoAction::RestoreRow {
                     table: table_name.to_string(),
-                    pk,
+                    row_idx,
                     col_idx,
                     old_val,
                 });
@@ -5030,6 +5247,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let mut row_count = 0;
         let mut returned_rows = Vec::new();
         let mut deleted_pks = Vec::new();
+        let mut deleted_row_indices = Vec::new();
 
         let resolved_where = if let Some(w) = where_clause {
             let w_up = w.to_uppercase();
@@ -5078,6 +5296,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         table.delete_row(row_idx);
                         row_count = 1;
                         deleted_pks.push(target_pk);
+                        deleted_row_indices.push(row_idx);
                     }
                 }
             } else {
@@ -5097,6 +5316,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                         table.delete_row(i);
                         row_count += 1;
+                        deleted_row_indices.push(i);
                     }
                 }
             }
@@ -5113,10 +5333,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 table: table_name.to_string(),
                 pk,
             });
-            if in_tx {
+        }
+        if in_tx {
+            for row_idx in deleted_row_indices {
                 self.storage.tx_undo_log.push(UndoAction::UndeleteRow {
                     table: table_name.to_string(),
-                    pk,
+                    row_idx,
                 });
             }
         }
@@ -7663,7 +7885,7 @@ fn evaluate_having_with_group(
     extra_names: Option<&[(&str, &str)]>,
     table: &crate::storage::table::Table,
     r_indices: &[usize],
-    params: &[Value],
+    _params: &[Value],
 ) -> bool {
     let mut substituted = having_str.to_string();
 
@@ -8030,6 +8252,61 @@ fn eval_window_functions(rows: &mut [serde_json::Value], select_clause: &str) {
                         if pos + offset < partition_len {
                             let next_idx = indices[pos + offset];
                             rows[next_idx].get(col_name).cloned().unwrap_or(serde_json::Value::Null)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    } else if upper_func.starts_with("NTILE(") {
+                        let k: usize = func_part[6..func_part.len() - 1].trim().parse().unwrap_or(1).max(1);
+                        let tile = ((pos * k) / partition_len) + 1;
+                        serde_json::Value::Number(tile.into())
+                    } else if upper_func.starts_with("PERCENT_RANK") {
+                        let pr = if partition_len > 1 {
+                            pos as f64 / (partition_len - 1) as f64
+                        } else {
+                            0.0
+                        };
+                        serde_json::Value::Number(serde_json::Number::from_f64(pr).unwrap_or(0.into()))
+                    } else if upper_func.starts_with("CUME_DIST") {
+                        let cd = (pos + 1) as f64 / partition_len as f64;
+                        serde_json::Value::Number(serde_json::Number::from_f64(cd).unwrap_or(0.into()))
+                    } else if upper_func.starts_with("MIN(") {
+                        let col = clean_col_name(&func_part[4..func_part.len() - 1]);
+                        let mut min_val: Option<f64> = None;
+                        for &cur_idx in &indices[..=pos] {
+                            if let Some(v) = rows[cur_idx].get(col) {
+                                if let Some(n) = v.as_f64() {
+                                    min_val = Some(min_val.map_or(n, |m| m.min(n)));
+                                }
+                            }
+                        }
+                        match min_val {
+                            Some(m) if m.fract() == 0.0 => serde_json::Value::Number((m as i64).into()),
+                            Some(m) => serde_json::Value::Number(serde_json::Number::from_f64(m).unwrap_or(0.into())),
+                            None => serde_json::Value::Null,
+                        }
+                    } else if upper_func.starts_with("MAX(") {
+                        let col = clean_col_name(&func_part[4..func_part.len() - 1]);
+                        let mut max_val: Option<f64> = None;
+                        for &cur_idx in &indices[..=pos] {
+                            if let Some(v) = rows[cur_idx].get(col) {
+                                if let Some(n) = v.as_f64() {
+                                    max_val = Some(max_val.map_or(n, |m| m.max(n)));
+                                }
+                            }
+                        }
+                        match max_val {
+                            Some(m) if m.fract() == 0.0 => serde_json::Value::Number((m as i64).into()),
+                            Some(m) => serde_json::Value::Number(serde_json::Number::from_f64(m).unwrap_or(0.into())),
+                            None => serde_json::Value::Null,
+                        }
+                    } else if upper_func.starts_with("NTH_VALUE(") {
+                        let inner = func_part[10..func_part.len() - 1].trim();
+                        let parts: Vec<&str> = inner.split(',').collect();
+                        let col_name = clean_col_name(parts[0].trim());
+                        let nth: usize = parts.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+                        if nth >= 1 && nth <= partition_len {
+                            let target_idx = indices[nth - 1];
+                            rows[target_idx].get(col_name).cloned().unwrap_or(serde_json::Value::Null)
                         } else {
                             serde_json::Value::Null
                         }
