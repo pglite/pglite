@@ -12,21 +12,19 @@ path = "src/bin/benchmark.rs"
 
 [features]
 default = ["napi-binding"]
-napi-binding = ["dep:napi", "dep:napi-derive"]
+napi-binding = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+wasm-binding = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:getrandom"]
 
 [dependencies]
-napi = { version = "2.16.14", default-features = false, features = ["napi4", "async", "serde-json"], optional = true }
-napi-derive = { version = "2.16.12", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 parking_lot = "0.12"
 rayon = "1.10"
 byteorder = "1.5"
 bincode = "1.3.3"
-memmap2 = "0.9"
 compact_str = { version = "0.8", features = ["serde"] }
 bitvec = "1.0"
-uuid = { version = "1.10", features = ["v4", "fast-rng"] }
+uuid = { version = "1.10", features = ["v4", "fast-rng", "js"] }
 sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
@@ -34,11 +32,24 @@ hex = "0.4"
 base64 = "0.22"
 regex = "1.10"
 
+# Node.js native addon dependencies
+napi = { version = "2.16.14", default-features = false, features = ["napi4", "async", "serde-json"], optional = true }
+napi-derive = { version = "2.16.12", optional = true }
+
+# WebAssembly dependencies
+wasm-bindgen = { version = "0.2.100", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+
 [build-dependencies]
-napi-build = "2.1.4"
+napi-build = { version = "2.1.4", optional = true }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+

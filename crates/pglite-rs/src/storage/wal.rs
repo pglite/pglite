@@ -53,9 +53,11 @@ pub enum WalRecord {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 const BATCH_FLUSH_SIZE: usize = 64 * 1024; // 64 KB in-memory buffer
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_FLUSH_INTERVAL_MS: u128 = 20;   // 20 ms batch interval
 
 pub struct WalManager {
@@ -63,6 +65,7 @@ pub struct WalManager {
     pub writer: Option<BufWriter<File>>,
     pub buffer: Vec<WalRecord>,
     pub pending_bytes: Vec<u8>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub last_flush: Instant,
 }
 
@@ -74,6 +77,7 @@ impl WalManager {
                 writer: None,
                 buffer: Vec::new(),
                 pending_bytes: Vec::new(),
+                #[cfg(not(target_arch = "wasm32"))]
                 last_flush: Instant::now(),
             };
         }
@@ -88,9 +92,13 @@ impl WalManager {
         } else if rwal_path.exists() {
             rwal_path
         } else if legacy_wal_path.exists() {
+            #[cfg(not(target_arch = "wasm32"))]
             let has_pgl_magic = File::open(&legacy_wal_path).ok().and_then(|f| {
                 unsafe { memmap2::Mmap::map(&f).ok() }
             }).map(|mmap| mmap.len() >= 4 && (&mmap[0..4] == WAL_MAGIC || &mmap[0..4] == WAL_MAGIC_V1)).unwrap_or(false);
+
+            #[cfg(target_arch = "wasm32")]
+            let has_pgl_magic = false;
 
             if has_pgl_magic {
                 let _ = std::fs::rename(&legacy_wal_path, &rwal_path);
@@ -106,9 +114,11 @@ impl WalManager {
             rwal_path
         };
 
+        #[allow(unused_mut)]
         let mut recovered_records: Vec<WalRecord> = Vec::new();
 
         // Zero-Copy WAL Recovery via Memory-Mapped File (mmap)
+        #[cfg(not(target_arch = "wasm32"))]
         if let Ok(file) = File::open(&wal_path) {
             if file.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
@@ -167,6 +177,7 @@ impl WalManager {
             writer,
             buffer: recovered_records,
             pending_bytes: Vec::with_capacity(BATCH_FLUSH_SIZE),
+            #[cfg(not(target_arch = "wasm32"))]
             last_flush: Instant::now(),
         }
     }
@@ -182,7 +193,18 @@ impl WalManager {
         self.buffer.push(record);
 
         // Asynchronous Batching: Flush when buffer threshold reached or interval elapsed
-        if self.pending_bytes.len() >= BATCH_FLUSH_SIZE || self.last_flush.elapsed().as_millis() >= MAX_FLUSH_INTERVAL_MS {
+        let should_flush = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.pending_bytes.len() >= BATCH_FLUSH_SIZE || self.last_flush.elapsed().as_millis() >= MAX_FLUSH_INTERVAL_MS
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.pending_bytes.len() >= BATCH_FLUSH_SIZE
+            }
+        };
+
+        if should_flush {
             self.flush_pending();
         }
     }
@@ -196,7 +218,10 @@ impl WalManager {
             let _ = writer.flush();
         }
         self.pending_bytes.clear();
-        self.last_flush = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.last_flush = Instant::now();
+        }
     }
 
     pub fn flush(&mut self) {
@@ -216,7 +241,10 @@ impl WalManager {
                 .ok();
             self.writer = file.map(BufWriter::new);
         }
-        self.last_flush = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.last_flush = Instant::now();
+        }
     }
 }
 

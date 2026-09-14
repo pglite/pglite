@@ -1,14 +1,19 @@
 #[cfg(feature = "napi-binding")]
 pub mod binding;
+#[cfg(feature = "wasm-binding")]
+pub mod wasm_binding;
 pub mod engine;
 pub mod storage;
 pub mod types;
 
 #[cfg(feature = "napi-binding")]
 pub use binding::LitePostgresNative;
+#[cfg(feature = "wasm-binding")]
+pub use wasm_binding::PGliteWasm;
 pub use engine::Executor;
 pub use storage::StorageEngine;
 pub use types::{ColumnDef, DataType, QueryResult, Value};
+
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,7 @@
-extern crate napi_build;
-
 fn main() {
-  napi_build::setup();
+    #[cfg(all(feature = "napi-binding", not(target_arch = "wasm32")))]
+    {
+        napi_build::setup();
+    }
 }
+
