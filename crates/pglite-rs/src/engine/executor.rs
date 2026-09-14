@@ -9,8 +9,9 @@ use base64::Engine;
 
 pub use crate::engine::plan::PlannedProjectedExpr as ProjectedExpr;
 use crate::engine::plan::{
-    evaluate_planned_condition, project_row_planned, resolve_operand, ColOpTemplate,
-    ConditionTemplate, ExecutionPlan, OperandTemplate, PlannedJoin, PlannedProjectedExpr,
+    evaluate_planned_condition, evaluate_planned_where, find_pk_equality_in_where_template,
+    project_row_planned, resolve_operand, ColOpTemplate, ConditionTemplate, ExecutionPlan,
+    OperandTemplate, PlannedJoin, PlannedProjectedExpr, WhereTemplate,
 };
 
 pub struct Executor {
@@ -3275,18 +3276,34 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         ProjectedExpr::Expr { expr_str, alias } => {
                             let empty_vec = Vec::new();
                             let j_row = joined_row.unwrap_or(&empty_vec);
-                            let v = eval_sql_expr(
-                                expr_str,
-                                primary_row,
-                                Some(table),
-                                j_row,
-                                joined_table_opt,
-                                params,
-                            );
-                            if expr_str.to_uppercase().starts_with("JSONB_PRETTY(") || expr_str.to_uppercase().starts_with("JSON_PRETTY(") {
-                                map.insert(alias.clone(), serde_json::Value::String(v.as_str()));
+                            let expr_up = expr_str.to_uppercase();
+                            if expr_up.contains("SELECT") && expr_up.contains("FROM") {
+                                let mut combined_meta = Vec::new();
+                                combined_meta.push((table, clauses.table_alias));
+                                if let Some(jt) = joined_table_opt {
+                                    combined_meta.push((jt, clauses.join_clause.as_ref().and_then(|jc| jc.joined_table_alias)));
+                                }
+                                let joined_schema = std::sync::Arc::new(JoinedSchema::new(&combined_meta));
+                                let mut comb = CombinedRow::from_base_row(joined_schema.clone(), primary_row);
+                                if let Some(jr) = joined_row {
+                                    comb = comb.with_joined_table(jr);
+                                }
+                                let val_json = eval_joined_scalar_expr(expr_str, &comb, params, &self.storage);
+                                map.insert(alias.clone(), val_json);
                             } else {
-                                map.insert(alias.clone(), value_to_json(&v));
+                                let v = eval_sql_expr(
+                                    expr_str,
+                                    primary_row,
+                                    Some(table),
+                                    j_row,
+                                    joined_table_opt,
+                                    params,
+                                );
+                                if expr_str.to_uppercase().starts_with("JSONB_PRETTY(") || expr_str.to_uppercase().starts_with("JSON_PRETTY(") {
+                                    map.insert(alias.clone(), serde_json::Value::String(v.as_str()));
+                                } else {
+                                    map.insert(alias.clone(), value_to_json(&v));
+                                }
                             }
                         }
                     }
@@ -3354,7 +3371,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let plan_opt = if select_clause.to_uppercase().contains(" OVER") || select_clause.to_uppercase().contains(" OVER(") {
             None
         } else if let Some(w) = clauses.where_clause {
-            if let Ok(condition_templates) = compile_condition_templates(w, table) {
+            if let Ok(where_tmpl) = compile_where_template(w, table) {
                 let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
                     let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
                     let j_idx = jt.get_column_index(clean_col_name(jc.joined_join_col)).unwrap_or(0);
@@ -3387,7 +3404,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 Some(ExecutionPlan::GeneralSelect {
                     table_name: table.name.clone(),
                     join: planned_join,
-                    conditions: condition_templates,
+                    where_template: Some(where_tmpl),
                     order_by: order_by_info,
                     limit: clauses.limit,
                     offset: clauses.offset,
@@ -3430,7 +3447,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             Some(ExecutionPlan::GeneralSelect {
                 table_name: table.name.clone(),
                 join: planned_join,
-                conditions: vec![],
+                where_template: None,
                 order_by: order_by_info,
                 limit: clauses.limit,
                 offset: clauses.offset,
@@ -3516,7 +3533,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             ExecutionPlan::GeneralSelect {
                 table_name,
                 join,
-                conditions,
+                where_template,
                 order_by,
                 limit,
                 offset,
@@ -3533,28 +3550,18 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let mut matched_indices = Vec::new();
 
                 let pk_target = table.pk_col_idx.and_then(|pk_idx| {
-                    conditions.iter().find_map(|c| {
-                        if c.col_idx == pk_idx {
-                            if let ColOpTemplate::Eq(opnd) = &c.op {
-                                return resolve_operand(opnd, params).as_i64();
-                            }
-                        }
-                        None
-                    })
+                    where_template.as_ref().and_then(|wt| find_pk_equality_in_where_template(wt, pk_idx, params))
                 });
 
                 if let Some(target_pk) = pk_target {
                     if let Some(&row_idx) = table.pk_index.get(&target_pk) {
                         if !table.is_deleted[row_idx] {
                             let row = &table.rows[row_idx];
-                            let mut ok = true;
-                            for c in conditions {
-                                if !evaluate_planned_condition(row, c, params) {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if ok {
+                            let matches = match &where_template {
+                                Some(wt) => evaluate_planned_where(row, wt, params),
+                                None => true,
+                            };
+                            if matches {
                                 matched_indices.push(row_idx);
                             }
                         }
@@ -3563,14 +3570,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     for i in 0..table.rows.len() {
                         if !table.is_deleted[i] {
                             let row = &table.rows[i];
-                            let mut ok = true;
-                            for c in conditions {
-                                if !evaluate_planned_condition(row, c, params) {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if ok {
+                            let matches = match &where_template {
+                                Some(wt) => evaluate_planned_where(row, wt, params),
+                                None => true,
+                            };
+                            if matches {
                                 matched_indices.push(i);
                             }
                         }
@@ -3687,15 +3691,31 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 PlannedProjectedExpr::Expr { expr_str, alias } => {
                                     let empty_vec = Vec::new();
                                     let j_slice = j_row.unwrap_or(&empty_vec);
-                                    let v = eval_sql_expr(
-                                        expr_str,
-                                        p_row,
-                                        Some(table),
-                                        j_slice,
-                                        joined_table_opt,
-                                        params,
-                                    );
-                                    map.insert(alias.clone(), value_to_json(&v));
+                                    let expr_up = expr_str.to_uppercase();
+                                    if expr_up.contains("SELECT") && expr_up.contains("FROM") {
+                                        let mut combined_meta = Vec::new();
+                                        combined_meta.push((table, None));
+                                        if let Some(jt) = joined_table_opt {
+                                            combined_meta.push((jt, None));
+                                        }
+                                        let joined_schema = std::sync::Arc::new(JoinedSchema::new(&combined_meta));
+                                        let mut comb = CombinedRow::from_base_row(joined_schema.clone(), p_row);
+                                        if let Some(jr) = j_row {
+                                            comb = comb.with_joined_table(jr);
+                                        }
+                                        let val_json = eval_joined_scalar_expr(expr_str, &comb, params, &self.storage);
+                                        map.insert(alias.clone(), val_json);
+                                    } else {
+                                        let v = eval_sql_expr(
+                                            expr_str,
+                                            p_row,
+                                            Some(table),
+                                            j_slice,
+                                            joined_table_opt,
+                                            params,
+                                        );
+                                        map.insert(alias.clone(), value_to_json(&v));
+                                    }
                                 }
                             }
                         }
@@ -6484,6 +6504,53 @@ fn cast_json_val(v: serde_json::Value, target_type: &str) -> serde_json::Value {
     }
 }
 
+fn parse_subquery_from_and_clauses<'a>(
+    after_from: &'a str,
+) -> (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>) {
+    let where_pos = find_top_level_keyword(after_from, "WHERE");
+    let order_pos = find_top_level_keyword(after_from, "ORDER BY");
+    let limit_pos = find_top_level_keyword(after_from, "LIMIT");
+    let offset_pos = find_top_level_keyword(after_from, "OFFSET");
+
+    let mut kw_positions: Vec<(usize, &str, usize)> = Vec::new();
+    if let Some(p) = where_pos { kw_positions.push((p, "WHERE", 5)); }
+    if let Some(p) = order_pos { kw_positions.push((p, "ORDER BY", 8)); }
+    if let Some(p) = limit_pos { kw_positions.push((p, "LIMIT", 5)); }
+    if let Some(p) = offset_pos { kw_positions.push((p, "OFFSET", 6)); }
+
+    kw_positions.sort_by_key(|(p, _, _)| *p);
+
+    let table_part = if let Some(&(first_p, _, _)) = kw_positions.first() {
+        after_from[..first_p].trim()
+    } else {
+        after_from.trim()
+    };
+
+    let mut where_opt = None;
+    let mut order_opt = None;
+    let mut limit_opt = None;
+    let mut offset_opt = None;
+
+    for (idx, &(p, kw, kw_len)) in kw_positions.iter().enumerate() {
+        let content_start = p + kw_len;
+        let content_end = if idx + 1 < kw_positions.len() {
+            kw_positions[idx + 1].0
+        } else {
+            after_from.len()
+        };
+        let content = after_from[content_start..content_end].trim();
+        match kw {
+            "WHERE" => where_opt = Some(content),
+            "ORDER BY" => order_opt = Some(content),
+            "LIMIT" => limit_opt = Some(content),
+            "OFFSET" => offset_opt = Some(content),
+            _ => {}
+        }
+    }
+
+    (table_part, where_opt, order_opt, limit_opt, offset_opt)
+}
+
 fn eval_joined_scalar_expr(
     expr: &str,
     row: &CombinedRow,
@@ -6500,128 +6567,179 @@ fn eval_joined_scalar_expr(
     }
     let upper = t.to_uppercase();
 
-    // 1. Correlated Subquery: (SELECT COUNT(*) FROM child WHERE child.fk = parent.id AND ...)
-    if (upper.starts_with("(SELECT COUNT") || upper.starts_with("SELECT COUNT")) && upper.contains("FROM") {
-        let sub_sql = if t.starts_with('(') && t.ends_with(')') {
+    // 1. Correlated / Scalar Subquery: (SELECT ... FROM child WHERE child.fk = parent.id AND ...)
+    if (upper.starts_with("(SELECT") || upper.starts_with("SELECT")) && upper.contains("FROM") {
+        let sub_sql = if t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
             t[1..t.len() - 1].trim()
         } else {
             t
         };
         if let Some(from_pos) = find_top_level_keyword(sub_sql, "FROM") {
-            let after_sub_from = sub_sql[from_pos + 4..].trim();
-            let where_sub_pos = find_top_level_keyword(after_sub_from, "WHERE");
-            let child_tbl_part = if let Some(w_pos) = where_sub_pos {
-                &after_sub_from[..w_pos]
+            let select_part = if sub_sql.to_uppercase().starts_with("SELECT ") {
+                sub_sql[6..from_pos].trim()
             } else {
-                after_sub_from
+                sub_sql[..from_pos].trim()
             };
+            let after_sub_from = sub_sql[from_pos + 4..].trim();
+            let (child_tbl_part, where_clause, _order_clause, _limit_clause, _offset_clause) =
+                parse_subquery_from_and_clauses(after_sub_from);
             let (child_table_name, child_alias) = extract_table_name_and_alias(child_tbl_part);
 
             if let Some(child_table) = storage.get_table(child_table_name) {
-                if let Some(w_pos) = where_sub_pos {
-                    let sub_where = after_sub_from[w_pos + 5..].trim();
-                    let and_parts = split_top_level_and(sub_where);
-                    let mut count = 0;
-
-                    let is_child_col = |col_str: &str| -> bool {
-                        let s = col_str.trim();
-                        if let Some(dot) = s.find('.') {
-                            let prefix = s[..dot].trim().to_lowercase();
-                            if prefix == child_table_name.to_lowercase() {
+                let is_child_col = |col_str: &str| -> bool {
+                    let s = col_str.trim().trim_matches('"');
+                    if let Some(dot) = s.find('.') {
+                        let prefix = s[..dot].trim().trim_matches('"').to_lowercase();
+                        if prefix == child_table_name.to_lowercase() {
+                            return true;
+                        }
+                        if let Some(ca) = child_alias {
+                            if prefix == ca.trim_matches('"').to_lowercase() {
                                 return true;
                             }
-                            if let Some(ca) = child_alias {
-                                if prefix == ca.to_lowercase() {
-                                    return true;
-                                }
-                            }
-                            return false;
                         }
-                        child_table.get_column_index(s).is_some()
-                    };
+                        return false;
+                    }
+                    child_table.get_column_index(s).is_some()
+                };
 
-                    for (cr_idx, cr) in child_table.rows.iter().enumerate() {
-                        if child_table.is_deleted[cr_idx] {
-                            continue;
+                let resolve_sub_operand = |operand: &str, cr: &[Value]| -> Value {
+                    let op = operand.trim();
+                    if is_child_col(op) {
+                        let cname = clean_col_name(op);
+                        if let Some(idx) = child_table.get_column_index(cname) {
+                            return cr.get(idx).cloned().unwrap_or(Value::Null);
                         }
-                        let mut matches = true;
-                        for part in &and_parts {
-                            let part_trimmed = part.trim();
-                            let part_upper = part_trimmed.to_uppercase();
-                            if part_upper.ends_with("IS NULL") {
-                                let col = part_trimmed[..part_trimmed.len() - 7].trim();
-                                let col_clean = clean_col_name(col);
-                                if is_child_col(col) {
-                                    if let Some(c_idx) = child_table.get_column_index(col_clean) {
-                                        if !cr.get(c_idx).map_or(true, |v| v.is_null()) {
-                                            matches = false;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    let v = row.get_val(col);
-                                    if !v.is_null() {
-                                        matches = false;
-                                        break;
-                                    }
-                                }
-                            } else if part_upper.ends_with("IS NOT NULL") {
-                                let col = part_trimmed[..part_trimmed.len() - 11].trim();
-                                let col_clean = clean_col_name(col);
-                                if is_child_col(col) {
-                                    if let Some(c_idx) = child_table.get_column_index(col_clean) {
-                                        if cr.get(c_idx).map_or(true, |v| v.is_null()) {
-                                            matches = false;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    let v = row.get_val(col);
-                                    if v.is_null() {
-                                        matches = false;
-                                        break;
-                                    }
-                                }
-                            } else if let Some(eq_idx) = part_trimmed.find('=') {
-                                let left_raw = part_trimmed[..eq_idx].trim();
-                                let right_raw = part_trimmed[eq_idx + 1..].trim();
-
-                                let left_val = if is_child_col(left_raw) {
-                                    let cname = clean_col_name(left_raw);
-                                    if let Some(idx) = child_table.get_column_index(cname) {
-                                        cr.get(idx).cloned().unwrap_or(Value::Null)
-                                    } else {
-                                        Value::Null
-                                    }
-                                } else {
-                                    row.get_val(left_raw)
-                                };
-
-                                let right_val = if is_child_col(right_raw) {
-                                    let cname = clean_col_name(right_raw);
-                                    if let Some(idx) = child_table.get_column_index(cname) {
-                                        cr.get(idx).cloned().unwrap_or(Value::Null)
-                                    } else {
-                                        Value::Null
-                                    }
-                                } else {
-                                    row.get_val(right_raw)
-                                };
-
-                                if !left_val.is_equal(&right_val) {
-                                    matches = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if matches {
-                            count += 1;
+                        return Value::Null;
+                    }
+                    if op.starts_with('$') {
+                        if let Ok(idx) = op[1..].parse::<usize>() {
+                            return params.get(idx.saturating_sub(1)).cloned().unwrap_or(Value::Null);
                         }
                     }
-                    return serde_json::json!(count);
+                    if op.starts_with('\'') && op.ends_with('\'') && op.len() >= 2 {
+                        return Value::text(op[1..op.len() - 1].replace("''", "'"));
+                    }
+                    if op.eq_ignore_ascii_case("TRUE") {
+                        return Value::Bool(true);
+                    }
+                    if op.eq_ignore_ascii_case("FALSE") {
+                        return Value::Bool(false);
+                    }
+                    if op.eq_ignore_ascii_case("NULL") {
+                        return Value::Null;
+                    }
+                    if let Ok(i) = op.parse::<i64>() {
+                        return Value::Int(i);
+                    }
+                    if let Ok(f) = op.parse::<f64>() {
+                        return Value::Float(f);
+                    }
+                    let clean_op = clean_col_name(op);
+                    let v = row.get_val(clean_op);
+                    if !v.is_null() {
+                        return v;
+                    }
+                    row.get_val(op)
+                };
+
+                let and_parts = if let Some(w_str) = where_clause {
+                    split_top_level_and(w_str)
                 } else {
-                    let count = child_table.rows.iter().enumerate().filter(|(idx, _)| !child_table.is_deleted[*idx]).count();
-                    return serde_json::json!(count);
+                    Vec::new()
+                };
+
+                let mut matching_rows: Vec<&Vec<Value>> = Vec::new();
+
+                for (cr_idx, cr) in child_table.rows.iter().enumerate() {
+                    if child_table.is_deleted[cr_idx] {
+                        continue;
+                    }
+                    let mut matches = true;
+                    for part in &and_parts {
+                        let part_trimmed = part.trim();
+                        let part_upper = part_trimmed.to_uppercase();
+                        if part_upper.ends_with("IS NULL") {
+                            let col = part_trimmed[..part_trimmed.len() - 7].trim();
+                            let v = resolve_sub_operand(col, cr);
+                            if !v.is_null() {
+                                matches = false;
+                                break;
+                            }
+                        } else if part_upper.ends_with("IS NOT NULL") {
+                            let col = part_trimmed[..part_trimmed.len() - 11].trim();
+                            let v = resolve_sub_operand(col, cr);
+                            if v.is_null() {
+                                matches = false;
+                                break;
+                            }
+                        } else if let Some(eq_idx) = part_trimmed.find('=') {
+                            let left_raw = part_trimmed[..eq_idx].trim();
+                            let right_raw = part_trimmed[eq_idx + 1..].trim();
+                            let left_val = resolve_sub_operand(left_raw, cr);
+                            let right_val = resolve_sub_operand(right_raw, cr);
+                            if !left_val.is_equal(&right_val) {
+                                matches = false;
+                                break;
+                            }
+                        } else if let Some(neq_idx) = part_trimmed.find("!=") {
+                            let left_raw = part_trimmed[..neq_idx].trim();
+                            let right_raw = part_trimmed[neq_idx + 2..].trim();
+                            let left_val = resolve_sub_operand(left_raw, cr);
+                            let right_val = resolve_sub_operand(right_raw, cr);
+                            if left_val.is_equal(&right_val) {
+                                matches = false;
+                                break;
+                            }
+                        } else if let Some(neq_idx) = part_trimmed.find("<>") {
+                            let left_raw = part_trimmed[..neq_idx].trim();
+                            let right_raw = part_trimmed[neq_idx + 2..].trim();
+                            let left_val = resolve_sub_operand(left_raw, cr);
+                            let right_val = resolve_sub_operand(right_raw, cr);
+                            if left_val.is_equal(&right_val) {
+                                matches = false;
+                                break;
+                            }
+                        }
+                    }
+                    if matches {
+                        matching_rows.push(cr);
+                    }
+                }
+
+                let sel_trimmed = select_part.trim();
+                let sel_upper = sel_trimmed.to_uppercase();
+
+                if sel_upper.starts_with("COUNT(") || sel_upper == "COUNT(*)" {
+                    return serde_json::json!(matching_rows.len());
+                } else if sel_upper.starts_with("SUM(") && sel_trimmed.ends_with(')') {
+                    let inner = sel_trimmed[4..sel_trimmed.len() - 1].trim();
+                    let mut sum_f = 0.0;
+                    let mut sum_i = 0i64;
+                    let mut is_float = false;
+                    for cr in &matching_rows {
+                        let v = resolve_sub_operand(inner, cr);
+                        if let Some(i) = v.as_i64() {
+                            sum_i += i;
+                            sum_f += i as f64;
+                        } else if let Some(f) = v.as_f64() {
+                            sum_f += f;
+                            is_float = true;
+                        }
+                    }
+                    return if is_float { serde_json::json!(sum_f) } else { serde_json::json!(sum_i) };
+                } else {
+                    let expr_to_eval = if let Some(as_idx) = sel_upper.rfind(" AS ") {
+                        sel_trimmed[..as_idx].trim()
+                    } else {
+                        sel_trimmed
+                    };
+                    if let Some(first_cr) = matching_rows.first() {
+                        let val = resolve_sub_operand(expr_to_eval, first_cr);
+                        return value_to_json(&val);
+                    } else {
+                        return serde_json::Value::Null;
+                    }
                 }
             }
         }
@@ -8396,11 +8514,15 @@ fn split_projection_items(s: &str) -> Vec<String> {
     let mut current = String::new();
     let mut depth: usize = 0;
     let mut in_quote = false;
+    let mut in_dq = false;
     for c in s.chars() {
-        if c == '\'' {
+        if c == '\'' && !in_dq {
             in_quote = !in_quote;
             current.push(c);
-        } else if in_quote {
+        } else if c == '"' && !in_quote {
+            in_dq = !in_dq;
+            current.push(c);
+        } else if in_quote || in_dq {
             current.push(c);
         } else if c == '(' || c == '[' {
             depth += 1;
@@ -8816,7 +8938,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
             if tok.is_empty() {
                 None
             } else {
-                Some(parse_operand_template(tok))
+                parse_operand_template(tok).ok()
             }
         }
         None => None,
@@ -8830,7 +8952,7 @@ fn parse_select_clauses<'a>(after_from: &'a str) -> SelectClauses<'a> {
             if tok.is_empty() {
                 None
             } else {
-                Some(parse_operand_template(tok))
+                parse_operand_template(tok).ok()
             }
         }
         None => None,
@@ -10137,7 +10259,7 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
     Value::text(t)
 }
 
-fn parse_operand_template(token: &str) -> OperandTemplate {
+fn parse_operand_template(token: &str) -> Result<OperandTemplate, String> {
     let mut t = token.trim();
     while is_fully_enclosed_in_parens(t) {
         t = t[1..t.len() - 1].trim();
@@ -10151,36 +10273,133 @@ fn parse_operand_template(token: &str) -> OperandTemplate {
     let upper = t.to_uppercase();
     if upper.starts_with("LOWER(") && t.ends_with(')') {
         let inner = t[6..t.len() - 1].trim().trim_matches('\'').replace("''", "'");
-        return OperandTemplate::Literal(Value::text(inner.to_lowercase()));
+        return Ok(OperandTemplate::Literal(Value::text(inner.to_lowercase())));
     }
     if upper.starts_with("UPPER(") && t.ends_with(')') {
         let inner = t[6..t.len() - 1].trim().trim_matches('\'').replace("''", "'");
-        return OperandTemplate::Literal(Value::text(inner.to_uppercase()));
+        return Ok(OperandTemplate::Literal(Value::text(inner.to_uppercase())));
     }
     if t.starts_with('$') {
         if let Ok(p_idx) = t[1..].parse::<usize>() {
-            return OperandTemplate::Param(p_idx.saturating_sub(1));
+            if p_idx > 0 {
+                return Ok(OperandTemplate::Param(p_idx - 1));
+            }
         }
     }
     if t.eq_ignore_ascii_case("TRUE") {
-        return OperandTemplate::Literal(Value::Bool(true));
+        return Ok(OperandTemplate::Literal(Value::Bool(true)));
     }
     if t.eq_ignore_ascii_case("FALSE") {
-        return OperandTemplate::Literal(Value::Bool(false));
+        return Ok(OperandTemplate::Literal(Value::Bool(false)));
     }
     if t.eq_ignore_ascii_case("NULL") {
-        return OperandTemplate::Literal(Value::Null);
+        return Ok(OperandTemplate::Literal(Value::Null));
     }
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
-        return OperandTemplate::Literal(Value::text(t[1..t.len() - 1].replace("''", "'")));
+        return Ok(OperandTemplate::Literal(Value::text(t[1..t.len() - 1].replace("''", "'"))));
     }
     if let Ok(i) = t.parse::<i64>() {
-        return OperandTemplate::Literal(Value::Int(i));
+        return Ok(OperandTemplate::Literal(Value::Int(i)));
     }
     if let Ok(f) = t.parse::<f64>() {
-        return OperandTemplate::Number(f);
+        return Ok(OperandTemplate::Number(f));
     }
-    OperandTemplate::Literal(Value::text(t))
+    Err(format!("Invalid operand template: {}", t))
+}
+
+fn parse_single_condition_template(
+    part: &str,
+    table: &crate::storage::table::Table,
+) -> Result<ConditionTemplate, String> {
+    let mut s = part.trim();
+    while is_fully_enclosed_in_parens(s) {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.contains("->") || s.contains("@>") || s.contains("<@") || s.contains('?') || s.contains("#>") {
+        return Err("Custom JSON condition".to_string());
+    }
+    let upper = s.to_uppercase();
+
+    if let Some(pos) = upper.find(" IS NOT NULL") {
+        let col_name = clean_col_name(&s[..pos]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::IsNotNull });
+    }
+    if let Some(pos) = upper.find(" IS NULL") {
+        let col_name = clean_col_name(&s[..pos]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::IsNull });
+    }
+    if let Some(b_idx) = upper.find(" BETWEEN ") {
+        let col_name = clean_col_name(&s[..b_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let rest = &s[b_idx + 9..];
+        let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
+        let min_token = rest[..and_idx].trim();
+        let max_token = rest[and_idx + 5..].trim();
+        let min_opnd = parse_operand_template(min_token)?;
+        let max_opnd = parse_operand_template(max_token)?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::Between(min_opnd, max_opnd) });
+    }
+    if let Some(op_idx) = s.find("!=") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let opnd = parse_operand_template(&s[op_idx + 2..])?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::NotEq(opnd) });
+    }
+    if let Some(op_idx) = s.find("<>") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let opnd = parse_operand_template(&s[op_idx + 2..])?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::NotEq(opnd) });
+    }
+    if let Some(op_idx) = s.find(">=") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let opnd = parse_operand_template(&s[op_idx + 2..])?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::Gte(opnd) });
+    }
+    if let Some(op_idx) = s.find("<=") {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let opnd = parse_operand_template(&s[op_idx + 2..])?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::Lte(opnd) });
+    }
+    if let Some(op_idx) = s.find('>') {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let opnd = parse_operand_template(&s[op_idx + 1..])?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::Gt(opnd) });
+    }
+    if let Some(op_idx) = s.find('<') {
+        let col_name = clean_col_name(&s[..op_idx]);
+        let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+        let opnd = parse_operand_template(&s[op_idx + 1..])?;
+        return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::Lt(opnd) });
+    }
+    if let Some(op_idx) = s.find('=') {
+        let left_raw = s[..op_idx].trim();
+        let upper_left = left_raw.to_uppercase();
+        let opnd = parse_operand_template(&s[op_idx + 1..])?;
+
+        if upper_left.starts_with("LOWER(") && left_raw.ends_with(')') {
+            let inner = &left_raw[6..left_raw.len() - 1].trim();
+            let col_name = clean_col_name(inner);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::LowerEq(opnd) });
+        } else if upper_left.starts_with("UPPER(") && left_raw.ends_with(')') {
+            let inner = &left_raw[6..left_raw.len() - 1].trim();
+            let col_name = clean_col_name(inner);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::UpperEq(opnd) });
+        } else {
+            let col_name = clean_col_name(left_raw);
+            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
+            return Ok(ConditionTemplate { col_idx, op: ColOpTemplate::Eq(opnd) });
+        }
+    }
+
+    Err(format!("Unsupported condition syntax: {}", s))
 }
 
 fn compile_condition_templates(where_clause: &str, table: &crate::storage::table::Table) -> Result<Vec<ConditionTemplate>, String> {
@@ -10188,81 +10407,7 @@ fn compile_condition_templates(where_clause: &str, table: &crate::storage::table
     let parts = split_where_conditions(where_clause);
 
     for part in &parts {
-        let upper = part.to_uppercase();
-
-        if let Some(pos) = upper.find(" IS NOT NULL") {
-            let col_name = clean_col_name(&part[..pos]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::IsNotNull });
-        } else if let Some(pos) = upper.find(" IS NULL") {
-            let col_name = clean_col_name(&part[..pos]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::IsNull });
-        } else if let Some(b_idx) = upper.find(" BETWEEN ") {
-            let col_name = clean_col_name(&part[..b_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let rest = &part[b_idx + 9..];
-            let and_idx = rest.to_uppercase().find(" AND ").ok_or("Missing AND in BETWEEN clause")?;
-            let min_token = rest[..and_idx].trim();
-            let max_token = rest[and_idx + 5..].trim();
-            let min_opnd = parse_operand_template(min_token);
-            let max_opnd = parse_operand_template(max_token);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Between(min_opnd, max_opnd) });
-        } else if let Some(op_idx) = part.find("!=") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let opnd = parse_operand_template(&part[op_idx + 2..]);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::NotEq(opnd) });
-        } else if let Some(op_idx) = part.find("<>") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let opnd = parse_operand_template(&part[op_idx + 2..]);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::NotEq(opnd) });
-        } else if let Some(op_idx) = part.find(">=") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let opnd = parse_operand_template(&part[op_idx + 2..]);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Gte(opnd) });
-        } else if let Some(op_idx) = part.find("<=") {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let opnd = parse_operand_template(&part[op_idx + 2..]);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Lte(opnd) });
-        } else if let Some(op_idx) = part.find('>') {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let opnd = parse_operand_template(&part[op_idx + 1..]);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Gt(opnd) });
-        } else if let Some(op_idx) = part.find('<') {
-            let col_name = clean_col_name(&part[..op_idx]);
-            let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-            let opnd = parse_operand_template(&part[op_idx + 1..]);
-            templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Lt(opnd) });
-        } else if let Some(op_idx) = part.find('=') {
-            let left_raw = part[..op_idx].trim();
-            let upper_left = left_raw.to_uppercase();
-            let opnd = parse_operand_template(&part[op_idx + 1..]);
-
-            if upper_left.starts_with("LOWER(") && left_raw.ends_with(')') {
-                let inner = &left_raw[6..left_raw.len() - 1].trim();
-                let col_name = clean_col_name(inner);
-                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-                templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::LowerEq(opnd) });
-            } else if upper_left.starts_with("UPPER(") && left_raw.ends_with(')') {
-                let inner = &left_raw[6..left_raw.len() - 1].trim();
-                let col_name = clean_col_name(inner);
-                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-                templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::UpperEq(opnd) });
-            } else {
-                let col_name = clean_col_name(left_raw);
-                let col_idx = table.get_column_index(col_name).ok_or_else(|| format!("Column {} not found", col_name))?;
-                templates.push(ConditionTemplate { col_idx, op: ColOpTemplate::Eq(opnd) });
-            }
-        }
-    }
-
-    if templates.len() != parts.len() {
-        return Err("Cannot compile all conditions into templates".to_string());
+        templates.push(parse_single_condition_template(part, table)?);
     }
 
     // Prioritize cheap, high-selectivity conditions: Eq > IsNull/IsNotNull > Range > Lower/Upper
@@ -10275,6 +10420,50 @@ fn compile_condition_templates(where_clause: &str, table: &crate::storage::table
     });
 
     Ok(templates)
+}
+
+fn compile_where_template(
+    where_clause: &str,
+    table: &crate::storage::table::Table,
+) -> Result<WhereTemplate, String> {
+    let mut trimmed = where_clause.trim();
+    while is_fully_enclosed_in_parens(trimmed) {
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
+    if trimmed.is_empty() {
+        return Err("Empty WHERE expression".to_string());
+    }
+
+    // 1. Top-level OR
+    let or_parts = split_top_level_or(trimmed);
+    if or_parts.len() > 1 {
+        let mut list = Vec::with_capacity(or_parts.len());
+        for p in or_parts {
+            list.push(compile_where_template(p, table)?);
+        }
+        return Ok(WhereTemplate::Or(list));
+    }
+
+    // 2. Top-level AND
+    let and_parts = split_top_level_and(trimmed);
+    if and_parts.len() > 1 {
+        let mut list = Vec::with_capacity(and_parts.len());
+        for p in and_parts {
+            list.push(compile_where_template(p, table)?);
+        }
+        return Ok(WhereTemplate::And(list));
+    }
+
+    // 3. Top-level NOT
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("NOT ") || upper.starts_with("NOT(") {
+        let inner = trimmed[3..].trim();
+        return Ok(WhereTemplate::Not(Box::new(compile_where_template(inner, table)?)));
+    }
+
+    // 4. Single condition
+    let cond = parse_single_condition_template(trimmed, table)?;
+    Ok(WhereTemplate::Condition(cond))
 }
 
 #[derive(Clone, Debug)]

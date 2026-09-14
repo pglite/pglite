@@ -29,6 +29,14 @@ pub struct ConditionTemplate {
 }
 
 #[derive(Clone, Debug)]
+pub enum WhereTemplate {
+    Condition(ConditionTemplate),
+    And(Vec<WhereTemplate>),
+    Or(Vec<WhereTemplate>),
+    Not(Box<WhereTemplate>),
+}
+
+#[derive(Clone, Debug)]
 pub enum PlannedProjectedExpr {
     PrimaryCol { col_idx: usize, alias: String },
     JoinedCol { col_idx: usize, alias: String },
@@ -80,7 +88,7 @@ pub enum ExecutionPlan {
     GeneralSelect {
         table_name: String,
         join: Option<PlannedJoin>,
-        conditions: Vec<ConditionTemplate>,
+        where_template: Option<WhereTemplate>,
         order_by: Option<(usize, bool)>, // (col_idx, is_desc)
         limit: Option<OperandTemplate>,
         offset: Option<OperandTemplate>,
@@ -115,6 +123,123 @@ pub fn resolve_number(opnd: &OperandTemplate, params: &[Value]) -> f64 {
         }
         OperandTemplate::Literal(v) => v.as_f64().unwrap_or(0.0),
         OperandTemplate::Number(n) => *n,
+    }
+}
+
+pub fn find_pk_equality_in_where_template(wt: &WhereTemplate, pk_col_idx: usize, params: &[Value]) -> Option<i64> {
+    match wt {
+        WhereTemplate::Condition(cond) => {
+            if cond.col_idx == pk_col_idx {
+                if let ColOpTemplate::Eq(opnd) = &cond.op {
+                    return resolve_operand(opnd, params).as_i64();
+                }
+            }
+            None
+        }
+        WhereTemplate::And(list) => {
+            for item in list {
+                if let Some(target) = find_pk_equality_in_where_template(item, pk_col_idx, params) {
+                    return Some(target);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[inline(always)]
+pub fn evaluate_planned_where(row: &[Value], wt: &WhereTemplate, params: &[Value]) -> bool {
+    evaluate_planned_where_3vl(row, wt, params) == Some(true)
+}
+
+pub fn evaluate_planned_where_3vl(row: &[Value], wt: &WhereTemplate, params: &[Value]) -> Option<bool> {
+    match wt {
+        WhereTemplate::And(list) => {
+            let mut has_null = false;
+            for e in list {
+                match evaluate_planned_where_3vl(row, e, params) {
+                    Some(false) => return Some(false),
+                    None => has_null = true,
+                    Some(true) => {}
+                }
+            }
+            if has_null { None } else { Some(true) }
+        }
+        WhereTemplate::Or(list) => {
+            let mut has_null = false;
+            for e in list {
+                match evaluate_planned_where_3vl(row, e, params) {
+                    Some(true) => return Some(true),
+                    None => has_null = true,
+                    Some(false) => {}
+                }
+            }
+            if has_null { None } else { Some(false) }
+        }
+        WhereTemplate::Not(inner) => {
+            match evaluate_planned_where_3vl(row, inner, params) {
+                Some(b) => Some(!b),
+                None => None,
+            }
+        }
+        WhereTemplate::Condition(cond) => {
+            if cond.col_idx >= row.len() {
+                return Some(false);
+            }
+            let val = &row[cond.col_idx];
+            match &cond.op {
+                ColOpTemplate::IsNull => Some(val.is_null()),
+                ColOpTemplate::IsNotNull => Some(!val.is_null()),
+                _ => {
+                    if val.is_null() {
+                        return None;
+                    }
+                    match &cond.op {
+                        ColOpTemplate::Eq(opnd) => {
+                            let target = resolve_operand(opnd, params);
+                            if target.is_null() { None } else { Some(val.is_equal(&target)) }
+                        }
+                        ColOpTemplate::NotEq(opnd) => {
+                            let target = resolve_operand(opnd, params);
+                            if target.is_null() { None } else { Some(!val.is_equal(&target)) }
+                        }
+                        ColOpTemplate::LowerEq(opnd) => {
+                            let target = resolve_operand(opnd, params);
+                            let target_str = target.as_text().unwrap_or_default().to_lowercase();
+                            Some(val.as_text().map(|s| s.to_lowercase() == target_str).unwrap_or(false))
+                        }
+                        ColOpTemplate::UpperEq(opnd) => {
+                            let target = resolve_operand(opnd, params);
+                            let target_str = target.as_text().unwrap_or_default().to_uppercase();
+                            Some(val.as_text().map(|s| s.to_uppercase() == target_str).unwrap_or(false))
+                        }
+                        ColOpTemplate::Gt(opnd) => {
+                            let target = resolve_number(opnd, params);
+                            Some(val.as_f64().map(|n| n > target).unwrap_or(false))
+                        }
+                        ColOpTemplate::Lt(opnd) => {
+                            let target = resolve_number(opnd, params);
+                            Some(val.as_f64().map(|n| n < target).unwrap_or(false))
+                        }
+                        ColOpTemplate::Gte(opnd) => {
+                            let target = resolve_number(opnd, params);
+                            Some(val.as_f64().map(|n| n >= target).unwrap_or(false))
+                        }
+                        ColOpTemplate::Lte(opnd) => {
+                            let target = resolve_number(opnd, params);
+                            Some(val.as_f64().map(|n| n <= target).unwrap_or(false))
+                        }
+                        ColOpTemplate::Between(a, b) => {
+                            let min = resolve_number(a, params);
+                            let max = resolve_number(b, params);
+                            Some(val.as_f64().map(|n| n >= min && n <= max).unwrap_or(false))
+                        }
+                        _ => Some(false),
+                    }
+                }
+            }
+        }
     }
 }
 
