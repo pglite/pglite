@@ -1,25 +1,25 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { LitePostgres } from "../src/database";
+import { PGLite } from "../src/index";
 import { unlinkSync, existsSync } from "fs";
-import { NodeFSAdapter } from "../src/adapters/node";
 
 const DB_FILE = "test_alter_multi.db";
+const cleanFiles = () => {
+  for (const ext of ["", ".wal", ".rwal", ".v2.rwal"]) {
+    if (existsSync(DB_FILE + ext)) unlinkSync(DB_FILE + ext);
+  }
+};
 
 describe("LEVEL 75: Multiple ALTER Actions and Table Constraints", () => {
-  let db: LitePostgres;
+  let db: PGLite;
 
   beforeAll(() => {
-    if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
-    if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
-    db = new LitePostgres(DB_FILE, {
-      database: "testdb",
-      adapter: new NodeFSAdapter(),
-    });
+    cleanFiles();
+    db = new PGLite(DB_FILE);
   });
 
-  afterAll(() => {
-    if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
-    if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
+  afterAll(async () => {
+    await db?.close();
+    cleanFiles();
   });
 
   test("75.1 CREATE TABLE with multiple UNIQUE constraint and references", async () => {

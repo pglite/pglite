@@ -7,6 +7,7 @@ dist
 *.tgz
 *.db
 *.wal
+*.rwal
 
 # code coverage
 coverage
@@ -36,3 +37,5 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 /pglite-rust/pglite/target
+.hapico/vibe_session.json
+/crates/pglite-rs/target

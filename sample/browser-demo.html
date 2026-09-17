@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PGlite WASM - Browser Database Engine</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: rgba(22, 27, 34, 0.85);
+      --accent: #58a6ff;
+      --accent-glow: rgba(88, 166, 255, 0.25);
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --border: #30363d;
+      --success: #3fb950;
+      --font-ui: 'Outfit', sans-serif;
+      --font-code: 'JetBrains Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(56, 139, 253, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(137, 87, 229, 0.15) 0px, transparent 50%);
+      color: var(--text);
+      font-family: var(--font-ui);
+      min-height: 100vh;
+      padding: 2rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .container {
+      max-width: 900px;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 1rem;
+    }
+
+    h1 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #58a6ff 0%, #bc8cff 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.5rem;
+    }
+
+    p.subtitle {
+      color: var(--text-muted);
+      font-size: 1rem;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      backdrop-filter: blur(12px);
+    }
+
+    .card-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--success);
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 8px var(--success);
+    }
+
+    textarea {
+      width: 100%;
+      height: 120px;
+      background: #090d13;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: #79c0ff;
+      font-family: var(--font-code);
+      font-size: 0.95rem;
+      padding: 1rem;
+      resize: vertical;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-top: 1rem;
+    }
+
+    button {
+      background: linear-gradient(180deg, #1f6feb 0%, #1158c7 100%);
+      color: white;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 0.6rem 1.4rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px var(--accent-glow);
+    }
+
+    button.secondary {
+      background: #21262d;
+      border-color: var(--border);
+      color: var(--text);
+    }
+
+    button.secondary:hover {
+      background: #30363d;
+      box-shadow: none;
+    }
+
+    .output-area {
+      background: #090d13;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      font-family: var(--font-code);
+      font-size: 0.9rem;
+      max-height: 350px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: #e6edf3;
+    }
+
+    .stats {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>⚡ PGlite WASM Browser Engine</h1>
+      <p class="subtitle">PostgreSQL query engine running 100% in-browser via WebAssembly & Rust</p>
+    </header>
+
+    <div class="card">
+      <div class="card-title">
+        <span>SQL Query Execution</span>
+        <div id="status" class="status-badge">
+          <div class="status-dot"></div>
+          <span>Engine Ready</span>
+        </div>
+      </div>
+
+      <textarea id="sqlInput">CREATE TABLE products (
+  id INT PRIMARY KEY,
+  name TEXT,
+  price FLOAT,
+  specs JSONB
+);
+
+INSERT INTO products VALUES (1, 'MacBook Pro M3', 1999.0, '{"brand": "Apple", "ram": "18GB", "ssd": "512GB"}');
+INSERT INTO products VALUES (2, 'Dell XPS 15', 1699.0, '{"brand": "Dell", "ram": "32GB", "ssd": "1TB"}');
+
+SELECT 
+  id, 
+  name, 
+  price, 
+  specs->>'brand' AS brand,
+  specs->>'ram' AS memory 
+FROM products 
+WHERE price > 1500.0;</textarea>
+
+      <div class="controls">
+        <button id="runBtn" onclick="runQuery()">▶ Run SQL</button>
+        <button class="secondary" onclick="resetDemo()">🔄 Reset Example</button>
+      </div>
+      <div class="stats" id="stats">Execution Time: -</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Query Output</div>
+      <div id="output" class="output-area">Initializing WebAssembly runtime...</div>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, { PGliteWasm } from '../dist/wasm/pglite_rs.js';
+
+    let db;
+
+    async function setup() {
+      const output = document.getElementById('output');
+      try {
+        await init();
+        db = new PGliteWasm(':memory:');
+        output.textContent = '✨ WebAssembly database initialized successfully!\nClick "Run SQL" to execute queries.';
+      } catch (err) {
+        output.textContent = '❌ Failed to load WASM engine: ' + err;
+      }
+    }
+
+    window.runQuery = function() {
+      if (!db) return;
+      const sql = document.getElementById('sqlInput').value.trim();
+      const output = document.getElementById('output');
+      const stats = document.getElementById('stats');
+
+      const statements = sql.split(';').map(s => s.trim()).filter(s => s.length > 0);
+      let lastResult = null;
+      let logs = [];
+
+      const startTime = performance.now();
+      try {
+        for (const stmt of statements) {
+          if (stmt.toUpperCase().startsWith('SELECT') || stmt.toUpperCase().startsWith('WITH')) {
+            lastResult = db.query(stmt + ';', null);
+            logs.push(`Query: ${stmt};\nResult:\n` + JSON.stringify(lastResult, null, 2));
+          } else {
+            const execRes = db.exec(stmt + ';', null);
+            logs.push(`Executed: ${stmt};\n` + JSON.stringify(execRes, null, 2));
+          }
+        }
+        const duration = (performance.now() - startTime).toFixed(2);
+        output.textContent = logs.join('\n\n----------------------------------------\n\n');
+        stats.textContent = `Execution Time: ${duration} ms (Statements: ${statements.length})`;
+      } catch (err) {
+        output.textContent = '⚠️ SQL Error:\n' + err;
+      }
+    };
+
+    window.resetDemo = function() {
+      if (db) db.close();
+      db = new PGliteWasm(':memory:');
+      document.getElementById('output').textContent = 'Database reset to fresh :memory: instance.';
+    };
+
+    setup();
+  </script>
+</body>
+</html>
