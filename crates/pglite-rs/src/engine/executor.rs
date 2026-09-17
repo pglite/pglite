@@ -405,7 +405,8 @@ impl Executor {
 
             let (default_val, default_str) = if let Some(def_pos) = after_add.to_uppercase().find("DEFAULT") {
                 let def_str = after_add[def_pos + 7..].trim();
-                (eval_sql_expr(def_str, &[], None, &[], None, &[]), Some(def_str.to_string()))
+                let fmt = format_attdef_to_sql(def_str);
+                (eval_sql_expr(&fmt, &[], None, &[], None, &[]), Some(fmt))
             } else {
                 (Value::Null, None)
             };
@@ -1955,6 +1956,26 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     } else {
                         Some(after_def.split_whitespace().next().unwrap_or("").trim_matches(';').trim_matches(',').to_string())
                     }
+                } else if after_def.starts_with('{') {
+                    let mut depth = 0;
+                    let mut end_pos = None;
+                    for (i, b) in after_def.bytes().enumerate() {
+                        if b == b'{' {
+                            depth += 1;
+                        } else if b == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                end_pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(end_p) = end_pos {
+                        let json_str = &after_def[..=end_p];
+                        Some(format_attdef_to_sql(json_str))
+                    } else {
+                        Some(format_attdef_to_sql(after_def))
+                    }
                 } else {
                     let mut tokens = Vec::new();
                     for part in after_def.split_whitespace() {
@@ -1967,7 +1988,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     if tokens.is_empty() {
                         None
                     } else {
-                        Some(tokens.join(" "))
+                        Some(format_attdef_to_sql(&tokens.join(" ")))
                     }
                 }
             } else {
@@ -2216,7 +2237,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         "name": col.name,
                         "type": type_str,
                         "nullable": col.is_nullable,
-                        "default": col.default_value.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+                        "default": col.default_value.as_ref().map(|d| format_attdef_to_sql(d)).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
                         "comment": col.comment.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
                     })
                 }).collect();
@@ -2353,7 +2374,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         DataType::Array(_) => ("ARRAY", "ARRAY"),
                     };
 
-                    let default_val = col.default_value.clone().or_else(|| {
+                    let default_val = col.default_value.as_ref().map(|d| format_attdef_to_sql(d)).or_else(|| {
                         if col.data_type == DataType::Serial {
                             Some(format!("nextval('{}_{}_seq'::regclass)", table.name, col.name))
                         } else {
@@ -9287,6 +9308,67 @@ pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn format_attdef_to_sql(attdef_str: &str) -> String {
+    let trimmed = attdef_str.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return format_ast_val_to_sql(&v);
+        } else if trimmed.starts_with("{\"type\":\"Identifier\"") {
+            return "".to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn format_ast_val_to_sql(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::Object(map) => {
+            let t = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match t {
+                "Literal" => {
+                    match map.get("value") {
+                        Some(serde_json::Value::Null) | None => "NULL".to_string(),
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(serde_json::Value::Bool(b)) => if *b { "true".to_string() } else { "false".to_string() },
+                        Some(serde_json::Value::Number(n)) => n.to_string(),
+                        Some(v) => v.to_string(),
+                    }
+                }
+                "Identifier" => {
+                    map.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                }
+                "Call" => {
+                    let fn_name = map.get("fnName").or_else(|| map.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    let args = map.get("args").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter().map(format_ast_val_to_sql).collect::<Vec<_>>().join(", ")
+                    }).unwrap_or_default();
+                    format!("{}({})", fn_name, args)
+                }
+                "Cast" => {
+                    let inner = map.get("expr").map(format_ast_val_to_sql).unwrap_or_default();
+                    let target = map.get("dataType").or_else(|| map.get("targetType")).and_then(|v| v.as_str());
+                    if let Some(dt) = target {
+                        format!("{}::{}", inner, dt)
+                    } else {
+                        inner
+                    }
+                }
+                _ => {
+                    if let Some(v) = map.get("value") {
+                        format_ast_val_to_sql(v)
+                    } else if let Some(n) = map.get("name").and_then(|v| v.as_str()) {
+                        n.to_string()
+                    } else {
+                        val.to_string()
+                    }
+                }
+            }
+        }
+        serde_json::Value::String(s) => s.clone(),
+        _ => val.to_string(),
+    }
 }
 
 fn split_comma_separated_tokens(s: &str) -> Vec<&str> {

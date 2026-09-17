@@ -1,4 +1,4 @@
-import { ColumnDef } from "../ast";
+import { ColumnDef, formatAttdefToSql } from "../ast";
 
 const PAGE_SIZE = 4096;
 
@@ -3860,46 +3860,6 @@ export class StorageEngine {
     }
 
     if (fullName === "information_schema.columns") {
-      const formatAttdefToSql = (attdef: any): string | null => {
-        if (!attdef) return null;
-        if (typeof attdef === "string") {
-          const trimmed = attdef.trim();
-          if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-            try {
-              const obj = JSON.parse(trimmed);
-              return formatAttdefToSql(obj);
-            } catch {
-              return trimmed;
-            }
-          }
-          return trimmed;
-        }
-        if (typeof attdef === "object") {
-          if (attdef.type === "Literal") {
-            if (attdef.value === null) return "NULL";
-            if (typeof attdef.value === "string") return `'${attdef.value.replace(/'/g, "''")}'`;
-            if (typeof attdef.value === "boolean") return attdef.value ? "true" : "false";
-            return String(attdef.value);
-          }
-          if (attdef.type === "Cast") {
-            const inner = formatAttdefToSql(attdef.expr);
-            const target = attdef.dataType || attdef.targetType;
-            return target ? `${inner}::${target}` : inner;
-          }
-          if (attdef.type === "Identifier") {
-            return attdef.name || "";
-          }
-          if (attdef.type === "Call") {
-            const args = Array.isArray(attdef.args) ? attdef.args.map(formatAttdefToSql).join(", ") : "";
-            return `${attdef.fnName || attdef.name || ""}(${args})`;
-          }
-          if (attdef.value !== undefined) {
-            return formatAttdefToSql({ type: "Literal", value: attdef.value });
-          }
-        }
-        return String(attdef);
-      };
-
       const nspMap = new Map();
       for await (const n of this.scanCatalog(this.pgNamespaceDef))
         nspMap.set(n.oid, n.nspname);

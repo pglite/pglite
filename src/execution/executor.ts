@@ -1,4 +1,4 @@
-import { Statement, Expr, JoinClause, OrderBy } from "../ast";
+import { Statement, Expr, JoinClause, OrderBy, formatAttdefToSql } from "../ast";
 import { endBenchmarks, startBenchmarks } from "../benchmarks";
 import { StorageEngine } from "../storage/engine";
 import { Lexer } from "../parser/lexer";
@@ -6270,19 +6270,7 @@ export class Executor {
         if (fnName === "PG_GET_EXPR") {
           const adbin = args[0];
           if (adbin == null) return null;
-          try {
-            const parsed = JSON.parse(String(adbin));
-            if (
-              parsed &&
-              typeof parsed === "object" &&
-              parsed.type === "Literal"
-            ) {
-              return String(parsed.value);
-            }
-            return String(adbin);
-          } catch {
-            return String(adbin);
-          }
+          return formatAttdefToSql(adbin);
         }
         return null;
       }
@@ -7432,19 +7420,7 @@ export class Executor {
           // In LitePostgres, adbin stores the JSON string of the expression object
           const adbin = args[0];
           if (adbin == null) return null;
-          try {
-            const parsed = JSON.parse(String(adbin));
-            if (
-              parsed &&
-              typeof parsed === "object" &&
-              parsed.type === "Literal"
-            ) {
-              return String(parsed.value);
-            }
-            return String(adbin);
-          } catch {
-            return String(adbin);
-          }
+          return formatAttdefToSql(adbin);
         }
         return null;
       }

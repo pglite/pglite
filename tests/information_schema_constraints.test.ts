@@ -258,4 +258,55 @@ describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", 
     if (existsSync(testDiskFile)) unlinkSync(testDiskFile);
     if (existsSync(testDiskFile + ".wal")) unlinkSync(testDiskFile + ".wal");
   });
+
+  test("94.8 Column default value introspection returns clean SQL expressions", async () => {
+    const memDb = new LitePostgres(":memory:");
+    await memDb.exec(`
+      CREATE TABLE test_defaults (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT now(),
+        status TEXT DEFAULT 'active',
+        retry_count INT DEFAULT 3,
+        is_active BOOLEAN DEFAULT true,
+        notes TEXT
+      );
+    `);
+
+    const q = `
+      SELECT 
+        table_name,
+        column_name,
+        data_type,
+        udt_name,
+        is_nullable,
+        column_default
+      FROM information_schema.columns 
+      WHERE table_name = 'test_defaults' AND table_schema = 'public' 
+      ORDER BY ordinal_position;
+    `;
+
+    const cols = await memDb.query<any>(q);
+    expect(cols.length).toBe(6);
+
+    const idCol = cols.find((c) => c.column_name === "id");
+    expect(idCol.column_default?.toLowerCase()).toBe("gen_random_uuid()");
+    expect(idCol.column_default).not.toContain("{");
+
+    const createdCol = cols.find((c) => c.column_name === "created_at");
+    expect(createdCol.column_default?.toLowerCase()).toBe("now()");
+    expect(createdCol.column_default).not.toContain("{");
+
+    const statusCol = cols.find((c) => c.column_name === "status");
+    expect(statusCol.column_default).toContain("active");
+
+    const retryCol = cols.find((c) => c.column_name === "retry_count");
+    expect(retryCol.column_default).toBe("3");
+
+    const activeCol = cols.find((c) => c.column_name === "is_active");
+    expect(activeCol.column_default).toBe("true");
+
+    const notesCol = cols.find((c) => c.column_name === "notes");
+    expect(notesCol.column_default).toBeNull();
+  });
 });
+

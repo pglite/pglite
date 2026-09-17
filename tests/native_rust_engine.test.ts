@@ -1545,7 +1545,68 @@ describe("Native Rust Engine (pglite-rs) Comprehensive Test Suite", () => {
       await pglite2.close();
     });
   });
+
+  describe("LEVEL 27: Native information_schema.columns & Column Defaults Introspection", () => {
+    test("27.1 Pure Native information_schema.columns introspection returns clean SQL expressions", async () => {
+      const dbPath = path.join(TEST_DIR, "test_level_27_defaults");
+      const pglite = new PGLiteNative(dbPath, { native: true, fallback: false });
+
+      await pglite.exec(`
+        CREATE TABLE accounts (
+          id SERIAL PRIMARY KEY,
+          uuid_val UUID DEFAULT gen_random_uuid(),
+          created_at TIMESTAMP DEFAULT now(),
+          role TEXT DEFAULT 'member',
+          balance NUMERIC DEFAULT 100.5,
+          is_verified BOOLEAN DEFAULT false,
+          bio TEXT
+        );
+      `);
+
+      const q = `
+        SELECT 
+          table_name,
+          column_name,
+          data_type,
+          udt_name,
+          is_nullable,
+          column_default
+        FROM information_schema.columns 
+        WHERE table_schema = 'public' AND table_name = 'accounts'
+        ORDER BY table_name, ordinal_position;
+      `;
+
+      const cols = await pglite.query(q);
+      expect(cols.length).toBe(7);
+
+      const idCol = cols.find((c: any) => c.column_name === "id");
+      expect(idCol.column_default).toContain("nextval");
+
+      const uuidCol = cols.find((c: any) => c.column_name === "uuid_val");
+      expect(uuidCol.column_default?.toLowerCase()).toBe("gen_random_uuid()");
+      expect(uuidCol.column_default).not.toContain("{");
+
+      const createdCol = cols.find((c: any) => c.column_name === "created_at");
+      expect(createdCol.column_default?.toLowerCase()).toBe("now()");
+      expect(createdCol.column_default).not.toContain("{");
+
+      const roleCol = cols.find((c: any) => c.column_name === "role");
+      expect(roleCol.column_default).toContain("member");
+
+      const balanceCol = cols.find((c: any) => c.column_name === "balance");
+      expect(balanceCol.column_default).toBe("100.5");
+
+      const verifiedCol = cols.find((c: any) => c.column_name === "is_verified");
+      expect(verifiedCol.column_default).toBe("false");
+
+      const bioCol = cols.find((c: any) => c.column_name === "bio");
+      expect(bioCol.column_default).toBeNull();
+
+      await pglite.close();
+    });
+  });
 });
+
 
 
 

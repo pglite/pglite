@@ -144,3 +144,41 @@ export type Statement =
   | { type: 'XrayMeta' }
   | { type: 'AutoFix' }
   | { type: 'Reindex'; targetType: 'DATABASE' | 'TABLE' | 'INDEX'; targetName?: string };
+
+export function formatAttdefToSql(attdef: any): string | null {
+  if (!attdef) return null;
+  if (typeof attdef === "string") {
+    const trimmed = attdef.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        const obj = JSON.parse(trimmed);
+        return formatAttdefToSql(obj);
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+  if (typeof attdef === "object") {
+    if (attdef.type === "Literal") {
+      if (attdef.value === null) return "NULL";
+      return String(attdef.value);
+    }
+    if (attdef.type === "Cast") {
+      const inner = formatAttdefToSql(attdef.expr);
+      const target = attdef.dataType || attdef.targetType;
+      return target ? `${inner}::${target}` : inner;
+    }
+    if (attdef.type === "Identifier") {
+      return attdef.name || "";
+    }
+    if (attdef.type === "Call") {
+      const args = Array.isArray(attdef.args) ? attdef.args.map(formatAttdefToSql).join(", ") : "";
+      return `${attdef.fnName || attdef.name || ""}(${args})`;
+    }
+    if (attdef.value !== undefined) {
+      return formatAttdefToSql({ type: "Literal", value: attdef.value });
+    }
+  }
+  return String(attdef);
+}
