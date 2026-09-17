@@ -1,21 +1,16 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { LitePostgres } from "../src/database";
 import { PGLite } from "../src/index";
 import { unlinkSync, existsSync } from "fs";
-import { NodeFSAdapter } from "../src/adapters/node";
 
 const DB_FILE = "test_info_schema.db";
 
 describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", () => {
-  let db: LitePostgres;
+  let db: PGLite;
 
   beforeAll(async () => {
     if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
     if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
-    db = new LitePostgres(DB_FILE, {
-      database: "testdb",
-      adapter: new NodeFSAdapter(),
-    });
+    db = new PGLite(DB_FILE);
 
     await db.exec(`
       CREATE TABLE departments (
@@ -223,11 +218,15 @@ describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", 
 
   test("94.7 Existing on-disk database files are 100% compatible and unchanged", async () => {
     const testDiskFile = "test_persistence_compat.db";
-    if (existsSync(testDiskFile)) unlinkSync(testDiskFile);
-    if (existsSync(testDiskFile + ".wal")) unlinkSync(testDiskFile + ".wal");
+    const cleanFiles = () => {
+      for (const ext of ["", ".wal", ".rwal", ".v2.rwal"]) {
+        if (existsSync(testDiskFile + ext)) unlinkSync(testDiskFile + ext);
+      }
+    };
+    cleanFiles();
 
     // 1. Create and write data
-    const db1 = new LitePostgres(testDiskFile, { adapter: new NodeFSAdapter() });
+    const db1 = new PGLite(testDiskFile);
     await db1.exec(`
       CREATE TABLE products (
         id SERIAL PRIMARY KEY,
@@ -236,9 +235,10 @@ describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", 
       );
       INSERT INTO products (sku, price) VALUES ('SKU-100', 49.99);
     `);
+    await db1.close();
 
     // 2. Re-open existing database file
-    const db2 = new LitePostgres(testDiskFile, { adapter: new NodeFSAdapter() });
+    const db2 = new PGLite(testDiskFile);
     const products = await db2.query<any>("SELECT * FROM products");
     expect(products.length).toBe(1);
     expect(products[0].sku).toBe("SKU-100");
@@ -254,13 +254,14 @@ describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", 
     `);
     expect(pks).toEqual([{ table_name: "products", column_name: "id" }]);
 
+    await db2.close();
+
     // Cleanup
-    if (existsSync(testDiskFile)) unlinkSync(testDiskFile);
-    if (existsSync(testDiskFile + ".wal")) unlinkSync(testDiskFile + ".wal");
+    cleanFiles();
   });
 
   test("94.8 Column default value introspection returns clean SQL expressions", async () => {
-    const memDb = new LitePostgres(":memory:");
+    const memDb = new PGLite(":memory:");
     await memDb.exec(`
       CREATE TABLE test_defaults (
         id UUID DEFAULT gen_random_uuid() PRIMARY KEY,

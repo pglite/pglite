@@ -14,9 +14,21 @@ use crate::engine::plan::{
     OperandTemplate, PlannedJoin, PlannedProjectedExpr, WhereTemplate,
 };
 
+#[derive(Debug, Clone)]
+pub struct TableConstraintDef {
+    pub table_name: String,
+    pub constraint_name: String,
+    pub constraint_type: String,
+    pub column_name: String,
+    pub ordinal_position: i64,
+    pub foreign_table_name: Option<String>,
+    pub foreign_column_name: Option<String>,
+}
+
 pub struct Executor {
     pub storage: StorageEngine,
     pub plan_cache: HashMap<String, ExecutionPlan>,
+    pub custom_constraints: Vec<TableConstraintDef>,
 }
 
 impl Executor {
@@ -24,6 +36,7 @@ impl Executor {
         Self {
             storage,
             plan_cache: HashMap::new(),
+            custom_constraints: Vec::new(),
         }
     }
 
@@ -183,6 +196,15 @@ impl Executor {
         }
 
         if upper.starts_with("SELECT") {
+            if upper.contains("TABLE_CONSTRAINTS")
+                || upper.contains("KEY_COLUMN_USAGE")
+                || upper.contains("CONSTRAINT_COLUMN_USAGE")
+                || upper.contains("PG_INDEX")
+                || (upper.contains("PG_CLASS") && !upper.contains("JSON_AGG"))
+            {
+                self.ensure_virtual_catalog_tables();
+            }
+
             if upper == "SELECT CURRENT_SCHEMA()" || upper == "SELECT CURRENT_SCHEMA" {
                 return Ok(QueryResult {
                     rows: vec![serde_json::json!({ "current_schema": "public" })],
@@ -230,7 +252,9 @@ impl Executor {
 
             if (upper.contains("FROM INFORMATION_SCHEMA.TABLES") || upper.contains("FROM PG_TABLES"))
                 && !upper.contains("JOIN") {
-                let mut table_keys: Vec<String> = self.storage.tables.keys().cloned().collect();
+                let mut table_keys: Vec<String> = self.storage.tables.keys()
+                    .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && *k != "table_constraints" && *k != "key_column_usage" && *k != "constraint_column_usage" && *k != "pg_index" && *k != "pg_class" && !k.starts_with("__ephemeral_"))
+                    .cloned().collect();
                 table_keys.sort();
                 let rows: Vec<serde_json::Value> = table_keys.into_iter().map(|k| {
                     let tbl = &self.storage.tables[&k];
@@ -255,34 +279,7 @@ impl Executor {
                 });
             }
 
-            if upper.contains("FROM PG_CLASS") && !upper.contains("JOIN") {
-                let mut table_keys: Vec<String> = self.storage.tables.keys().cloned().collect();
-                table_keys.sort();
-                let mut rows: Vec<serde_json::Value> = table_keys.into_iter().map(|k| {
-                    let tbl = &self.storage.tables[&k];
-                    serde_json::json!({
-                        "relname": tbl.name,
-                        "relkind": "r",
-                        "relnamespace": 2200,
-                    })
-                }).collect();
-                if let Some(where_pos) = find_top_level_keyword(trimmed, "WHERE") {
-                    let where_clause = trimmed[where_pos + 5..].trim().trim_end_matches(';').trim();
-                    rows.retain(|r| {
-                        let relname = r.get("relname").and_then(|v| v.as_str()).unwrap_or("");
-                        where_clause.contains(&format!("'{}'", relname))
-                    });
-                }
-                let row_count = rows.len();
-                return Ok(QueryResult {
-                    rows,
-                    row_count,
-                    fields: vec![
-                        FieldInfo { name: "relname".to_string(), data_type: "text".to_string() },
-                    ],
-                    command: "SELECT".to_string(),
-                });
-            }
+
 
             // Check if FROM has a derived subquery e.g. FROM (SELECT ...)
             if let Some(from_pos) = find_top_level_keyword(trimmed, "FROM") {
@@ -370,86 +367,85 @@ impl Executor {
 
         if let Some(pos) = add_kw_pos {
             let table_name = clean_table_name(after_alter[..pos].trim());
-            let mut after_add = after_alter[pos + 3..].trim();
-            if after_add.to_uppercase().starts_with("COLUMN") {
-                after_add = after_add[6..].trim();
-            }
+            let actions_raw = &after_alter[pos..];
+            let actions = split_comma_separated_tokens(actions_raw);
 
-            let mut if_not_exists = false;
-            if after_add.to_uppercase().starts_with("IF NOT EXISTS") {
-                if_not_exists = true;
-                after_add = after_add[13..].trim();
-            }
+            for action_part in actions {
+                let act_trim = action_part.trim();
+                let mut after_add = if act_trim.to_uppercase().starts_with("ADD") {
+                    act_trim[3..].trim()
+                } else {
+                    act_trim
+                };
+                if after_add.to_uppercase().starts_with("COLUMN") {
+                    after_add = after_add[6..].trim();
+                }
 
-            // Ignore ADD CONSTRAINT or similar table-level constraints gracefully
-            if after_add.to_uppercase().starts_with("CONSTRAINT")
-                || after_add.to_uppercase().starts_with("PRIMARY KEY")
-                || after_add.to_uppercase().starts_with("FOREIGN KEY")
-                || after_add.to_uppercase().starts_with("UNIQUE")
-            {
-                return Ok(QueryResult {
-                    rows: vec![],
-                    row_count: 0,
-                    fields: vec![],
-                    command: "ALTER TABLE".to_string(),
+                let mut if_not_exists = false;
+                if after_add.to_uppercase().starts_with("IF NOT EXISTS") {
+                    if_not_exists = true;
+                    after_add = after_add[13..].trim();
+                }
+
+                if after_add.to_uppercase().starts_with("CONSTRAINT")
+                    || after_add.to_uppercase().starts_with("PRIMARY KEY")
+                    || after_add.to_uppercase().starts_with("FOREIGN KEY")
+                    || after_add.to_uppercase().starts_with("UNIQUE")
+                {
+                    continue;
+                }
+
+                let tokens: Vec<&str> = after_add.split_whitespace().collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+                let col_name = clean_col_name(tokens[0]).to_string();
+                let type_str = if tokens.len() > 1 { tokens[1] } else { "TEXT" };
+                let data_type = crate::types::DataType::from_sql_str(type_str);
+
+                let (default_val, default_str) = if let Some(def_pos) = after_add.to_uppercase().find("DEFAULT") {
+                    let def_str = after_add[def_pos + 7..].trim();
+                    let fmt = format_attdef_to_sql(def_str);
+                    (eval_sql_expr(&fmt, &[], None, &[], None, &[]), Some(fmt))
+                } else {
+                    (Value::Null, None)
+                };
+
+                let col_def = crate::types::ColumnDef {
+                    name: col_name.clone(),
+                    data_type,
+                    is_primary_key: false,
+                    is_nullable: true,
+                    default_value: default_str,
+                    comment: None,
+                };
+
+                {
+                    let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+                    if table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                        if if_not_exists {
+                            continue;
+                        }
+                        return Err(format!("Column \"{}\" of relation \"{}\" already exists", col_name, table_name));
+                    }
+
+                    table.columns.push(col_def.clone());
+                    for row in &mut table.rows {
+                        let cell = if let Some(ref expr_str) = col_def.default_value {
+                            eval_sql_expr(expr_str, &[], None, &[], None, &[])
+                        } else {
+                            default_val.clone()
+                        };
+                        row.push(cell);
+                    }
+                }
+
+                self.storage.wal.append(WalRecord::AlterTableAddColumn {
+                    table: table_name.to_string(),
+                    column: col_def,
+                    default_val,
                 });
             }
-
-            let tokens: Vec<&str> = after_add.split_whitespace().collect();
-            if tokens.is_empty() {
-                return Err("Missing column definition in ALTER TABLE ADD".to_string());
-            }
-            let col_name = clean_col_name(tokens[0]).to_string();
-            let type_str = if tokens.len() > 1 { tokens[1] } else { "TEXT" };
-            let data_type = crate::types::DataType::from_sql_str(type_str);
-
-            let (default_val, default_str) = if let Some(def_pos) = after_add.to_uppercase().find("DEFAULT") {
-                let def_str = after_add[def_pos + 7..].trim();
-                let fmt = format_attdef_to_sql(def_str);
-                (eval_sql_expr(&fmt, &[], None, &[], None, &[]), Some(fmt))
-            } else {
-                (Value::Null, None)
-            };
-
-            let col_def = crate::types::ColumnDef {
-                name: col_name.clone(),
-                data_type,
-                is_primary_key: false,
-                is_nullable: true,
-                default_value: default_str,
-                comment: None,
-            };
-
-            {
-                let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-                if table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                    if if_not_exists {
-                        return Ok(QueryResult {
-                            rows: vec![],
-                            row_count: 0,
-                            fields: vec![],
-                            command: "ALTER TABLE".to_string(),
-                        });
-                    }
-                    return Err(format!("Column \"{}\" of relation \"{}\" already exists", col_name, table_name));
-                }
-
-                table.columns.push(col_def.clone());
-                for row in &mut table.rows {
-                    let cell = if let Some(ref expr_str) = col_def.default_value {
-                        eval_sql_expr(expr_str, &[], None, &[], None, &[])
-                    } else {
-                        default_val.clone()
-                    };
-                    row.push(cell);
-                }
-            }
-
-            self.storage.wal.append(WalRecord::AlterTableAddColumn {
-                table: table_name.to_string(),
-                column: col_def,
-                default_val,
-            });
 
             Ok(QueryResult {
                 rows: vec![],
@@ -1923,7 +1919,30 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 continue;
             }
 
-            // Ignore other table constraints like FOREIGN KEY, CHECK, UNIQUE (...)
+            // Handle table-level UNIQUE (...)
+            if upper_def.starts_with("UNIQUE ") || upper_def.starts_with("UNIQUE(") || (upper_def.starts_with("CONSTRAINT") && upper_def.contains("UNIQUE")) {
+                if let Some(open_p) = col_def_str.find('(') {
+                    if let Some(close_p) = col_def_str.rfind(')') {
+                        let inner = &col_def_str[open_p + 1..close_p];
+                        let cols: Vec<String> = split_comma_separated_tokens(inner).into_iter().map(|c| clean_col_name(c).to_string()).collect();
+                        let c_name = format!("{}_{}_key", table_name, cols.join("_"));
+                        for (ord, c) in cols.iter().enumerate() {
+                            self.custom_constraints.push(TableConstraintDef {
+                                table_name: table_name.clone(),
+                                constraint_name: c_name.clone(),
+                                constraint_type: "UNIQUE".to_string(),
+                                column_name: c.clone(),
+                                ordinal_position: (ord + 1) as i64,
+                                foreign_table_name: None,
+                                foreign_column_name: None,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Ignore other table constraints like FOREIGN KEY, CHECK
             if upper_def.starts_with("FOREIGN KEY ") || upper_def.starts_with("FOREIGN KEY(") || upper_def.starts_with("CHECK ") || upper_def.starts_with("CHECK(") || (upper_def.starts_with("CONSTRAINT") && !upper_def.contains("PRIMARY KEY")) {
                 continue;
             }
@@ -1995,6 +2014,53 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 None
             };
 
+            if upper_rest.contains("UNIQUE") && !is_primary_key {
+                self.custom_constraints.push(TableConstraintDef {
+                    table_name: table_name.clone(),
+                    constraint_name: format!("{}_{}_key", table_name, col_name),
+                    constraint_type: "UNIQUE".to_string(),
+                    column_name: col_name.clone(),
+                    ordinal_position: 1,
+                    foreign_table_name: None,
+                    foreign_column_name: None,
+                });
+            }
+
+            if let Some(ref_idx) = upper_rest.find("REFERENCES") {
+                let after_ref = rest_def[ref_idx + 10..].trim();
+                let f_table_part = after_ref.split_whitespace().next().unwrap_or("").trim_matches(',').trim_matches(';');
+                let (f_table, f_col) = if let Some(open_p) = f_table_part.find('(') {
+                    let close_p = f_table_part.find(')').unwrap_or(f_table_part.len());
+                    let t = clean_table_name(&f_table_part[..open_p]);
+                    let c = clean_col_name(&f_table_part[open_p + 1..close_p]);
+                    (t.to_string(), c.to_string())
+                } else {
+                    (clean_table_name(f_table_part).to_string(), "id".to_string())
+                };
+
+                self.custom_constraints.push(TableConstraintDef {
+                    table_name: table_name.clone(),
+                    constraint_name: format!("{}_{}_fkey", table_name, col_name),
+                    constraint_type: "FOREIGN KEY".to_string(),
+                    column_name: col_name.clone(),
+                    ordinal_position: 1,
+                    foreign_table_name: Some(f_table),
+                    foreign_column_name: Some(f_col),
+                });
+            }
+
+            if is_primary_key {
+                self.custom_constraints.push(TableConstraintDef {
+                    table_name: table_name.clone(),
+                    constraint_name: format!("{}_pkey", table_name),
+                    constraint_type: "PRIMARY KEY".to_string(),
+                    column_name: col_name.clone(),
+                    ordinal_position: 1,
+                    foreign_table_name: None,
+                    foreign_column_name: None,
+                });
+            }
+
             columns.push(ColumnDef {
                 name: col_name,
                 data_type,
@@ -2006,10 +2072,19 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         }
 
         // Apply table-level primary keys
-        for pk_col_name in table_level_pks {
-            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&pk_col_name)) {
+        for (ord, pk_col_name) in table_level_pks.iter().enumerate() {
+            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pk_col_name)) {
                 col.is_primary_key = true;
             }
+            self.custom_constraints.push(TableConstraintDef {
+                table_name: table_name.clone(),
+                constraint_name: format!("{}_pkey", table_name),
+                constraint_type: "PRIMARY KEY".to_string(),
+                column_name: pk_col_name.clone(),
+                ordinal_position: (ord + 1) as i64,
+                foreign_table_name: None,
+                foreign_column_name: None,
+            });
         }
 
         let _ = self.storage.create_table(table_name, columns);
@@ -2320,6 +2395,298 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             fields,
             command: "SELECT".to_string(),
         })
+    }
+
+
+    pub fn ensure_virtual_catalog_tables(&mut self) {
+        use crate::storage::table::Table;
+
+        // 1. Prepare table_constraints table
+        let tc_cols = vec![
+            ColumnDef { name: "constraint_catalog".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_schema".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_catalog".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_schema".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_type".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "is_deferrable".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "initially_deferred".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "enforced".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+        ];
+        let mut tc_table = Table::new("information_schema.table_constraints".to_string(), tc_cols);
+
+        // 2. Prepare key_column_usage table
+        let kcu_cols = vec![
+            ColumnDef { name: "constraint_catalog".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_schema".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_catalog".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_schema".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "column_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "ordinal_position".to_string(), data_type: DataType::Integer, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "position_in_unique_constraint".to_string(), data_type: DataType::Integer, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+        ];
+        let mut kcu_table = Table::new("information_schema.key_column_usage".to_string(), kcu_cols);
+
+        // 3. Prepare constraint_column_usage table
+        let ccu_cols = vec![
+            ColumnDef { name: "table_catalog".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_schema".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "table_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "column_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_catalog".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_schema".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "constraint_name".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+        ];
+        let mut ccu_table = Table::new("information_schema.constraint_column_usage".to_string(), ccu_cols);
+
+        // 4. Prepare pg_class table
+        let pg_class_cols = vec![
+            ColumnDef { name: "oid".to_string(), data_type: DataType::Integer, is_primary_key: true, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "relname".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "relnamespace".to_string(), data_type: DataType::Integer, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "relkind".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+        ];
+        let mut pg_class_table = Table::new("pg_catalog.pg_class".to_string(), pg_class_cols);
+
+        // 5. Prepare pg_index table
+        let pg_index_cols = vec![
+            ColumnDef { name: "indexrelid".to_string(), data_type: DataType::Integer, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "indrelid".to_string(), data_type: DataType::Integer, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "indisunique".to_string(), data_type: DataType::Boolean, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "indisprimary".to_string(), data_type: DataType::Boolean, is_primary_key: false, is_nullable: false, default_value: None, comment: None },
+            ColumnDef { name: "indkey".to_string(), data_type: DataType::Array("int4".to_string()), is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+        ];
+        let mut pg_index_table = Table::new("pg_catalog.pg_index".to_string(), pg_index_cols);
+
+        let mut user_tables: Vec<String> = self.storage.tables.keys()
+            .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && *k != "table_constraints" && *k != "key_column_usage" && *k != "constraint_column_usage" && *k != "pg_index" && *k != "pg_class" && !k.starts_with("__ephemeral_"))
+            .cloned().collect();
+        user_tables.sort();
+
+        let mut oid_counter = 16384i64;
+        let mut index_oid_counter = 20000i64;
+        let mut table_oid_map = std::collections::HashMap::new();
+
+        for tbl_name in &user_tables {
+            let table = match self.storage.tables.get(tbl_name) {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+
+            let table_oid = oid_counter;
+            oid_counter += 1;
+            table_oid_map.insert(table.name.clone(), table_oid);
+            table_oid_map.insert(tbl_name.clone(), table_oid);
+
+            pg_class_table.insert(vec![
+                Value::Int(table_oid),
+                Value::text(&table.name),
+                Value::Int(2200),
+                Value::text("r"),
+            ]);
+        }
+
+        // Add constraints from custom_constraints
+        let mut added_c_names = std::collections::HashSet::new();
+        for cc in &self.custom_constraints {
+            let tbl_name = &cc.table_name;
+            let c_name = &cc.constraint_name;
+
+            if added_c_names.insert((tbl_name.clone(), c_name.clone())) {
+                tc_table.insert(vec![
+                    Value::text("litepostgres"),
+                    Value::text("public"),
+                    Value::text(c_name),
+                    Value::text("litepostgres"),
+                    Value::text("public"),
+                    Value::text(tbl_name),
+                    Value::text(&cc.constraint_type),
+                    Value::text("NO"),
+                    Value::text("NO"),
+                    Value::text("YES"),
+                ]);
+            }
+
+            kcu_table.insert(vec![
+                Value::text("litepostgres"),
+                Value::text("public"),
+                Value::text(c_name),
+                Value::text("litepostgres"),
+                Value::text("public"),
+                Value::text(tbl_name),
+                Value::text(&cc.column_name),
+                Value::Int(cc.ordinal_position),
+                if cc.constraint_type == "FOREIGN KEY" { Value::Int(1) } else { Value::Null },
+            ]);
+
+            if cc.constraint_type == "FOREIGN KEY" {
+                if let (Some(ftable), Some(fcol)) = (&cc.foreign_table_name, &cc.foreign_column_name) {
+                    ccu_table.insert(vec![
+                        Value::text("litepostgres"),
+                        Value::text("public"),
+                        Value::text(ftable),
+                        Value::text(fcol),
+                        Value::text("litepostgres"),
+                        Value::text("public"),
+                        Value::text(c_name),
+                    ]);
+                }
+            } else {
+                ccu_table.insert(vec![
+                    Value::text("litepostgres"),
+                    Value::text("public"),
+                    Value::text(tbl_name),
+                    Value::text(&cc.column_name),
+                    Value::text("litepostgres"),
+                    Value::text("public"),
+                    Value::text(c_name),
+                ]);
+            }
+
+        }
+
+        // Group custom_constraints for pg_index and pg_class (indexes)
+        let mut index_constraints: std::collections::HashMap<(String, String), (String, Vec<(i64, String)>)> = std::collections::HashMap::new();
+        for cc in &self.custom_constraints {
+            if cc.constraint_type == "PRIMARY KEY" || cc.constraint_type == "UNIQUE" {
+                index_constraints.entry((cc.table_name.clone(), cc.constraint_name.clone()))
+                    .or_insert_with(|| (cc.constraint_type.clone(), Vec::new()))
+                    .1.push((cc.ordinal_position, cc.column_name.clone()));
+            }
+        }
+
+        let mut index_keys: Vec<_> = index_constraints.keys().cloned().collect();
+        index_keys.sort();
+
+        for (tbl_name, c_name) in index_keys {
+            let (c_type, mut cols) = index_constraints.remove(&(tbl_name.clone(), c_name.clone())).unwrap();
+            cols.sort_by_key(|(ord, _)| *ord);
+
+            let table_oid = table_oid_map.get(&tbl_name).copied().unwrap_or(16384);
+            let is_pk = c_type == "PRIMARY KEY";
+            let index_oid = index_oid_counter;
+            index_oid_counter += 1;
+
+            pg_class_table.insert(vec![
+                Value::Int(index_oid),
+                Value::text(&c_name),
+                Value::Int(2200),
+                Value::text("i"),
+            ]);
+
+            let col_indices: Vec<usize> = cols.iter().map(|(_, col_name)| {
+                if let Some(t) = self.storage.tables.get(&tbl_name) {
+                    t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name)).map(|p| p + 1).unwrap_or(1)
+                } else {
+                    1
+                }
+            }).collect();
+
+            let indkey_json = serde_json::Value::Array(
+                col_indices.iter().map(|idx| serde_json::Value::Number((*idx as i64).into())).collect()
+            ).to_string();
+
+            pg_index_table.insert(vec![
+                Value::Int(index_oid),
+                Value::Int(table_oid),
+                Value::Bool(true),
+                Value::Bool(is_pk),
+                Value::text(&indkey_json),
+            ]);
+        }
+
+        // Also add any tables from storage that might not have custom_constraints (e.g. created earlier or reloaded from disk)
+        for tbl_name in &user_tables {
+            let table = match self.storage.tables.get(tbl_name) {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+
+            let table_oid = table_oid_map.get(&table.name).copied().unwrap_or(16384);
+            let c_name = format!("{}_pkey", table.name);
+
+            if !added_c_names.contains(&(table.name.clone(), c_name.clone())) {
+                let pk_indices: Vec<(usize, &str)> = table.columns.iter().enumerate()
+                    .filter(|(_, c)| c.is_primary_key || c.data_type == DataType::Serial)
+                    .map(|(i, c)| (i + 1, c.name.as_str()))
+                    .collect();
+
+                if !pk_indices.is_empty() {
+                    added_c_names.insert((table.name.clone(), c_name.clone()));
+                    tc_table.insert(vec![
+                        Value::text("litepostgres"),
+                        Value::text("public"),
+                        Value::text(&c_name),
+                        Value::text("litepostgres"),
+                        Value::text("public"),
+                        Value::text(&table.name),
+                        Value::text("PRIMARY KEY"),
+                        Value::text("NO"),
+                        Value::text("NO"),
+                        Value::text("YES"),
+                    ]);
+
+                    let indkey_json = serde_json::Value::Array(
+                        pk_indices.iter().map(|(idx, _)| serde_json::Value::Number((*idx as i64).into())).collect()
+                    ).to_string();
+
+                    let index_oid = index_oid_counter;
+                    index_oid_counter += 1;
+
+                    pg_index_table.insert(vec![
+                        Value::Int(index_oid),
+                        Value::Int(table_oid),
+                        Value::Bool(true),
+                        Value::Bool(true),
+                        Value::text(&indkey_json),
+                    ]);
+
+                    for (ord, (_, col_name)) in pk_indices.iter().enumerate() {
+                        kcu_table.insert(vec![
+                            Value::text("litepostgres"),
+                            Value::text("public"),
+                            Value::text(&c_name),
+                            Value::text("litepostgres"),
+                            Value::text("public"),
+                            Value::text(&table.name),
+                            Value::text(col_name),
+                            Value::Int((ord + 1) as i64),
+                            Value::Null,
+                        ]);
+
+                        ccu_table.insert(vec![
+                            Value::text("litepostgres"),
+                            Value::text("public"),
+                            Value::text(&table.name),
+                            Value::text(col_name),
+                            Value::text("litepostgres"),
+                            Value::text("public"),
+                            Value::text(&c_name),
+                        ]);
+                    }
+                }
+            }
+        }
+
+        // Deduplicate and group composite primary keys in pg_index_table if needed
+        // Insert into storage.tables
+        self.storage.tables.insert("information_schema.table_constraints".to_string(), tc_table.clone());
+        self.storage.tables.insert("table_constraints".to_string(), tc_table);
+
+        self.storage.tables.insert("information_schema.key_column_usage".to_string(), kcu_table.clone());
+        self.storage.tables.insert("key_column_usage".to_string(), kcu_table);
+
+        self.storage.tables.insert("information_schema.constraint_column_usage".to_string(), ccu_table.clone());
+        self.storage.tables.insert("constraint_column_usage".to_string(), ccu_table);
+
+        self.storage.tables.insert("pg_catalog.pg_class".to_string(), pg_class_table.clone());
+        self.storage.tables.insert("pg_class".to_string(), pg_class_table);
+
+        self.storage.tables.insert("pg_catalog.pg_index".to_string(), pg_index_table.clone());
+        self.storage.tables.insert("pg_index".to_string(), pg_index_table);
     }
 
     fn handle_information_schema_columns_query(&self, _sql: &str, params: &[Value]) -> Result<QueryResult, String> {

@@ -57,11 +57,14 @@ try {
   }
 
   // 3. Build TypeScript and generate JS bundle + types (after native binaries are generated)
-  console.log("\n📦 [3/4] Building TypeScript bundle & type declarations...");
-  run("bun build src/index.ts src/adapters/node.ts src/adapters/browser.ts --outdir dist --target node && tsc");
+  run("bun build src/index.ts --outdir dist --target node && tsc");
 
-  // 4. Sync Native Addons to NATA backend if present
-  console.log("\n🔗 [4/4] Synchronizing Native Addons to NATA backend...");
+  // 4. Build WebAssembly (WASM) for Web target
+  console.log("\n🌐 [4/5] Building WebAssembly (WASM) module...");
+  run("bun run scripts/build_wasm.ts");
+
+  // 5. Sync Native Addons to NATA backend if present
+  console.log("\n🔗 [5/5] Synchronizing Native Addons to NATA backend...");
   const nataBackendDist = resolve(ROOT_DIR, "../NATA/backend/dist");
   const nataBackendWs5 = resolve(ROOT_DIR, "../NATA/backend/dist-ws5");
   const nataBackendRoot = resolve(ROOT_DIR, "../NATA/backend");

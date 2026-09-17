@@ -1,5 +1,4 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { LitePostgres as JSPostgres } from "../src/database";
 import { PGLiteNative } from "../src/native";
 import { unlinkSync, existsSync } from "fs";
 
@@ -13,7 +12,7 @@ function cleanFiles(prefix: string) {
   }
 }
 
-describe("JSONB Migration & Native Rust Engine Support Test Suite", () => {
+describe("JSONB Native Rust Engine Support Test Suite", () => {
   beforeAll(() => {
     cleanFiles(TEST_DB);
   });
@@ -22,10 +21,10 @@ describe("JSONB Migration & Native Rust Engine Support Test Suite", () => {
     cleanFiles(TEST_DB);
   });
 
-  test("1. Create legacy DB in JS with JSONB and timestamps, then verify Native Rust reads it properly", async () => {
-    // Step 1: Create table and insert via pure JS engine
-    const jsDb = new JSPostgres(TEST_DB);
-    await jsDb.exec(`
+  test("1. Create DB with JSONB and timestamps, then verify Native Rust reads it properly", async () => {
+    // Step 1: Create table and insert via native Rust engine
+    const initDb = new PGLiteNative(TEST_DB);
+    await initDb.exec(`
       CREATE TABLE "users" (
         "id" SERIAL PRIMARY KEY,
         "username" TEXT NOT NULL,
@@ -35,7 +34,7 @@ describe("JSONB Migration & Native Rust Engine Support Test Suite", () => {
       )
     `);
 
-    await jsDb.query(`
+    await initDb.query(`
       INSERT INTO "users" ("username", "profile", "tags", "created_at")
       VALUES ($1, $2, $3, $4)
     `, [
@@ -45,7 +44,7 @@ describe("JSONB Migration & Native Rust Engine Support Test Suite", () => {
       "2026-09-08T10:00:00.000Z"
     ]);
 
-    await jsDb.query(`
+    await initDb.query(`
       INSERT INTO "users" ("username", "profile", "tags", "created_at")
       VALUES ($1, $2, $3, $4)
     `, [
@@ -55,7 +54,7 @@ describe("JSONB Migration & Native Rust Engine Support Test Suite", () => {
       "2026-09-08T11:00:00.000Z"
     ]);
 
-    await jsDb.close();
+    await initDb.close();
 
     // Step 2: Open with PGLiteNative (Rust engine)
     const nativeDb = new PGLiteNative(TEST_DB, { autoFallback: false });
