@@ -1,5 +1,6 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-const { LitePostgresNative } = require("../crates/pglite-rs/pglite.node");
+import { getNativeBinding } from "../src/native-loader";
+const { LitePostgresNative } = getNativeBinding() || require("../pglite.node");
 import { PGLiteNative } from "../src/native";
 import { unlinkSync, existsSync } from "fs";
 import * as path from "path";

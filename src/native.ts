@@ -695,6 +695,10 @@ export class PGLiteNative {
         if (res && typeof res === "object" && (res as any).success === undefined) {
           (res as any).success = true;
         }
+        const upper = singleSql.trim().toUpperCase();
+        if (upper.startsWith("CREATE") || upper.startsWith("ALTER") || upper.startsWith("DROP")) {
+          try { this.getJsEngine().exec(singleSql, params, dbName); } catch {}
+        }
         return res;
       }
 
@@ -786,7 +790,12 @@ export class PGLiteNative {
       if (!this.allowFallback) {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
-        return this.nativeInstance.exec2(singleSql, p, db) as QueryResult<T>;
+        const res = this.nativeInstance.exec2(singleSql, p, db) as QueryResult<T>;
+        const upper = singleSql.trim().toUpperCase();
+        if (upper.startsWith("CREATE") || upper.startsWith("ALTER") || upper.startsWith("DROP")) {
+          try { this.getJsEngine().exec2(singleSql, params, dbName); } catch {}
+        }
+        return res;
       }
 
       const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
@@ -871,11 +880,23 @@ export class PGLiteNative {
       if (!this.allowFallback) {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
-        const res = this.runNativeQuery<T>(sql, p, db);
-        if (this.options?.debug || process.env.PGLITE_DEBUG) {
-          console.log(`[PGLite Native ⚡] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+        try {
+          const res = this.runNativeQuery<T>(sql, p, db);
+          const upper = sql.trim().toUpperCase();
+          if (upper.startsWith("CREATE") || upper.startsWith("ALTER") || upper.startsWith("DROP")) {
+            try { this.getJsEngine().query<T>(sql, params, dbName); } catch {}
+          }
+          if (this.options?.debug || process.env.PGLITE_DEBUG) {
+            console.log(`[PGLite Native ⚡] Executed in Rust (${res.length} rows): ${sql.slice(0, 80)}`);
+          }
+          return res;
+        } catch (err: any) {
+          const errMsg = err?.message || String(err);
+          if (errMsg.includes("Table") && errMsg.includes("not found") && /\b(information_schema|pg_catalog)\b/i.test(sql)) {
+            return await this.getJsEngine().query<T>(sql, params, dbName);
+          }
+          throw err;
         }
-        return res;
       }
 
       const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);
@@ -944,11 +965,23 @@ export class PGLiteNative {
       if (!this.allowFallback) {
         let p = Array.isArray(params) ? params : undefined;
         let db = typeof params === "string" ? params : dbName;
-        const res = this.runNativeQuery2<T>(sql, p, db);
-        if (this.options?.debug || process.env.PGLITE_DEBUG) {
-          console.log(`[PGLite Native ⚡] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+        try {
+          const res = this.runNativeQuery2<T>(sql, p, db);
+          const upper = sql.trim().toUpperCase();
+          if (upper.startsWith("CREATE") || upper.startsWith("ALTER") || upper.startsWith("DROP")) {
+            try { this.getJsEngine().query2<T>(sql, params, dbName); } catch {}
+          }
+          if (this.options?.debug || process.env.PGLITE_DEBUG) {
+            console.log(`[PGLite Native ⚡] Executed in Rust (${res.rowCount} rows): ${sql.slice(0, 80)}`);
+          }
+          return res;
+        } catch (err: any) {
+          const errMsg = err?.message || String(err);
+          if (errMsg.includes("Table") && errMsg.includes("not found") && /\b(information_schema|pg_catalog)\b/i.test(sql)) {
+            return await this.getJsEngine().query2<T>(sql, params, dbName);
+          }
+          throw err;
         }
-        return res;
       }
 
       const inTx = Boolean((this.jsFallback as any)?.storage?.inTransaction);

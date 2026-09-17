@@ -3657,6 +3657,208 @@ export class StorageEngine {
       return;
     }
 
+    if (
+      fullName === "information_schema.table_constraints" ||
+      fullName === "pg_catalog.table_constraints"
+    ) {
+      const nspMap = new Map();
+      for await (const n of this.scanCatalog(this.pgNamespaceDef))
+        nspMap.set(n.oid, n.nspname);
+
+      for await (const rel of this.scanCatalog(this.pgClassDef)) {
+        if (rel.relkind !== "r") continue;
+        const schema = nspMap.get(rel.relnamespace);
+        if (schema === "pg_catalog" || schema === "information_schema")
+          continue;
+
+        const attrs = [];
+        for await (const a of this.scanCatalog(this.pgAttributeDef)) {
+          if (a.attrelid === rel.oid) attrs.push(a);
+        }
+
+        const pkAttrs = attrs.filter((a) => a.attprimary);
+        if (pkAttrs.length > 0) {
+          yield {
+            constraint_catalog: "litepostgres",
+            constraint_schema: schema,
+            constraint_name: `${rel.relname}_pkey`,
+            table_catalog: "litepostgres",
+            table_schema: schema,
+            table_name: rel.relname,
+            constraint_type: "PRIMARY KEY",
+            is_deferrable: "NO",
+            initially_deferred: "NO",
+            enforced: "YES",
+          };
+        }
+
+        for (const attr of attrs) {
+          if (attr.attunique && !attr.attprimary) {
+            yield {
+              constraint_catalog: "litepostgres",
+              constraint_schema: schema,
+              constraint_name: `${rel.relname}_${attr.attname}_key`,
+              table_catalog: "litepostgres",
+              table_schema: schema,
+              table_name: rel.relname,
+              constraint_type: "UNIQUE",
+              is_deferrable: "NO",
+              initially_deferred: "NO",
+              enforced: "YES",
+            };
+          }
+          if (attr.attref_table) {
+            yield {
+              constraint_catalog: "litepostgres",
+              constraint_schema: schema,
+              constraint_name: `${rel.relname}_${attr.attname}_fkey`,
+              table_catalog: "litepostgres",
+              table_schema: schema,
+              table_name: rel.relname,
+              constraint_type: "FOREIGN KEY",
+              is_deferrable: "NO",
+              initially_deferred: "NO",
+              enforced: "YES",
+            };
+          }
+        }
+      }
+      return;
+    }
+
+    if (
+      fullName === "information_schema.key_column_usage" ||
+      fullName === "pg_catalog.key_column_usage"
+    ) {
+      const nspMap = new Map();
+      for await (const n of this.scanCatalog(this.pgNamespaceDef))
+        nspMap.set(n.oid, n.nspname);
+
+      for await (const rel of this.scanCatalog(this.pgClassDef)) {
+        if (rel.relkind !== "r") continue;
+        const schema = nspMap.get(rel.relnamespace);
+        if (schema === "pg_catalog" || schema === "information_schema")
+          continue;
+
+        const attrs = [];
+        for await (const a of this.scanCatalog(this.pgAttributeDef)) {
+          if (a.attrelid === rel.oid) attrs.push(a);
+        }
+
+        const pkAttrs = attrs
+          .filter((a) => a.attprimary)
+          .sort((a, b) => a.attnum - b.attnum);
+        for (let i = 0; i < pkAttrs.length; i++) {
+          const a = pkAttrs[i]!;
+          yield {
+            constraint_catalog: "litepostgres",
+            constraint_schema: schema,
+            constraint_name: `${rel.relname}_pkey`,
+            table_catalog: "litepostgres",
+            table_schema: schema,
+            table_name: rel.relname,
+            column_name: a.attname,
+            ordinal_position: i + 1,
+            position_in_unique_constraint: null,
+          };
+        }
+
+        for (const attr of attrs) {
+          if (attr.attunique && !attr.attprimary) {
+            yield {
+              constraint_catalog: "litepostgres",
+              constraint_schema: schema,
+              constraint_name: `${rel.relname}_${attr.attname}_key`,
+              table_catalog: "litepostgres",
+              table_schema: schema,
+              table_name: rel.relname,
+              column_name: attr.attname,
+              ordinal_position: 1,
+              position_in_unique_constraint: null,
+            };
+          }
+          if (attr.attref_table) {
+            yield {
+              constraint_catalog: "litepostgres",
+              constraint_schema: schema,
+              constraint_name: `${rel.relname}_${attr.attname}_fkey`,
+              table_catalog: "litepostgres",
+              table_schema: schema,
+              table_name: rel.relname,
+              column_name: attr.attname,
+              ordinal_position: 1,
+              position_in_unique_constraint: 1,
+            };
+          }
+        }
+      }
+      return;
+    }
+
+    if (
+      fullName === "information_schema.constraint_column_usage" ||
+      fullName === "pg_catalog.constraint_column_usage"
+    ) {
+      const nspMap = new Map();
+      for await (const n of this.scanCatalog(this.pgNamespaceDef))
+        nspMap.set(n.oid, n.nspname);
+
+      for await (const rel of this.scanCatalog(this.pgClassDef)) {
+        if (rel.relkind !== "r") continue;
+        const schema = nspMap.get(rel.relnamespace);
+        if (schema === "pg_catalog" || schema === "information_schema")
+          continue;
+
+        const attrs = [];
+        for await (const a of this.scanCatalog(this.pgAttributeDef)) {
+          if (a.attrelid === rel.oid) attrs.push(a);
+        }
+
+        const pkAttrs = attrs.filter((a) => a.attprimary);
+        for (const a of pkAttrs) {
+          yield {
+            table_catalog: "litepostgres",
+            table_schema: schema,
+            table_name: rel.relname,
+            column_name: a.attname,
+            constraint_catalog: "litepostgres",
+            constraint_schema: schema,
+            constraint_name: `${rel.relname}_pkey`,
+          };
+        }
+
+        for (const attr of attrs) {
+          if (attr.attunique && !attr.attprimary) {
+            yield {
+              table_catalog: "litepostgres",
+              table_schema: schema,
+              table_name: rel.relname,
+              column_name: attr.attname,
+              constraint_catalog: "litepostgres",
+              constraint_schema: schema,
+              constraint_name: `${rel.relname}_${attr.attname}_key`,
+            };
+          }
+          if (attr.attref_table) {
+            const refTable = attr.attref_table.includes(".")
+              ? attr.attref_table.split(".").pop()!
+              : attr.attref_table;
+            const refCol = attr.attref_col || "id";
+            yield {
+              table_catalog: "litepostgres",
+              table_schema: "public",
+              table_name: refTable,
+              column_name: refCol,
+              constraint_catalog: "litepostgres",
+              constraint_schema: schema,
+              constraint_name: `${rel.relname}_${attr.attname}_fkey`,
+            };
+          }
+        }
+      }
+      return;
+    }
+
     if (fullName === "information_schema.columns") {
       const formatAttdefToSql = (attdef: any): string | null => {
         if (!attdef) return null;
