@@ -357,3 +357,143 @@ fn extract_bytes_from_str(s: &str) -> Option<Vec<u8>> {
 pub fn generate_uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Ergonomic Type Conversions for Native Rust
+// ---------------------------------------------------------------------------
+
+impl From<i64> for Value {
+    #[inline]
+    fn from(v: i64) -> Self {
+        Value::Int(v)
+    }
+}
+
+impl From<i32> for Value {
+    #[inline]
+    fn from(v: i32) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<i16> for Value {
+    #[inline]
+    fn from(v: i16) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<i8> for Value {
+    #[inline]
+    fn from(v: i8) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<isize> for Value {
+    #[inline]
+    fn from(v: isize) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<u32> for Value {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<u16> for Value {
+    #[inline]
+    fn from(v: u16) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<u8> for Value {
+    #[inline]
+    fn from(v: u8) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<usize> for Value {
+    #[inline]
+    fn from(v: usize) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<f64> for Value {
+    #[inline]
+    fn from(v: f64) -> Self {
+        Value::Float(v)
+    }
+}
+
+impl From<f32> for Value {
+    #[inline]
+    fn from(v: f32) -> Self {
+        Value::Float(v as f64)
+    }
+}
+
+impl From<bool> for Value {
+    #[inline]
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+
+impl From<&str> for Value {
+    #[inline]
+    fn from(v: &str) -> Self {
+        Value::text(v)
+    }
+}
+
+impl From<&String> for Value {
+    #[inline]
+    fn from(v: &String) -> Self {
+        Value::text(v.as_str())
+    }
+}
+
+impl From<String> for Value {
+    #[inline]
+    fn from(v: String) -> Self {
+        Value::Text(CompactString::new(v))
+    }
+}
+
+impl From<CompactString> for Value {
+    #[inline]
+    fn from(v: CompactString) -> Self {
+        Value::Text(v)
+    }
+}
+
+impl<T> From<Option<T>> for Value
+where
+    T: Into<Value>,
+{
+    #[inline]
+    fn from(v: Option<T>) -> Self {
+        match v {
+            Some(x) => x.into(),
+            None => Value::Null,
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! params {
+    () => {
+        Vec::<$crate::types::Value>::new()
+    };
+    ($($val:expr),* $(,)?) => {
+        vec![$($crate::types::Value::from($val)),*]
+    };
+}
+

@@ -22,7 +22,7 @@ try {
   // 1. Build macOS Native Addon (darwin-arm64)
   console.log("\n🍎 [1/4] Building macOS Native Rust Addon (arm64)...");
   run(
-    "cargo build --release --manifest-path crates/pglite-rs/Cargo.toml --lib",
+    "cargo build --release --manifest-path crates/pglite-rs/Cargo.toml --lib --features napi-binding",
     ROOT_DIR,
     { RUSTFLAGS: "-C link-arg=-undefined -C link-arg=dynamic_lookup" }
   );
@@ -44,7 +44,7 @@ try {
     chmodSync(ZIG_SCRIPT, 0o755);
   }
   run(
-    `cargo build --target x86_64-unknown-linux-gnu --manifest-path crates/pglite-rs/Cargo.toml --lib --release`,
+    `cargo build --target x86_64-unknown-linux-gnu --manifest-path crates/pglite-rs/Cargo.toml --lib --release --features napi-binding`,
     ROOT_DIR,
     { RUSTFLAGS: `-C linker=${ZIG_SCRIPT}` }
   );

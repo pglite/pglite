@@ -31,12 +31,14 @@ Traditional PostgreSQL setups require a separate background daemon, network TCP 
 graph TD
     App[Application Layer]
     
-    subgraph Environments [Runtimes]
+    subgraph Environments [Runtimes & SDKs]
+        RustApps["Native Rust Applications<br/>(Embedded Engine / SDK)"]
         NodeBun["Backend Runtimes<br/>(Node.js / Bun / Edge)"]
         WebBrowsers["Frontend Runtimes<br/>(Browsers / Web Workers)"]
     end
     
     subgraph CoreBindings [Engine Bindings]
+        RustSDK["Direct Rust API (PGlite)<br/>Cargo crate: pglite-rs"]
         NAPI["Native N-API Addon (.node)<br/>darwin-arm64 / linux-x64"]
         WASM["WebAssembly Module (.wasm)<br/>wasm-bindgen (target web)"]
     end
@@ -50,10 +52,13 @@ graph TD
         Catalogs["information_schema & pg_catalog"]
     end
 
+    App --> RustApps
     App --> NodeBun
     App --> WebBrowsers
+    RustApps --> RustSDK
     NodeBun --> NAPI
     WebBrowsers --> WASM
+    RustSDK --> Parser
     NAPI --> Parser
     WASM --> Parser
     Parser --> Volcano
@@ -245,7 +250,56 @@ const db = new PGliteWasm(":memory:");
 
 ---
 
-### 3. In-Browser Interactive Playground
+### 3. Pure Rust Native Applications (`pglite-rs`)
+
+For Rust projects, you can use `pglite-rs` directly as an embedded database crate without any Node.js or N-API dependencies:
+
+```toml
+# In your Cargo.toml
+[dependencies]
+pglite-rs = { path = "crates/pglite-rs" }
+serde = { version = "1.0", features = ["derive"] }
+```
+
+```rust
+use pglite_rs::{PGlite, params};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct User {
+    id: i64,
+    username: String,
+    age: i32,
+}
+
+fn main() -> Result<(), String> {
+    // Open in-memory or on-disk database
+    let mut db = PGlite::in_memory()?;
+    // Or: let mut db = PGlite::open("app.db")?;
+
+    // DDL
+    db.exec("CREATE TABLE users (id SERIAL PRIMARY KEY, username TEXT, age INT);", &[])?;
+
+    // Parameterized INSERT
+    db.exec("INSERT INTO users (username, age) VALUES ($1, $2);", &params!["alice", 30])?;
+
+    // Deserializing directly into typed Rust structs
+    let users: Vec<User> = db.query_as("SELECT id, username, age FROM users WHERE age >= $1;", &params![20])?;
+    println!("Users: {:?}", users);
+
+    // Full PostgreSQL JSONB operators: ->, ->>, #>, @>, ?
+    db.exec("CREATE TABLE items (id INT, details JSONB);", &[])?;
+    db.exec("INSERT INTO items VALUES (1, '{\"brand\": \"Apple\", \"in_stock\": true}');", &[])?;
+    let in_stock = db.query("SELECT * FROM items WHERE details @> '{\"in_stock\": true}';", &[])?;
+    assert_eq!(in_stock.row_count, 1);
+
+    Ok(())
+}
+```
+
+---
+
+### 4. In-Browser Interactive Playground
 
 We provide a ready-to-run interactive browser demo showcasing the WASM engine in action:
 
