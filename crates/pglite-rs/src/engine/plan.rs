@@ -1,3 +1,4 @@
+use crate::engine::expr::CompiledExpr;
 use crate::types::{FieldInfo, Value};
 
 #[derive(Clone, Debug)]
@@ -53,6 +54,10 @@ pub enum PlannedProjectedExpr {
         expr_str: String,
         alias: String,
     },
+    Compiled {
+        expr: CompiledExpr,
+        alias: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -88,7 +93,7 @@ pub enum ExecutionPlan {
     GeneralSelect {
         table_name: String,
         join: Option<PlannedJoin>,
-        where_template: Option<WhereTemplate>,
+        where_expr: Option<CompiledExpr>,
         order_by: Option<(usize, bool)>, // (col_idx, is_desc)
         limit: Option<OperandTemplate>,
         offset: Option<OperandTemplate>,
@@ -329,6 +334,10 @@ pub fn project_row_planned(
                 let key = parent_val.as_str();
                 let count = count_maps.get(alias).and_then(|m| m.get(&key).copied()).unwrap_or(0);
                 map.insert(alias.clone(), serde_json::Value::Number(count.into()));
+            }
+            PlannedProjectedExpr::Compiled { expr, alias } => {
+                let v = expr.eval(primary_row, joined_row, &[]);
+                map.insert(alias.clone(), value_to_json(&v));
             }
             PlannedProjectedExpr::Expr { alias, .. } => {
                 map.insert(alias.clone(), serde_json::Value::Null);

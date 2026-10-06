@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use md5::{Digest, Md5};
 use base64::Engine;
 
+use crate::engine::expr::{compile_expr, compile_expr_for_joined, CompiledExpr};
 pub use crate::engine::plan::PlannedProjectedExpr as ProjectedExpr;
 use crate::engine::plan::{
-    evaluate_planned_condition, evaluate_planned_where, find_pk_equality_in_where_template,
-    project_row_planned, resolve_operand, ColOpTemplate, ConditionTemplate, ExecutionPlan,
-    OperandTemplate, PlannedJoin, PlannedProjectedExpr, WhereTemplate,
+    evaluate_planned_condition, project_row_planned, resolve_operand, ColOpTemplate,
+    ConditionTemplate, ExecutionPlan, OperandTemplate, PlannedJoin, PlannedProjectedExpr,
+    WhereTemplate,
 };
 
 #[derive(Debug, Clone)]
@@ -1362,6 +1363,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         let joined_schema = std::sync::Arc::new(JoinedSchema::new(&all_tables_meta));
         let pushdown = plan_predicate_pushdown(resolved_where.as_deref(), &all_tables_meta, &joins);
+        let compiled_base_preds: Vec<CompiledExpr> = pushdown.base_predicates.iter()
+            .map(|p| compile_expr_for_joined(p, &joined_schema))
+            .collect();
+        let compiled_remaining: Vec<CompiledExpr> = pushdown.remaining_where.iter()
+            .map(|p| compile_expr_for_joined(p, &joined_schema))
+            .collect();
         let base_table_columns = base_table.columns.clone();
 
         let can_early_limit = group_opt.is_none() 
@@ -1380,8 +1387,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             if !base_table.is_deleted[r_idx] {
                 let comb = CombinedRow::from_base_row(joined_schema.clone(), r);
                 let mut pass = true;
-                for pred in &pushdown.base_predicates {
-                    if !eval_condition_on_row(&comb, pred, params) {
+                for pred in &compiled_base_preds {
+                    if pred.eval_joined(&comb, params) != Some(true) {
                         pass = false;
                         break;
                     }
@@ -1459,30 +1466,47 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             let filter_preds = &pushdown.joined_table_predicates[j_idx];
             let table_offset = joined_schema.table_offsets.get(j_idx + 1).cloned().unwrap_or(0);
 
-            if let Some(equi) = maybe_equi {
-                if current_rows.len() * 2 < j_table.rows.len() {
-                    // Adaptive Hash Join: Build hash table on current_rows (much smaller!), Probe j_table
-                    let mut left_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
-                    for (base_idx, base_comb) in current_rows.iter().enumerate() {
-                        let left_val = eval_operand_on_row(base_comb, &equi.left_expr, params);
-                        left_hash_map.entry(value_to_join_key(&left_val)).or_default().push(base_idx);
-                    }
+            let mut test_comb = if !filter_preds.is_empty() {
+                let mut c = CombinedRow::new_with_schema(joined_schema.clone());
+                c.values.resize(table_offset + j_table.columns.len(), Value::Null);
+                Some(c)
+            } else {
+                None
+            };
 
-                    let mut matched_left_counts = if j.kind == JoinKind::Left {
-                        vec![0usize; current_rows.len()]
-                    } else {
-                        Vec::new()
-                    };
+            let target_limit = if can_early_limit && j_idx + 1 == joins.len() {
+                limit_opt.map(|lim| lim + offset_opt.unwrap_or(0))
+            } else {
+                None
+            };
+
+            if let Some(mut equi) = maybe_equi {
+                equi.left_slot = joined_schema.get_slot(&equi.left_expr)
+                    .or_else(|| joined_schema.get_slot(&clean_col_name(&equi.left_expr)));
+
+                let should_build_left = j.kind != JoinKind::Left && current_rows.len() < j_table.rows.len();
+
+                if should_build_left {
+                    // Adaptive Hash Join: Build hash table on current_rows (smaller), Probe j_table
+                    let mut left_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::with_capacity(current_rows.len());
+                    for (base_idx, base_comb) in current_rows.iter().enumerate() {
+                        let left_val = match equi.left_slot {
+                            Some(slot) => base_comb.values.get(slot).unwrap_or(&Value::Null),
+                            None => &eval_operand_on_row(base_comb, &equi.left_expr, params),
+                        };
+                        if !left_val.is_null() {
+                            left_hash_map.entry(value_to_join_key(left_val)).or_default().push(base_idx);
+                        }
+                    }
 
                     for (jr_idx, jr) in j_table.rows.iter().enumerate() {
                         if !j_table.is_deleted[jr_idx] {
-                            if !filter_preds.is_empty() {
-                                let mut test_comb = CombinedRow::new_with_schema(joined_schema.clone());
-                                test_comb.values.resize(table_offset, Value::Null);
-                                test_comb.values.extend_from_slice(jr);
+                            if let Some(ref mut c) = test_comb {
+                                let end_idx = (table_offset + jr.len()).min(c.values.len());
+                                c.values[table_offset..end_idx].clone_from_slice(&jr[..end_idx - table_offset]);
                                 let mut pass = true;
                                 for p in filter_preds {
-                                    if !eval_condition_on_row(&test_comb, p, params) {
+                                    if !eval_condition_on_row(c, p, params) {
                                         pass = false;
                                         break;
                                     }
@@ -1493,23 +1517,24 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
 
                             if let Some(val) = jr.get(equi.right_col_idx) {
-                                let key = value_to_join_key(val);
-                                if let Some(base_indices) = left_hash_map.get(&key) {
-                                    for &base_idx in base_indices {
-                                        let base_comb = &current_rows[base_idx];
-                                        if let Some(ref res_cond) = equi.residual_cond {
-                                            let candidate = base_comb.with_joined_table(jr);
-                                            if eval_condition_on_row(&candidate, res_cond, params) {
-                                                next_rows.push(candidate);
-                                                if j.kind == JoinKind::Left {
-                                                    matched_left_counts[base_idx] += 1;
+                                if !val.is_null() {
+                                    let key = value_to_join_key(val);
+                                    if let Some(base_indices) = left_hash_map.get(&key) {
+                                        for &base_idx in base_indices {
+                                            let base_comb = &current_rows[base_idx];
+                                            if let Some(ref res_cond) = equi.residual_cond {
+                                                let candidate = base_comb.with_joined_table(jr);
+                                                if eval_condition_on_row(&candidate, res_cond, params) {
+                                                    next_rows.push(candidate);
                                                 }
+                                            } else {
+                                                let matched_comb = base_comb.with_joined_table(jr);
+                                                next_rows.push(matched_comb);
                                             }
-                                        } else {
-                                            let matched_comb = base_comb.with_joined_table(jr);
-                                            next_rows.push(matched_comb);
-                                            if j.kind == JoinKind::Left {
-                                                matched_left_counts[base_idx] += 1;
+                                        }
+                                        if let Some(target) = target_limit {
+                                            if next_rows.len() >= target {
+                                                break;
                                             }
                                         }
                                     }
@@ -1517,27 +1542,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
                         }
                     }
-
-                    if j.kind == JoinKind::Left {
-                        for (base_idx, &count) in matched_left_counts.iter().enumerate() {
-                            if count == 0 {
-                                let null_comb = current_rows[base_idx].with_null_table(j_table.columns.len());
-                                next_rows.push(null_comb);
-                            }
-                        }
-                    }
                 } else {
-                    // Standard Hash Join: Build hash table on j_table's right_col_idx
-                    let mut right_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
+                    // Standard Hash Join: Build hash table on j_table's right_col_idx, Probe current_rows
+                    let mut right_hash_map: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::with_capacity(j_table.active_count);
                     for (jr_idx, jr) in j_table.rows.iter().enumerate() {
                         if !j_table.is_deleted[jr_idx] {
-                            if !filter_preds.is_empty() {
-                                let mut test_comb = CombinedRow::new_with_schema(joined_schema.clone());
-                                test_comb.values.resize(table_offset, Value::Null);
-                                test_comb.values.extend_from_slice(jr);
+                            if let Some(ref mut c) = test_comb {
+                                let end_idx = (table_offset + jr.len()).min(c.values.len());
+                                c.values[table_offset..end_idx].clone_from_slice(&jr[..end_idx - table_offset]);
                                 let mut pass = true;
                                 for p in filter_preds {
-                                    if !eval_condition_on_row(&test_comb, p, params) {
+                                    if !eval_condition_on_row(c, p, params) {
                                         pass = false;
                                         break;
                                     }
@@ -1547,31 +1562,54 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 }
                             }
                             if let Some(val) = jr.get(equi.right_col_idx) {
-                                right_hash_map.entry(value_to_join_key(val)).or_default().push(jr_idx);
+                                if !val.is_null() {
+                                    right_hash_map.entry(value_to_join_key(val)).or_default().push(jr_idx);
+                                }
                             }
                         }
                     }
 
                     // Probe phase: match against current_rows
                     for base_comb in &current_rows {
+                        if let Some(target) = target_limit {
+                            if next_rows.len() >= target {
+                                break;
+                            }
+                        }
+
                         let mut match_count = 0;
-                        let left_val = eval_operand_on_row(base_comb, &equi.left_expr, params);
+                        let left_val = match equi.left_slot {
+                            Some(slot) => base_comb.values.get(slot).unwrap_or(&Value::Null),
+                            None => &eval_operand_on_row(base_comb, &equi.left_expr, params),
+                        };
 
-                        let key = value_to_join_key(&left_val);
-                        if let Some(matched_indices) = right_hash_map.get(&key) {
-                            for &jr_idx in matched_indices {
-                                let jr = &j_table.rows[jr_idx];
+                        if !left_val.is_null() {
+                            let key = value_to_join_key(left_val);
+                            if let Some(matched_indices) = right_hash_map.get(&key) {
+                                for &jr_idx in matched_indices {
+                                    let jr = &j_table.rows[jr_idx];
 
-                                if let Some(ref res_cond) = equi.residual_cond {
-                                    let candidate = base_comb.with_joined_table(jr);
-                                    if eval_condition_on_row(&candidate, res_cond, params) {
-                                        next_rows.push(candidate);
+                                    if let Some(ref res_cond) = equi.residual_cond {
+                                        let candidate = base_comb.with_joined_table(jr);
+                                        if eval_condition_on_row(&candidate, res_cond, params) {
+                                            next_rows.push(candidate);
+                                            match_count += 1;
+                                            if let Some(target) = target_limit {
+                                                if next_rows.len() >= target {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let matched_comb = base_comb.with_joined_table(jr);
+                                        next_rows.push(matched_comb);
                                         match_count += 1;
+                                        if let Some(target) = target_limit {
+                                            if next_rows.len() >= target {
+                                                break;
+                                            }
+                                        }
                                     }
-                                } else {
-                                    let matched_comb = base_comb.with_joined_table(jr);
-                                    next_rows.push(matched_comb);
-                                    match_count += 1;
                                 }
                             }
                         }
@@ -1585,16 +1623,20 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             } else {
                 // Fallback: Nested Loop Join for non-equi joins
                 for base_comb in &current_rows {
+                    if let Some(target) = target_limit {
+                        if next_rows.len() >= target {
+                            break;
+                        }
+                    }
                     let mut match_count = 0;
                     for (jr_idx, jr) in j_table.rows.iter().enumerate() {
                         if !j_table.is_deleted[jr_idx] {
-                            if !filter_preds.is_empty() {
-                                let mut test_comb = CombinedRow::new_with_schema(joined_schema.clone());
-                                test_comb.values.resize(table_offset, Value::Null);
-                                test_comb.values.extend_from_slice(jr);
+                            if let Some(ref mut c) = test_comb {
+                                let end_idx = (table_offset + jr.len()).min(c.values.len());
+                                c.values[table_offset..end_idx].clone_from_slice(&jr[..end_idx - table_offset]);
                                 let mut pass = true;
                                 for p in filter_preds {
-                                    if !eval_condition_on_row(&test_comb, p, params) {
+                                    if !eval_condition_on_row(c, p, params) {
                                         pass = false;
                                         break;
                                     }
@@ -1611,6 +1653,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             if matches {
                                 next_rows.push(candidate);
                                 match_count += 1;
+                                if let Some(target) = target_limit {
+                                    if next_rows.len() >= target {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1643,8 +1690,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             current_rows = next_rows;
         }
 
-        for rem in &pushdown.remaining_where {
-            current_rows.retain(|r| eval_condition_on_row(r, rem, params));
+        for rem in &compiled_remaining {
+            current_rows.retain(|r| rem.eval_joined(r, params) == Some(true));
         }
 
         let mut final_json_rows: Vec<serde_json::Value> = Vec::new();
@@ -1737,69 +1784,112 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         std::cmp::Ordering::Equal
                     });
                 }
-                for r in &current_rows {
-                    let mut row_map = serde_json::Map::new();
-                    for item in &proj_items {
-                        let trimmed_item = item.trim();
-                        if trimmed_item.ends_with(".*") {
-                            let prefix = trimmed_item[..trimmed_item.len() - 2].trim().trim_matches('"');
-                            let is_base = prefix.eq_ignore_ascii_case(&base_tbl_name)
-                                || base_alias.as_ref().map(|a| prefix.eq_ignore_ascii_case(a.trim_matches('"'))).unwrap_or(false);
-                            if is_base {
-                                for col in &base_table_columns {
-                                    let col_name = &col.name;
-                                    let val = r.get_val(&format!("{}.{}", prefix, col_name));
-                                    let final_val = if val.is_null() { r.get_val(col_name) } else { val };
-                                    row_map.insert(col_name.clone(), value_to_json(&final_val));
-                                }
-                                continue;
-                            }
-                            let mut matched_join = false;
-                            for j in &joins {
-                                let is_j = prefix.eq_ignore_ascii_case(&j.table_name)
-                                    || j.alias.as_ref().map(|a| prefix.eq_ignore_ascii_case(a.trim_matches('"'))).unwrap_or(false);
-                                if is_j {
-                                    if let Some(jt) = self.storage.get_table(&j.table_name) {
-                                        for col in &jt.columns {
-                                            let col_name = &col.name;
-                                            let val = r.get_val(&format!("{}.{}", prefix, col_name));
-                                            let final_val = if val.is_null() { r.get_val(col_name) } else { val };
-                                            row_map.insert(col_name.clone(), value_to_json(&final_val));
-                                        }
-                                    }
-                                    matched_join = true;
-                                    break;
-                                }
-                            }
-                            if matched_join {
-                                continue;
-                            }
-                        } else if trimmed_item == "*" {
-                            for col in &base_table_columns {
-                                let val = r.get_val(&col.name);
-                                row_map.insert(col.name.clone(), value_to_json(&val));
-                            }
-                            for j in &joins {
-                                if let Some(jt) = self.storage.get_table(&j.table_name) {
-                                    for col in &jt.columns {
-                                        let val = r.get_val(&col.name);
-                                        row_map.insert(col.name.clone(), value_to_json(&val));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
+                let has_wildcards = proj_items.iter().any(|item| {
+                    let t = item.trim();
+                    t.ends_with(".*") || t == "*"
+                });
 
+                if !has_wildcards {
+                    let precompiled: Vec<(String, Option<usize>, String)> = proj_items.iter().map(|item| {
                         let upper = item.to_uppercase();
                         let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
                             (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
                         } else {
                             (item.trim(), clean_col_name(item.trim()).replace('"', ""))
                         };
-                        let val = eval_joined_scalar_expr(expr_part, r, params, &self.storage);
-                        row_map.insert(alias, val);
+                        let clean_expr = expr_part.trim().replace('"', "");
+                        let slot = if !clean_expr.contains('(')
+                            && !clean_expr.contains('+')
+                            && !clean_expr.contains('-')
+                            && !clean_expr.contains('*')
+                            && !clean_expr.contains('/')
+                            && !clean_expr.contains("::")
+                            && !clean_expr.contains("->")
+                            && !clean_expr.contains(' ')
+                        {
+                            joined_schema.get_slot(&clean_expr)
+                        } else {
+                            None
+                        };
+                        (alias, slot, expr_part.to_string())
+                    }).collect();
+
+                    for r in &current_rows {
+                        let mut row_map = serde_json::Map::with_capacity(precompiled.len());
+                        for (alias, slot, expr_part) in &precompiled {
+                            let val = match slot {
+                                Some(s) => value_to_json(r.values.get(*s).unwrap_or(&Value::Null)),
+                                None => eval_joined_scalar_expr(expr_part, r, params, &self.storage),
+                            };
+                            row_map.insert(alias.clone(), val);
+                        }
+                        final_json_rows.push(serde_json::Value::Object(row_map));
                     }
-                    final_json_rows.push(serde_json::Value::Object(row_map));
+                } else {
+                    for r in &current_rows {
+                        let mut row_map = serde_json::Map::new();
+                        for item in &proj_items {
+                            let trimmed_item = item.trim();
+                            if trimmed_item.ends_with(".*") {
+                                let prefix = trimmed_item[..trimmed_item.len() - 2].trim().trim_matches('"');
+                                let is_base = prefix.eq_ignore_ascii_case(&base_tbl_name)
+                                    || base_alias.as_ref().map(|a| prefix.eq_ignore_ascii_case(a.trim_matches('"'))).unwrap_or(false);
+                                if is_base {
+                                    for col in &base_table_columns {
+                                        let col_name = &col.name;
+                                        let val = r.get_val(&format!("{}.{}", prefix, col_name));
+                                        let final_val = if val.is_null() { r.get_val(col_name) } else { val };
+                                        row_map.insert(col_name.clone(), value_to_json(&final_val));
+                                    }
+                                    continue;
+                                }
+                                let mut matched_join = false;
+                                for j in &joins {
+                                    let is_j = prefix.eq_ignore_ascii_case(&j.table_name)
+                                        || j.alias.as_ref().map(|a| prefix.eq_ignore_ascii_case(a.trim_matches('"'))).unwrap_or(false);
+                                    if is_j {
+                                        if let Some(jt) = self.storage.get_table(&j.table_name) {
+                                            for col in &jt.columns {
+                                                let col_name = &col.name;
+                                                let val = r.get_val(&format!("{}.{}", prefix, col_name));
+                                                let final_val = if val.is_null() { r.get_val(col_name) } else { val };
+                                                row_map.insert(col_name.clone(), value_to_json(&final_val));
+                                            }
+                                        }
+                                        matched_join = true;
+                                        break;
+                                    }
+                                }
+                                if matched_join {
+                                    continue;
+                                }
+                            } else if trimmed_item == "*" {
+                                for col in &base_table_columns {
+                                    let val = r.get_val(&col.name);
+                                    row_map.insert(col.name.clone(), value_to_json(&val));
+                                }
+                                for j in &joins {
+                                    if let Some(jt) = self.storage.get_table(&j.table_name) {
+                                        for col in &jt.columns {
+                                            let val = r.get_val(&col.name);
+                                            row_map.insert(col.name.clone(), value_to_json(&val));
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let upper = item.to_uppercase();
+                            let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                                (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
+                            } else {
+                                (item.trim(), clean_col_name(item.trim()).replace('"', ""))
+                            };
+                            let val = eval_joined_scalar_expr(expr_part, r, params, &self.storage);
+                            row_map.insert(alias, val);
+                        }
+                        final_json_rows.push(serde_json::Value::Object(row_map));
+                    }
                 }
             }
         }
@@ -3306,17 +3396,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
-        // 4. General Scan with WHERE condition filtering
-        let where_expr = match clauses.where_clause {
-            Some(w) => Some(parse_where_expr(w, table, params)?),
+        // 4. Pre-compiled AST for WHERE condition filtering
+        let compiled_where: Option<CompiledExpr> = match clauses.where_clause {
+            Some(w) => {
+                let jt_ref = if let Some(ref jc) = clauses.join_clause {
+                    self.storage.get_table(jc.joined_table_name)
+                } else {
+                    None
+                };
+                Some(compile_expr(w, Some(table), clauses.table_alias, jt_ref, clauses.join_clause.as_ref().and_then(|j| j.joined_table_alias)))
+            }
             None => None,
         };
 
         let total_rows = table.rows.len();
-
-        // Check if any condition is an exact equality on the Primary Key column!
-        let pk_target = if let Some(ref expr) = where_expr {
-            table.pk_col_idx.and_then(|pk_idx| extract_single_pk_eq(expr, pk_idx))
+        let pk_target = if let Some(ref expr) = compiled_where {
+            table.pk_col_idx.and_then(|pk_idx| expr.find_pk_eq(pk_idx, params))
         } else {
             None
         };
@@ -3357,8 +3452,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
             if let Some(target_pk) = pk_target {
                 if let Some(&row_idx) = table.pk_index.get(&target_pk) {
-                    let matches = match &where_expr {
-                        Some(expr) => evaluate_where_expr(&table.rows[row_idx], Some(table), expr, params),
+                    let matches = match &compiled_where {
+                        Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
                         None => true,
                     };
                     if !table.is_deleted[row_idx] && matches {
@@ -3369,21 +3464,21 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 } else {
                     vec![]
                 }
-            } else if where_expr.is_none() {
+            } else if compiled_where.is_none() {
                 (0..total_rows)
                     .into_par_iter()
                     .filter(|&i| !table.is_deleted[i])
                     .collect()
             } else if total_rows > 20_000 {
-                let expr_ref = where_expr.as_ref().unwrap();
+                let expr_ref = compiled_where.as_ref().unwrap();
                 (0..total_rows)
                     .into_par_iter()
-                    .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], Some(table), expr_ref, params))
+                    .filter(|&i| !table.is_deleted[i] && expr_ref.eval_bool(&table.rows[i], None, params) == Some(true))
                     .collect()
             } else {
-                let expr_ref = where_expr.as_ref().unwrap();
+                let expr_ref = compiled_where.as_ref().unwrap();
                 (0..total_rows)
-                    .filter(|&i| !table.is_deleted[i] && evaluate_where_expr(&table.rows[i], Some(table), expr_ref, params))
+                    .filter(|&i| !table.is_deleted[i] && expr_ref.eval_bool(&table.rows[i], None, params) == Some(true))
                     .collect()
             }
         };
@@ -3401,19 +3496,36 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
             if !jc.is_left {
                 if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
-                    matched_indices.retain(|&idx| {
-                        let join_key = &table.rows[idx][p_col_idx];
-                        if join_key.is_null() {
-                            return false;
+                    let j_col_idx_opt = jt.get_column_index(jc.joined_join_col);
+                    let is_pk = jt.pk_col_idx == j_col_idx_opt;
+                    if is_pk {
+                        matched_indices.retain(|&idx| {
+                            let join_key = &table.rows[idx][p_col_idx];
+                            if join_key.is_null() {
+                                return false;
+                            }
+                            join_key.as_i64().and_then(|pk| jt.get_by_pk(pk)).is_some()
+                        });
+                    } else if let Some(j_col_idx) = j_col_idx_opt {
+                        let mut jt_keys = std::collections::HashSet::with_capacity(jt.active_count);
+                        for (r_idx, r) in jt.rows.iter().enumerate() {
+                            if !jt.is_deleted[r_idx] && !r.is_empty() {
+                                if let Some(v) = r.get(j_col_idx) {
+                                    if !v.is_null() {
+                                        jt_keys.insert(value_to_join_key(v));
+                                    }
+                                }
+                            }
                         }
-                        if let Some(target_pk) = join_key.as_i64() {
-                            jt.get_by_pk(target_pk).is_some()
-                        } else if let Some(j_col_idx) = jt.get_column_index(jc.joined_join_col) {
-                            jt.rows.iter().enumerate().any(|(r_idx, r)| !jt.is_deleted[r_idx] && r.get(j_col_idx).map(|v| v.is_equal(join_key)).unwrap_or(false))
-                        } else {
-                            false
-                        }
-                    });
+                        matched_indices.retain(|&idx| {
+                            let join_key = &table.rows[idx][p_col_idx];
+                            if join_key.is_null() {
+                                false
+                            } else {
+                                jt_keys.contains(&value_to_join_key(join_key))
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -3590,16 +3702,46 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
+        let jt_hash_map: Option<std::collections::HashMap<JoinKey, usize>> = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
+            if let Some(j_col_idx) = jt.get_column_index(jc.joined_join_col) {
+                if jt.pk_col_idx != Some(j_col_idx) {
+                    let mut map = std::collections::HashMap::with_capacity(jt.active_count);
+                    for (r_idx, r) in jt.rows.iter().enumerate() {
+                        if !jt.is_deleted[r_idx] && !r.is_empty() {
+                            if let Some(v) = r.get(j_col_idx) {
+                                if !v.is_null() {
+                                    map.entry(value_to_join_key(v)).or_insert(r_idx);
+                                }
+                            }
+                        }
+                    }
+                    Some(map)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let build_row = |idx: usize| -> serde_json::Value {
             if !projected_exprs.is_empty() {
                 let primary_row = &table.rows[idx];
                 let joined_row: Option<&Vec<Value>> = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
                     if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
                         let join_key = &primary_row[p_col_idx];
-                        if let Some(target_pk) = join_key.as_i64() {
-                            jt.get_by_pk(target_pk)
+                        if join_key.is_null() {
+                            None
                         } else if let Some(j_col_idx) = jt.get_column_index(jc.joined_join_col) {
-                            jt.rows.iter().find(|r| !r.is_empty() && r[j_col_idx].is_equal(join_key))
+                            if jt.pk_col_idx == Some(j_col_idx) {
+                                join_key.as_i64().and_then(|pk| jt.get_by_pk(pk))
+                            } else if let Some(ref map) = jt_hash_map {
+                                map.get(&value_to_join_key(join_key)).map(|&r_idx| &jt.rows[r_idx])
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -3694,6 +3836,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 }
                             }
                         }
+                        ProjectedExpr::Compiled { expr, alias } => {
+                            let v = expr.eval(primary_row, joined_row.map(|r| r.as_slice()), params);
+                            map.insert(alias.clone(), value_to_json(&v));
+                        }
                     }
                 }
                 serde_json::Value::Object(map)
@@ -3743,6 +3889,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     ProjectedExpr::CoalesceJoinedCol { alias, .. } => (alias.clone(), "text".to_string()),
                     ProjectedExpr::CorrelatedCount { alias, .. } => (alias.clone(), "bigint".to_string()),
                     ProjectedExpr::Expr { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::Compiled { alias, .. } => (alias.clone(), "text".to_string()),
                 };
                 FieldInfo {
                     name: alias,
@@ -3758,8 +3905,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         let plan_opt = if select_clause.to_uppercase().contains(" OVER") || select_clause.to_uppercase().contains(" OVER(") {
             None
-        } else if let Some(w) = clauses.where_clause {
-            if let Ok(where_tmpl) = compile_where_template(w, table) {
+        } else if clauses.where_clause.is_some() {
                 let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
                     let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
                     let j_idx = jt.get_column_index(clean_col_name(jc.joined_join_col)).unwrap_or(0);
@@ -3792,16 +3938,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 Some(ExecutionPlan::GeneralSelect {
                     table_name: table.name.clone(),
                     join: planned_join,
-                    where_template: Some(where_tmpl),
+                    where_expr: compiled_where,
                     order_by: order_by_info,
                     limit: clauses.limit,
                     offset: clauses.offset,
                     projections: plan_projections,
                     fields: fields.clone(),
                 })
-            } else {
-                None
-            }
         } else {
             let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
                 let p_idx = table.get_column_index(clean_col_name(jc.primary_join_col)).unwrap_or(0);
@@ -3835,7 +3978,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             Some(ExecutionPlan::GeneralSelect {
                 table_name: table.name.clone(),
                 join: planned_join,
-                where_template: None,
+                where_expr: None,
                 order_by: order_by_info,
                 limit: clauses.limit,
                 offset: clauses.offset,
@@ -3921,7 +4064,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             ExecutionPlan::GeneralSelect {
                 table_name,
                 join,
-                where_template,
+                where_expr,
                 order_by,
                 limit,
                 offset,
@@ -3938,15 +4081,15 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let mut matched_indices = Vec::new();
 
                 let pk_target = table.pk_col_idx.and_then(|pk_idx| {
-                    where_template.as_ref().and_then(|wt| find_pk_equality_in_where_template(wt, pk_idx, params))
+                    where_expr.as_ref().and_then(|we| we.find_pk_eq(pk_idx, params))
                 });
 
                 if let Some(target_pk) = pk_target {
                     if let Some(&row_idx) = table.pk_index.get(&target_pk) {
                         if !table.is_deleted[row_idx] {
                             let row = &table.rows[row_idx];
-                            let matches = match &where_template {
-                                Some(wt) => evaluate_planned_where(row, wt, params),
+                            let matches = match &where_expr {
+                                Some(we) => we.eval_bool(row, None, params) == Some(true),
                                 None => true,
                             };
                             if matches {
@@ -3958,8 +4101,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     for i in 0..table.rows.len() {
                         if !table.is_deleted[i] {
                             let row = &table.rows[i];
-                            let matches = match &where_template {
-                                Some(wt) => evaluate_planned_where(row, wt, params),
+                            let matches = match &where_expr {
+                                Some(we) => we.eval_bool(row, None, params) == Some(true),
                                 None => true,
                             };
                             if matches {
@@ -4026,6 +4169,26 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     }
                 }
 
+                let jt_hash_map: Option<std::collections::HashMap<JoinKey, usize>> = if let (Some(ref j), Some(jt)) = (join, joined_table_opt) {
+                    if !j.is_pk_join {
+                        let mut map = std::collections::HashMap::with_capacity(jt.active_count);
+                        for (r_idx, r) in jt.rows.iter().enumerate() {
+                            if !jt.is_deleted[r_idx] && !r.is_empty() {
+                                if let Some(val) = r.get(j.joined_join_col_idx) {
+                                    if !val.is_null() {
+                                        map.entry(value_to_join_key(val)).or_insert(r_idx);
+                                    }
+                                }
+                            }
+                        }
+                        Some(map)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 // Output projection
                 let mut out_rows = Vec::with_capacity(paged_indices.len());
                 let has_expr = projections.iter().any(|p| matches!(p, PlannedProjectedExpr::Expr { .. }));
@@ -4034,9 +4197,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     let j_row = if let (Some(ref j), Some(jt)) = (join, joined_table_opt) {
                         if j.is_pk_join {
                             p_row.get(j.primary_join_col_idx).and_then(|v| v.as_i64()).and_then(|pk| jt.get_by_pk(pk))
+                        } else if let Some(ref map) = jt_hash_map {
+                            p_row.get(j.primary_join_col_idx)
+                                .filter(|v| !v.is_null())
+                                .and_then(|v| map.get(&value_to_join_key(v)))
+                                .map(|&r_idx| &jt.rows[r_idx])
                         } else {
-                            let target_val = p_row.get(j.primary_join_col_idx);
-                            jt.rows.iter().enumerate().find(|(r_idx, r)| !jt.is_deleted[*r_idx] && r.get(j.joined_join_col_idx) == target_val).map(|(_, r)| r)
+                            None
                         }
                     } else {
                         None
@@ -4104,6 +4271,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                         );
                                         map.insert(alias.clone(), value_to_json(&v));
                                     }
+                                }
+                                PlannedProjectedExpr::Compiled { expr, alias } => {
+                                    let v = expr.eval(p_row, j_row.map(|r| r.as_slice()), params);
+                                    map.insert(alias.clone(), value_to_json(&v));
                                 }
                             }
                         }
@@ -5506,10 +5677,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 raw_assignments.push((col_idx, val_str));
             }
 
-            // Parse WHERE conditions
+            // Pre-compile WHERE AST
             let where_expr = if let Some(ref w) = resolved_where {
                 if !w.is_empty() {
-                    Some(parse_where_expr(w, table, params)?)
+                    Some(compile_expr(w, Some(table), None, None, None))
                 } else {
                     None
                 }
@@ -5520,7 +5691,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             // Check if there is a primary key equality check for O(1) point update
             let pk_target = if let Some(ref expr) = where_expr {
                 if let Some(pk_idx) = table.pk_col_idx {
-                    extract_single_pk_eq(expr, pk_idx)
+                    expr.find_pk_eq(pk_idx, params)
                 } else {
                     None
                 }
@@ -5531,7 +5702,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             if let Some(target_pk) = pk_target {
                 if let Some(&row_idx) = table.pk_index.get(&target_pk) {
                     let matches = match &where_expr {
-                        Some(expr) => evaluate_where_expr(&table.rows[row_idx], Some(table), expr, params),
+                        Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
                         None => true,
                     };
                     if !table.is_deleted[row_idx] && matches {
@@ -5564,7 +5735,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 // General scan update
                 for i in 0..table.rows.len() {
                     let matches = match &where_expr {
-                        Some(expr) => evaluate_where_expr(&table.rows[i], Some(table), expr, params),
+                        Some(expr) => expr.eval_bool(&table.rows[i], None, params) == Some(true),
                         None => true,
                     };
                     if !table.is_deleted[i] && matches {
@@ -5673,7 +5844,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             let where_expr = if let Some(ref w) = resolved_where {
                 if !w.is_empty() {
-                    Some(parse_where_expr(w, table, params)?)
+                    Some(compile_expr(w, Some(table), None, None, None))
                 } else {
                     None
                 }
@@ -5683,7 +5854,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             let pk_target = if let Some(ref expr) = where_expr {
                 if let Some(pk_idx) = table.pk_col_idx {
-                    extract_single_pk_eq(expr, pk_idx)
+                    expr.find_pk_eq(pk_idx, params)
                 } else {
                     None
                 }
@@ -5694,7 +5865,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             if let Some(target_pk) = pk_target {
                 if let Some(&row_idx) = table.pk_index.get(&target_pk) {
                     let matches = match &where_expr {
-                        Some(expr) => evaluate_where_expr(&table.rows[row_idx], Some(table), expr, params),
+                        Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
                         None => true,
                     };
                     if !table.is_deleted[row_idx] && matches {
@@ -5710,7 +5881,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             } else {
                 for i in 0..table.rows.len() {
                     let matches = match &where_expr {
-                        Some(expr) => evaluate_where_expr(&table.rows[i], Some(table), expr, params),
+                        Some(expr) => expr.eval_bool(&table.rows[i], None, params) == Some(true),
                         None => true,
                     };
                     if !table.is_deleted[i] && matches {
@@ -5778,14 +5949,14 @@ struct ParsedJoin {
 }
 
 #[derive(Clone, Debug)]
-struct JoinedSchema {
-    col_map: std::collections::HashMap<String, usize>,
-    table_offsets: Vec<usize>,
-    total_cols: usize,
+pub(crate) struct JoinedSchema {
+    pub(crate) col_map: std::collections::HashMap<String, usize>,
+    pub(crate) table_offsets: Vec<usize>,
+    pub(crate) total_cols: usize,
 }
 
 impl JoinedSchema {
-    fn new(tables: &[(&crate::storage::table::Table, Option<&str>)]) -> Self {
+    pub(crate) fn new(tables: &[(&crate::storage::table::Table, Option<&str>)]) -> Self {
         let mut col_map = std::collections::HashMap::new();
         let mut table_offsets = Vec::with_capacity(tables.len());
         let mut offset = 0;
@@ -5820,7 +5991,7 @@ impl JoinedSchema {
     }
 
     #[inline(always)]
-    fn get_slot(&self, key: &str) -> Option<usize> {
+    pub(crate) fn get_slot(&self, key: &str) -> Option<usize> {
         let clean = key.trim().replace('"', "");
         let lower = clean.to_lowercase();
         if let Some(&idx) = self.col_map.get(&lower) {
@@ -5837,15 +6008,15 @@ impl JoinedSchema {
 }
 
 #[derive(Clone, Debug)]
-struct CombinedRow {
-    values: Vec<Value>,
-    schema: std::sync::Arc<JoinedSchema>,
-    extra: Option<std::collections::HashMap<String, Value>>,
+pub(crate) struct CombinedRow {
+    pub(crate) values: Vec<Value>,
+    pub(crate) schema: std::sync::Arc<JoinedSchema>,
+    pub(crate) extra: Option<std::collections::HashMap<String, Value>>,
 }
 
 impl CombinedRow {
     #[inline(always)]
-    fn new_with_schema(schema: std::sync::Arc<JoinedSchema>) -> Self {
+    pub(crate) fn new_with_schema(schema: std::sync::Arc<JoinedSchema>) -> Self {
         Self {
             values: Vec::with_capacity(schema.total_cols),
             schema,
@@ -5854,7 +6025,7 @@ impl CombinedRow {
     }
 
     #[inline(always)]
-    fn from_base_row(schema: std::sync::Arc<JoinedSchema>, base_row: &[Value]) -> Self {
+    pub(crate) fn from_base_row(schema: std::sync::Arc<JoinedSchema>, base_row: &[Value]) -> Self {
         let mut values = Vec::with_capacity(schema.total_cols);
         values.extend_from_slice(base_row);
         Self {
@@ -5865,7 +6036,7 @@ impl CombinedRow {
     }
 
     #[inline(always)]
-    fn with_joined_table(&self, joined_row: &[Value]) -> Self {
+    pub(crate) fn with_joined_table(&self, joined_row: &[Value]) -> Self {
         let mut values = Vec::with_capacity(self.schema.total_cols);
         values.extend_from_slice(&self.values);
         values.extend_from_slice(joined_row);
@@ -5877,7 +6048,7 @@ impl CombinedRow {
     }
 
     #[inline(always)]
-    fn with_null_table(&self, num_cols: usize) -> Self {
+    pub(crate) fn with_null_table(&self, num_cols: usize) -> Self {
         let mut values = Vec::with_capacity(self.schema.total_cols);
         values.extend_from_slice(&self.values);
         values.resize(values.len() + num_cols, Value::Null);
@@ -5889,7 +6060,7 @@ impl CombinedRow {
     }
 
     #[inline(always)]
-    fn get_val(&self, key: &str) -> Value {
+    pub(crate) fn get_val(&self, key: &str) -> Value {
         if let Some(ref extra) = self.extra {
             let clean = key.trim().replace('"', "");
             let lower = clean.to_lowercase();
@@ -6094,6 +6265,8 @@ fn value_to_join_key(val: &Value) -> JoinKey {
         Value::Text(t) => {
             if let Ok(num) = t.parse::<i64>() {
                 JoinKey::Int(num)
+            } else if t.len() == 36 {
+                JoinKey::Text(compact_str::CompactString::new(t.to_lowercase()))
             } else {
                 JoinKey::Text(t.clone())
             }
@@ -6103,6 +6276,7 @@ fn value_to_join_key(val: &Value) -> JoinKey {
 
 struct EquiJoinCandidate {
     left_expr: String,
+    left_slot: Option<usize>,
     right_col_idx: usize,
     residual_cond: Option<String>,
 }
@@ -6230,6 +6404,7 @@ fn parse_equi_join_candidate(
 
                 return Some(EquiJoinCandidate {
                     left_expr,
+                    left_slot: None,
                     right_col_idx,
                     residual_cond,
                 });
@@ -6724,7 +6899,7 @@ fn eval_condition_on_row(row: &CombinedRow, cond_str: &str, params: &[Value]) ->
     false
 }
 
-fn eval_operand_on_row(row: &CombinedRow, token: &str, params: &[Value]) -> Value {
+pub(crate) fn eval_operand_on_row(row: &CombinedRow, token: &str, params: &[Value]) -> Value {
     let mut t = token.trim();
     while t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
         let inside = t[1..t.len() - 1].trim();
@@ -9738,7 +9913,7 @@ fn format_ast_val_to_sql(val: &serde_json::Value) -> String {
     }
 }
 
-fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
+pub(crate) fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut tokens = Vec::new();
     let mut depth = 0;
@@ -9884,7 +10059,7 @@ fn extract_value_groups(values_part: &str) -> Vec<&str> {
     groups
 }
 
-fn clean_col_name(raw: &str) -> &str {
+pub(crate) fn clean_col_name(raw: &str) -> &str {
     let mut s = raw.trim();
     while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
         s = s[1..s.len() - 1].trim();
@@ -10125,7 +10300,7 @@ fn is_fully_enclosed_in_parens(s: &str) -> bool {
     depth == 0
 }
 
-fn split_top_level_or(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_or(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut depth = 0;
@@ -10170,7 +10345,7 @@ fn split_top_level_or(s: &str) -> Vec<&str> {
     parts
 }
 
-fn split_top_level_and(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_and(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut depth = 0;
@@ -10479,7 +10654,7 @@ fn eval_age(dt1: &DateTimeParts, dt2: &DateTimeParts) -> String {
     parts.join(" ")
 }
 
-fn get_current_timestamp() -> String {
+pub(crate) fn get_current_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now();
     let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -10506,12 +10681,12 @@ fn get_current_timestamp() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", year, m, d, hours, mins, s, millis)
 }
 
-fn get_current_date() -> String {
+pub(crate) fn get_current_date() -> String {
     let ts = get_current_timestamp();
     ts[..10].to_string()
 }
 
-fn get_current_time() -> String {
+pub(crate) fn get_current_time() -> String {
     let ts = get_current_timestamp();
     ts[11..19].to_string()
 }
@@ -10871,6 +11046,7 @@ fn compile_condition_templates(where_clause: &str, table: &crate::storage::table
     Ok(templates)
 }
 
+#[allow(dead_code)]
 fn compile_where_template(
     where_clause: &str,
     table: &crate::storage::table::Table,
@@ -11169,6 +11345,7 @@ fn parse_single_condition(
     Err(format!("Unsupported condition: {}", s))
 }
 
+#[allow(dead_code)]
 fn extract_single_pk_eq(expr: &WhereExpr, pk_idx: usize) -> Option<i64> {
     match expr {
         WhereExpr::Condition(cond) => {
@@ -11414,7 +11591,7 @@ fn sql_like_match_with_escape(text: &str, pattern: &str, case_insensitive: bool,
 }
 
 #[inline(always)]
-fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+pub(crate) fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
     sql_like_match_with_escape(text, pattern, case_insensitive, None)
 }
 
@@ -11503,7 +11680,7 @@ fn get_raw_bytes(val: &Value) -> Vec<u8> {
     }
 }
 
-fn regex_match(text: &str, pat: &str, case_insensitive: bool) -> bool {
+pub(crate) fn regex_match(text: &str, pat: &str, case_insensitive: bool) -> bool {
     let pattern = if case_insensitive {
         format!("(?i){}", pat)
     } else {
@@ -11516,7 +11693,7 @@ fn regex_match(text: &str, pat: &str, case_insensitive: bool) -> bool {
     }
 }
 
-fn json_to_value(j: &serde_json::Value) -> Value {
+pub(crate) fn json_to_value(j: &serde_json::Value) -> Value {
     match j {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -11588,7 +11765,7 @@ fn val_to_array_items(val: &Value) -> Vec<Value> {
     }
 }
 
-fn array_contains_check(container: &Value, subset: &Value) -> bool {
+pub(crate) fn array_contains_check(container: &Value, subset: &Value) -> bool {
     if container.is_null() || subset.is_null() {
         return false;
     }
@@ -11597,7 +11774,7 @@ fn array_contains_check(container: &Value, subset: &Value) -> bool {
     s_items.iter().all(|s| c_items.iter().any(|c| c.is_equal(s)))
 }
 
-fn array_overlap_check(a: &Value, b: &Value) -> bool {
+pub(crate) fn array_overlap_check(a: &Value, b: &Value) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
@@ -11854,7 +12031,7 @@ fn coerce_update_val(col_def: &crate::types::ColumnDef, val: Value) -> Value {
     }
 }
 
-fn cast_val(val: Value, target_type: &str) -> Value {
+pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
     if val.is_null() {
         return Value::Null;
     }
@@ -11901,7 +12078,7 @@ fn cast_val(val: Value, target_type: &str) -> Value {
     }
 }
 
-fn split_function_args(inner: &str) -> Vec<String> {
+pub(crate) fn split_function_args(inner: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut depth: i32 = 0;
@@ -11936,7 +12113,7 @@ fn split_function_args(inner: &str) -> Vec<String> {
     args
 }
 
-fn split_when_clauses(when_part: &str) -> Vec<(String, String)> {
+pub(crate) fn split_when_clauses(when_part: &str) -> Vec<(String, String)> {
     let mut clauses = Vec::new();
     let s = when_part.trim();
     let mut i = 0;
@@ -11970,7 +12147,7 @@ fn split_when_clauses(when_part: &str) -> Vec<(String, String)> {
     clauses
 }
 
-fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
+pub(crate) fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
     let mut in_str = false;
     let mut depth: i32 = 0;
     let op_bytes = op.as_bytes();
@@ -12060,7 +12237,7 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
     None
 }
 
-fn find_last_top_level_op(s: &str, op: &str) -> Option<usize> {
+pub(crate) fn find_last_top_level_op(s: &str, op: &str) -> Option<usize> {
     let mut in_str = false;
     let mut depth: i32 = 0;
     let op_bytes = op.as_bytes();
@@ -12132,7 +12309,7 @@ fn find_top_level_shift_op(s: &str) -> Option<(usize, &'static str)> {
     None
 }
 
-fn find_top_level_math_op(s: &str, ops: &[char]) -> Option<(usize, char)> {
+pub(crate) fn find_top_level_math_op(s: &str, ops: &[char]) -> Option<(usize, char)> {
     let mut in_single_quote = false;
     let mut depth: i32 = 0;
     let bytes = s.as_bytes();
@@ -12196,7 +12373,7 @@ fn find_top_level_math_op(s: &str, ops: &[char]) -> Option<(usize, char)> {
     None
 }
 
-fn find_last_top_level_json_op(s: &str) -> Option<(usize, &'static str)> {
+pub(crate) fn find_last_top_level_json_op(s: &str) -> Option<(usize, &'static str)> {
     let mut in_str = false;
     let mut depth: i32 = 0;
     let s_bytes = s.as_bytes();
@@ -12243,7 +12420,7 @@ fn find_last_top_level_json_op(s: &str) -> Option<(usize, &'static str)> {
     last_match
 }
 
-fn parse_val_to_json(v: &Value) -> Option<serde_json::Value> {
+pub(crate) fn parse_val_to_json(v: &Value) -> Option<serde_json::Value> {
     match v {
         Value::Text(s) => {
             let trimmed = s.trim();
@@ -12297,7 +12474,7 @@ fn parse_json_path_keys(rhs_val: &serde_json::Value) -> Vec<String> {
     }
 }
 
-fn parse_str_or_json_keys(v: &Value) -> Vec<String> {
+pub(crate) fn parse_str_or_json_keys(v: &Value) -> Vec<String> {
     match v {
         Value::Text(s) => {
             let val = serde_json::Value::String(s.to_string());
@@ -12310,7 +12487,7 @@ fn parse_str_or_json_keys(v: &Value) -> Vec<String> {
     }
 }
 
-fn json_contains_check(target: &serde_json::Value, contained: &serde_json::Value) -> bool {
+pub(crate) fn json_contains_check(target: &serde_json::Value, contained: &serde_json::Value) -> bool {
     match (target, contained) {
         (serde_json::Value::Object(t_map), serde_json::Value::Object(c_map)) => {
             for (k, c_v) in c_map {
@@ -12339,7 +12516,7 @@ fn json_contains_check(target: &serde_json::Value, contained: &serde_json::Value
     }
 }
 
-fn json_has_key_check(target: &serde_json::Value, key: &str) -> bool {
+pub(crate) fn json_has_key_check(target: &serde_json::Value, key: &str) -> bool {
     let clean_key = key.trim().trim_matches('\'').trim_matches('"');
     match target {
         serde_json::Value::Object(map) => map.contains_key(clean_key),
@@ -12398,7 +12575,7 @@ fn jsonb_set_serde(target: &mut serde_json::Value, path: &[String], new_val: &se
     }
 }
 
-fn eval_json_extract_serde(lhs: &serde_json::Value, rhs: &serde_json::Value, op: &str) -> serde_json::Value {
+pub(crate) fn eval_json_extract_serde(lhs: &serde_json::Value, rhs: &serde_json::Value, op: &str) -> serde_json::Value {
     let parsed_lhs = match lhs {
         serde_json::Value::String(s) => {
             let trimmed = s.trim();
@@ -12518,7 +12695,7 @@ fn evaluate_custom_condition(
     eval_sql_expr(cond, primary_row, primary_table, joined_row, joined_table, params).as_bool() == Some(true)
 }
 
-fn eval_sql_expr(
+pub(crate) fn eval_sql_expr(
     expr: &str,
     primary_row: &[Value],
     primary_table: Option<&crate::storage::table::Table>,
