@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum UndoAction {
+    DeleteInsertedRows { table: String, count: usize },
     DeleteLastInsertedRow { table: String },
     RestoreRow { table: String, row_idx: usize, col_idx: usize, old_val: Value },
     UndeleteRow { table: String, row_idx: usize },
@@ -21,7 +22,7 @@ pub struct StorageEngine {
 
 impl StorageEngine {
     pub fn new(filepath: String) -> Self {
-        let wal = WalManager::new(&filepath);
+        let (wal, recovered_records) = WalManager::new(&filepath);
         let mut engine = Self {
             filepath,
             tables: HashMap::new(),
@@ -34,8 +35,7 @@ impl StorageEngine {
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
 
         // Replay WAL records recovered via zero-copy mmap
-        let records = engine.wal.buffer.clone();
-        for record in records {
+        for record in recovered_records {
             match record {
                 WalRecord::CreateTable { name, columns } => {
                     let clean = name.to_lowercase();
@@ -202,6 +202,21 @@ impl StorageEngine {
 
     pub fn apply_undo(&mut self, undo: UndoAction) {
         match undo {
+            UndoAction::DeleteInsertedRows { table, count } => {
+                if let Some(t) = self.get_table_mut(&table) {
+                    for _ in 0..count {
+                        if let Some(last_row) = t.rows.pop() {
+                            t.is_deleted.pop();
+                            t.active_count = t.active_count.saturating_sub(1);
+                            if let Some(pk_idx) = t.pk_col_idx {
+                                if let Some(pk_val) = last_row.get(pk_idx).and_then(|v| v.as_i64()) {
+                                    t.pk_index.remove(&pk_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             UndoAction::DeleteLastInsertedRow { table } => {
                 if let Some(t) = self.get_table_mut(&table) {
                     if let Some(last_row) = t.rows.pop() {
@@ -252,6 +267,7 @@ impl StorageEngine {
             self.wal.flush();
             self.in_transaction = false;
             self.tx_undo_log.clear();
+            self.tx_undo_log.shrink_to_fit();
             self.savepoints.clear();
         }
     }
@@ -265,6 +281,7 @@ impl StorageEngine {
             self.wal.append(WalRecord::Rollback);
             self.wal.flush();
             self.in_transaction = false;
+            self.tx_undo_log.shrink_to_fit();
             self.savepoints.clear();
         }
     }

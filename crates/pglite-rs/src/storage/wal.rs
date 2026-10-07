@@ -63,23 +63,24 @@ const MAX_FLUSH_INTERVAL_MS: u128 = 20;   // 20 ms batch interval
 pub struct WalManager {
     pub filepath: Option<PathBuf>,
     pub writer: Option<BufWriter<File>>,
-    pub buffer: Vec<WalRecord>,
     pub pending_bytes: Vec<u8>,
     #[cfg(not(target_arch = "wasm32"))]
     pub last_flush: Instant,
 }
 
 impl WalManager {
-    pub fn new(db_path: &str) -> Self {
+    pub fn new(db_path: &str) -> (Self, Vec<WalRecord>) {
         if db_path == ":memory:" || db_path.starts_with(":memory:") {
-            return Self {
-                filepath: None,
-                writer: None,
-                buffer: Vec::new(),
-                pending_bytes: Vec::new(),
-                #[cfg(not(target_arch = "wasm32"))]
-                last_flush: Instant::now(),
-            };
+            return (
+                Self {
+                    filepath: None,
+                    writer: None,
+                    pending_bytes: Vec::new(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    last_flush: Instant::now(),
+                },
+                Vec::new(),
+            );
         }
 
         let v2_rwal_path = PathBuf::from(format!("{}.v2.rwal", db_path));
@@ -172,14 +173,15 @@ impl WalManager {
 
         let writer = file.map(BufWriter::new);
 
-        Self {
+        let manager = Self {
             filepath: Some(wal_path),
             writer,
-            buffer: recovered_records,
             pending_bytes: Vec::with_capacity(BATCH_FLUSH_SIZE),
             #[cfg(not(target_arch = "wasm32"))]
             last_flush: Instant::now(),
-        }
+        };
+
+        (manager, recovered_records)
     }
 
     pub fn append(&mut self, record: WalRecord) {
@@ -190,7 +192,6 @@ impl WalManager {
                 self.pending_bytes.extend_from_slice(&bytes);
             }
         }
-        self.buffer.push(record);
 
         // Asynchronous Batching: Flush when buffer threshold reached or interval elapsed
         let should_flush = {
@@ -229,7 +230,6 @@ impl WalManager {
     }
 
     pub fn clear(&mut self) {
-        self.buffer.clear();
         self.pending_bytes.clear();
         if let Some(path) = &self.filepath {
             let _ = std::fs::remove_file(path);

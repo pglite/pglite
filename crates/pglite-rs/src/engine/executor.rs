@@ -3064,34 +3064,32 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let in_tx = self.storage.in_transaction;
 
         let mut returned_rows = Vec::new();
-        let mut appended_records = Vec::new();
-        if let Some(table) = self.storage.get_table_mut(&clean_table_name) {
+        let has_wal = self.storage.wal.writer.is_some();
+        let wal = &mut self.storage.wal;
+        if let Some(table) = self.storage.tables.get_mut(&clean_table_name) {
             table.rows.reserve(count);
             table.is_deleted.reserve(count);
             for row in inserted_rows {
                 let _pk = table.insert(row);
                 if let Some(last_row) = table.rows.last() {
-                    appended_records.push(last_row.clone());
                     if let Some(r_cols) = returning_cols {
                         returned_rows.push(project_returning_row(table, last_row, r_cols));
+                    }
+                    if has_wal {
+                        wal.append(WalRecord::Insert {
+                            table: clean_table_name.clone(),
+                            row: last_row.clone(),
+                        });
                     }
                 }
             }
         }
 
-        for row in appended_records {
-            self.storage.wal.append(WalRecord::Insert {
+        if in_tx && count > 0 {
+            self.storage.tx_undo_log.push(UndoAction::DeleteInsertedRows {
                 table: clean_table_name.clone(),
-                row,
+                count,
             });
-        }
-
-        if in_tx {
-            for _ in 0..count {
-                self.storage.tx_undo_log.push(UndoAction::DeleteLastInsertedRow {
-                    table: clean_table_name.clone(),
-                });
-            }
         }
 
         let fields = if let (Some(r_cols), Some(table)) = (returning_cols, self.storage.get_table(&clean_table_name)) {

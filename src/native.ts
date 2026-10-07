@@ -8,6 +8,9 @@ export interface QueryResult<R = any> {
 }
 
 function stripSqlComments(sql: string): string {
+  if (!sql.includes("--") && !sql.includes("/*")) {
+    return sql;
+  }
   let result = "";
   let inLineComment = false;
   let inBlockComment = false;
@@ -127,6 +130,10 @@ function normalizeQueryParams(sql: string, params: any): { sql: string; params: 
 }
 
 function splitStatements(sql: string): string[] {
+  if (!sql.includes(";") && !sql.includes("--") && !sql.includes("/*")) {
+    const trimmed = sql.trim();
+    return trimmed ? [trimmed] : [];
+  }
   const stripped = stripSqlComments(sql).trim();
   const stmts: string[] = [];
   let current = "";

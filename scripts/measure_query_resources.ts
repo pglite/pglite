@@ -473,7 +473,7 @@ export async function runQueryResourceSuite(useMemoryDb: boolean = false): Promi
   const DB_FILE = useMemoryDb ? ":memory:" : "query_resource_benchmark.db";
 
   if (!useMemoryDb) {
-    for (const f of [DB_FILE, DB_FILE + ".wal"]) {
+    for (const f of [DB_FILE, DB_FILE + ".wal", DB_FILE + ".rwal", DB_FILE + ".v2.rwal"]) {
       if (fs.existsSync(f)) {
         try { fs.unlinkSync(f); } catch {}
       }
