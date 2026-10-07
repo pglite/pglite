@@ -1,6 +1,9 @@
-use crate::types::Value;
+use crate::types::{Value, JoinKey, value_to_join_key};
+use compact_str::CompactString;
 use md5::{Digest as Md5Digest, Md5};
 use sha2::Sha256;
+use std::collections::HashSet;
+
 
 #[derive(Clone, Debug)]
 pub enum CompiledExpr {
@@ -84,6 +87,13 @@ pub enum CompiledExpr {
         list: Vec<CompiledExpr>,
         negated: bool,
     },
+    InSet {
+        expr: Box<CompiledExpr>,
+        set: HashSet<JoinKey>,
+        has_null: bool,
+        negated: bool,
+    },
+
     Case {
         when_branches: Vec<(CompiledExpr, CompiledExpr)>,
         else_branch: Option<Box<CompiledExpr>>,
@@ -208,6 +218,31 @@ impl CompiledExpr {
                     None
                 } else {
                     Some(vl.cmp_value(&vr) != std::cmp::Ordering::Greater)
+                }
+            }
+            CompiledExpr::InSet { expr, set, has_null, negated } => {
+                let v = expr.eval(primary_row, joined_row, params);
+                if v.is_null() {
+                    None
+                } else {
+                    let key = value_to_join_key(&v);
+                    if set.contains(&key) {
+                        Some(!*negated)
+                    } else if *has_null {
+                        None
+                    } else {
+                        Some(*negated)
+                    }
+                }
+            }
+            CompiledExpr::Like { expr, pattern, case_insensitive, negated } => {
+                let text_val = expr.eval(primary_row, joined_row, params);
+                let pat_val = pattern.eval(primary_row, joined_row, params);
+                if text_val.is_null() || pat_val.is_null() {
+                    None
+                } else {
+                    let m = crate::engine::executor::sql_like_match(&text_val.as_str(), &pat_val.as_str(), *case_insensitive);
+                    Some(if *negated { !m } else { m })
                 }
             }
             _ => {
@@ -543,6 +578,21 @@ impl CompiledExpr {
                     Value::Bool(*negated)
                 }
             }
+            CompiledExpr::InSet { expr, set, has_null, negated } => {
+                let v = expr.eval(primary_row, joined_row, params);
+                if v.is_null() {
+                    return Value::Null;
+                }
+                let key = value_to_join_key(&v);
+                if set.contains(&key) {
+                    Value::Bool(!*negated)
+                } else if *has_null {
+                    Value::Null
+                } else {
+                    Value::Bool(*negated)
+                }
+            }
+
             CompiledExpr::Case { when_branches, else_branch } => {
                 for (cond, result) in when_branches {
                     if cond.eval_bool(primary_row, joined_row, params) == Some(true) {
@@ -733,6 +783,31 @@ impl CompiledExpr {
                 let v = inner.eval_on_combined(row, params);
                 Value::Bool(!v.is_null())
             }
+            CompiledExpr::InSet { expr, set, has_null, negated } => {
+                let v = expr.eval_on_combined(row, params);
+                if v.is_null() {
+                    Value::Null
+                } else {
+                    let key = value_to_join_key(&v);
+                    if set.contains(&key) {
+                        Value::Bool(!*negated)
+                    } else if *has_null {
+                        Value::Null
+                    } else {
+                        Value::Bool(*negated)
+                    }
+                }
+            }
+            CompiledExpr::Like { expr, pattern, case_insensitive, negated } => {
+                let text_val = expr.eval_on_combined(row, params);
+                let pat_val = pattern.eval_on_combined(row, params);
+                if text_val.is_null() || pat_val.is_null() {
+                    Value::Null
+                } else {
+                    let m = crate::engine::executor::sql_like_match(&text_val.as_str(), &pat_val.as_str(), *case_insensitive);
+                    Value::Bool(if *negated { !m } else { m })
+                }
+            }
             CompiledExpr::Raw(s) => {
                 Value::Bool(crate::engine::executor::eval_condition_on_row(row, s, params))
             }
@@ -773,6 +848,107 @@ impl CompiledExpr {
             _ => None,
         }
     }
+
+    pub fn find_pk_in(&self, pk_col_idx: usize) -> Option<&HashSet<JoinKey>> {
+        match self {
+            CompiledExpr::InSet { expr, set, negated: false, .. } => {
+                if let CompiledExpr::Col(idx) = &**expr {
+                    if *idx == pk_col_idx {
+                        return Some(set);
+                    }
+                }
+                None
+            }
+            CompiledExpr::And(branches) => {
+                for b in branches {
+                    if let Some(target) = b.find_pk_in(pk_col_idx) {
+                        return Some(target);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn try_fast_in_set(
+    inside: &str,
+    expr: CompiledExpr,
+    negated: bool,
+) -> Option<CompiledExpr> {
+    let tokens = crate::engine::executor::split_comma_separated_tokens(inside);
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut set = HashSet::with_capacity(tokens.len());
+    let mut has_null = false;
+
+    for tok in tokens {
+        let t = tok.trim();
+        if t.eq_ignore_ascii_case("null") {
+            has_null = true;
+        } else if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+            let unescaped = t[1..t.len() - 1].replace("''", "'");
+            if let Ok(num) = unescaped.parse::<i64>() {
+                set.insert(JoinKey::Int(num));
+            } else if unescaped.len() == 36 {
+                set.insert(JoinKey::Text(CompactString::new(unescaped.to_lowercase())));
+            } else {
+                set.insert(JoinKey::Text(CompactString::new(&unescaped)));
+            }
+        } else if let Ok(num) = t.parse::<i64>() {
+            set.insert(JoinKey::Int(num));
+        } else if let Ok(flt) = t.parse::<f64>() {
+            set.insert(JoinKey::FloatBits(flt.to_bits()));
+        } else if t.eq_ignore_ascii_case("true") {
+            set.insert(JoinKey::Bool(true));
+        } else if t.eq_ignore_ascii_case("false") {
+            set.insert(JoinKey::Bool(false));
+        } else {
+            return None;
+        }
+    }
+
+    Some(CompiledExpr::InSet {
+        expr: Box::new(expr),
+        set,
+        has_null,
+        negated,
+    })
+}
+
+pub(crate) fn try_make_in_set(
+    expr: CompiledExpr,
+    list: &[CompiledExpr],
+    negated: bool,
+) -> Option<CompiledExpr> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut set = HashSet::with_capacity(list.len());
+    let mut has_null = false;
+
+    for item in list {
+        match item.eval_const(&[]) {
+            Some(Value::Null) => {
+                has_null = true;
+            }
+            Some(val) => {
+                set.insert(value_to_join_key(&val));
+            }
+            None => {
+                return None;
+            }
+        }
+    }
+
+    Some(CompiledExpr::InSet {
+        expr: Box::new(expr),
+        set,
+        has_null,
+        negated,
+    })
 }
 
 pub fn compile_expr(
@@ -900,11 +1076,17 @@ pub fn compile_expr(
         let right_str = s[pos + 6..].trim();
         if right_str.starts_with('(') && right_str.ends_with(')') {
             let inside = &right_str[1..right_str.len() - 1];
-            let list = crate::engine::executor::split_comma_separated_tokens(inside)
+            let expr = compile_expr(left_str, table, table_alias, joined_table, joined_alias);
+            if let Some(in_set) = try_fast_in_set(inside, expr.clone(), true) {
+                return in_set;
+            }
+            let list: Vec<CompiledExpr> = crate::engine::executor::split_comma_separated_tokens(inside)
                 .into_iter()
                 .map(|tok| compile_expr(tok, table, table_alias, joined_table, joined_alias))
                 .collect();
-            let expr = compile_expr(left_str, table, table_alias, joined_table, joined_alias);
+            if let Some(in_set) = try_make_in_set(expr.clone(), &list, true) {
+                return in_set;
+            }
             return CompiledExpr::In { expr: Box::new(expr), list, negated: true };
         }
     }
@@ -913,11 +1095,17 @@ pub fn compile_expr(
         let right_str = s[pos + 2..].trim();
         if right_str.starts_with('(') && right_str.ends_with(')') {
             let inside = &right_str[1..right_str.len() - 1];
-            let list = crate::engine::executor::split_comma_separated_tokens(inside)
+            let expr = compile_expr(left_str, table, table_alias, joined_table, joined_alias);
+            if let Some(in_set) = try_fast_in_set(inside, expr.clone(), false) {
+                return in_set;
+            }
+            let list: Vec<CompiledExpr> = crate::engine::executor::split_comma_separated_tokens(inside)
                 .into_iter()
                 .map(|tok| compile_expr(tok, table, table_alias, joined_table, joined_alias))
                 .collect();
-            let expr = compile_expr(left_str, table, table_alias, joined_table, joined_alias);
+            if let Some(in_set) = try_make_in_set(expr.clone(), &list, false) {
+                return in_set;
+            }
             return CompiledExpr::In { expr: Box::new(expr), list, negated: false };
         }
     }
@@ -1237,11 +1425,17 @@ pub(crate) fn compile_expr_for_joined(
         let right_str = s[pos + 6..].trim();
         if right_str.starts_with('(') && right_str.ends_with(')') {
             let inside = &right_str[1..right_str.len() - 1];
-            let list = crate::engine::executor::split_comma_separated_tokens(inside)
+            let expr = compile_expr_for_joined(left_str, joined_schema);
+            if let Some(in_set) = try_fast_in_set(inside, expr.clone(), true) {
+                return in_set;
+            }
+            let list: Vec<CompiledExpr> = crate::engine::executor::split_comma_separated_tokens(inside)
                 .into_iter()
                 .map(|tok| compile_expr_for_joined(tok, joined_schema))
                 .collect();
-            let expr = compile_expr_for_joined(left_str, joined_schema);
+            if let Some(in_set) = try_make_in_set(expr.clone(), &list, true) {
+                return in_set;
+            }
             return CompiledExpr::In { expr: Box::new(expr), list, negated: true };
         }
     }
@@ -1250,11 +1444,17 @@ pub(crate) fn compile_expr_for_joined(
         let right_str = s[pos + 2..].trim();
         if right_str.starts_with('(') && right_str.ends_with(')') {
             let inside = &right_str[1..right_str.len() - 1];
-            let list = crate::engine::executor::split_comma_separated_tokens(inside)
+            let expr = compile_expr_for_joined(left_str, joined_schema);
+            if let Some(in_set) = try_fast_in_set(inside, expr.clone(), false) {
+                return in_set;
+            }
+            let list: Vec<CompiledExpr> = crate::engine::executor::split_comma_separated_tokens(inside)
                 .into_iter()
                 .map(|tok| compile_expr_for_joined(tok, joined_schema))
                 .collect();
-            let expr = compile_expr_for_joined(left_str, joined_schema);
+            if let Some(in_set) = try_make_in_set(expr.clone(), &list, false) {
+                return in_set;
+            }
             return CompiledExpr::In { expr: Box::new(expr), list, negated: false };
         }
     }

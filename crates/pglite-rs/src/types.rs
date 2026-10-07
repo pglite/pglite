@@ -567,3 +567,30 @@ macro_rules! params {
     };
 }
 
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+pub enum JoinKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Text(CompactString),
+    FloatBits(u64),
+}
+
+pub fn value_to_join_key(val: &Value) -> JoinKey {
+    match val {
+        Value::Null => JoinKey::Null,
+        Value::Bool(b) => JoinKey::Bool(*b),
+        Value::Int(i) => JoinKey::Int(*i),
+        Value::Float(f) => JoinKey::FloatBits(f.to_bits()),
+        Value::Text(t) => {
+            if let Ok(num) = t.parse::<i64>() {
+                JoinKey::Int(num)
+            } else if t.len() == 36 {
+                JoinKey::Text(CompactString::new(t.to_lowercase()))
+            } else {
+                JoinKey::Text(t.clone())
+            }
+        }
+    }
+}
+

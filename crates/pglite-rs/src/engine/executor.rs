@@ -1000,6 +1000,7 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
 
             let before = resolved[..pos].trim_end();
             if before.to_uppercase().ends_with("IN") {
+                let mut seen = std::collections::HashSet::new();
                 let mut items = Vec::new();
                 for r in sub_res.rows {
                     if let serde_json::Value::Object(map) = r {
@@ -1011,7 +1012,10 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
                                 serde_json::Value::Null => "NULL".to_string(),
                                 _ => val.to_string(),
                             }).collect();
-                            items.push(format!("({})", tuple_items.join(", ")));
+                            let s = format!("({})", tuple_items.join(", "));
+                            if seen.insert(s.clone()) {
+                                items.push(s);
+                            }
                         } else if let Some(first_val) = map.values().next() {
                             let str_item = match first_val {
                                 serde_json::Value::Number(n) => n.to_string(),
@@ -1020,7 +1024,9 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
                                 serde_json::Value::Null => "NULL".to_string(),
                                 _ => first_val.to_string(),
                             };
-                            items.push(str_item);
+                            if seen.insert(str_item.clone()) {
+                                items.push(str_item);
+                            }
                         }
                     }
                 }
@@ -3431,6 +3437,16 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         } else {
             None
         };
+        let pk_set = if pk_target.is_none() {
+            if let Some(ref expr) = compiled_where {
+                table.pk_col_idx.and_then(|pk_idx| expr.find_pk_in(pk_idx))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
 
         let has_correlated = clauses.where_clause.map_or(false, |w| {
             let u = w.to_uppercase();
@@ -3480,6 +3496,25 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 } else {
                     vec![]
                 }
+            } else if let Some(target_set) = pk_set {
+                let mut matched = Vec::with_capacity(target_set.len().min(total_rows));
+                for key in target_set {
+                    if let JoinKey::Int(pk_val) = key {
+                        if let Some(&row_idx) = table.pk_index.get(pk_val) {
+                            if !table.is_deleted[row_idx] {
+                                let matches = match &compiled_where {
+                                    Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
+                                    None => true,
+                                };
+                                if matches {
+                                    matched.push(row_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                matched.sort_unstable();
+                matched
             } else if compiled_where.is_none() {
                 (0..total_rows)
                     .into_par_iter()
@@ -4099,6 +4134,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let pk_target = table.pk_col_idx.and_then(|pk_idx| {
                     where_expr.as_ref().and_then(|we| we.find_pk_eq(pk_idx, params))
                 });
+                let pk_set = if pk_target.is_none() {
+                    table.pk_col_idx.and_then(|pk_idx| {
+                        where_expr.as_ref().and_then(|we| we.find_pk_in(pk_idx))
+                    })
+                } else {
+                    None
+                };
 
                 if let Some(target_pk) = pk_target {
                     if let Some(&row_idx) = table.pk_index.get(&target_pk) {
@@ -4113,6 +4155,24 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
                         }
                     }
+                } else if let Some(target_set) = pk_set {
+                    for key in target_set {
+                        if let JoinKey::Int(pk_val) = key {
+                            if let Some(&row_idx) = table.pk_index.get(pk_val) {
+                                if !table.is_deleted[row_idx] {
+                                    let row = &table.rows[row_idx];
+                                    let matches = match &where_expr {
+                                        Some(we) => we.eval_bool(row, None, params) == Some(true),
+                                        None => true,
+                                    };
+                                    if matches {
+                                        matched_indices.push(row_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    matched_indices.sort_unstable();
                 } else {
                     for i in 0..table.rows.len() {
                         if !table.is_deleted[i] {
@@ -6264,32 +6324,7 @@ fn plan_predicate_pushdown(
     plan
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Debug)]
-enum JoinKey {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Text(compact_str::CompactString),
-    FloatBits(u64),
-}
-
-fn value_to_join_key(val: &Value) -> JoinKey {
-    match val {
-        Value::Null => JoinKey::Null,
-        Value::Bool(b) => JoinKey::Bool(*b),
-        Value::Int(i) => JoinKey::Int(*i),
-        Value::Float(f) => JoinKey::FloatBits(f.to_bits()),
-        Value::Text(t) => {
-            if let Ok(num) = t.parse::<i64>() {
-                JoinKey::Int(num)
-            } else if t.len() == 36 {
-                JoinKey::Text(compact_str::CompactString::new(t.to_lowercase()))
-            } else {
-                JoinKey::Text(t.clone())
-            }
-        }
-    }
-}
+pub use crate::types::{JoinKey, value_to_join_key};
 
 struct EquiJoinCandidate {
     left_expr: String,
@@ -11560,67 +11595,242 @@ enum LikeToken {
     AnyMany,
 }
 
-fn sql_like_match_with_escape(text: &str, pattern: &str, case_insensitive: bool, esc_char: Option<char>) -> bool {
-    let t_chars: Vec<char> = if case_insensitive {
-        text.to_lowercase().chars().collect()
+#[inline(always)]
+fn ends_with_ignore_case(text: &str, suffix: &str) -> bool {
+    if text.len() < suffix.len() {
+        return false;
+    }
+    if text.is_ascii() && suffix.is_ascii() {
+        text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
     } else {
-        text.chars().collect()
-    };
-    let p_chars: Vec<char> = if case_insensitive {
-        pattern.to_lowercase().chars().collect()
-    } else {
-        pattern.chars().collect()
-    };
-    let esc = esc_char.map(|c| if case_insensitive { c.to_lowercase().next().unwrap_or(c) } else { c });
+        let t_low = text.to_lowercase();
+        let s_low = suffix.to_lowercase();
+        t_low.ends_with(&s_low)
+    }
+}
 
-    let mut tokens: Vec<LikeToken> = Vec::new();
-    let mut i = 0;
-    while i < p_chars.len() {
-        let ch = p_chars[i];
-        if let Some(e) = esc {
-            if ch == e && i + 1 < p_chars.len() {
-                tokens.push(LikeToken::Exact(p_chars[i + 1]));
-                i += 2;
-                continue;
+#[inline(always)]
+fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    if text.len() < prefix.len() {
+        return false;
+    }
+    if text.is_ascii() && prefix.is_ascii() {
+        text[..prefix.len()].eq_ignore_ascii_case(prefix)
+    } else {
+        let t_low = text.to_lowercase();
+        let p_low = prefix.to_lowercase();
+        t_low.starts_with(&p_low)
+    }
+}
+
+#[inline(always)]
+fn contains_ignore_case(text: &str, sub: &str) -> bool {
+    if sub.is_empty() {
+        return true;
+    }
+    if text.len() < sub.len() {
+        return false;
+    }
+    if text.is_ascii() && sub.is_ascii() {
+        let sub_bytes = sub.as_bytes();
+        let text_bytes = text.as_bytes();
+        let first_lower = sub_bytes[0].to_ascii_lowercase();
+        let first_upper = sub_bytes[0].to_ascii_uppercase();
+        let max_start = text_bytes.len() - sub_bytes.len();
+        for i in 0..=max_start {
+            let b = text_bytes[i];
+            if b == first_lower || b == first_upper {
+                if text_bytes[i..i + sub_bytes.len()].eq_ignore_ascii_case(sub_bytes) {
+                    return true;
+                }
             }
         }
-        if ch == '%' {
-            tokens.push(LikeToken::AnyMany);
-        } else if ch == '_' {
-            tokens.push(LikeToken::AnyOne);
-        } else {
-            tokens.push(LikeToken::Exact(ch));
+        false
+    } else {
+        let t_low = text.to_lowercase();
+        let s_low = sub.to_lowercase();
+        t_low.contains(&s_low)
+    }
+}
+
+#[inline(always)]
+fn eq_ignore_case(text: &str, other: &str) -> bool {
+    if text.is_ascii() && other.is_ascii() {
+        text.eq_ignore_ascii_case(other)
+    } else {
+        text.to_lowercase() == other.to_lowercase()
+    }
+}
+
+fn sql_like_match_with_escape(text: &str, pattern: &str, case_insensitive: bool, esc_char: Option<char>) -> bool {
+    // 1. Fast-Path khi không có escape char (chiếm 99% các truy vấn)
+    if esc_char.is_none() {
+        if pattern.is_empty() {
+            return text.is_empty();
         }
-        i += 1;
+        if pattern == "%" {
+            return true;
+        }
+
+        let p_bytes = pattern.as_bytes();
+        let has_wildcard_any_one = pattern.contains('_');
+        let has_any_many = pattern.contains('%');
+
+        // Case 1: Không chứa bất kỳ wildcard nào -> Exact match
+        if !has_any_many && !has_wildcard_any_one {
+            return if case_insensitive {
+                eq_ignore_case(text, pattern)
+            } else {
+                text == pattern
+            };
+        }
+
+        // Case 2: Chỉ có 1 dấu '%' ở đầu (%suffix) và không có '_'
+        if !has_wildcard_any_one && p_bytes[0] == b'%' && !pattern[1..].contains('%') {
+            let suffix = &pattern[1..];
+            return if case_insensitive {
+                ends_with_ignore_case(text, suffix)
+            } else {
+                text.ends_with(suffix)
+            };
+        }
+
+        // Case 3: Chỉ có 1 dấu '%' ở cuối (prefix%) và không có '_'
+        if !has_wildcard_any_one && p_bytes[pattern.len() - 1] == b'%' && !pattern[..pattern.len() - 1].contains('%') {
+            let prefix = &pattern[..pattern.len() - 1];
+            return if case_insensitive {
+                starts_with_ignore_case(text, prefix)
+            } else {
+                text.starts_with(prefix)
+            };
+        }
+
+        // Case 4: Có 2 dấu '%' ở đầu và cuối (%sub%) và ở giữa không có '%' hay '_'
+        if !has_wildcard_any_one && pattern.len() >= 2 && p_bytes[0] == b'%' && p_bytes[pattern.len() - 1] == b'%' {
+            let sub = &pattern[1..pattern.len() - 1];
+            if !sub.contains('%') {
+                return if case_insensitive {
+                    contains_ignore_case(text, sub)
+                } else {
+                    text.contains(sub)
+                };
+            }
+        }
     }
 
-    let t_len = t_chars.len();
-    let p_len = tokens.len();
-    let mut dp = vec![vec![false; p_len + 1]; t_len + 1];
-    dp[0][0] = true;
+    // 2. Tokenize pattern vào stack buffer (hoặc Vec nếu pattern > 128 tokens)
+    const STACK_TOKENS_CAP: usize = 128;
+    let mut stack_tokens = [LikeToken::AnyMany; STACK_TOKENS_CAP];
+    let mut heap_tokens = Vec::new();
+    let mut p_len = 0;
+
+    let esc = esc_char.map(|c| if case_insensitive { c.to_lowercase().next().unwrap_or(c) } else { c });
+    let mut chars_iter = pattern.chars().peekable();
+    let mut last_was_any_many = false;
+
+    while let Some(ch) = chars_iter.next() {
+        let token = if let Some(e) = esc {
+            if ch == e {
+                if let Some(next_c) = chars_iter.next() {
+                    let c = if case_insensitive { next_c.to_lowercase().next().unwrap_or(next_c) } else { next_c };
+                    LikeToken::Exact(c)
+                } else {
+                    LikeToken::Exact(if case_insensitive { ch.to_lowercase().next().unwrap_or(ch) } else { ch })
+                }
+            } else if ch == '%' {
+                LikeToken::AnyMany
+            } else if ch == '_' {
+                LikeToken::AnyOne
+            } else {
+                LikeToken::Exact(if case_insensitive { ch.to_lowercase().next().unwrap_or(ch) } else { ch })
+            }
+        } else if ch == '%' {
+            LikeToken::AnyMany
+        } else if ch == '_' {
+            LikeToken::AnyOne
+        } else {
+            LikeToken::Exact(if case_insensitive { ch.to_lowercase().next().unwrap_or(ch) } else { ch })
+        };
+
+        // Nén các AnyMany liên tiếp (% % -> %)
+        if token == LikeToken::AnyMany {
+            if last_was_any_many {
+                continue;
+            }
+            last_was_any_many = true;
+        } else {
+            last_was_any_many = false;
+        }
+
+        if p_len < STACK_TOKENS_CAP && heap_tokens.is_empty() {
+            stack_tokens[p_len] = token;
+        } else {
+            if heap_tokens.is_empty() {
+                heap_tokens.reserve(STACK_TOKENS_CAP * 2);
+                heap_tokens.extend_from_slice(&stack_tokens[..p_len]);
+            }
+            heap_tokens.push(token);
+        }
+        p_len += 1;
+    }
+
+    let tokens: &[LikeToken] = if heap_tokens.is_empty() {
+        &stack_tokens[..p_len]
+    } else {
+        &heap_tokens
+    };
+
+    // 3. Quy hoạch động 2 hàng 1 chiều trên Stack (0 heap allocation!)
+    const STACK_DP_CAP: usize = 129;
+    let mut stack_prev = [false; STACK_DP_CAP];
+    let mut stack_curr = [false; STACK_DP_CAP];
+    let mut heap_prev = Vec::new();
+    let mut heap_curr = Vec::new();
+
+    let (prev, curr): (&mut [bool], &mut [bool]) = if p_len + 1 <= STACK_DP_CAP {
+        (&mut stack_prev[..=p_len], &mut stack_curr[..=p_len])
+    } else {
+        heap_prev.resize(p_len + 1, false);
+        heap_curr.resize(p_len + 1, false);
+        (&mut heap_prev, &mut heap_curr)
+    };
+
+    // Khởi tạo hàng 0 (khi text rỗng)
+    prev[0] = true;
     for j in 1..=p_len {
         if tokens[j - 1] == LikeToken::AnyMany {
-            dp[0][j] = dp[0][j - 1];
+            prev[j] = prev[j - 1];
+        } else {
+            prev[j] = false;
         }
     }
-    for i in 1..=t_len {
+
+    // Duyệt qua từng ký tự của text (không cấp phát heap)
+    for ch in text.chars() {
+        let target_ch = if case_insensitive {
+            ch.to_lowercase().next().unwrap_or(ch)
+        } else {
+            ch
+        };
+
+        curr[0] = false;
         for j in 1..=p_len {
             match tokens[j - 1] {
                 LikeToken::AnyMany => {
-                    dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+                    curr[j] = prev[j] || curr[j - 1];
                 }
                 LikeToken::AnyOne => {
-                    dp[i][j] = dp[i - 1][j - 1];
+                    curr[j] = prev[j - 1];
                 }
                 LikeToken::Exact(c) => {
-                    if c == t_chars[i - 1] {
-                        dp[i][j] = dp[i - 1][j - 1];
-                    }
+                    curr[j] = prev[j - 1] && (c == target_ch);
                 }
             }
         }
+        prev.copy_from_slice(curr);
     }
-    dp[t_len][p_len]
+
+    prev[p_len]
 }
 
 #[inline(always)]
