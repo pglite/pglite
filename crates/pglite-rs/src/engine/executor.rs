@@ -1465,6 +1465,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             let filter_preds = &pushdown.joined_table_predicates[j_idx];
             let table_offset = joined_schema.table_offsets.get(j_idx + 1).cloned().unwrap_or(0);
+            let compiled_filter_preds: Vec<CompiledExpr> = filter_preds.iter()
+                .map(|p| compile_expr_for_joined(p, &joined_schema))
+                .collect();
+            let compiled_residual: Option<CompiledExpr> = maybe_equi.as_ref().and_then(|e| e.residual_cond.as_ref())
+                .map(|cond| compile_expr_for_joined(cond, &joined_schema));
+            let compiled_on_cond = j.on_condition.as_ref()
+                .map(|cond| compile_expr_for_joined(cond, &joined_schema));
 
             let mut test_comb = if !filter_preds.is_empty() {
                 let mut c = CombinedRow::new_with_schema(joined_schema.clone());
@@ -1505,8 +1512,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 let end_idx = (table_offset + jr.len()).min(c.values.len());
                                 c.values[table_offset..end_idx].clone_from_slice(&jr[..end_idx - table_offset]);
                                 let mut pass = true;
-                                for p in filter_preds {
-                                    if !eval_condition_on_row(c, p, params) {
+                                for p in &compiled_filter_preds {
+                                    if p.eval_joined(c, params) != Some(true) {
                                         pass = false;
                                         break;
                                     }
@@ -1522,9 +1529,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                     if let Some(base_indices) = left_hash_map.get(&key) {
                                         for &base_idx in base_indices {
                                             let base_comb = &current_rows[base_idx];
-                                            if let Some(ref res_cond) = equi.residual_cond {
+                                            if let Some(ref res_expr) = compiled_residual {
                                                 let candidate = base_comb.with_joined_table(jr);
-                                                if eval_condition_on_row(&candidate, res_cond, params) {
+                                                if res_expr.eval_joined(&candidate, params) == Some(true) {
                                                     next_rows.push(candidate);
                                                 }
                                             } else {
@@ -1551,8 +1558,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 let end_idx = (table_offset + jr.len()).min(c.values.len());
                                 c.values[table_offset..end_idx].clone_from_slice(&jr[..end_idx - table_offset]);
                                 let mut pass = true;
-                                for p in filter_preds {
-                                    if !eval_condition_on_row(c, p, params) {
+                                for p in &compiled_filter_preds {
+                                    if p.eval_joined(c, params) != Some(true) {
                                         pass = false;
                                         break;
                                     }
@@ -1589,9 +1596,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 for &jr_idx in matched_indices {
                                     let jr = &j_table.rows[jr_idx];
 
-                                    if let Some(ref res_cond) = equi.residual_cond {
+                                    if let Some(ref res_expr) = compiled_residual {
                                         let candidate = base_comb.with_joined_table(jr);
-                                        if eval_condition_on_row(&candidate, res_cond, params) {
+                                        if res_expr.eval_joined(&candidate, params) == Some(true) {
                                             next_rows.push(candidate);
                                             match_count += 1;
                                             if let Some(target) = target_limit {
@@ -1635,8 +1642,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 let end_idx = (table_offset + jr.len()).min(c.values.len());
                                 c.values[table_offset..end_idx].clone_from_slice(&jr[..end_idx - table_offset]);
                                 let mut pass = true;
-                                for p in filter_preds {
-                                    if !eval_condition_on_row(c, p, params) {
+                                for p in &compiled_filter_preds {
+                                    if p.eval_joined(c, params) != Some(true) {
                                         pass = false;
                                         break;
                                     }
@@ -1646,8 +1653,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 }
                             }
                             let candidate = base_comb.with_joined_table(jr);
-                            let matches = match &j.on_condition {
-                                Some(cond) => eval_condition_on_row(&candidate, cond, params),
+                            let matches = match &compiled_on_cond {
+                                Some(expr) => expr.eval_joined(&candidate, params) == Some(true),
                                 None => true,
                             };
                             if matches {
@@ -1669,9 +1676,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
 
             // Intermediate predicate filtering right after this join step
-            if let Some(preds) = pushdown.intermediate_predicates.get(j_idx + 1) {
+            let compiled_intermediate: Vec<Vec<CompiledExpr>> = pushdown.intermediate_predicates.iter()
+                .map(|preds| preds.iter().map(|p| compile_expr_for_joined(p, &joined_schema)).collect())
+                .collect();
+            if let Some(preds) = compiled_intermediate.get(j_idx + 1) {
                 for pred in preds {
-                    next_rows.retain(|r| eval_condition_on_row(r, pred, params));
+                    next_rows.retain(|r| pred.eval_joined(r, params) == Some(true));
                 }
             }
 
@@ -1790,7 +1800,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 });
 
                 if !has_wildcards {
-                    let precompiled: Vec<(String, Option<usize>, String)> = proj_items.iter().map(|item| {
+                    let precompiled: Vec<(String, Option<usize>, Option<CompiledExpr>, String)> = proj_items.iter().map(|item| {
                         let upper = item.to_uppercase();
                         let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
                             (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
@@ -1811,15 +1821,28 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         } else {
                             None
                         };
-                        (alias, slot, expr_part.to_string())
+                        let compiled = if slot.is_none() && !expr_part.to_uppercase().contains("SELECT") {
+                            let c = compile_expr_for_joined(expr_part, &joined_schema);
+                            if !matches!(c, CompiledExpr::Raw(_)) {
+                                Some(c)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        (alias, slot, compiled, expr_part.to_string())
                     }).collect();
 
                     for r in &current_rows {
                         let mut row_map = serde_json::Map::with_capacity(precompiled.len());
-                        for (alias, slot, expr_part) in &precompiled {
-                            let val = match slot {
-                                Some(s) => value_to_json(r.values.get(*s).unwrap_or(&Value::Null)),
-                                None => eval_joined_scalar_expr(expr_part, r, params, &self.storage),
+                        for (alias, slot, compiled, expr_part) in &precompiled {
+                            let val = if let Some(s) = slot {
+                                value_to_json(r.values.get(*s).unwrap_or(&Value::Null))
+                            } else if let Some(c) = compiled {
+                                value_to_json(&c.eval_on_combined(r, params))
+                            } else {
+                                eval_joined_scalar_expr(expr_part, r, params, &self.storage)
                             };
                             row_map.insert(alias.clone(), val);
                         }
@@ -6062,7 +6085,8 @@ impl CombinedRow {
     #[inline(always)]
     pub(crate) fn get_val(&self, key: &str) -> Value {
         if let Some(ref extra) = self.extra {
-            let clean = key.trim().replace('"', "");
+            let trimmed = key.trim();
+            let clean = if trimmed.contains('"') { trimmed.replace('"', "") } else { trimmed.to_string() };
             let lower = clean.to_lowercase();
             if let Some(v) = extra.get(&lower) {
                 return v.clone();
@@ -9320,7 +9344,18 @@ fn parse_projection(
             }
         }
 
-        exprs.push(ProjectedExpr::Expr { expr_str: expr_part.to_string(), alias });
+        let compiled = compile_expr(
+            expr_part,
+            Some(primary_table),
+            _primary_alias,
+            joined_table,
+            joined_alias,
+        );
+        if !matches!(compiled, CompiledExpr::Raw(_)) {
+            exprs.push(ProjectedExpr::Compiled { expr: compiled, alias });
+        } else {
+            exprs.push(ProjectedExpr::Expr { expr_str: expr_part.to_string(), alias });
+        }
     }
 
     exprs

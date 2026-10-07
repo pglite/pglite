@@ -1169,6 +1169,27 @@ pub(crate) fn compile_expr_for_joined(
         s = inside;
     }
 
+    let upper = s.to_uppercase();
+
+    // CASE WHEN ... THEN ... ELSE ... END
+    if upper.starts_with("CASE") && upper.ends_with("END") {
+        let inside = s[4..s.len() - 3].trim();
+        let (when_part, else_part) = if let Some(else_idx) = crate::engine::executor::find_top_level_keyword(inside, "ELSE") {
+            (&inside[..else_idx], Some(inside[else_idx + 4..].trim()))
+        } else {
+            (inside, None)
+        };
+        let raw_branches = crate::engine::executor::split_when_clauses(when_part);
+        let when_branches = raw_branches.into_iter().map(|(c, r)| {
+            (
+                compile_expr_for_joined(&c, joined_schema),
+                compile_expr_for_joined(&r, joined_schema),
+            )
+        }).collect();
+        let else_branch = else_part.map(|e| Box::new(compile_expr_for_joined(e, joined_schema)));
+        return CompiledExpr::Case { when_branches, else_branch };
+    }
+
     // OR
     let or_parts = crate::engine::executor::split_top_level_or(s);
     if or_parts.len() > 1 {
@@ -1184,7 +1205,6 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     // NOT
-    let upper = s.to_uppercase();
     if upper.starts_with("NOT ") {
         return CompiledExpr::Not(Box::new(compile_expr_for_joined(&s[4..], joined_schema)));
     }
@@ -1259,6 +1279,69 @@ pub(crate) fn compile_expr_for_joined(
         return CompiledExpr::IsNull(Box::new(compile_expr_for_joined(&s[..pos], joined_schema)));
     }
 
+    // JSON / Array containment
+    if let Some(pos) = s.find(" @> ") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 4..], joined_schema);
+        return CompiledExpr::JsonContains(Box::new(l), Box::new(r));
+    }
+    if let Some(pos) = s.find(" <@ ") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 4..], joined_schema);
+        return CompiledExpr::JsonContained(Box::new(l), Box::new(r));
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_op(s, "&&") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 2..], joined_schema);
+        return CompiledExpr::ArrayOverlap(Box::new(l), Box::new(r));
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_op(s, "?|") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 2..], joined_schema);
+        return CompiledExpr::JsonHasAnyKey(Box::new(l), Box::new(r));
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_op(s, "?&") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 2..], joined_schema);
+        return CompiledExpr::JsonHasAllKeys(Box::new(l), Box::new(r));
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_op(s, "?") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 1..], joined_schema);
+        return CompiledExpr::JsonHasKey(Box::new(l), Box::new(r));
+    }
+
+    // Concat (||)
+    if let Some(pipe_idx) = crate::engine::executor::find_top_level_op(s, "||") {
+        let l = compile_expr_for_joined(&s[..pipe_idx], joined_schema);
+        let r = compile_expr_for_joined(&s[pipe_idx + 2..], joined_schema);
+        return CompiledExpr::Concat(Box::new(l), Box::new(r));
+    }
+
+    // Arithmetic (+, -, *, /, %)
+    if let Some((op_idx, op)) = crate::engine::executor::find_top_level_math_op(s, &['+', '-']) {
+        let l = compile_expr_for_joined(&s[..op_idx], joined_schema);
+        let r = compile_expr_for_joined(&s[op_idx + 1..], joined_schema);
+        return if op == '+' { CompiledExpr::Add(Box::new(l), Box::new(r)) } else { CompiledExpr::Sub(Box::new(l), Box::new(r)) };
+    }
+    if let Some((op_idx, op)) = crate::engine::executor::find_top_level_math_op(s, &['*', '/', '%']) {
+        let l = compile_expr_for_joined(&s[..op_idx], joined_schema);
+        let r = compile_expr_for_joined(&s[op_idx + 1..], joined_schema);
+        return match op {
+            '*' => CompiledExpr::Mul(Box::new(l), Box::new(r)),
+            '/' => CompiledExpr::Div(Box::new(l), Box::new(r)),
+            '%' => CompiledExpr::Mod(Box::new(l), Box::new(r)),
+            _ => unreachable!(),
+        };
+    }
+
+    // Cast (::)
+    if let Some(colon_pos) = crate::engine::executor::find_last_top_level_op(s, "::") {
+        let target_expr = compile_expr_for_joined(&s[..colon_pos], joined_schema);
+        let target_type = s[colon_pos + 2..].trim().to_uppercase();
+        return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
+    }
+
     // Comparisons
     for op in &[">=", "<=", "!=", "<>", "=", ">", "<"] {
         if let Some(idx) = crate::engine::executor::find_top_level_op(s, op) {
@@ -1274,6 +1357,56 @@ pub(crate) fn compile_expr_for_joined(
                 _ => unreachable!(),
             };
         }
+    }
+
+    // JSON extract operators (->, ->>, #>, #>>)
+    if let Some((op_idx, op)) = crate::engine::executor::find_last_top_level_json_op(s) {
+        let l = compile_expr_for_joined(&s[..op_idx], joined_schema);
+        let r = compile_expr_for_joined(&s[op_idx + op.len()..], joined_schema);
+        return match op {
+            "->" => CompiledExpr::JsonExtract { lhs: Box::new(l), rhs: Box::new(r), as_text: false },
+            "->>" => CompiledExpr::JsonExtract { lhs: Box::new(l), rhs: Box::new(r), as_text: true },
+            "#>" => CompiledExpr::JsonExtractPath { lhs: Box::new(l), path: Box::new(r), as_text: false },
+            "#>>" => CompiledExpr::JsonExtractPath { lhs: Box::new(l), path: Box::new(r), as_text: true },
+            _ => CompiledExpr::Raw(s.to_string()),
+        };
+    }
+
+    // COALESCE / NULLIF
+    if upper.starts_with("COALESCE(") && s.ends_with(')') {
+        let inner = &s[9..s.len() - 1];
+        let args = crate::engine::executor::split_function_args(inner)
+            .into_iter()
+            .map(|a| compile_expr_for_joined(&a, joined_schema))
+            .collect();
+        return CompiledExpr::Coalesce(args);
+    }
+    if upper.starts_with("NULLIF(") && s.ends_with(')') {
+        let inner = &s[7..s.len() - 1];
+        let args = crate::engine::executor::split_function_args(inner);
+        if args.len() == 2 {
+            let a = compile_expr_for_joined(&args[0], joined_schema);
+            let b = compile_expr_for_joined(&args[1], joined_schema);
+            return CompiledExpr::NullIf(Box::new(a), Box::new(b));
+        }
+    }
+
+    // Functions (LOWER, UPPER, TRIM)
+    if upper.starts_with("LOWER(") && s.ends_with(')') {
+        let inner = &s[6..s.len() - 1];
+        return CompiledExpr::Lower(Box::new(compile_expr_for_joined(inner, joined_schema)));
+    }
+    if upper.starts_with("UPPER(") && s.ends_with(')') {
+        let inner = &s[6..s.len() - 1];
+        return CompiledExpr::Upper(Box::new(compile_expr_for_joined(inner, joined_schema)));
+    }
+    if (upper.starts_with("TRIM(") || upper.starts_with("BTRIM(")) && s.ends_with(')') {
+        let open_p = s.find('(').unwrap();
+        let inner = &s[open_p + 1..s.len() - 1];
+        return CompiledExpr::Trim(Box::new(compile_expr_for_joined(inner, joined_schema)));
+    }
+    if upper == "CURRENT_TIMESTAMP" || upper == "NOW()" || upper == "LOCALTIMESTAMP" {
+        return CompiledExpr::Now;
     }
 
     // Parameters
