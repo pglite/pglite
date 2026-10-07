@@ -149,6 +149,8 @@ impl Value {
             (Value::Text(a), Value::Text(b)) => {
                 if a == b {
                     true
+                } else if let (Some(ea), Some(eb)) = (try_parse_datetime_epoch_ms(a), try_parse_datetime_epoch_ms(b)) {
+                    ea == eb
                 } else if (a.len() == 36 || b.len() == 36) && a.eq_ignore_ascii_case(b) {
                     true
                 } else if let (Some(ba), Some(bb)) = (extract_bytes_from_str(a), extract_bytes_from_str(b)) {
@@ -196,7 +198,9 @@ impl Value {
             (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
             (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
             (Value::Text(a), Value::Text(b)) => {
-                if let (Some(ba), Some(bb)) = (extract_bytes_from_str(a), extract_bytes_from_str(b)) {
+                if let (Some(ea), Some(eb)) = (try_parse_datetime_epoch_ms(a), try_parse_datetime_epoch_ms(b)) {
+                    ea.cmp(&eb)
+                } else if let (Some(ba), Some(bb)) = (extract_bytes_from_str(a), extract_bytes_from_str(b)) {
                     ba.cmp(&bb)
                 } else if a.len() == 36 && b.len() == 36 {
                     a.to_lowercase().cmp(&b.to_lowercase())
@@ -356,6 +360,72 @@ fn extract_bytes_from_str(s: &str) -> Option<Vec<u8>> {
 #[inline]
 pub fn generate_uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+pub fn try_parse_datetime_epoch_ms(s: &str) -> Option<i64> {
+    let trimmed = s.trim().trim_matches('\'').trim_matches('"').trim();
+    if trimmed.len() < 10 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if !(bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[7] == b'-'
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit())
+    {
+        return None;
+    }
+
+    let year = ((bytes[0] - b'0') as i32) * 1000
+        + ((bytes[1] - b'0') as i32) * 100
+        + ((bytes[2] - b'0') as i32) * 10
+        + ((bytes[3] - b'0') as i32);
+    let month = ((bytes[5] - b'0') as u32) * 10 + ((bytes[6] - b'0') as u32);
+    let day = ((bytes[8] - b'0') as u32) * 10 + ((bytes[9] - b'0') as u32);
+
+    if month == 0 || month > 12 || day == 0 || day > 31 {
+        return None;
+    }
+
+    let y = if month <= 2 { (year - 1) as i64 } else { year as i64 };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+
+    let mut hour = 0u32;
+    let mut minute = 0u32;
+    let mut second = 0u32;
+    let mut millis = 0u32;
+
+    if trimmed.len() > 10 {
+        let sep = bytes[10];
+        if sep == b'T' || sep == b' ' {
+            let time_str = &trimmed[11..].trim_end_matches('Z').trim_end_matches('z');
+            let mut parts = time_str.split(':');
+            if let Some(h) = parts.next().and_then(|x| x.parse::<u32>().ok()) { hour = h; }
+            if let Some(m) = parts.next().and_then(|x| x.parse::<u32>().ok()) { minute = m; }
+            if let Some(s_part) = parts.next() {
+                if let Some((s, ms)) = s_part.split_once('.') {
+                    second = s.parse::<u32>().unwrap_or(0);
+                    let mut ms_str = ms.to_string();
+                    while ms_str.len() < 3 { ms_str.push('0'); }
+                    millis = ms_str[..3].parse::<u32>().unwrap_or(0);
+                } else {
+                    second = s_part.parse::<u32>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    let secs = days * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
+    Some(secs * 1000 + millis as i64)
 }
 
 // ---------------------------------------------------------------------------

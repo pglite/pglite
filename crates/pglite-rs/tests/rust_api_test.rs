@@ -185,3 +185,101 @@ fn test_param_types_conversion() {
     assert_eq!(rows.rows[0]["opt"], "hello");
     assert_eq!(rows.rows[1]["opt"], serde_json::Value::Null);
 }
+
+#[test]
+fn test_kysely_schedule_left_joins_and_date_filtering() {
+    let mut db = PGlite::in_memory().unwrap();
+
+    db.exec("CREATE TABLE users (id SERIAL PRIMARY KEY, full_name TEXT);", &[]).unwrap();
+    db.exec("CREATE TABLE schools (id SERIAL PRIMARY KEY, name TEXT);", &[]).unwrap();
+    db.exec("CREATE TABLE schedules (
+        id SERIAL PRIMARY KEY,
+        user_id INT,
+        school_id INT,
+        start_date DATE,
+        end_date DATE,
+        deleted_at TIMESTAMP
+    );", &[]).unwrap();
+
+    db.exec("INSERT INTO users VALUES (1, 'Teacher Alice'), (2, 'Teacher Bob');", &[]).unwrap();
+    db.exec("INSERT INTO schools VALUES (10, 'High School A'), (20, 'Primary School B');", &[]).unwrap();
+    
+    // Schedule 1: valid May schedule
+    db.exec("INSERT INTO schedules VALUES (100, 1, 10, '2024-05-02', '2024-05-25', NULL);", &[]).unwrap();
+    // Schedule 2: open-ended schedule (end_date IS NULL)
+    db.exec("INSERT INTO schedules VALUES (101, 1, 10, '2024-05-10', NULL, NULL);", &[]).unwrap();
+    // Schedule 3: deleted schedule (deleted_at IS NOT NULL)
+    db.exec("INSERT INTO schedules VALUES (102, 1, 10, '2024-05-15', '2024-05-20', '2024-05-16 00:00:00');", &[]).unwrap();
+    // Schedule 4: schedule in April (out of range)
+    db.exec("INSERT INTO schedules VALUES (103, 1, 10, '2024-04-01', '2024-04-20', NULL);", &[]).unwrap();
+
+    let sql = r#"
+      SELECT
+        "schedules"."id",
+        "schedules"."user_id" AS "userId",
+        "users"."full_name" AS "teacherName",
+        "schedules"."school_id" AS "schoolId",
+        "schools"."name" AS "schoolName",
+        "schedules"."start_date" AS "startDate",
+        "schedules"."end_date" AS "endDate"
+      FROM "schedules"
+      LEFT JOIN "users" ON "users"."id" = "schedules"."user_id"
+      LEFT JOIN "schools" ON "schools"."id" = "schedules"."school_id"
+      WHERE "schedules"."deleted_at" IS NULL
+        AND "schedules"."start_date" <= $1
+        AND ("schedules"."end_date" IS NULL OR "schedules"."end_date" >= $2)
+        AND "schedules"."user_id" = $3
+        AND "schedules"."school_id" = $4
+    "#;
+
+    let res = db.query(sql, &params!["2024-05-31T23:59:59.000Z", "2024-05-01T00:00:00.000Z", 1, 10]).unwrap();
+    assert_eq!(res.row_count, 2);
+    assert_eq!(res.rows[0]["teacherName"], "Teacher Alice");
+    assert_eq!(res.rows[0]["schoolName"], "High School A");
+}
+
+#[test]
+fn test_kysely_schedule_time_slots_in_operator() {
+    let mut db = PGlite::in_memory().unwrap();
+
+    db.exec("CREATE TABLE schools (id SERIAL PRIMARY KEY, name TEXT);", &[]).unwrap();
+    db.exec("CREATE TABLE schedule_time_slots (
+        id SERIAL PRIMARY KEY,
+        schedule_id INT,
+        day_of_week INT,
+        start_time TEXT,
+        end_time TEXT,
+        school_id INT,
+        class_ids JSONB,
+        no_fuel_allowance BOOLEAN DEFAULT false,
+        no_travel_allowance BOOLEAN DEFAULT false,
+        support_amount NUMERIC DEFAULT 0,
+        is_non_salary_session BOOLEAN DEFAULT false,
+        deleted_at TIMESTAMP
+    );", &[]).unwrap();
+
+    db.exec("INSERT INTO schools VALUES (1, 'Greenwood High'), (2, 'Oakridge School');", &[]).unwrap();
+    db.exec("INSERT INTO schedule_time_slots (id, schedule_id, day_of_week, start_time, end_time, school_id, deleted_at)
+        VALUES (10, 100, 2, '08:00', '09:30', 1, NULL),
+               (11, 100, 3, '10:00', '11:30', 2, NULL),
+               (12, 101, 2, '13:00', '14:30', 1, NULL),
+               (13, 100, 2, '15:00', '16:30', 1, '2024-05-01 00:00:00'),
+               (14, 999, 4, '08:00', '09:30', 2, NULL);", &[]).unwrap();
+
+    // Kysely style query: expanded IN ($1, $2)
+    let sql = r#"
+      SELECT
+        "schedule_time_slots"."id",
+        "schedule_time_slots"."schedule_id" AS "scheduleId",
+        "schedule_time_slots"."day_of_week" AS "dayOfWeek",
+        "schools"."name" AS "schoolName"
+      FROM "schedule_time_slots"
+      LEFT JOIN "schools" ON "schools"."id" = "schedule_time_slots"."school_id"
+      WHERE "schedule_time_slots"."schedule_id" IN ($1, $2)
+        AND "schedule_time_slots"."deleted_at" IS NULL
+      ORDER BY "schedule_time_slots"."day_of_week", "schedule_time_slots"."start_time";
+    "#;
+
+    let res = db.query(sql, &params![100, 101]).unwrap();
+    assert_eq!(res.row_count, 3);
+}

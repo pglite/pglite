@@ -6129,7 +6129,7 @@ fn extract_identifiers_from_condition(cond: &str) -> Vec<String> {
                 }
             }
             let s = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-            let clean = s.trim_matches('"').to_string();
+            let clean = s.replace('"', "").to_string();
             let upper = clean.to_uppercase();
             if !matches!(upper.as_str(), 
                 "AND" | "OR" | "NOT" | "IS" | "NULL" | "TRUE" | "FALSE" | "LIKE" | "ILIKE" | 
@@ -6525,25 +6525,30 @@ fn parse_from_and_joins(s: &str) -> Result<(String, Option<String>, Option<Strin
                 positions.push((i, 1, JoinKind::Cross));
                 i += 1;
                 continue;
-            } else if upper.starts_with("CROSS JOIN ") {
-                positions.push((i, 11, JoinKind::Cross));
-                i += 11;
+            } else if upper.starts_with("CROSS JOIN") && rest[10..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
+                let ws_len = 10 + rest[10..].chars().take_while(|c| c.is_ascii_whitespace()).count();
+                positions.push((i, ws_len, JoinKind::Cross));
+                i += ws_len;
                 continue;
-            } else if upper.starts_with("LEFT OUTER JOIN ") {
-                positions.push((i, 16, JoinKind::Left));
-                i += 16;
+            } else if upper.starts_with("LEFT OUTER JOIN") && rest[15..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
+                let ws_len = 15 + rest[15..].chars().take_while(|c| c.is_ascii_whitespace()).count();
+                positions.push((i, ws_len, JoinKind::Left));
+                i += ws_len;
                 continue;
-            } else if upper.starts_with("LEFT JOIN ") {
-                positions.push((i, 10, JoinKind::Left));
-                i += 10;
+            } else if upper.starts_with("LEFT JOIN") && rest[9..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
+                let ws_len = 9 + rest[9..].chars().take_while(|c| c.is_ascii_whitespace()).count();
+                positions.push((i, ws_len, JoinKind::Left));
+                i += ws_len;
                 continue;
-            } else if upper.starts_with("INNER JOIN ") {
-                positions.push((i, 11, JoinKind::Inner));
-                i += 11;
+            } else if upper.starts_with("INNER JOIN") && rest[10..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
+                let ws_len = 10 + rest[10..].chars().take_while(|c| c.is_ascii_whitespace()).count();
+                positions.push((i, ws_len, JoinKind::Inner));
+                i += ws_len;
                 continue;
-            } else if upper.starts_with("JOIN ") {
-                positions.push((i, 5, JoinKind::Inner));
-                i += 5;
+            } else if upper.starts_with("JOIN") && rest[4..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
+                let ws_len = 4 + rest[4..].chars().take_while(|c| c.is_ascii_whitespace()).count();
+                positions.push((i, ws_len, JoinKind::Inner));
+                i += ws_len;
                 continue;
             }
         }
@@ -6719,7 +6724,7 @@ fn parse_query_clauses<'a>(
     (from_joins_str, where_clause, group_by_clause, having_clause, order_by_specs, limit_val, offset_val)
 }
 
-fn eval_condition_on_row(row: &CombinedRow, cond_str: &str, params: &[Value]) -> bool {
+pub(crate) fn eval_condition_on_row(row: &CombinedRow, cond_str: &str, params: &[Value]) -> bool {
     let mut s = cond_str.trim();
     while s.starts_with('(') && s.ends_with(')') && is_fully_enclosed_in_parens(s) {
         s = s[1..s.len() - 1].trim();
@@ -11736,7 +11741,7 @@ fn is_complete_array_constructor(s: &str) -> bool {
     false
 }
 
-fn val_to_array_items(val: &Value) -> Vec<Value> {
+pub(crate) fn val_to_array_items(val: &Value) -> Vec<Value> {
     match val {
         Value::Null => vec![],
         Value::Text(s) => {

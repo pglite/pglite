@@ -528,6 +528,13 @@ impl CompiledExpr {
                         has_null = true;
                     } else if v.is_equal(&it) {
                         return Value::Bool(!*negated);
+                    } else {
+                        let items = crate::engine::executor::val_to_array_items(&it);
+                        if (items.len() > 1 || (items.len() == 1 && !items[0].is_equal(&it)))
+                            && items.iter().any(|item| v.is_equal(item))
+                        {
+                            return Value::Bool(!*negated);
+                        }
                     }
                 }
                 if has_null {
@@ -727,7 +734,7 @@ impl CompiledExpr {
                 Value::Bool(!v.is_null())
             }
             CompiledExpr::Raw(s) => {
-                crate::engine::executor::eval_operand_on_row(row, s, params)
+                Value::Bool(crate::engine::executor::eval_condition_on_row(row, s, params))
             }
             _ => self.eval(&row.values, None, params),
         }
@@ -1182,6 +1189,68 @@ pub(crate) fn compile_expr_for_joined(
         return CompiledExpr::Not(Box::new(compile_expr_for_joined(&s[4..], joined_schema)));
     }
 
+    // BETWEEN / NOT BETWEEN
+    if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "NOT BETWEEN") {
+        let left_str = s[..pos].trim();
+        let right_str = s[pos + 11..].trim();
+        if let Some(and_pos) = crate::engine::executor::find_top_level_keyword(right_str, "AND") {
+            let low = compile_expr_for_joined(right_str[..and_pos].trim(), joined_schema);
+            let high = compile_expr_for_joined(right_str[and_pos + 3..].trim(), joined_schema);
+            let expr = compile_expr_for_joined(left_str, joined_schema);
+            return CompiledExpr::Between { expr: Box::new(expr), low: Box::new(low), high: Box::new(high), negated: true };
+        }
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "BETWEEN") {
+        let left_str = s[..pos].trim();
+        let right_str = s[pos + 7..].trim();
+        if let Some(and_pos) = crate::engine::executor::find_top_level_keyword(right_str, "AND") {
+            let low = compile_expr_for_joined(right_str[..and_pos].trim(), joined_schema);
+            let high = compile_expr_for_joined(right_str[and_pos + 3..].trim(), joined_schema);
+            let expr = compile_expr_for_joined(left_str, joined_schema);
+            return CompiledExpr::Between { expr: Box::new(expr), low: Box::new(low), high: Box::new(high), negated: false };
+        }
+    }
+
+    // IN / NOT IN
+    if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "NOT IN") {
+        let left_str = s[..pos].trim();
+        let right_str = s[pos + 6..].trim();
+        if right_str.starts_with('(') && right_str.ends_with(')') {
+            let inside = &right_str[1..right_str.len() - 1];
+            let list = crate::engine::executor::split_comma_separated_tokens(inside)
+                .into_iter()
+                .map(|tok| compile_expr_for_joined(tok, joined_schema))
+                .collect();
+            let expr = compile_expr_for_joined(left_str, joined_schema);
+            return CompiledExpr::In { expr: Box::new(expr), list, negated: true };
+        }
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "IN") {
+        let left_str = s[..pos].trim();
+        let right_str = s[pos + 2..].trim();
+        if right_str.starts_with('(') && right_str.ends_with(')') {
+            let inside = &right_str[1..right_str.len() - 1];
+            let list = crate::engine::executor::split_comma_separated_tokens(inside)
+                .into_iter()
+                .map(|tok| compile_expr_for_joined(tok, joined_schema))
+                .collect();
+            let expr = compile_expr_for_joined(left_str, joined_schema);
+            return CompiledExpr::In { expr: Box::new(expr), list, negated: false };
+        }
+    }
+
+    // LIKE / ILIKE
+    if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "NOT ILIKE") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 9..], joined_schema);
+        return CompiledExpr::Like { expr: Box::new(l), pattern: Box::new(r), case_insensitive: true, negated: true };
+    }
+    if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "ILIKE") {
+        let l = compile_expr_for_joined(&s[..pos], joined_schema);
+        let r = compile_expr_for_joined(&s[pos + 5..], joined_schema);
+        return CompiledExpr::Like { expr: Box::new(l), pattern: Box::new(r), case_insensitive: true, negated: false };
+    }
+
     // IS NULL / IS NOT NULL
     if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "IS NOT NULL") {
         return CompiledExpr::IsNotNull(Box::new(compile_expr_for_joined(&s[..pos], joined_schema)));
@@ -1235,11 +1304,11 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     // Slot in joined schema
-    if let Some(slot) = joined_schema.get_slot(s) {
+    let clean_all = s.trim().replace('"', "");
+    if let Some(slot) = joined_schema.get_slot(&clean_all) {
         return CompiledExpr::Col(slot);
     }
-    let clean = crate::engine::executor::clean_col_name(s);
-    if let Some(slot) = joined_schema.get_slot(clean) {
+    if let Some(slot) = joined_schema.get_slot(&crate::engine::executor::clean_col_name(s).replace('"', "")) {
         return CompiledExpr::Col(slot);
     }
 
