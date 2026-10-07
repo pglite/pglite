@@ -2971,114 +2971,109 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             (indices, table.columns.len(), table.pk_col_idx, table.name.clone(), defaults, col_defs)
         };
 
-        // Parse row groups in VALUES clause
-        let mut param_cursor = 0;
-        let mut inserted_rows = Vec::new();
-
         let groups = extract_value_groups(values_part);
-        for group in groups {
-            let mut row = vec![Value::Null; num_table_cols];
-            for (i, def_opt) in col_defaults.iter().enumerate() {
-                if let Some(def_str) = def_opt {
-                    let up = def_str.trim().to_uppercase();
-                    if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
-                        row[i] = Value::text(crate::types::generate_uuid_v4());
-                    } else if let Some(dt_val) = eval_date_time_keyword(def_str) {
-                        row[i] = dt_val;
-                    } else if def_str.starts_with('\'') && def_str.ends_with('\'') && def_str.len() >= 2 {
-                        row[i] = Value::text(&def_str[1..def_str.len() - 1]);
-                    } else if let Ok(n) = def_str.parse::<i64>() {
-                        row[i] = Value::Int(n);
-                    } else if let Ok(f) = def_str.parse::<f64>() {
-                        row[i] = Value::Float(f);
-                    } else if def_str.eq_ignore_ascii_case("TRUE") {
-                        row[i] = Value::Bool(true);
-                    } else if def_str.eq_ignore_ascii_case("FALSE") {
-                        row[i] = Value::Bool(false);
-                    } else {
-                        row[i] = eval_sql_expr(def_str, &[], None, &[], None, params);
-                    }
-                }
-            }
-            let mut col_ptr = 0;
-            let tokens = split_comma_separated_tokens(group);
-
-            for token in tokens {
-                let token = token.trim();
-                if col_ptr >= col_indices.len() {
-                    break;
-                }
-                let target_idx = col_indices[col_ptr];
-
-                let val = if token.starts_with('$') {
-                    if let Ok(p_num) = token[1..].parse::<usize>() {
-                        if p_num >= 1 && p_num <= params.len() {
-                            params[p_num - 1].clone()
-                        } else if param_cursor < params.len() {
-                            let v = params[param_cursor].clone();
-                            param_cursor += 1;
-                            v
-                        } else {
-                            Value::Null
-                        }
-                    } else {
-                        Value::Null
-                    }
-                } else if token.eq_ignore_ascii_case("DEFAULT") {
-                    if let Some(def_str) = col_defaults.get(target_idx).and_then(|d| d.as_ref()) {
-                        let up = def_str.trim().to_uppercase();
-                        if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
-                            Value::text(crate::types::generate_uuid_v4())
-                        } else {
-                            eval_sql_expr(def_str, &[], None, &[], None, params)
-                        }
-                    } else {
-                        Value::Null
-                    }
-                } else if let Some(dt_val) = eval_date_time_keyword(token) {
-                    dt_val
-                } else if token.eq_ignore_ascii_case("NULL") {
-                    Value::Null
-                } else if token.eq_ignore_ascii_case("TRUE") {
-                    Value::Bool(true)
-                } else if token.eq_ignore_ascii_case("FALSE") {
-                    Value::Bool(false)
-                } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
-                    Value::text(token[1..token.len() - 1].replace("''", "'"))
-                } else if let Ok(int_val) = token.parse::<i64>() {
-                    Value::Int(int_val)
-                } else if let Ok(flt_val) = token.parse::<f64>() {
-                    Value::Float(flt_val)
-                } else {
-                    eval_sql_expr(token, &[], None, &[], None, params)
-                };
-
-                row[target_idx] = coerce_update_val(&col_defs[target_idx], val);
-                col_ptr += 1;
-            }
-
-            inserted_rows.push(row);
-        }
-
-        let count = inserted_rows.len();
+        let count = groups.len();
         let in_tx = self.storage.in_transaction;
 
         let mut returned_rows = Vec::new();
         let has_wal = self.storage.wal.writer.is_some();
         let wal = &mut self.storage.wal;
+        let mut param_cursor = 0;
+
         if let Some(table) = self.storage.tables.get_mut(&clean_table_name) {
             table.rows.reserve(count);
             table.is_deleted.reserve(count);
-            for row in inserted_rows {
+
+            for group in groups {
+                let mut row = vec![Value::Null; num_table_cols];
+                for (i, def_opt) in col_defaults.iter().enumerate() {
+                    if let Some(def_str) = def_opt {
+                        let up = def_str.trim().to_uppercase();
+                        if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
+                            row[i] = Value::text(crate::types::generate_uuid_v4());
+                        } else if let Some(dt_val) = eval_date_time_keyword(def_str) {
+                            row[i] = dt_val;
+                        } else if def_str.starts_with('\'') && def_str.ends_with('\'') && def_str.len() >= 2 {
+                            row[i] = Value::text(&def_str[1..def_str.len() - 1]);
+                        } else if let Ok(n) = def_str.parse::<i64>() {
+                            row[i] = Value::Int(n);
+                        } else if let Ok(f) = def_str.parse::<f64>() {
+                            row[i] = Value::Float(f);
+                        } else if def_str.eq_ignore_ascii_case("TRUE") {
+                            row[i] = Value::Bool(true);
+                        } else if def_str.eq_ignore_ascii_case("FALSE") {
+                            row[i] = Value::Bool(false);
+                        } else {
+                            row[i] = eval_sql_expr(def_str, &[], None, &[], None, params);
+                        }
+                    }
+                }
+                let mut col_ptr = 0;
+                let tokens = split_comma_separated_tokens(group);
+
+                for token in tokens {
+                    let token = token.trim();
+                    if col_ptr >= col_indices.len() {
+                        break;
+                    }
+                    let target_idx = col_indices[col_ptr];
+
+                    let val = if token.starts_with('$') {
+                        if let Ok(p_num) = token[1..].parse::<usize>() {
+                            if p_num >= 1 && p_num <= params.len() {
+                                params[p_num - 1].clone()
+                            } else if param_cursor < params.len() {
+                                let v = params[param_cursor].clone();
+                                param_cursor += 1;
+                                v
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    } else if token.eq_ignore_ascii_case("DEFAULT") {
+                        if let Some(def_str) = col_defaults.get(target_idx).and_then(|d| d.as_ref()) {
+                            let up = def_str.trim().to_uppercase();
+                            if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
+                                Value::text(crate::types::generate_uuid_v4())
+                            } else {
+                                eval_sql_expr(def_str, &[], None, &[], None, params)
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    } else if let Some(dt_val) = eval_date_time_keyword(token) {
+                        dt_val
+                    } else if token.eq_ignore_ascii_case("NULL") {
+                        Value::Null
+                    } else if token.eq_ignore_ascii_case("TRUE") {
+                        Value::Bool(true)
+                    } else if token.eq_ignore_ascii_case("FALSE") {
+                        Value::Bool(false)
+                    } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
+                        Value::text(token[1..token.len() - 1].replace("''", "'"))
+                    } else if let Ok(int_val) = token.parse::<i64>() {
+                        Value::Int(int_val)
+                    } else if let Ok(flt_val) = token.parse::<f64>() {
+                        Value::Float(flt_val)
+                    } else {
+                        eval_sql_expr(token, &[], None, &[], None, params)
+                    };
+
+                    row[target_idx] = coerce_update_val(&col_defs[target_idx], val);
+                    col_ptr += 1;
+                }
+
                 let _pk = table.insert(row);
                 if let Some(last_row) = table.rows.last() {
                     if let Some(r_cols) = returning_cols {
                         returned_rows.push(project_returning_row(table, last_row, r_cols));
                     }
                     if has_wal {
-                        wal.append(WalRecord::Insert {
-                            table: clean_table_name.clone(),
-                            row: last_row.clone(),
+                        wal.append_ref(crate::storage::wal::WalRecordRef::Insert {
+                            table: &clean_table_name,
+                            row: last_row,
                         });
                     }
                 }

@@ -53,6 +53,52 @@ pub enum WalRecord {
     },
 }
 
+#[derive(Serialize)]
+pub enum WalRecordRef<'a> {
+    Begin,
+    Commit,
+    Rollback,
+    CreateTable {
+        name: &'a str,
+        columns: &'a [ColumnDef],
+    },
+    DropTable {
+        name: &'a str,
+    },
+    Insert {
+        table: &'a str,
+        row: &'a [Value],
+    },
+    Update {
+        table: &'a str,
+        pk: i64,
+        col_idx: usize,
+        new_val: &'a Value,
+    },
+    Delete {
+        table: &'a str,
+        pk: i64,
+    },
+    CommentOnTable {
+        table: &'a str,
+        comment: Option<&'a str>,
+    },
+    CommentOnColumn {
+        table: &'a str,
+        column: &'a str,
+        comment: Option<&'a str>,
+    },
+    AlterTableAddColumn {
+        table: &'a str,
+        column: &'a ColumnDef,
+        default_val: &'a Value,
+    },
+    AlterTableDropColumn {
+        table: &'a str,
+        column: &'a str,
+    },
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
@@ -194,6 +240,31 @@ impl WalManager {
         }
 
         // Asynchronous Batching: Flush when buffer threshold reached or interval elapsed
+        let should_flush = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.pending_bytes.len() >= BATCH_FLUSH_SIZE || self.last_flush.elapsed().as_millis() >= MAX_FLUSH_INTERVAL_MS
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.pending_bytes.len() >= BATCH_FLUSH_SIZE
+            }
+        };
+
+        if should_flush {
+            self.flush_pending();
+        }
+    }
+
+    pub fn append_ref<'a>(&mut self, record: WalRecordRef<'a>) {
+        if self.writer.is_some() {
+            if let Ok(bytes) = bincode::serialize(&record) {
+                let len = bytes.len() as u32;
+                self.pending_bytes.extend_from_slice(&len.to_le_bytes());
+                self.pending_bytes.extend_from_slice(&bytes);
+            }
+        }
+
         let should_flush = {
             #[cfg(not(target_arch = "wasm32"))]
             {
