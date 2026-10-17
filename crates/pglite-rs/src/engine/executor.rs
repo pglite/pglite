@@ -52,6 +52,17 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        let res = self.execute_statement(sql, params);
+        // Lệnh ngoài giao dịch (autocommit) phải nằm trong file ngay khi trả kết quả, nếu không
+        // tiến trình bị kill (pm2 restart, deploy) sẽ làm mất nó. Đây là write vào page cache,
+        // không fsync. Trong giao dịch thì COMMIT/ROLLBACK đã tự flush.
+        if !self.storage.in_transaction && self.storage.wal.has_pending() {
+            self.storage.wal.flush();
+        }
+        res
+    }
+
+    fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = strip_sql_comments(sql);
         let normalized_sql = normalize_named_sql_params(&clean_sql);
 
@@ -3496,7 +3507,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     if let Some(eq_idx) = w.find('=') {
                         let left = w[..eq_idx].trim().trim_matches('"');
                         let right = w[eq_idx + 1..].trim();
-                        if !right.contains("AND") && !right.contains("OR") {
+                        if is_single_operand(right) {
                             if let Some(col_idx) = table.get_column_index(left) {
                                 let (param_idx, literal_str, target_val) = if right.starts_with('$') {
                                     let p_idx = right[1..].parse::<usize>().unwrap_or(1);
@@ -3755,6 +3766,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         // 5. ORDER BY sorting
         if !clauses.order_by_specs.is_empty() {
+            let alias_exprs = projection_exprs_by_alias(select_clause);
             let resolve_spec_name = |spec_name: &str| -> String {
                 for p in &projected_exprs {
                     match p {
@@ -3765,6 +3777,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             return expr_str.clone();
                         }
                         _ => {}
+                    }
+                }
+                // Alias của biểu thức đã biên dịch (vd. `n * 10 AS score`): dùng biểu thức gốc
+                if table.get_column_index(spec_name).is_none() {
+                    if let Some(expr) = alias_exprs.iter().find(|(a, _)| a.eq_ignore_ascii_case(spec_name)).map(|(_, e)| e) {
+                        return expr.clone();
                     }
                 }
                 spec_name.to_string()
@@ -3840,22 +3858,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     }
                 }
             } else {
-                matched_indices.sort_by(|&a, &b| {
-                    for spec in &clauses.order_by_specs {
-                        let actual_expr = resolve_spec_name(spec.col_name);
-                        let va = eval_sql_expr(&actual_expr, &table.rows[a], Some(table), &[], None, params);
-                        let vb = eval_sql_expr(&actual_expr, &table.rows[b], Some(table), &[], None, params);
-                        let ord = if spec.is_desc {
-                            vb.cmp_value(&va)
-                        } else {
-                            va.cmp_value(&vb)
-                        };
+                // Tính khoá sắp xếp một lần cho mỗi dòng, không tính lại ở mỗi phép so sánh
+                let exprs: Vec<(String, bool)> = clauses.order_by_specs.iter().map(|spec| (resolve_spec_name(spec.col_name), spec.is_desc)).collect();
+                let mut keyed: Vec<(usize, Vec<Value>)> = matched_indices
+                    .iter()
+                    .map(|&idx| (idx, exprs.iter().map(|(e, _)| eval_sql_expr(e, &table.rows[idx], Some(table), &[], None, params)).collect()))
+                    .collect();
+                keyed.sort_by(|(_, ka), (_, kb)| {
+                    for (i, (_, desc)) in exprs.iter().enumerate() {
+                        let ord = if *desc { kb[i].cmp_value(&ka[i]) } else { ka[i].cmp_value(&kb[i]) };
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
                     }
                     std::cmp::Ordering::Equal
                 });
+                matched_indices = keyed.into_iter().map(|(idx, _)| idx).collect();
             }
         }
 
@@ -4114,7 +4132,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }).collect()
         };
 
-        let plan_opt = if select_clause.to_uppercase().contains(" OVER") || select_clause.to_uppercase().contains(" OVER(") {
+        // Subquery đã được thay bằng kết quả cụ thể (phụ thuộc tham số và dữ liệu hiện tại):
+        // không được cache plan theo nguyên văn SQL, nếu không lần sau sẽ trả kết quả cũ.
+        let has_resolved_subquery = resolved_where_owner.is_some() || resolved_select_owner.is_some();
+        // Plan đã cache chỉ lưu được ORDER BY một cột thật, không lưu DISTINCT, và chỉ tra được
+        // tập IN gồm số nguyên: các dạng khác không được cache để lần sau không trả sai.
+        let order_cacheable = clauses.order_by_specs.len() <= 1
+            && clauses
+                .order_by_specs
+                .first()
+                .map_or(true, |spec| table.get_column_index(clean_col_name(spec.col_name)).is_some());
+        let has_text_in_list = clauses.where_clause.map_or(false, |w| {
+            let u = w.to_uppercase();
+            (u.contains(" IN ") || u.contains(" IN(")) && w.contains('\'')
+        });
+        let cacheable = !has_resolved_subquery && !is_distinct && order_cacheable && !has_text_in_list;
+        let plan_opt = if !cacheable || select_clause.to_uppercase().contains(" OVER") || select_clause.to_uppercase().contains(" OVER(") {
             None
         } else if clauses.where_clause.is_some() {
                 let planned_join = if let (Some(ref jc), Some(jt)) = (&clauses.join_clause, joined_table_opt) {
@@ -5880,7 +5913,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         }
 
         let in_tx = self.storage.in_transaction;
-        let mut wal_updates = Vec::new();
+        let mut wal_updates: Vec<(RowIdentity, Vec<(usize, Value)>)> = Vec::new();
         let mut undo_restores = Vec::new();
         let mut row_count = 0;
         let mut returned_rows = Vec::new();
@@ -5952,14 +5985,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         for (c_idx, _) in &updates {
                             old_vals.push((*c_idx, table.rows[row_idx][*c_idx].clone()));
                         }
+                        let identity = RowIdentity::of(table, row_idx);
                         table.update_row_multi(row_idx, &updates);
                         row_count = 1;
                         if let Some(r_cols) = returning_cols {
                             returned_rows.push(project_returning_row(table, &table.rows[row_idx], r_cols));
                         }
-                        for (col_idx, new_val) in &updates {
-                            wal_updates.push((target_pk, *col_idx, new_val.clone()));
-                        }
+                        wal_updates.push((identity, updates));
                         if in_tx {
                             for (col_idx, old_val) in old_vals {
                                 undo_restores.push((row_idx, col_idx, old_val));
@@ -5981,7 +6013,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             (c_idx, coerced)
                         }).collect();
 
-                        let pk_val = table.pk_col_idx.and_then(|pk_idx| table.rows[i].get(pk_idx).and_then(|v| v.as_i64()));
+                        let identity = RowIdentity::of(table, i);
                         let mut old_vals = Vec::new();
                         for (c_idx, _) in &updates {
                             old_vals.push((*c_idx, table.rows[i][*c_idx].clone()));
@@ -5991,11 +6023,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         if let Some(r_cols) = returning_cols {
                             returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
                         }
-                        if let Some(pk) = pk_val {
-                            for (col_idx, new_val) in &updates {
-                                wal_updates.push((pk, *col_idx, new_val.clone()));
-                            }
-                        }
+                        wal_updates.push((identity, updates));
                         if in_tx {
                             for (col_idx, old_val) in old_vals {
                                 undo_restores.push((i, col_idx, old_val));
@@ -6012,13 +6040,25 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         };
 
-        for (pk, col_idx, new_val) in wal_updates {
-            self.storage.wal.append(WalRecord::Update {
-                table: table_name.to_string(),
-                pk,
-                col_idx,
-                new_val,
-            });
+        let pk_col_idx = self.storage.get_table(table_name).and_then(|t| t.pk_col_idx);
+        for (identity, mut updates) in wal_updates {
+            // Cột khoá chính ghi sau cùng: các bản ghi trước vẫn tra được dòng bằng khoá cũ.
+            updates.sort_by_key(|(c, _)| Some(*c) == pk_col_idx);
+            match identity {
+                RowIdentity::Pk(pk) => {
+                    for (col_idx, new_val) in updates {
+                        self.storage.wal.append(WalRecord::Update { table: table_name.to_string(), pk, col_idx, new_val });
+                    }
+                }
+                RowIdentity::Key(key) => {
+                    for (col_idx, new_val) in updates {
+                        self.storage.wal.append(WalRecord::UpdateByKey { table: table_name.to_string(), key: key.clone(), col_idx, new_val });
+                    }
+                }
+                RowIdentity::Row(old_row) => {
+                    self.storage.wal.append(WalRecord::UpdateByRow { table: table_name.to_string(), old_row, updates });
+                }
+            }
         }
         if in_tx {
             for (row_idx, col_idx, old_val) in undo_restores {
@@ -6061,7 +6101,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let in_tx = self.storage.in_transaction;
         let mut row_count = 0;
         let mut returned_rows = Vec::new();
-        let mut deleted_pks = Vec::new();
+        let mut deleted_pks: Vec<RowIdentity> = Vec::new();
         let mut deleted_row_indices = Vec::new();
 
         let resolved_where = if let Some(w) = where_clause {
@@ -6108,9 +6148,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         if let Some(r_cols) = returning_cols {
                             returned_rows.push(project_returning_row(table, &table.rows[row_idx], r_cols));
                         }
+                        deleted_pks.push(RowIdentity::of(table, row_idx));
                         table.delete_row(row_idx);
                         row_count = 1;
-                        deleted_pks.push(target_pk);
                         deleted_row_indices.push(row_idx);
                     }
                 }
@@ -6124,11 +6164,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         if let Some(r_cols) = returning_cols {
                             returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
                         }
-                        if let Some(pk_idx) = table.pk_col_idx {
-                            if let Some(pk_val) = table.rows[i].get(pk_idx).and_then(|v| v.as_i64()) {
-                                deleted_pks.push(pk_val);
-                            }
-                        }
+                        deleted_pks.push(RowIdentity::of(table, i));
                         table.delete_row(i);
                         row_count += 1;
                         deleted_row_indices.push(i);
@@ -6143,10 +6179,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         };
 
-        for pk in deleted_pks {
-            self.storage.wal.append(WalRecord::Delete {
-                table: table_name.to_string(),
-                pk,
+        for identity in deleted_pks {
+            let table = table_name.to_string();
+            self.storage.wal.append(match identity {
+                RowIdentity::Pk(pk) => WalRecord::Delete { table, pk },
+                RowIdentity::Key(key) => WalRecord::DeleteByKey { table, key },
+                RowIdentity::Row(row) => WalRecord::DeleteByRow { table, row },
             });
         }
         if in_tx {
@@ -10178,52 +10216,32 @@ pub(crate) fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
 }
 
 fn split_sql_statements(sql: &str) -> Vec<String> {
+    // Chỉ cắt tại byte ';' (ASCII) nên luôn đúng ranh giới ký tự UTF-8; mỗi câu được chép
+    // nguyên lát chuỗi gốc để không làm hỏng tiếng Việt.
     let mut stmts = Vec::new();
-    let mut current = String::new();
     let mut in_str = false;
     let mut depth: i32 = 0;
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        let b = bytes[i];
+    let mut seg_start = 0;
+    for (i, &b) in sql.as_bytes().iter().enumerate() {
         if b == b'\'' {
             in_str = !in_str;
-            current.push(b as char);
-            i += 1;
+        } else if in_str {
             continue;
-        }
-        if in_str {
-            current.push(b as char);
-            i += 1;
-            continue;
-        }
-        if b == b'(' || b == b'[' {
+        } else if b == b'(' || b == b'[' {
             depth += 1;
-            current.push(b as char);
-            i += 1;
-            continue;
-        }
-        if b == b')' || b == b']' {
+        } else if b == b')' || b == b']' {
             depth = depth.saturating_sub(1);
-            current.push(b as char);
-            i += 1;
-            continue;
-        }
-        if depth == 0 && b == b';' {
-            if !current.trim().is_empty() {
-                stmts.push(current.trim().to_string());
-                current.clear();
+        } else if depth == 0 && b == b';' {
+            let stmt = sql[seg_start..i].trim();
+            if !stmt.is_empty() {
+                stmts.push(stmt.to_string());
             }
-            i += 1;
-            continue;
+            seg_start = i + 1;
         }
-        current.push(b as char);
-        i += 1;
     }
-    if !current.trim().is_empty() {
-        stmts.push(current.trim().to_string());
+    let stmt = sql[seg_start..].trim();
+    if !stmt.is_empty() {
+        stmts.push(stmt.to_string());
     }
     stmts
 }
@@ -10425,7 +10443,9 @@ fn normalize_named_sql_params(sql: &str) -> String {
         return sql.to_string();
     }
 
+    // Chép nguyên các đoạn giữa những tham số `:ten` (không đi từng byte) để giữ UTF-8.
     let mut result = String::with_capacity(sql.len());
+    let mut copied_until = 0;
     let mut i = 0;
     in_single_quote = false;
     in_double_quote = false;
@@ -10434,12 +10454,8 @@ fn normalize_named_sql_params(sql: &str) -> String {
         let b = bytes[i];
         if b == b'\'' && !in_double_quote {
             in_single_quote = !in_single_quote;
-            result.push(b as char);
-            i += 1;
         } else if b == b'"' && !in_single_quote {
             in_double_quote = !in_double_quote;
-            result.push(b as char);
-            i += 1;
         } else if !in_single_quote && !in_double_quote && b == b':' {
             let prev_is_colon = i > 0 && bytes[i - 1] == b':';
             let next_is_colon = i + 1 < len && bytes[i + 1] == b':';
@@ -10451,21 +10467,17 @@ fn normalize_named_sql_params(sql: &str) -> String {
                 }
                 let name = &sql[start..end];
                 if let Some(pos) = param_names.iter().position(|n| n == name) {
+                    result.push_str(&sql[copied_until..i]);
                     result.push_str(&format!("${}", pos + 1));
-                } else {
-                    result.push_str(&sql[i..end]);
+                    copied_until = end;
                 }
                 i = end;
-            } else {
-                result.push(b as char);
-                i += 1;
+                continue;
             }
-        } else {
-            result.push(b as char);
-            i += 1;
         }
+        i += 1;
     }
-
+    result.push_str(&sql[copied_until..]);
     result
 }
 
@@ -12239,6 +12251,42 @@ fn projection_exprs_by_alias(select_clause: &str) -> HashMap<String, String> {
         out.entry(alias).or_insert_with(|| e.to_string());
     }
     out
+}
+
+/// Vế phải chỉ gồm đúng một toán hạng: `$n`, một chuỗi '...' hoặc một số.
+/// (Không có AND/OR/toán tử theo sau, kể cả viết thường.)
+fn is_single_operand(s: &str) -> bool {
+    let t = s.trim();
+    if let Some(n) = t.strip_prefix('$') {
+        return !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
+    }
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        // Chuỗi duy nhất: dấu nháy bên trong chỉ được xuất hiện dạng '' (escape)
+        let inner = &t[1..t.len() - 1];
+        return !inner.replace("''", "").contains('\'');
+    }
+    t.parse::<f64>().is_ok()
+}
+
+/// Cách nhận diện một dòng trong WAL khi UPDATE/DELETE.
+enum RowIdentity {
+    /// Khoá chính là số: bản ghi `Update`/`Delete` như định dạng cũ.
+    Pk(i64),
+    /// Khoá chính UUID/text: `UpdateByKey`/`DeleteByKey`.
+    Key(Value),
+    /// Không có khoá chính (hoặc khoá NULL): nhận diện bằng toàn bộ giá trị dòng.
+    Row(Vec<Value>),
+}
+
+impl RowIdentity {
+    fn of(table: &crate::storage::table::Table, row_idx: usize) -> Self {
+        let row = &table.rows[row_idx];
+        match table.pk_col_idx.and_then(|i| row.get(i)) {
+            Some(v) if v.as_i64().is_some() => RowIdentity::Pk(v.as_i64().unwrap()),
+            Some(v) if !v.is_null() => RowIdentity::Key(v.clone()),
+            _ => RowIdentity::Row(row.clone()),
+        }
+    }
 }
 
 /// Kiểu của một giá trị đã tính xong, dùng khi không suy được từ biểu thức.

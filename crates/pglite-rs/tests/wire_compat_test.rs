@@ -270,7 +270,36 @@ fn wal_ref_records_are_byte_identical_to_legacy_records() {
             bincode::serialize(&WalRecord::AlterTableDropColumn { table: "t".into(), column: "c".into() }).unwrap(),
             bincode::serialize(&WalRecordRef::AlterTableDropColumn { table: "t", column: "c" }).unwrap(),
         ),
+        (bincode::serialize(&WalRecord::TxRollback).unwrap(), bincode::serialize(&WalRecordRef::TxRollback).unwrap()),
+        (bincode::serialize(&WalRecord::Savepoint { name: "s".into() }).unwrap(), bincode::serialize(&WalRecordRef::Savepoint { name: "s" }).unwrap()),
+        (
+            bincode::serialize(&WalRecord::RollbackToSavepoint { name: "s".into() }).unwrap(),
+            bincode::serialize(&WalRecordRef::RollbackToSavepoint { name: "s" }).unwrap(),
+        ),
+        (bincode::serialize(&WalRecord::ReleaseSavepoint { name: "s".into() }).unwrap(), bincode::serialize(&WalRecordRef::ReleaseSavepoint { name: "s" }).unwrap()),
+        (
+            bincode::serialize(&WalRecord::UpdateByKey { table: "t".into(), key: Value::text("k"), col_idx: 1, new_val: Value::Int(2) }).unwrap(),
+            bincode::serialize(&WalRecordRef::UpdateByKey { table: "t", key: &Value::text("k"), col_idx: 1, new_val: &Value::Int(2) }).unwrap(),
+        ),
+        (
+            bincode::serialize(&WalRecord::DeleteByKey { table: "t".into(), key: Value::text("k") }).unwrap(),
+            bincode::serialize(&WalRecordRef::DeleteByKey { table: "t", key: &Value::text("k") }).unwrap(),
+        ),
+        (
+            bincode::serialize(&WalRecord::UpdateByRow { table: "t".into(), old_row: row.clone(), updates: vec![(1, Value::Null)] }).unwrap(),
+            bincode::serialize(&WalRecordRef::UpdateByRow { table: "t", old_row: &row, updates: &[(1, Value::Null)] }).unwrap(),
+        ),
+        (
+            bincode::serialize(&WalRecord::DeleteByRow { table: "t".into(), row: row.clone() }).unwrap(),
+            bincode::serialize(&WalRecordRef::DeleteByRow { table: "t", row: &row }).unwrap(),
+        ),
     ];
+    // Chỉ số biến thể của các bản ghi cũ không được đổi (định dạng file).
+    let tag = |b: &Vec<u8>| u32::from_le_bytes(b[0..4].try_into().unwrap());
+    assert_eq!(tag(&pairs[0].0), 0, "Begin");
+    assert_eq!(tag(&pairs[5].0), 5, "Insert");
+    assert_eq!(tag(&pairs[11].0), 11, "AlterTableDropColumn");
+    assert_eq!(tag(&pairs[12].0), 12, "TxRollback phải nằm sau mọi biến thể cũ");
     for (i, (legacy, by_ref)) in pairs.iter().enumerate() {
         assert_eq!(legacy, by_ref, "biến thể #{i} khác byte");
     }
@@ -318,4 +347,25 @@ fn inserts_into_legacy_db_work_and_survive_reopen() {
     let extra = db.query("SELECT v FROM extra", &[]).unwrap();
     assert_eq!(extra.rows[0]["v"], "e1");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Câu có subquery không được dùng lại kết quả cũ khi đổi tham số hoặc khi dữ liệu thay đổi.
+#[test]
+fn subquery_results_are_not_served_from_stale_plan_cache() {
+    let mut db = setup();
+    let sql = "SELECT id, name FROM schools WHERE id IN (SELECT school_id FROM schedules WHERE title = $1)";
+    let a = db.query(sql, &[Value::text("Math")]).unwrap();
+    assert_eq!(a.rows.len(), 1);
+    let b = db.query(sql, &[Value::text("Không có")]).unwrap();
+    assert!(b.rows.is_empty(), "tham số mới nhưng trả kết quả cũ: {:?}", b.rows);
+
+    let no_param = "SELECT id FROM schools WHERE id IN (SELECT school_id FROM schedules)";
+    assert_eq!(db.query(no_param, &[]).unwrap().rows.len(), 1);
+    db.exec("INSERT INTO schedules (school_id, title, start_at) VALUES (2, 'Art', '2026-10-13 09:00:00')", &[]).unwrap();
+    assert_eq!(db.query(no_param, &[]).unwrap().rows.len(), 2, "dữ liệu mới không được thấy");
+
+    let in_select = "SELECT id, (SELECT COUNT(*) FROM schedules WHERE title = $1) AS n FROM schools WHERE id = 1";
+    let x = db.query(in_select, &[Value::text("Math")]).unwrap();
+    let y = db.query(in_select, &[Value::text("Art")]).unwrap();
+    assert_eq!(x.rows.len(), y.rows.len());
 }

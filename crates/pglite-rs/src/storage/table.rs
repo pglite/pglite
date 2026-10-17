@@ -319,15 +319,77 @@ impl Table {
         }
     }
 
+    /// Đặt giá trị một ô và giữ khoá chính + index phụ đồng bộ. Trả về giá trị cũ.
+    pub fn set_cell(&mut self, row_idx: usize, col_idx: usize, val: Value) -> Option<Value> {
+        if row_idx >= self.rows.len() || col_idx >= self.rows[row_idx].len() {
+            return None;
+        }
+        let new_val = val.clone();
+        let old_val = std::mem::replace(&mut self.rows[row_idx][col_idx], val);
+        if Some(col_idx) == self.pk_col_idx {
+            self.remove_pk_from_index(&old_val);
+            self.add_pk_to_index(&new_val, row_idx);
+        }
+        if let Some(map) = self.col_indexes.get_mut(&col_idx) {
+            if !old_val.is_null() {
+                let old_key = value_to_join_key(&old_val);
+                if let Some(list) = map.get_mut(&old_key) {
+                    list.retain(|&i| i != row_idx);
+                    if list.is_empty() {
+                        map.remove(&old_key);
+                    }
+                }
+            }
+            if !new_val.is_null() {
+                map.entry(value_to_join_key(&new_val)).or_default().push(row_idx);
+            }
+        }
+        Some(old_val)
+    }
+
+    /// Gỡ dòng chèn cuối cùng (hoàn tác INSERT) khỏi bảng và mọi index.
+    pub fn pop_last_row(&mut self) -> Option<Vec<Value>> {
+        let row_idx = self.rows.len().checked_sub(1)?;
+        let row = self.rows.pop()?;
+        let was_deleted = self.is_deleted.pop().unwrap_or(false);
+        if !was_deleted {
+            self.active_count = self.active_count.saturating_sub(1);
+        }
+        if let Some(pk_idx) = self.pk_col_idx {
+            if let Some(pk_val) = row.get(pk_idx) {
+                // Chỉ gỡ nếu index đang trỏ đúng dòng này
+                let points_here = pk_val.as_i64().map_or(false, |i| self.pk_index.get(&i) == Some(&row_idx))
+                    || matches!(pk_val, Value::Text(t) if self.pk_index_str.get(t) == Some(&row_idx));
+                if points_here {
+                    self.remove_pk_from_index(pk_val);
+                }
+            }
+        }
+        for (&col_idx, map) in &mut self.col_indexes {
+            if let Some(v) = row.get(col_idx) {
+                if !v.is_null() {
+                    let key = value_to_join_key(v);
+                    if let Some(list) = map.get_mut(&key) {
+                        list.retain(|&i| i != row_idx);
+                        if list.is_empty() {
+                            map.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        Some(row)
+    }
+
+    /// Dòng còn sống đầu tiên có giá trị đúng bằng `values` (bảng không có khoá chính).
+    pub fn find_live_row(&self, values: &[Value]) -> Option<usize> {
+        (0..self.rows.len()).find(|&i| !self.is_deleted[i] && self.rows[i].as_slice() == values)
+    }
+
     pub fn update_by_pk(&mut self, pk: i64, col_idx: usize, val: Value) -> bool {
         if let Some(&row_idx) = self.pk_index.get(&pk) {
             if !self.is_deleted[row_idx] && col_idx < self.rows[row_idx].len() {
-                if Some(col_idx) == self.pk_col_idx {
-                    let old_val = self.rows[row_idx][col_idx].clone();
-                    self.remove_pk_from_index(&old_val);
-                    self.add_pk_to_index(&val, row_idx);
-                }
-                self.rows[row_idx][col_idx] = val;
+                self.set_cell(row_idx, col_idx, val);
                 return true;
             }
         }
@@ -337,14 +399,7 @@ impl Table {
     pub fn update_row_multi(&mut self, row_idx: usize, updates: &[(usize, Value)]) {
         if row_idx < self.rows.len() && !self.is_deleted[row_idx] {
             for (col_idx, val) in updates {
-                if *col_idx < self.rows[row_idx].len() {
-                    if Some(*col_idx) == self.pk_col_idx {
-                        let old_val = self.rows[row_idx][*col_idx].clone();
-                        self.remove_pk_from_index(&old_val);
-                        self.add_pk_to_index(val, row_idx);
-                    }
-                    self.rows[row_idx][*col_idx] = val.clone();
-                }
+                self.set_cell(row_idx, *col_idx, val.clone());
             }
         }
     }

@@ -51,6 +51,41 @@ pub enum WalRecord {
         table: String,
         column: String,
     },
+    // ---- Các biến thể dưới đây chỉ được THÊM VÀO CUỐI: thứ tự là một phần của định dạng
+    // file (bincode ghi chỉ số biến thể). Binary cũ gặp chúng sẽ bỏ qua bản ghi đó.
+    /// ROLLBACK ghi từ bản này trở đi: được hoàn tác khi replay. `Rollback` cũ vẫn bị bỏ qua
+    /// để DB cũ mở ra đúng như trước.
+    TxRollback,
+    Savepoint {
+        name: String,
+    },
+    RollbackToSavepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
+    /// UPDATE/DELETE trên bảng có khoá chính không phải số (UUID, text).
+    UpdateByKey {
+        table: String,
+        key: Value,
+        col_idx: usize,
+        new_val: Value,
+    },
+    DeleteByKey {
+        table: String,
+        key: Value,
+    },
+    /// UPDATE/DELETE trên bảng không có khoá chính: nhận diện dòng bằng toàn bộ giá trị cũ.
+    UpdateByRow {
+        table: String,
+        old_row: Vec<Value>,
+        updates: Vec<(usize, Value)>,
+    },
+    DeleteByRow {
+        table: String,
+        row: Vec<Value>,
+    },
 }
 
 #[derive(Serialize)]
@@ -96,6 +131,35 @@ pub enum WalRecordRef<'a> {
     AlterTableDropColumn {
         table: &'a str,
         column: &'a str,
+    },
+    TxRollback,
+    Savepoint {
+        name: &'a str,
+    },
+    RollbackToSavepoint {
+        name: &'a str,
+    },
+    ReleaseSavepoint {
+        name: &'a str,
+    },
+    UpdateByKey {
+        table: &'a str,
+        key: &'a Value,
+        col_idx: usize,
+        new_val: &'a Value,
+    },
+    DeleteByKey {
+        table: &'a str,
+        key: &'a Value,
+    },
+    UpdateByRow {
+        table: &'a str,
+        old_row: &'a [Value],
+        updates: &'a [(usize, Value)],
+    },
+    DeleteByRow {
+        table: &'a str,
+        row: &'a [Value],
     },
 }
 
@@ -308,6 +372,11 @@ impl WalManager {
 
     pub fn flush(&mut self) {
         self.flush_pending();
+    }
+
+    /// Còn dữ liệu trong buffer chưa ghi xuống file.
+    pub fn has_pending(&self) -> bool {
+        !self.pending_bytes.is_empty()
     }
 
     pub fn clear(&mut self) {

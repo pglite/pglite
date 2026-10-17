@@ -1,6 +1,6 @@
 use crate::storage::table::Table;
 use crate::storage::wal::{WalManager, WalRecord};
-use crate::types::{ColumnDef, Value};
+use crate::types::{value_to_join_key, ColumnDef, Value};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -34,7 +34,9 @@ impl StorageEngine {
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Replay WAL records recovered via zero-copy mmap
+        // Replay WAL records recovered via zero-copy mmap.
+        // Giao dịch được mô phỏng bằng đúng cơ chế undo lúc chạy, nên trạng thái sau replay
+        // trùng trạng thái trong bộ nhớ. Không có gì được ghi lại vào WAL trong lúc replay.
         for record in recovered_records {
             match record {
                 WalRecord::CreateTable { name, columns } => {
@@ -48,51 +50,83 @@ impl StorageEngine {
                     engine.tables.remove(&clean);
                 }
                 WalRecord::Insert { table, row } => {
-                    let clean = table.to_lowercase();
-                    if let Some(t) = engine.get_table_mut(&clean) {
-                        let hist_cols = table_hist_cols.get(&clean);
-                        if let Some(h_cols) = hist_cols {
-                            if row.len() > t.columns.len() && row.len() <= h_cols.len() {
-                                let mut aligned_row = Vec::with_capacity(t.columns.len());
-                                for col in &t.columns {
-                                    if let Some(h_idx) = h_cols.iter().position(|h| h.eq_ignore_ascii_case(&col.name)) {
-                                        if h_idx < row.len() {
-                                            aligned_row.push(row[h_idx].clone());
-                                        } else {
-                                            aligned_row.push(Value::Null);
-                                        }
-                                    } else {
-                                        aligned_row.push(Value::Null);
-                                    }
-                                }
-                                t.insert(aligned_row);
-                                continue;
-                            }
-                        }
-                        t.insert(row);
-                    }
+                    engine.replay_insert(&table_hist_cols, &table, row);
                 }
                 WalRecord::Update { table, pk, col_idx, new_val } => {
                     let clean = table.to_lowercase();
-                    if let Some(t) = engine.get_table_mut(&clean) {
-                        let hist_cols = table_hist_cols.get(&clean);
-                        let target_col_idx = if let Some(h_cols) = hist_cols {
-                            if h_cols.len() > t.columns.len() && col_idx < h_cols.len() {
-                                t.get_column_index(&h_cols[col_idx]).unwrap_or(col_idx)
-                            } else {
-                                col_idx
-                            }
-                        } else {
-                            col_idx
-                        };
-                        t.update_by_pk(pk, target_col_idx, new_val);
+                    let row_idx = engine.get_table(&clean).and_then(|t| t.pk_index.get(&pk).copied());
+                    if let Some(row_idx) = row_idx {
+                        engine.replay_set_cell(&table_hist_cols, &clean, row_idx, col_idx, new_val);
                     }
                 }
                 WalRecord::Delete { table, pk } => {
                     let clean = table.to_lowercase();
-                    if let Some(t) = engine.get_table_mut(&clean) {
-                        t.delete_by_pk(pk);
+                    let row_idx = engine.get_table(&clean).and_then(|t| t.pk_index.get(&pk).copied());
+                    if let Some(row_idx) = row_idx {
+                        engine.replay_delete(&clean, row_idx);
                     }
+                }
+                WalRecord::UpdateByKey { table, key, col_idx, new_val } => {
+                    let clean = table.to_lowercase();
+                    let row_idx = engine.get_table(&clean).and_then(|t| t.get_row_idx_by_pk_key(&value_to_join_key(&key)));
+                    if let Some(row_idx) = row_idx {
+                        engine.replay_set_cell(&table_hist_cols, &clean, row_idx, col_idx, new_val);
+                    }
+                }
+                WalRecord::DeleteByKey { table, key } => {
+                    let clean = table.to_lowercase();
+                    let row_idx = engine.get_table(&clean).and_then(|t| t.get_row_idx_by_pk_key(&value_to_join_key(&key)));
+                    if let Some(row_idx) = row_idx {
+                        engine.replay_delete(&clean, row_idx);
+                    }
+                }
+                WalRecord::UpdateByRow { table, old_row, updates } => {
+                    let clean = table.to_lowercase();
+                    let row_idx = engine.get_table(&clean).and_then(|t| t.find_live_row(&old_row));
+                    if let Some(row_idx) = row_idx {
+                        for (col_idx, new_val) in updates {
+                            engine.replay_set_cell(&table_hist_cols, &clean, row_idx, col_idx, new_val);
+                        }
+                    }
+                }
+                WalRecord::DeleteByRow { table, row } => {
+                    let clean = table.to_lowercase();
+                    let row_idx = engine.get_table(&clean).and_then(|t| t.find_live_row(&row));
+                    if let Some(row_idx) = row_idx {
+                        engine.replay_delete(&clean, row_idx);
+                    }
+                }
+                WalRecord::Begin => {
+                    engine.in_transaction = true;
+                    engine.tx_undo_log.clear();
+                    engine.savepoints.clear();
+                }
+                WalRecord::Commit => engine.end_replayed_transaction(),
+                // ROLLBACK ghi bởi bản cũ: giữ đúng hành vi cũ (dữ liệu không bị hoàn tác),
+                // để DB cũ mở ra đúng như trước.
+                WalRecord::Rollback => engine.end_replayed_transaction(),
+                WalRecord::TxRollback => {
+                    while let Some(undo) = engine.tx_undo_log.pop() {
+                        engine.apply_undo(undo);
+                    }
+                    engine.end_replayed_transaction();
+                }
+                WalRecord::Savepoint { name } => {
+                    let clean = name.trim_matches('"').to_lowercase();
+                    engine.savepoints.insert(clean, engine.tx_undo_log.len());
+                }
+                WalRecord::RollbackToSavepoint { name } => {
+                    let clean = name.trim_matches('"').to_lowercase();
+                    if let Some(&target_len) = engine.savepoints.get(&clean) {
+                        while engine.tx_undo_log.len() > target_len {
+                            if let Some(undo) = engine.tx_undo_log.pop() {
+                                engine.apply_undo(undo);
+                            }
+                        }
+                    }
+                }
+                WalRecord::ReleaseSavepoint { name } => {
+                    engine.savepoints.remove(&name.trim_matches('"').to_lowercase());
                 }
                 WalRecord::CommentOnTable { table, comment } => {
                     let clean = table.to_lowercase();
@@ -131,11 +165,89 @@ impl StorageEngine {
                         t.drop_column(&column);
                     }
                 }
-                _ => {}
             }
         }
 
+        // Giao dịch còn dang dở ở cuối file (BEGIN không có COMMIT/ROLLBACK) được giữ
+        // nguyên như bản cũ: db-rs dùng chung một engine nên một BEGIN bị bỏ quên khiến mọi
+        // lệnh ghi sau đó nằm "trong giao dịch"; bỏ chúng đi sẽ làm mất dữ liệu thật.
+        engine.end_replayed_transaction();
+
         engine
+    }
+
+    fn end_replayed_transaction(&mut self) {
+        self.in_transaction = false;
+        self.tx_undo_log.clear();
+        self.savepoints.clear();
+    }
+
+    /// Chỉ số cột hiện tại cho một `col_idx` ghi trong WAL (bảng từng bị DROP COLUMN).
+    fn replay_col_idx(hist: &HashMap<String, Vec<String>>, t: &Table, clean: &str, col_idx: usize) -> usize {
+        match hist.get(clean) {
+            Some(h_cols) if h_cols.len() > t.columns.len() && col_idx < h_cols.len() => {
+                t.get_column_index(&h_cols[col_idx]).unwrap_or(col_idx)
+            }
+            _ => col_idx,
+        }
+    }
+
+    fn replay_insert(&mut self, hist: &HashMap<String, Vec<String>>, table: &str, row: Vec<Value>) {
+        let clean = table.to_lowercase();
+        let in_tx = self.in_transaction;
+        let Some(t) = self.tables.get_mut(&clean) else {
+            return;
+        };
+        let mut row = row;
+        if let Some(h_cols) = hist.get(&clean) {
+            if row.len() > t.columns.len() && row.len() <= h_cols.len() {
+                row = t
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        h_cols
+                            .iter()
+                            .position(|h| h.eq_ignore_ascii_case(&col.name))
+                            .and_then(|h_idx| row.get(h_idx).cloned())
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+            }
+        }
+        t.insert(row);
+        if in_tx {
+            self.tx_undo_log.push(UndoAction::DeleteInsertedRows { table: clean, count: 1 });
+        }
+    }
+
+    fn replay_set_cell(&mut self, hist: &HashMap<String, Vec<String>>, clean: &str, row_idx: usize, col_idx: usize, val: Value) {
+        let in_tx = self.in_transaction;
+        let Some(t) = self.tables.get_mut(clean) else {
+            return;
+        };
+        if row_idx >= t.rows.len() || t.is_deleted[row_idx] {
+            return;
+        }
+        let target = Self::replay_col_idx(hist, t, clean, col_idx);
+        if let Some(old_val) = t.set_cell(row_idx, target, val) {
+            if in_tx {
+                self.tx_undo_log.push(UndoAction::RestoreRow {
+                    table: clean.to_string(),
+                    row_idx,
+                    col_idx: target,
+                    old_val,
+                });
+            }
+        }
+    }
+
+    fn replay_delete(&mut self, clean: &str, row_idx: usize) {
+        let in_tx = self.in_transaction;
+        if let Some(t) = self.tables.get_mut(clean) {
+            if t.delete_row(row_idx) && in_tx {
+                self.tx_undo_log.push(UndoAction::UndeleteRow { table: clean.to_string(), row_idx });
+            }
+        }
     }
 
     pub fn create_table(&mut self, name: String, columns: Vec<ColumnDef>) -> Result<(), String> {
@@ -178,7 +290,10 @@ impl StorageEngine {
 
     pub fn savepoint(&mut self, name: &str) {
         let clean = name.trim_matches('"').to_lowercase();
-        self.savepoints.insert(clean, self.tx_undo_log.len());
+        self.savepoints.insert(clean.clone(), self.tx_undo_log.len());
+        if self.in_transaction {
+            self.wal.append(WalRecord::Savepoint { name: clean });
+        }
     }
 
     pub fn rollback_to_savepoint(&mut self, name: &str) -> bool {
@@ -189,6 +304,7 @@ impl StorageEngine {
                     self.apply_undo(undo);
                 }
             }
+            self.wal.append(WalRecord::RollbackToSavepoint { name: clean });
             true
         } else {
             false
@@ -197,7 +313,11 @@ impl StorageEngine {
 
     pub fn release_savepoint(&mut self, name: &str) -> bool {
         let clean = name.trim_matches('"').to_lowercase();
-        self.savepoints.remove(&clean).is_some()
+        let existed = self.savepoints.remove(&clean).is_some();
+        if existed {
+            self.wal.append(WalRecord::ReleaseSavepoint { name: clean });
+        }
+        existed
     }
 
     pub fn apply_undo(&mut self, undo: UndoAction) {
@@ -205,41 +325,18 @@ impl StorageEngine {
             UndoAction::DeleteInsertedRows { table, count } => {
                 if let Some(t) = self.get_table_mut(&table) {
                     for _ in 0..count {
-                        if let Some(last_row) = t.rows.pop() {
-                            t.is_deleted.pop();
-                            t.active_count = t.active_count.saturating_sub(1);
-                            if let Some(pk_idx) = t.pk_col_idx {
-                                if let Some(pk_val) = last_row.get(pk_idx) {
-                                    t.remove_pk_from_index(pk_val);
-                                }
-                            }
-                        }
+                        t.pop_last_row();
                     }
                 }
             }
             UndoAction::DeleteLastInsertedRow { table } => {
                 if let Some(t) = self.get_table_mut(&table) {
-                    if let Some(last_row) = t.rows.pop() {
-                        t.is_deleted.pop();
-                        t.active_count = t.active_count.saturating_sub(1);
-                        if let Some(pk_idx) = t.pk_col_idx {
-                            if let Some(pk_val) = last_row.get(pk_idx) {
-                                t.remove_pk_from_index(pk_val);
-                            }
-                        }
-                    }
+                    t.pop_last_row();
                 }
             }
             UndoAction::RestoreRow { table, row_idx, col_idx, old_val } => {
                 if let Some(t) = self.get_table_mut(&table) {
-                    if row_idx < t.rows.len() && col_idx < t.rows[row_idx].len() {
-                        if Some(col_idx) == t.pk_col_idx {
-                            let cur_val = t.rows[row_idx][col_idx].clone();
-                            t.remove_pk_from_index(&cur_val);
-                            t.add_pk_to_index(&old_val, row_idx);
-                        }
-                        t.rows[row_idx][col_idx] = old_val;
-                    }
+                    t.set_cell(row_idx, col_idx, old_val);
                 }
             }
             UndoAction::UndeleteRow { table, row_idx } => {
@@ -275,7 +372,8 @@ impl StorageEngine {
             while let Some(undo) = self.tx_undo_log.pop() {
                 self.apply_undo(undo);
             }
-            self.wal.append(WalRecord::Rollback);
+            // TxRollback (không phải Rollback cũ) để lần mở lại sau hoàn tác đúng giao dịch này
+            self.wal.append(WalRecord::TxRollback);
             self.wal.flush();
             self.in_transaction = false;
             self.tx_undo_log.shrink_to_fit();

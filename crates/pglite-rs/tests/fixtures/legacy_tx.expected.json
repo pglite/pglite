@@ -1,0 +1,34 @@
+{
+  "t": [
+    {
+      "id": 1,
+      "v": "a-changed-then-rolled-back"
+    },
+    {
+      "id": 2,
+      "v": "rolled-back"
+    },
+    {
+      "id": 3,
+      "v": "b"
+    },
+    {
+      "id": 4,
+      "v": "c-savepoint-rolled-back"
+    },
+    {
+      "id": 5,
+      "v": "after"
+    }
+  ],
+  "u": [
+    {
+      "id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+      "name": "old"
+    },
+    {
+      "id": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12",
+      "name": "to-delete"
+    }
+  ]
+}
