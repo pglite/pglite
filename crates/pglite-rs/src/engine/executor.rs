@@ -180,8 +180,16 @@ impl Executor {
             return self.handle_create_table(trimmed);
         }
 
+        if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") {
+            return self.handle_create_index(trimmed);
+        }
+
         if upper.starts_with("DROP TABLE") {
             return self.handle_drop_table(trimmed);
+        }
+
+        if upper.starts_with("DROP INDEX") {
+            return self.handle_drop_index(trimmed);
         }
 
         if upper.starts_with("INSERT INTO") {
@@ -1953,19 +1961,130 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         }
 
         let row_count = final_json_rows.len();
-        let fields: Vec<FieldInfo> = final_json_rows.first().and_then(|r| {
-            if let serde_json::Value::Object(map) = r {
-                Some(map.keys().map(|k| FieldInfo { name: k.clone(), data_type: "text".to_string() }).collect())
-            } else {
-                None
+        let mut fields = self.joined_projection_fields(clean_select, &base_tbl_name, base_alias.as_deref(), &joins);
+        // Key phát sinh ngoài danh sách SELECT (vd. cột của hàm cửa sổ) vẫn được giữ.
+        if let Some(serde_json::Value::Object(map)) = final_json_rows.first() {
+            for (k, v) in map {
+                if !fields.iter().any(|f| &f.name == k) {
+                    fields.push(FieldInfo { name: k.clone(), data_type: type_str_from_json_value(v) });
+                }
             }
-        }).unwrap_or_default();
+        }
 
         Ok(QueryResult {
             rows: final_json_rows,
             row_count,
             fields,
             command: "SELECT".to_string(),
+        })
+    }
+
+    /// Cột kết quả của truy vấn JOIN, theo đúng thứ tự và quy tắc đặt tên mà
+    /// `handle_joined_query_internal` dùng khi dựng dòng, kèm kiểu thật của cột.
+    fn joined_projection_fields(
+        &self,
+        clean_select: &str,
+        base_tbl_name: &str,
+        base_alias: Option<&str>,
+        joins: &[ParsedJoin],
+    ) -> Vec<FieldInfo> {
+        let mut tables: Vec<(&crate::storage::table::Table, Option<&str>)> = Vec::new();
+        if let Some(t) = self.storage.get_table(base_tbl_name) {
+            tables.push((t, base_alias));
+        }
+        for j in joins {
+            if let Some(t) = self.storage.get_table(&j.table_name) {
+                tables.push((t, j.alias.as_deref()));
+            }
+        }
+        let col_type = |c: &str| column_ref_type(c, &tables);
+
+        let mut fields: Vec<FieldInfo> = Vec::new();
+        let push = |fields: &mut Vec<FieldInfo>, name: String, data_type: String| {
+            if !fields.iter().any(|f| f.name == name) {
+                fields.push(FieldInfo { name, data_type });
+            }
+        };
+        for item in split_projection_items(clean_select) {
+            let t = item.trim();
+            if t == "*" {
+                for (tbl, _) in &tables {
+                    for c in &tbl.columns {
+                        push(&mut fields, c.name.clone(), c.data_type.field_type_str());
+                    }
+                }
+                continue;
+            }
+            if let Some(prefix) = t.strip_suffix(".*") {
+                let prefix = prefix.trim().trim_matches('"');
+                if let Some((tbl, _)) = tables.iter().find(|(tbl, alias)| {
+                    prefix.eq_ignore_ascii_case(&tbl.name) || alias.map(|a| prefix.eq_ignore_ascii_case(a.trim_matches('"'))).unwrap_or(false)
+                }) {
+                    for c in &tbl.columns {
+                        push(&mut fields, c.name.clone(), c.data_type.field_type_str());
+                    }
+                    continue;
+                }
+            }
+            let upper = item.to_uppercase();
+            let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
+            } else {
+                (item.trim(), clean_col_name(item.trim()).replace('"', ""))
+            };
+            let mut e = expr_part;
+            while e.starts_with('(') && e.ends_with(')') && is_fully_enclosed_in_parens(e) {
+                e = e[1..e.len() - 1].trim();
+            }
+            let dt = crate::pg_types::infer_expr_type(e, &col_type).unwrap_or_else(|| "text".to_string());
+            push(&mut fields, alias, dt);
+        }
+        fields
+    }
+
+    fn handle_create_index(&mut self, sql: &str) -> Result<QueryResult, String> {
+        let on_pos = find_top_level_keyword(sql, "ON").ok_or("Missing ON clause in CREATE INDEX")?;
+        let after_on = sql[on_pos + 2..].trim();
+
+        let open_paren = after_on.find('(').ok_or("Missing '(' in CREATE INDEX column list")?;
+        let close_paren = after_on.rfind(')').ok_or("Missing ')' in CREATE INDEX column list")?;
+
+        let table_spec = after_on[..open_paren].trim();
+        let table_name = if let Some(using_pos) = find_top_level_keyword(table_spec, "USING") {
+            table_spec[..using_pos].trim()
+        } else {
+            table_spec
+        }.trim_matches('"').trim();
+
+        let cols_part = &after_on[open_paren + 1..close_paren];
+        let col_names = split_comma_separated_tokens(cols_part);
+
+        if let Some(table) = self.storage.get_table_mut(table_name) {
+            for col_name in col_names {
+                let clean_col = clean_col_name(col_name.trim());
+                if let Some(col_idx) = table.get_column_index(clean_col) {
+                    table.add_secondary_index(col_idx);
+                }
+            }
+        }
+
+        self.plan_cache.clear();
+
+        Ok(QueryResult {
+            rows: vec![],
+            row_count: 0,
+            fields: vec![],
+            command: "CREATE INDEX".to_string(),
+        })
+    }
+
+    fn handle_drop_index(&mut self, _sql: &str) -> Result<QueryResult, String> {
+        self.plan_cache.clear();
+        Ok(QueryResult {
+            rows: vec![],
+            row_count: 0,
+            fields: vec![],
+            command: "DROP INDEX".to_string(),
         })
     }
 
@@ -2824,6 +2943,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             FieldInfo { name: "column_default".to_string(), data_type: "text".to_string() },
             FieldInfo { name: "constraint_type".to_string(), data_type: "text".to_string() },
             FieldInfo { name: "comment".to_string(), data_type: "text".to_string() },
+            FieldInfo { name: "ordinal_position".to_string(), data_type: "integer".to_string() },
         ];
 
         if let Some(s) = schema_filter {
@@ -2907,12 +3027,21 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
+        let mut fields = fields;
         let projected_rows = if !up_sql.starts_with("SELECT *") {
             let from_idx = up_sql.find(" FROM ").unwrap_or(_sql.len());
             let select_part = &_sql[6..from_idx].trim();
             let req_cols: Vec<String> = split_comma_separated_tokens(select_part)
                 .into_iter()
                 .map(|c| clean_col_name(c).to_string())
+                .collect();
+            // fields theo đúng các cột được chọn, đúng thứ tự
+            fields = req_cols
+                .iter()
+                .map(|c| {
+                    let data_type = fields.iter().find(|f| &f.name == c).map(|f| f.data_type.clone()).unwrap_or_else(|| "text".to_string());
+                    FieldInfo { name: c.clone(), data_type }
+                })
                 .collect();
             filtered_rows.into_iter().map(|r| {
                 let mut map = serde_json::Map::new();
@@ -3126,8 +3255,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 while trimmed_expr.starts_with('(') && trimmed_expr.ends_with(')') && is_fully_enclosed_in_parens(trimmed_expr) {
                     trimmed_expr = trimmed_expr[1..trimmed_expr.len() - 1].trim();
                 }
+                let mut sub_type: Option<String> = None;
                 let val_json = if trimmed_expr.to_uppercase().starts_with("SELECT") && trimmed_expr.to_uppercase().contains("FROM") {
                     if let Ok((sub_res, _)) = self.handle_select(trimmed_expr, params) {
+                        if sub_res.fields.len() == 1 {
+                            sub_type = Some(sub_res.fields[0].data_type.clone());
+                        }
                         if let Some(first_row) = sub_res.rows.first() {
                             if let Some(obj) = first_row.as_object() {
                                 if obj.len() == 1 {
@@ -3148,10 +3281,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     let val = eval_sql_expr(expr_part, &[], None, &[], None, params);
                     value_to_json(&val)
                 };
+                let data_type = sub_type
+                    .or_else(|| crate::pg_types::infer_expr_type(trimmed_expr, &|_| None))
+                    .unwrap_or_else(|| type_str_from_json_value(&val_json));
                 map.insert(alias.clone(), val_json);
                 fields.push(FieldInfo {
                     name: alias,
-                    data_type: "text".to_string(),
+                    data_type,
                 });
             }
             return Ok((QueryResult {
@@ -3319,20 +3455,16 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let w_upper = w.to_uppercase();
                 if clauses.order_by_specs.is_empty() && clauses.limit.is_none() && !w_upper.contains("AND") && !w_upper.contains("OR") {
                     if let Some(pk_idx) = table.pk_col_idx {
-                        let is_int_pk = matches!(table.columns[pk_idx].data_type, DataType::Integer | DataType::BigInt | DataType::Serial);
-                        if is_int_pk {
-                            let pk_col_name = &table.columns[pk_idx].name;
-                            if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
-                               w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
-                               w_upper.starts_with("ID =") {
-                                let val_part = w.split('=').nth(1).unwrap().trim();
-                            let (param_idx, literal_pk, target_id) = if val_part.starts_with('$') {
+                        let pk_col_name = &table.columns[pk_idx].name;
+                        if w_upper.starts_with(&format!("{} =", pk_col_name.to_uppercase())) ||
+                           w_upper.starts_with(&format!("\"{}\" =", pk_col_name.to_uppercase())) ||
+                           w_upper.starts_with("ID =") {
+                            let val_part = w.split('=').nth(1).unwrap().trim();
+                            let target_val = if val_part.starts_with('$') {
                                 let p_idx = val_part[1..].parse::<usize>().unwrap_or(1);
-                                let tid = params.get(p_idx - 1).and_then(|v| v.as_i64()).unwrap_or(0);
-                                (Some(p_idx.saturating_sub(1)), None, tid)
+                                params.get(p_idx - 1).cloned().unwrap_or(Value::Null)
                             } else {
-                                let tid = val_part.parse::<i64>().unwrap_or(0);
-                                (None, Some(tid), tid)
+                                parse_value(val_part, params)
                             };
 
                             let fields: Vec<FieldInfo> = table.columns.iter().map(|c| FieldInfo {
@@ -3340,32 +3472,24 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 data_type: format!("{:?}", c.data_type).to_lowercase(),
                             }).collect();
 
-                            let plan = ExecutionPlan::PointLookupPk {
-                                table_name: table.name.clone(),
-                                param_idx,
-                                literal_pk,
-                                fields: fields.clone(),
-                            };
-
-                            if let Some(row) = table.get_by_pk(target_id) {
+                            if let Some(row) = table.get_by_pk_val(&target_val) {
                                 return Ok((QueryResult {
                                     rows: vec![row_to_json(table, row)],
                                     row_count: 1,
                                     fields,
                                     command: "SELECT".to_string(),
-                                }, Some(plan)));
+                                }, None));
                             } else {
                                 return Ok((QueryResult {
                                     rows: vec![],
                                     row_count: 0,
-                                    fields: vec![],
+                                    fields,
                                     command: "SELECT".to_string(),
-                                }, Some(plan)));
+                                }, None));
                             }
                         }
                     }
                 }
-            }
 
                 // 3. Fast-Path: Non-PK exact string lookup (WHERE name = $1 or WHERE name = '...')
                 if clauses.join_clause.is_none() && select_clause.trim() == "*" && clauses.order_by_specs.is_empty() && clauses.limit.is_none() {
@@ -3432,14 +3556,23 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         };
 
         let total_rows = table.rows.len();
-        let pk_target = if let Some(ref expr) = compiled_where {
-            table.pk_col_idx.and_then(|pk_idx| expr.find_pk_eq(pk_idx, params))
+        let pk_target_key = if let Some(ref expr) = compiled_where {
+            table.pk_col_idx.and_then(|pk_idx| expr.find_pk_key_eq(pk_idx, params))
         } else {
             None
         };
-        let pk_set = if pk_target.is_none() {
+        let pk_set = if pk_target_key.is_none() {
             if let Some(ref expr) = compiled_where {
                 table.pk_col_idx.and_then(|pk_idx| expr.find_pk_in(pk_idx))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let col_eq_target = if pk_target_key.is_none() && pk_set.is_none() {
+            if let Some(ref expr) = compiled_where {
+                expr.find_col_eq(params)
             } else {
                 None
             }
@@ -3482,8 +3615,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             matched
         } else {
             let table = self.storage.get_table(clauses.table_name).ok_or_else(|| format!("Table {} not found", clauses.table_name))?;
-            if let Some(target_pk) = pk_target {
-                if let Some(&row_idx) = table.pk_index.get(&target_pk) {
+            if let Some(target_key) = pk_target_key {
+                if let Some(row_idx) = table.get_row_idx_by_pk_key(&target_key) {
                     let matches = match &compiled_where {
                         Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
                         None => true,
@@ -3499,22 +3632,43 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             } else if let Some(target_set) = pk_set {
                 let mut matched = Vec::with_capacity(target_set.len().min(total_rows));
                 for key in target_set {
-                    if let JoinKey::Int(pk_val) = key {
-                        if let Some(&row_idx) = table.pk_index.get(pk_val) {
-                            if !table.is_deleted[row_idx] {
-                                let matches = match &compiled_where {
-                                    Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
-                                    None => true,
-                                };
-                                if matches {
-                                    matched.push(row_idx);
-                                }
+                    if let Some(row_idx) = table.get_row_idx_by_pk_key(key) {
+                        if !table.is_deleted[row_idx] {
+                            let matches = match &compiled_where {
+                                Some(expr) => expr.eval_bool(&table.rows[row_idx], None, params) == Some(true),
+                                None => true,
+                            };
+                            if matches {
+                                matched.push(row_idx);
                             }
                         }
                     }
                 }
                 matched.sort_unstable();
                 matched
+            } else if let Some((col_idx, key)) = col_eq_target {
+                if let Some(candidates) = table.col_indexes.get(&col_idx).and_then(|map| map.get(&key)) {
+                    let expr_ref = compiled_where.as_ref();
+                    candidates.iter().copied()
+                        .filter(|&i| !table.is_deleted[i] && expr_ref.map_or(true, |e| e.eval_bool(&table.rows[i], None, params) == Some(true)))
+                        .collect()
+                } else if compiled_where.is_none() {
+                    (0..total_rows)
+                        .into_par_iter()
+                        .filter(|&i| !table.is_deleted[i])
+                        .collect()
+                } else if total_rows > 20_000 {
+                    let expr_ref = compiled_where.as_ref().unwrap();
+                    (0..total_rows)
+                        .into_par_iter()
+                        .filter(|&i| !table.is_deleted[i] && expr_ref.eval_bool(&table.rows[i], None, params) == Some(true))
+                        .collect()
+                } else {
+                    let expr_ref = compiled_where.as_ref().unwrap();
+                    (0..total_rows)
+                        .filter(|&i| !table.is_deleted[i] && expr_ref.eval_bool(&table.rows[i], None, params) == Some(true))
+                        .collect()
+                }
             } else if compiled_where.is_none() {
                 (0..total_rows)
                     .into_par_iter()
@@ -3555,7 +3709,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             if join_key.is_null() {
                                 return false;
                             }
-                            join_key.as_i64().and_then(|pk| jt.get_by_pk(pk)).is_some()
+                            jt.has_pk_val(join_key)
                         });
                     } else if let Some(j_col_idx) = j_col_idx_opt {
                         let mut jt_keys = std::collections::HashSet::with_capacity(jt.active_count);
@@ -3670,12 +3824,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 matched_indices.sort_by(|&a, &b| {
                                     let get_val = |row_idx: usize| -> Option<&Value> {
                                         let key = table.rows[row_idx].get(p_col_idx)?;
-                                        if let Some(pk) = key.as_i64() {
-                                            let j_row = jt.get_by_pk(pk)?;
-                                            j_row.get(j_col_idx)
-                                        } else {
-                                            None
-                                        }
+                                        let j_row = jt.get_by_pk_val(key)?;
+                                        j_row.get(j_col_idx)
                                     };
                                     let va = get_val(a).unwrap_or(&Value::Null);
                                     let vb = get_val(b).unwrap_or(&Value::Null);
@@ -3787,7 +3937,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             None
                         } else if let Some(j_col_idx) = jt.get_column_index(jc.joined_join_col) {
                             if jt.pk_col_idx == Some(j_col_idx) {
-                                join_key.as_i64().and_then(|pk| jt.get_by_pk(pk))
+                                jt.get_by_pk_val(join_key)
                             } else if let Some(ref map) = jt_hash_map {
                                 map.get(&value_to_join_key(join_key)).map(|&r_idx| &jt.rows[r_idx])
                             } else {
@@ -3809,9 +3959,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         if v.is_null() {
                             serde_json::Value::Null
                         } else {
-                            let raw = get_raw_bytes(v);
-                            let json_arr: Vec<serde_json::Value> = raw.into_iter().map(|b| serde_json::json!(b)).collect();
-                            serde_json::Value::Array(json_arr)
+                            bytea_to_json(v)
                         }
                     } else {
                         value_to_json(v)
@@ -3932,15 +4080,27 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         };
 
         let fields: Vec<FieldInfo> = if !projected_exprs.is_empty() {
+            let mut tables_for_types: Vec<(&crate::storage::table::Table, Option<&str>)> = vec![(table, clauses.table_alias)];
+            if let Some(jt) = joined_table_opt {
+                tables_for_types.push((jt, clauses.join_clause.as_ref().and_then(|j| j.joined_table_alias)));
+            }
+            let col_type = |c: &str| column_ref_type(c, &tables_for_types);
+            let expr_by_alias = projection_exprs_by_alias(select_clause);
+            let expr_type = |expr: &str| crate::pg_types::infer_expr_type(expr, &col_type).unwrap_or_else(|| "text".to_string());
+            let primary_type = |idx: &usize| table.columns.get(*idx).map(|c| c.data_type.field_type_str()).unwrap_or_else(|| "text".to_string());
+            let joined_type = |idx: &usize| joined_table_opt.and_then(|jt| jt.columns.get(*idx)).map(|c| c.data_type.field_type_str()).unwrap_or_else(|| "text".to_string());
             projected_exprs.iter().map(|e| {
                 let (alias, dt) = match e {
-                    ProjectedExpr::PrimaryCol { alias, .. } => (alias.clone(), "text".to_string()),
-                    ProjectedExpr::JoinedCol { alias, .. } => (alias.clone(), "text".to_string()),
-                    ProjectedExpr::CoalescePrimaryCol { alias, .. } => (alias.clone(), "text".to_string()),
-                    ProjectedExpr::CoalesceJoinedCol { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::PrimaryCol { alias, col_idx } => (alias.clone(), primary_type(col_idx)),
+                    ProjectedExpr::JoinedCol { alias, col_idx } => (alias.clone(), joined_type(col_idx)),
+                    ProjectedExpr::CoalescePrimaryCol { alias, col_idx, .. } => (alias.clone(), primary_type(col_idx)),
+                    ProjectedExpr::CoalesceJoinedCol { alias, col_idx, .. } => (alias.clone(), joined_type(col_idx)),
                     ProjectedExpr::CorrelatedCount { alias, .. } => (alias.clone(), "bigint".to_string()),
-                    ProjectedExpr::Expr { alias, .. } => (alias.clone(), "text".to_string()),
-                    ProjectedExpr::Compiled { alias, .. } => (alias.clone(), "text".to_string()),
+                    ProjectedExpr::Expr { alias, expr_str } => (alias.clone(), expr_type(expr_str)),
+                    ProjectedExpr::Compiled { alias, .. } => (
+                        alias.clone(),
+                        expr_by_alias.get(alias).map(|e| expr_type(e)).unwrap_or_else(|| "text".to_string()),
+                    ),
                 };
                 FieldInfo {
                     name: alias,
@@ -4072,7 +4232,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     Ok(QueryResult {
                         rows: vec![],
                         row_count: 0,
-                        fields: vec![],
+                        fields: fields.clone(),
                         command: "SELECT".to_string(),
                     })
                 }
@@ -4272,7 +4432,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     let p_row = &table.rows[idx];
                     let j_row = if let (Some(ref j), Some(jt)) = (join, joined_table_opt) {
                         if j.is_pk_join {
-                            p_row.get(j.primary_join_col_idx).and_then(|v| v.as_i64()).and_then(|pk| jt.get_by_pk(pk))
+                            p_row.get(j.primary_join_col_idx).and_then(|val| jt.get_by_pk_val(val))
                         } else if let Some(ref map) = jt_hash_map {
                             p_row.get(j.primary_join_col_idx)
                                 .filter(|v| !v.is_null())
@@ -12038,8 +12198,98 @@ fn cmp_composite_tuples(left: &Value, right: &Value) -> std::cmp::Ordering {
     l_items.len().cmp(&r_items.len())
 }
 
+/// Kiểu (chuỗi FieldInfo) của tham chiếu cột `col` hoặc `alias.col` trong các bảng cho trước.
+fn column_ref_type(expr: &str, tables: &[(&crate::storage::table::Table, Option<&str>)]) -> Option<String> {
+    let e = expr.trim();
+    if e.is_empty() || e.contains(|c: char| c == '(' || c == ' ' || c == '\'' || c == ':' || c == '-' || c == '+' || c == '*' || c == '/') {
+        return None;
+    }
+    let (prefix, col) = match e.rsplit_once('.') {
+        Some((p, c)) => (Some(p.trim_matches('"')), c.trim_matches('"')),
+        None => (None, e.trim_matches('"')),
+    };
+    for (t, alias) in tables {
+        if let Some(p) = prefix {
+            let matches = p.eq_ignore_ascii_case(&t.name) || alias.map(|a| p.eq_ignore_ascii_case(a.trim_matches('"'))).unwrap_or(false);
+            if !matches {
+                continue;
+            }
+        }
+        if let Some(c) = t.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+            return Some(c.data_type.field_type_str());
+        }
+    }
+    None
+}
+
+/// alias → biểu thức gốc, theo cùng quy tắc đặt alias với `parse_projection`.
+fn projection_exprs_by_alias(select_clause: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for item in split_projection_items(select_clause) {
+        let upper = item.to_uppercase();
+        let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+            (item[..as_idx].trim(), item[as_idx + 4..].trim().trim_matches('"').to_string())
+        } else {
+            (item.trim(), clean_col_name(item.trim()).to_string())
+        };
+        let mut e = expr_part;
+        while e.starts_with('(') && e.ends_with(')') && is_fully_enclosed_in_parens(e) {
+            e = e[1..e.len() - 1].trim();
+        }
+        out.entry(alias).or_insert_with(|| e.to_string());
+    }
+    out
+}
+
+/// Kiểu của một giá trị đã tính xong, dùng khi không suy được từ biểu thức.
+fn type_str_from_json_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(n) if n.as_i64().map_or(false, |i| i32::try_from(i).is_ok()) => "integer",
+        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "bigint",
+        serde_json::Value::Number(_) => "numeric",
+        serde_json::Value::Object(_) => "jsonb",
+        _ => "text",
+    }
+    .to_string()
+}
+
+thread_local! {
+    /// Bật khi trả kết quả cho giao thức Postgres (`PGlite::query_wire`): chuỗi được giữ
+    /// nguyên văn thay vì tự đoán thành mảng/JSON, bytea giữ dạng `\x…`.
+    static RAW_TEXT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Bật/tắt chế độ raw text cho luồng hiện tại, trả về giá trị cũ để khôi phục.
+pub(crate) fn set_raw_text_mode(on: bool) -> bool {
+    RAW_TEXT_MODE.with(|m| m.replace(on))
+}
+
+#[inline(always)]
+fn raw_text_mode() -> bool {
+    RAW_TEXT_MODE.with(|m| m.get())
+}
+
+fn bytea_to_json(v: &Value) -> serde_json::Value {
+    let raw = get_raw_bytes(v);
+    if raw_text_mode() {
+        let mut s = String::with_capacity(2 + raw.len() * 2);
+        s.push_str("\\x");
+        for b in raw {
+            s.push_str(&format!("{:02x}", b));
+        }
+        return serde_json::Value::String(s);
+    }
+    serde_json::Value::Array(raw.into_iter().map(|b| serde_json::json!(b)).collect())
+}
+
 #[inline(always)]
 fn value_to_json(val: &Value) -> serde_json::Value {
+    if let Value::Text(s) = val {
+        if raw_text_mode() {
+            return serde_json::Value::String(s.to_string());
+        }
+    }
     match val {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -12083,9 +12333,7 @@ fn row_to_json(table: &crate::storage::table::Table, row: &[Value]) -> serde_jso
             if v.is_null() {
                 map.insert(col.name.clone(), serde_json::Value::Null);
             } else {
-                let raw = get_raw_bytes(v);
-                let json_arr: Vec<serde_json::Value> = raw.into_iter().map(|b| serde_json::json!(b)).collect();
-                map.insert(col.name.clone(), serde_json::Value::Array(json_arr));
+                map.insert(col.name.clone(), bytea_to_json(v));
             }
             continue;
         } else if col.data_type == crate::types::DataType::Date {
@@ -14965,3 +15213,138 @@ pub(crate) fn eval_sql_expr(
 
 
 
+
+// ---------------------------------------------------------------------------
+// Kết quả theo giao thức Postgres (dùng cho pg-gateway). Không đụng tới WAL.
+// ---------------------------------------------------------------------------
+
+/// Tắt chế độ raw text khi ra khỏi phạm vi, kể cả khi execute trả lỗi.
+struct RawTextGuard(bool);
+
+impl Drop for RawTextGuard {
+    fn drop(&mut self) {
+        set_raw_text_mode(self.0);
+    }
+}
+
+impl Executor {
+    /// Thực thi và trả kết quả dạng giao thức Postgres: cột đúng thứ tự, OID, giá trị text chuẩn.
+    pub fn execute_wire(&mut self, sql: &str, params: &[Value]) -> Result<crate::pg_types::WireResult, String> {
+        let res = {
+            let _guard = RawTextGuard(set_raw_text_mode(true));
+            self.execute(sql, params)?
+        };
+        Ok(query_result_to_wire(&res))
+    }
+
+    /// Trả về các cột kết quả và số tham số `$n` mà không ghi dữ liệu.
+    /// SELECT/WITH được chạy với tham số NULL (chỉ đọc); INSERT/UPDATE/DELETE … RETURNING
+    /// lấy cột từ định nghĩa bảng, không thực thi.
+    pub fn describe(&mut self, sql: &str) -> Result<crate::pg_types::DescribeResult, String> {
+        let clean = strip_sql_comments(sql);
+        let normalized = normalize_named_sql_params(&clean);
+        let trimmed = normalized.trim().trim_end_matches(';').trim();
+        let param_count = crate::pg_types::count_params(trimmed);
+        let upper = trimmed.to_uppercase();
+        let first_word = upper.split_whitespace().next().unwrap_or("");
+
+        let fields = match first_word {
+            "SELECT" | "VALUES" | "TABLE" | "SHOW" => {
+                let null_params = vec![Value::Null; param_count];
+                self.execute_wire(trimmed, &null_params)?.fields
+            }
+            "WITH" => {
+                // CTE có thể chứa lệnh ghi; chỉ chạy thử khi không có lệnh ghi nào.
+                let has_write = ["INSERT ", "UPDATE ", "DELETE ", "MERGE "].iter().any(|k| upper.contains(k));
+                if has_write {
+                    vec![]
+                } else {
+                    let null_params = vec![Value::Null; param_count];
+                    self.execute_wire(trimmed, &null_params)?.fields
+                }
+            }
+            "INSERT" | "UPDATE" | "DELETE" => {
+                let (_, returning) = extract_returning_clause(trimmed);
+                match (returning, dml_target_table(trimmed)) {
+                    (Some(r_cols), Some(tbl)) => match self.storage.get_table(&tbl) {
+                        Some(table) => fields_to_wire(&get_returning_fields(table, r_cols)),
+                        None => return Err(format!("relation \"{}\" does not exist", tbl)),
+                    },
+                    _ => vec![],
+                }
+            }
+            _ => vec![],
+        };
+        Ok(crate::pg_types::DescribeResult { fields, param_count })
+    }
+}
+
+fn fields_to_wire(fields: &[FieldInfo]) -> Vec<crate::pg_types::WireField> {
+    fields
+        .iter()
+        .map(|f| crate::pg_types::WireField {
+            name: f.name.clone(),
+            type_oid: crate::pg_types::oid_for_type_str(&f.data_type),
+        })
+        .collect()
+}
+
+/// Tên bảng đích của INSERT INTO t / UPDATE t / DELETE FROM t.
+fn dml_target_table(sql: &str) -> Option<String> {
+    let mut words = sql.split_whitespace();
+    let first = words.next()?.to_uppercase();
+    let name = match first.as_str() {
+        "INSERT" | "DELETE" => {
+            let kw = words.next()?.to_uppercase();
+            if kw != "INTO" && kw != "FROM" {
+                return None;
+            }
+            words.next()?
+        }
+        "UPDATE" => {
+            let w = words.next()?;
+            if w.eq_ignore_ascii_case("ONLY") { words.next()? } else { w }
+        }
+        _ => return None,
+    };
+    let name = name.split('(').next().unwrap_or(name);
+    let name = name.rsplit('.').next().unwrap_or(name);
+    Some(name.trim_matches('"').to_string())
+}
+
+/// QueryResult (rows dạng object) → WireResult (rows dạng mảng theo thứ tự fields).
+pub(crate) fn query_result_to_wire(res: &QueryResult) -> crate::pg_types::WireResult {
+    let mut fields = fields_to_wire(&res.fields);
+    // Một số nhánh (catalog giả lập, nhánh gom nhóm) có thể trả key không có trong fields:
+    // bổ sung theo thứ tự xuất hiện trong dòng đầu tiên để không mất cột.
+    if let Some(serde_json::Value::Object(first)) = res.rows.first() {
+        for (k, v) in first {
+            if !fields.iter().any(|f| &f.name == k) {
+                fields.push(crate::pg_types::WireField {
+                    name: k.clone(),
+                    type_oid: crate::pg_types::oid_for_type_str(&type_str_from_json_value(v)),
+                });
+            }
+        }
+    }
+    let rows = res
+        .rows
+        .iter()
+        .map(|row| {
+            fields
+                .iter()
+                .map(|f| match row {
+                    serde_json::Value::Object(map) => map.get(&f.name).and_then(|v| crate::pg_types::to_pg_text(v, f.type_oid)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let row_count = res.row_count;
+    crate::pg_types::WireResult {
+        fields,
+        rows,
+        command: crate::pg_types::command_tag(&res.command, row_count),
+        row_count,
+    }
+}

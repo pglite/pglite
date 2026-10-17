@@ -172,19 +172,29 @@ impl WalManager {
                     if mmap.len() >= 4 && (&mmap[0..4] == WAL_MAGIC || &mmap[0..4] == WAL_MAGIC_V1) {
                         // High-Speed Binary Zero-Copy Stream Deserialization
                         let mut cursor = 4;
+                        let mut skipped = 0usize;
                         while cursor + 4 <= mmap.len() {
                             let len = u32::from_le_bytes(
                                 mmap[cursor..cursor + 4].try_into().unwrap_or([0; 4])
                             ) as usize;
                             cursor += 4;
                             if cursor + len <= mmap.len() {
-                                if let Ok(record) = bincode::deserialize::<WalRecord>(&mmap[cursor..cursor + len]) {
-                                    recovered_records.push(record);
+                                match bincode::deserialize::<WalRecord>(&mmap[cursor..cursor + len]) {
+                                    Ok(record) => recovered_records.push(record),
+                                    Err(_) => skipped += 1,
                                 }
                                 cursor += len;
                             } else {
                                 break;
                             }
+                        }
+                        if skipped > 0 {
+                            // Vẫn mở DB như trước, nhưng không còn bỏ qua trong im lặng.
+                            eprintln!(
+                                "[pglite-rs] WARNING: {} WAL record(s) in {} could not be decoded and were skipped",
+                                skipped,
+                                wal_path.display()
+                            );
                         }
                     } else if !mmap.is_empty() && mmap[0] == b'{' {
                         // Legacy JSON format fallback

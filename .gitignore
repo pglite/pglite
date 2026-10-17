@@ -40,3 +40,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 /crates/pglite-rs/target
 target/
 .hapico/
+
+# WAL fixture do code cũ tạo, dùng cho test tương thích định dạng file
+!crates/pglite-rs/tests/fixtures/*.rwal

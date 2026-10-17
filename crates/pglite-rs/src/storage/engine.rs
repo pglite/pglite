@@ -209,8 +209,8 @@ impl StorageEngine {
                             t.is_deleted.pop();
                             t.active_count = t.active_count.saturating_sub(1);
                             if let Some(pk_idx) = t.pk_col_idx {
-                                if let Some(pk_val) = last_row.get(pk_idx).and_then(|v| v.as_i64()) {
-                                    t.pk_index.remove(&pk_val);
+                                if let Some(pk_val) = last_row.get(pk_idx) {
+                                    t.remove_pk_from_index(pk_val);
                                 }
                             }
                         }
@@ -223,8 +223,8 @@ impl StorageEngine {
                         t.is_deleted.pop();
                         t.active_count = t.active_count.saturating_sub(1);
                         if let Some(pk_idx) = t.pk_col_idx {
-                            if let Some(pk_val) = last_row.get(pk_idx).and_then(|v| v.as_i64()) {
-                                t.pk_index.remove(&pk_val);
+                            if let Some(pk_val) = last_row.get(pk_idx) {
+                                t.remove_pk_from_index(pk_val);
                             }
                         }
                     }
@@ -234,12 +234,9 @@ impl StorageEngine {
                 if let Some(t) = self.get_table_mut(&table) {
                     if row_idx < t.rows.len() && col_idx < t.rows[row_idx].len() {
                         if Some(col_idx) == t.pk_col_idx {
-                            if let Some(old_pk) = old_val.as_i64() {
-                                if let Some(cur_pk) = t.rows[row_idx][col_idx].as_i64() {
-                                    t.pk_index.remove(&cur_pk);
-                                }
-                                t.pk_index.insert(old_pk, row_idx);
-                            }
+                            let cur_val = t.rows[row_idx][col_idx].clone();
+                            t.remove_pk_from_index(&cur_val);
+                            t.add_pk_to_index(&old_val, row_idx);
                         }
                         t.rows[row_idx][col_idx] = old_val;
                     }
@@ -251,8 +248,8 @@ impl StorageEngine {
                         t.is_deleted[row_idx] = false;
                         t.active_count += 1;
                         if let Some(pk_idx) = t.pk_col_idx {
-                            if let Some(pk) = t.rows[row_idx].get(pk_idx).and_then(|v| v.as_i64()) {
-                                t.pk_index.insert(pk, row_idx);
+                            if let Some(pk) = t.rows[row_idx].get(pk_idx).cloned() {
+                                t.add_pk_to_index(&pk, row_idx);
                             }
                         }
                     }

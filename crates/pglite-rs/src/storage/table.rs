@@ -1,6 +1,7 @@
 use crate::storage::page::SlottedPage;
-use crate::types::{ColumnDef, Value};
-use std::collections::BTreeMap;
+use crate::types::{ColumnDef, JoinKey, Value, value_to_join_key};
+use compact_str::CompactString;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -11,6 +12,8 @@ pub struct Table {
     pub auto_increment: i64,
     pub rows: Vec<Vec<Value>>,
     pub pk_index: BTreeMap<i64, usize>,
+    pub pk_index_str: BTreeMap<CompactString, usize>,
+    pub col_indexes: HashMap<usize, HashMap<JoinKey, Vec<usize>>>,
     pub is_deleted: Vec<bool>,
     pub active_count: usize,
     pub pages: Vec<SlottedPage>,
@@ -44,6 +47,14 @@ impl Table {
             columns[idx].is_primary_key = true;
         }
 
+        let mut col_indexes = HashMap::new();
+        for (i, c) in columns.iter().enumerate() {
+            let col_name_lower = c.name.to_lowercase();
+            if col_name_lower.ends_with("_id") || (col_name_lower.ends_with("id") && col_name_lower.len() > 2) {
+                col_indexes.insert(i, HashMap::new());
+            }
+        }
+
         Self {
             name,
             comment: None,
@@ -52,6 +63,8 @@ impl Table {
             auto_increment: 1,
             rows: Vec::new(),
             pk_index: BTreeMap::new(),
+            pk_index_str: BTreeMap::new(),
+            col_indexes,
             is_deleted: Vec::new(),
             active_count: 0,
             pages: Vec::new(),
@@ -127,6 +140,23 @@ impl Table {
                 if let Some(pk_val) = val.as_i64() {
                     self.pk_index.insert(pk_val, row_idx);
                 }
+                match val {
+                    Value::Text(s) => {
+                        self.pk_index_str.insert(s.clone(), row_idx);
+                        if s.len() == 36 {
+                            self.pk_index_str.insert(CompactString::new(s.to_lowercase()), row_idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (&col_idx, map) in &mut self.col_indexes {
+            if let Some(val) = row.get(col_idx) {
+                if !val.is_null() {
+                    map.entry(value_to_join_key(val)).or_default().push(row_idx);
+                }
             }
         }
 
@@ -146,6 +176,22 @@ impl Table {
         }
     }
 
+    pub fn add_secondary_index(&mut self, col_idx: usize) {
+        if col_idx < self.columns.len() {
+            let mut map: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+            for (r_idx, r) in self.rows.iter().enumerate() {
+                if !self.is_deleted[r_idx] {
+                    if let Some(v) = r.get(col_idx) {
+                        if !v.is_null() {
+                            map.entry(value_to_join_key(v)).or_default().push(r_idx);
+                        }
+                    }
+                }
+            }
+            self.col_indexes.insert(col_idx, map);
+        }
+    }
+
     pub fn get_by_pk(&self, pk: i64) -> Option<&Vec<Value>> {
         if let Some(&row_idx) = self.pk_index.get(&pk) {
             if !self.is_deleted[row_idx] {
@@ -155,9 +201,132 @@ impl Table {
         None
     }
 
+    pub fn get_row_idx_by_pk_key(&self, key: &JoinKey) -> Option<usize> {
+        match key {
+            JoinKey::Int(pk_val) => {
+                if let Some(&row_idx) = self.pk_index.get(pk_val) {
+                    if !self.is_deleted[row_idx] {
+                        return Some(row_idx);
+                    }
+                }
+                let s = CompactString::new(pk_val.to_string());
+                if let Some(&row_idx) = self.pk_index_str.get(&s) {
+                    if !self.is_deleted[row_idx] {
+                        return Some(row_idx);
+                    }
+                }
+                None
+            }
+            JoinKey::Text(s) => {
+                if let Some(&row_idx) = self.pk_index_str.get(s) {
+                    if !self.is_deleted[row_idx] {
+                        return Some(row_idx);
+                    }
+                }
+                if s.len() == 36 {
+                    let lower = CompactString::new(s.to_lowercase());
+                    if let Some(&row_idx) = self.pk_index_str.get(&lower) {
+                        if !self.is_deleted[row_idx] {
+                            return Some(row_idx);
+                        }
+                    }
+                }
+                if let Ok(num) = s.parse::<i64>() {
+                    if let Some(&row_idx) = self.pk_index.get(&num) {
+                        if !self.is_deleted[row_idx] {
+                            return Some(row_idx);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_row_idx_by_pk_str(&self, pk: &str) -> Option<usize> {
+        let key = CompactString::new(pk);
+        if let Some(&row_idx) = self.pk_index_str.get(&key) {
+            if !self.is_deleted[row_idx] {
+                return Some(row_idx);
+            }
+        }
+        if pk.len() == 36 {
+            let lower = CompactString::new(pk.to_lowercase());
+            if let Some(&row_idx) = self.pk_index_str.get(&lower) {
+                if !self.is_deleted[row_idx] {
+                    return Some(row_idx);
+                }
+            }
+        }
+        if let Ok(num) = pk.parse::<i64>() {
+            if let Some(&row_idx) = self.pk_index.get(&num) {
+                if !self.is_deleted[row_idx] {
+                    return Some(row_idx);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_by_pk_str(&self, pk: &str) -> Option<&Vec<Value>> {
+        self.get_row_idx_by_pk_str(pk).map(|idx| &self.rows[idx])
+    }
+
+    pub fn get_by_pk_val(&self, val: &Value) -> Option<&Vec<Value>> {
+        match val {
+            Value::Int(i) => self.get_by_pk(*i),
+            Value::Text(s) => self.get_by_pk_str(s),
+            _ => None,
+        }
+    }
+
+    pub fn has_pk_val(&self, val: &Value) -> bool {
+        match val {
+            Value::Int(i) => {
+                if let Some(&row_idx) = self.pk_index.get(i) {
+                    !self.is_deleted[row_idx]
+                } else {
+                    false
+                }
+            }
+            Value::Text(s) => self.get_row_idx_by_pk_str(s).is_some(),
+            _ => false,
+        }
+    }
+
+    pub fn remove_pk_from_index(&mut self, val: &Value) {
+        if let Some(i) = val.as_i64() {
+            self.pk_index.remove(&i);
+        }
+        if let Value::Text(s) = val {
+            self.pk_index_str.remove(s);
+            if s.len() == 36 {
+                self.pk_index_str.remove(&CompactString::new(s.to_lowercase()));
+            }
+        }
+    }
+
+    pub fn add_pk_to_index(&mut self, val: &Value, row_idx: usize) {
+        if let Some(i) = val.as_i64() {
+            self.pk_index.insert(i, row_idx);
+        }
+        if let Value::Text(s) = val {
+            self.pk_index_str.insert(s.clone(), row_idx);
+            if s.len() == 36 {
+                self.pk_index_str.insert(CompactString::new(s.to_lowercase()), row_idx);
+            }
+        }
+    }
+
     pub fn update_by_pk(&mut self, pk: i64, col_idx: usize, val: Value) -> bool {
         if let Some(&row_idx) = self.pk_index.get(&pk) {
             if !self.is_deleted[row_idx] && col_idx < self.rows[row_idx].len() {
+                if Some(col_idx) == self.pk_col_idx {
+                    let old_val = self.rows[row_idx][col_idx].clone();
+                    self.remove_pk_from_index(&old_val);
+                    self.add_pk_to_index(&val, row_idx);
+                }
                 self.rows[row_idx][col_idx] = val;
                 return true;
             }
@@ -169,6 +338,11 @@ impl Table {
         if row_idx < self.rows.len() && !self.is_deleted[row_idx] {
             for (col_idx, val) in updates {
                 if *col_idx < self.rows[row_idx].len() {
+                    if Some(*col_idx) == self.pk_col_idx {
+                        let old_val = self.rows[row_idx][*col_idx].clone();
+                        self.remove_pk_from_index(&old_val);
+                        self.add_pk_to_index(val, row_idx);
+                    }
                     self.rows[row_idx][*col_idx] = val.clone();
                 }
             }
@@ -179,6 +353,11 @@ impl Table {
         if row_idx < self.rows.len() && !self.is_deleted[row_idx] {
             self.is_deleted[row_idx] = true;
             self.active_count = self.active_count.saturating_sub(1);
+            if let Some(pk_idx) = self.pk_col_idx {
+                if let Some(val) = self.rows[row_idx].get(pk_idx).cloned() {
+                    self.remove_pk_from_index(&val);
+                }
+            }
             return true;
         }
         false
@@ -186,11 +365,14 @@ impl Table {
 
     pub fn delete_by_pk(&mut self, pk: i64) -> bool {
         if let Some(&row_idx) = self.pk_index.get(&pk) {
-            if !self.is_deleted[row_idx] {
-                self.is_deleted[row_idx] = true;
-                self.active_count = self.active_count.saturating_sub(1);
-                return true;
-            }
+            return self.delete_row(row_idx);
+        }
+        false
+    }
+
+    pub fn delete_by_pk_str(&mut self, pk: &str) -> bool {
+        if let Some(row_idx) = self.get_row_idx_by_pk_str(pk) {
+            return self.delete_row(row_idx);
         }
         false
     }

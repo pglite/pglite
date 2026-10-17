@@ -283,3 +283,51 @@ fn test_kysely_schedule_time_slots_in_operator() {
     let res = db.query(sql, &params![100, 101]).unwrap();
     assert_eq!(res.row_count, 3);
 }
+
+#[test]
+fn test_uuid_pk_index_and_secondary_index() {
+    let mut db = PGlite::in_memory().expect("failed to init db");
+
+    db.exec(
+        "CREATE TABLE accounts (id UUID PRIMARY KEY, username TEXT, tenant_id INT);",
+        &[],
+    )
+    .unwrap();
+
+    let u1 = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    let u2 = "b1ffcd88-8b0a-3ef7-aa5c-5aa8ac270b22";
+
+    db.exec(
+        "INSERT INTO accounts (id, username, tenant_id) VALUES ($1, $2, $3);",
+        &params![u1, "user_one", 10],
+    )
+    .unwrap();
+    db.exec(
+        "INSERT INTO accounts (id, username, tenant_id) VALUES ($1, $2, $3);",
+        &params![u2, "user_two", 20],
+    )
+    .unwrap();
+
+    // 1. Point lookup by UUID PK with parameter
+    let res = db.query("SELECT * FROM accounts WHERE id = $1;", &params![u1]).unwrap();
+    assert_eq!(res.row_count, 1);
+    assert_eq!(res.rows[0]["username"], "user_one");
+
+    // 2. Point lookup by UUID PK with string literal
+    let res_lit = db.query(&format!("SELECT * FROM accounts WHERE id = '{}';", u2), &[]).unwrap();
+    assert_eq!(res_lit.row_count, 1);
+    assert_eq!(res_lit.rows[0]["username"], "user_two");
+
+    // 3. IN query with UUID PKs
+    let res_in = db.query(&format!("SELECT * FROM accounts WHERE id IN ('{}', '{}');", u1, u2), &[]).unwrap();
+    assert_eq!(res_in.row_count, 2);
+
+    // 4. Secondary index creation
+    db.exec("CREATE INDEX idx_accounts_username ON accounts(username);", &[]).unwrap();
+
+    // Query on indexed column
+    let res_sec = db.query("SELECT * FROM accounts WHERE username = $1;", &params!["user_one"]).unwrap();
+    assert_eq!(res_sec.row_count, 1);
+    assert_eq!(res_sec.rows[0]["tenant_id"], 10);
+}
+

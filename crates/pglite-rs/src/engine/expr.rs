@@ -849,6 +849,56 @@ impl CompiledExpr {
         }
     }
 
+    pub fn find_pk_key_eq(&self, pk_col_idx: usize, params: &[Value]) -> Option<JoinKey> {
+        match self {
+            CompiledExpr::Eq(lhs, rhs) => {
+                match (&**lhs, &**rhs) {
+                    (CompiledExpr::Col(idx), val_expr) if *idx == pk_col_idx => {
+                        val_expr.eval_const(params).map(|v| value_to_join_key(&v))
+                    }
+                    (val_expr, CompiledExpr::Col(idx)) if *idx == pk_col_idx => {
+                        val_expr.eval_const(params).map(|v| value_to_join_key(&v))
+                    }
+                    _ => None,
+                }
+            }
+            CompiledExpr::And(branches) => {
+                for b in branches {
+                    if let Some(target) = b.find_pk_key_eq(pk_col_idx, params) {
+                        return Some(target);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn find_col_eq(&self, params: &[Value]) -> Option<(usize, JoinKey)> {
+        match self {
+            CompiledExpr::Eq(lhs, rhs) => {
+                match (&**lhs, &**rhs) {
+                    (CompiledExpr::Col(idx), val_expr) => {
+                        val_expr.eval_const(params).map(|v| (*idx, value_to_join_key(&v)))
+                    }
+                    (val_expr, CompiledExpr::Col(idx)) => {
+                        val_expr.eval_const(params).map(|v| (*idx, value_to_join_key(&v)))
+                    }
+                    _ => None,
+                }
+            }
+            CompiledExpr::And(branches) => {
+                for b in branches {
+                    if let Some(target) = b.find_col_eq(params) {
+                        return Some(target);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     pub fn find_pk_in(&self, pk_col_idx: usize) -> Option<&HashSet<JoinKey>> {
         match self {
             CompiledExpr::InSet { expr, set, negated: false, .. } => {

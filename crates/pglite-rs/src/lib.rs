@@ -39,6 +39,7 @@ pub mod binding;
 #[cfg(feature = "wasm-binding")]
 pub mod wasm_binding;
 pub mod engine;
+pub mod pg_types;
 pub mod storage;
 pub mod types;
 
@@ -48,6 +49,7 @@ pub use binding::LitePostgresNative;
 pub use wasm_binding::PGliteWasm;
 pub use engine::Executor;
 pub use storage::StorageEngine;
+pub use pg_types::{DescribeResult, WireField, WireResult};
 pub use types::{ColumnDef, DataType, FieldInfo, QueryResult, Value};
 
 /// High-level embedded PostgreSQL database client for native Rust applications.
@@ -169,6 +171,34 @@ impl PGlite {
         } else {
             Ok(Some(list.remove(0)))
         }
+    }
+
+    /// Execute and return the result in PostgreSQL wire form, for protocol gateways:
+    /// columns in SELECT order with type OIDs, rows as arrays of PostgreSQL text values
+    /// (`None` = NULL) and a CommandComplete tag such as `INSERT 0 1`.
+    ///
+    /// Unlike [`PGlite::query`], text values are returned verbatim (no guessing of
+    /// arrays/JSON) and bytea as `\x…`. Storage format is not affected.
+    ///
+    /// # Example
+    /// ```rust
+    /// use pglite_rs::PGlite;
+    /// let mut db = PGlite::in_memory().unwrap();
+    /// db.exec("CREATE TABLE t (id INT, ok BOOLEAN);", &[]).unwrap();
+    /// db.exec("INSERT INTO t VALUES (1, true);", &[]).unwrap();
+    /// let res = db.query_wire("SELECT ok, id FROM t;", &[]).unwrap();
+    /// assert_eq!(res.fields[0].name, "ok");
+    /// assert_eq!(res.fields[0].type_oid, 16);
+    /// assert_eq!(res.rows[0], vec![Some("t".to_string()), Some("1".to_string())]);
+    /// assert_eq!(res.command, "SELECT 1");
+    /// ```
+    pub fn query_wire(&mut self, sql: &str, params: &[Value]) -> Result<WireResult, String> {
+        self.executor.execute_wire(sql, params)
+    }
+
+    /// Describe a statement's result columns and `$n` parameter count without writing data.
+    pub fn describe(&mut self, sql: &str) -> Result<DescribeResult, String> {
+        self.executor.describe(sql)
     }
 
     /// Flush all memory-buffered WAL and table pages to disk.

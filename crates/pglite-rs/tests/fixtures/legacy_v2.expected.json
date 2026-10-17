@@ -1,0 +1,61 @@
+{
+  "schedules": [
+    {
+      "big": 9000000000,
+      "id": 1,
+      "school_id": 1,
+      "slot": "08:00:00",
+      "start_at": "2026-10-12 08:00:00",
+      "title": "Math"
+    },
+    {
+      "big": 1,
+      "id": 2,
+      "school_id": 2,
+      "slot": "09:30:00",
+      "start_at": "2026-10-13 09:30:00",
+      "title": "Art"
+    }
+  ],
+  "schools": [
+    {
+      "active": true,
+      "class_ids": [
+        7831,
+        7832
+      ],
+      "code": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+      "created_at": "2026-10-12 08:00:00",
+      "id": 1,
+      "logo": [
+        1,
+        2
+      ],
+      "meta": {
+        "a": 1
+      },
+      "name": "Alpha",
+      "opened": "2026-01-02",
+      "phone": "0909",
+      "rating": 4.5,
+      "tags": [
+        "x",
+        "y"
+      ]
+    },
+    {
+      "active": false,
+      "class_ids": null,
+      "code": null,
+      "created_at": null,
+      "id": 2,
+      "logo": null,
+      "meta": null,
+      "name": "Beta",
+      "opened": null,
+      "phone": null,
+      "rating": 3,
+      "tags": null
+    }
+  ]
+}
