@@ -1,3 +1,4 @@
+pub mod constraints;
 pub mod expr;
 pub mod executor;
 pub mod plan;

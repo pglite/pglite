@@ -90,6 +90,13 @@ pub enum WalRecord {
     /// COMMIT/ROLLBACK ở cuối file (crash giữa giao dịch) thì bị hoàn tác khi replay. Giao dịch
     /// chỉ có `Begin` (file cũ) vẫn được giữ như trước. Binary cũ bỏ qua bản ghi này và vẫn thấy `Begin`.
     TxBegin,
+    /// Thay đổi catalog (ràng buộc, index, ALTER COLUMN, đổi tên): `payload` = bincode của
+    /// `catalog::SchemaOp`. Để dạng byte thô để bản này luôn giải mã được khung, kể cả khi bản sau
+    /// thêm loại op mới (op lạ chỉ bị bỏ qua). Binary cũ bỏ qua cả khung.
+    Schema {
+        version: u8,
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Serialize)]
@@ -166,8 +173,28 @@ pub enum WalRecordRef<'a> {
         row: &'a [Value],
     },
     TxBegin,
+    Schema {
+        version: u8,
+        payload: &'a [u8],
+    },
 }
 
+
+impl WalRecord {
+    /// Bản ghi đổi schema (không phải dữ liệu hay điều khiển giao dịch).
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            WalRecord::CreateTable { .. }
+                | WalRecord::DropTable { .. }
+                | WalRecord::CommentOnTable { .. }
+                | WalRecord::CommentOnColumn { .. }
+                | WalRecord::AlterTableAddColumn { .. }
+                | WalRecord::AlterTableDropColumn { .. }
+                | WalRecord::Schema { .. }
+        )
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -177,7 +204,7 @@ const BATCH_FLUSH_SIZE: usize = 64 * 1024; // 64 KB in-memory buffer
 const MAX_FLUSH_INTERVAL_MS: u128 = 20;   // 20 ms batch interval
 
 /// Số biến thể `WalRecord` mà bản này biết (chỉ số bincode 0..KNOWN_VARIANTS).
-pub const KNOWN_VARIANTS: u32 = 21;
+pub const KNOWN_VARIANTS: u32 = 22;
 /// Khoảng rác tối đa được quét để tìm lại ranh giới khung sau một chỗ hỏng.
 const RESYNC_WINDOW: usize = 64 * 1024 * 1024;
 
@@ -398,6 +425,11 @@ pub struct WalManager {
     unsynced: bool,
     /// Tăng mỗi khi có bản ghi được thêm; executor dùng để biết lệnh có ghi gì không.
     pub appended: u64,
+    /// Tăng mỗi khi có bản ghi DDL (đổi schema) được thêm. Lệnh lỗi đã ghi DDL thì không bị cắt
+    /// khỏi WAL, vì DDL không hoàn tác được trong bộ nhớ.
+    pub ddl_appended: u64,
+    /// Độ dài file tại điểm commit gần nhất: không bao giờ cắt WAL ngắn hơn mốc này.
+    committed_len: u64,
     #[cfg(not(target_arch = "wasm32"))]
     pub last_flush: Instant,
 }
@@ -413,6 +445,8 @@ impl WalManager {
             durable_len,
             unsynced: false,
             appended: 0,
+            ddl_appended: 0,
+            committed_len: durable_len,
             #[cfg(not(target_arch = "wasm32"))]
             last_flush: Instant::now(),
         }
@@ -576,6 +610,9 @@ impl WalManager {
 
     pub fn append(&mut self, record: WalRecord) {
         self.appended += 1;
+        if record.is_ddl() {
+            self.ddl_appended += 1;
+        }
         if self.writer.is_some() {
             if let Ok(bytes) = bincode::serialize(&record) {
                 self.push_frame(&bytes);
@@ -653,7 +690,35 @@ impl WalManager {
             }
             self.unsynced = false;
         }
+        self.committed_len = self.durable_len;
         Ok(())
+    }
+
+    /// Vị trí cuối WAL (gồm cả phần còn trong buffer).
+    pub fn position(&self) -> u64 {
+        self.durable_len + self.pending_bytes.len() as u64
+    }
+
+    /// Bỏ mọi bản ghi từ `pos` trở đi (lệnh lỗi giữa chừng). Chỉ được khi `pos` nằm sau điểm commit
+    /// gần nhất, tức phần bị bỏ chưa từng được chốt. Trả về `false` (không làm gì) nếu không được.
+    pub fn truncate_to(&mut self, pos: u64) -> bool {
+        if self.poisoned.is_some() || pos < self.committed_len || pos > self.position() {
+            return false;
+        }
+        if pos >= self.durable_len {
+            self.pending_bytes.truncate((pos - self.durable_len) as usize);
+            return true;
+        }
+        self.pending_bytes.clear();
+        if let Some(writer) = &mut self.writer {
+            let res = writer.flush().and_then(|_| writer.get_ref().set_len(pos));
+            if let Err(e) = res {
+                self.poison(e.to_string());
+                return false;
+            }
+        }
+        self.durable_len = pos;
+        true
     }
 
     /// Còn dữ liệu chưa ghi hoặc chưa fsync.
@@ -676,6 +741,7 @@ impl WalManager {
                 let _ = f.sync_all();
             }
             self.durable_len = WAL_MAGIC.len() as u64;
+            self.committed_len = self.durable_len;
             self.writer = file.map(BufWriter::new);
         }
         self.unsynced = false;

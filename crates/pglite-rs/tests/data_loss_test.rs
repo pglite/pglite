@@ -156,7 +156,7 @@ fn future_record_variant_is_skipped_not_removed() {
 #[test]
 fn known_variant_count_matches_enum() {
     use pglite_rs::storage::wal::{WalRecord, KNOWN_VARIANTS};
-    let last = bincode::serialize(&WalRecord::TxBegin).unwrap();
+    let last = bincode::serialize(&WalRecord::Schema { version: 1, payload: vec![] }).unwrap();
     assert_eq!(u32::from_le_bytes(last[0..4].try_into().unwrap()), KNOWN_VARIANTS - 1);
 }
 

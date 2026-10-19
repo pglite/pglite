@@ -293,6 +293,11 @@ fn wal_ref_records_are_byte_identical_to_legacy_records() {
             bincode::serialize(&WalRecord::DeleteByRow { table: "t".into(), row: row.clone() }).unwrap(),
             bincode::serialize(&WalRecordRef::DeleteByRow { table: "t", row: &row }).unwrap(),
         ),
+        (bincode::serialize(&WalRecord::TxBegin).unwrap(), bincode::serialize(&WalRecordRef::TxBegin).unwrap()),
+        (
+            bincode::serialize(&WalRecord::Schema { version: 1, payload: vec![1, 2, 3] }).unwrap(),
+            bincode::serialize(&WalRecordRef::Schema { version: 1, payload: &[1, 2, 3] }).unwrap(),
+        ),
     ];
     // Chỉ số biến thể của các bản ghi cũ không được đổi (định dạng file).
     let tag = |b: &Vec<u8>| u32::from_le_bytes(b[0..4].try_into().unwrap());
@@ -300,6 +305,8 @@ fn wal_ref_records_are_byte_identical_to_legacy_records() {
     assert_eq!(tag(&pairs[5].0), 5, "Insert");
     assert_eq!(tag(&pairs[11].0), 11, "AlterTableDropColumn");
     assert_eq!(tag(&pairs[12].0), 12, "TxRollback phải nằm sau mọi biến thể cũ");
+    assert_eq!(tag(&pairs[20].0), 20, "TxBegin");
+    assert_eq!(tag(&pairs[21].0), 21, "Schema phải nằm sau TxBegin");
     for (i, (legacy, by_ref)) in pairs.iter().enumerate() {
         assert_eq!(legacy, by_ref, "biến thể #{i} khác byte");
     }

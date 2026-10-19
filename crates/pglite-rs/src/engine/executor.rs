@@ -53,7 +53,10 @@ impl Executor {
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let appended_before = self.storage.wal.appended;
+        // Lệnh lỗi giữa chừng (vi phạm ràng buộc ở dòng thứ n, cascade lỗi...) được hoàn tác hết.
+        let mark = self.storage.begin_statement();
         let res = self.execute_statement(sql, params);
+        self.storage.end_statement(mark, res.is_ok());
         // Lệnh ngoài giao dịch (autocommit) phải nằm trong file (và được fsync, nếu bật `sync`)
         // trước khi trả kết quả, nếu không tiến trình bị kill hay mất điện sẽ làm mất nó.
         // Trong giao dịch thì COMMIT/ROLLBACK tự làm điều đó.
@@ -361,7 +364,8 @@ impl Executor {
                 names_part = &rest[..pos.min(names_part.len())];
             }
         }
-        let table_names: Vec<String> = names_part
+        let cascade = upper.contains(" CASCADE");
+        let mut table_names: Vec<String> = names_part
             .split(',')
             .map(|n| n.trim().trim_start_matches("ONLY ").trim_start_matches("only ").trim().trim_matches('"').to_string())
             .filter(|n| !n.is_empty())
@@ -373,6 +377,35 @@ impl Executor {
             if self.storage.get_table(name).is_none() {
                 return Err(format!("Table {} not found", name));
             }
+        }
+        // Bảng bị khoá ngoại từ bảng khác trỏ tới: như PostgreSQL, phải có CASCADE (xoá luôn bảng con).
+        loop {
+            let listed: std::collections::HashSet<String> = table_names.iter().map(|n| n.to_lowercase()).collect();
+            let mut extra: Vec<String> = Vec::new();
+            for (key, t) in &self.storage.tables {
+                if listed.contains(key) {
+                    continue;
+                }
+                for c in &t.constraints {
+                    if let crate::storage::catalog::ConstraintKind::ForeignKey { ref_table, .. } = &c.kind {
+                        if listed.contains(&ref_table.to_lowercase()) {
+                            if !cascade {
+                                return Err(format!(
+                                    "cannot truncate a table referenced in a foreign key constraint (Table \"{}\" references \"{}\".)",
+                                    key, ref_table
+                                ));
+                            }
+                            if !extra.contains(key) {
+                                extra.push(key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if extra.is_empty() {
+                break;
+            }
+            table_names.extend(extra);
         }
 
         let mut count = 0;
@@ -409,7 +442,7 @@ impl Executor {
                     });
                 }
             } else {
-                let (columns, comment) = {
+                let (columns, comment, catalog) = {
                     let table = self.storage.get_table_mut(table_name).unwrap();
                     count += table.active_count;
                     table.rows.clear();
@@ -418,7 +451,8 @@ impl Executor {
                     table.auto_increment = 1;
                     // Mọi index (kể cả khoá text/UUID và index phụ) phải rỗng theo bảng.
                     table.rebuild_indexes();
-                    (table.declared_columns(), table.comment.clone())
+                    let catalog = table.catalog_tracked.then(|| (table.constraints.clone(), table.indexes.clone(), table.legacy_data));
+                    (table.declared_columns(), table.comment.clone(), catalog)
                 };
                 self.storage.wal.append(WalRecord::DropTable {
                     name: table_name.to_string(),
@@ -431,6 +465,18 @@ impl Executor {
                     self.storage.wal.append(WalRecord::CommentOnTable {
                         table: table_name.to_string(),
                         comment,
+                    });
+                }
+                // Replay tạo lại bảng rỗng từ `CreateTable`: ghi lại catalog để không mất ràng buộc.
+                if let Some((constraints, indexes, legacy)) = catalog {
+                    self.storage.wal.append(WalRecord::Schema {
+                        version: crate::storage::catalog::SCHEMA_OP_VERSION,
+                        payload: crate::storage::catalog::encode_schema_op(&crate::storage::catalog::SchemaOp::TableCatalog {
+                            table: table_name.to_string(),
+                            constraints,
+                            indexes,
+                            legacy,
+                        }),
                     });
                 }
             }
@@ -2151,42 +2197,75 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_create_index(&mut self, sql: &str) -> Result<QueryResult, String> {
-        let on_pos = find_top_level_keyword(sql, "ON").ok_or("Missing ON clause in CREATE INDEX")?;
-        let after_on = sql[on_pos + 2..].trim();
-
-        let open_paren = after_on.find('(').ok_or("Missing '(' in CREATE INDEX column list")?;
-        let close_paren = after_on.rfind(')').ok_or("Missing ')' in CREATE INDEX column list")?;
-
-        let table_spec = after_on[..open_paren].trim();
-        let table_name = if let Some(using_pos) = find_top_level_keyword(table_spec, "USING") {
-            table_spec[..using_pos].trim()
-        } else {
-            table_spec
-        }.trim_matches('"').trim();
-
-        let cols_part = &after_on[open_paren + 1..close_paren];
-        let col_names = split_comma_separated_tokens(cols_part);
-
-        if let Some(table) = self.storage.get_table_mut(table_name) {
-            for col_name in col_names {
-                let clean_col = clean_col_name(col_name.trim());
-                if let Some(col_idx) = table.get_column_index(clean_col) {
-                    table.add_secondary_index(col_idx);
-                }
-            }
-        }
-
-        self.plan_cache.clear();
-
-        Ok(QueryResult {
+        let parsed = crate::engine::constraints::parse_create_index(sql)?;
+        let done = Ok(QueryResult {
             rows: vec![],
             row_count: 0,
             fields: vec![],
             command: "CREATE INDEX".to_string(),
-        })
+        });
+        let Some(table) = self.storage.get_table(&parsed.table) else {
+            return Err(format!("relation \"{}\" does not exist", parsed.table));
+        };
+        // Bảng do bản cũ tạo: dữ liệu có thể đã trùng (không được kiểm tra lúc ghi).
+        let strict = table.catalog_tracked && !table.legacy_data;
+        let name_taken = self.storage.tables.values().any(|t| {
+            t.indexes.iter().any(|ix| ix.name.eq_ignore_ascii_case(&parsed.name))
+                || t.constraints.iter().any(|c| c.name.eq_ignore_ascii_case(&parsed.name))
+        });
+        if name_taken {
+            if parsed.if_not_exists {
+                return done;
+            }
+            return Err(format!("relation \"{}\" already exists", parsed.name));
+        }
+        if parsed.def.unique {
+            if let Err(e) = self.validate_unique_index(&parsed.table, &parsed.def) {
+                if strict || !parsed.if_not_exists {
+                    return Err(e);
+                }
+                // Bảng do bản cũ tạo, dữ liệu cũ đã trùng: không ép, để app vẫn khởi động được.
+                eprintln!("[pglite-rs] WARNING: unique index \"{}\" is not enforced: {}", parsed.name, e);
+                self.plan_cache.clear();
+                return done;
+            }
+        }
+        // Index phụ trong bộ nhớ cho từng cột đơn (như trước), để tăng tốc tra cứu.
+        if let Some(table) = self.storage.get_table_mut(&parsed.table) {
+            for c in &parsed.def.cols {
+                if let Some(col_idx) = table.get_column_index(c) {
+                    if !table.col_indexes.contains_key(&col_idx) {
+                        table.add_secondary_index(col_idx);
+                    }
+                }
+            }
+        }
+        self.storage.log_schema_op(crate::storage::catalog::SchemaOp::CreateIndex { table: parsed.table.clone(), def: parsed.def });
+        self.plan_cache.clear();
+        done
     }
 
-    fn handle_drop_index(&mut self, _sql: &str) -> Result<QueryResult, String> {
+    fn handle_drop_index(&mut self, sql: &str) -> Result<QueryResult, String> {
+        let mut rest = sql.trim().trim_end_matches(';').trim()[10..].trim();
+        if rest.to_uppercase().starts_with("CONCURRENTLY ") {
+            rest = rest[13..].trim();
+        }
+        if rest.to_uppercase().starts_with("IF EXISTS ") {
+            rest = rest[10..].trim();
+        }
+        for kw in [" CASCADE", " RESTRICT"] {
+            if rest.to_uppercase().ends_with(kw) {
+                rest = rest[..rest.len() - kw.len()].trim();
+            }
+        }
+        for name in split_comma_separated_tokens(rest) {
+            let name = strip_schema_keep_case(name);
+            let owner = self.storage.tables.iter().find(|(_, t)| t.indexes.iter().any(|ix| ix.name.eq_ignore_ascii_case(&name))).map(|(k, _)| k.clone());
+            // Index chưa từng được lưu (DB do bản cũ tạo) thì không báo lỗi, giữ hành vi cũ.
+            if let Some(table) = owner {
+                self.storage.log_schema_op(crate::storage::catalog::SchemaOp::DropIndex { table, name });
+            }
+        }
         self.plan_cache.clear();
         Ok(QueryResult {
             rows: vec![],
@@ -2197,14 +2276,61 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_drop_table(&mut self, sql: &str) -> Result<QueryResult, String> {
-        let after_drop = sql[10..].trim();
-        let mut table_name = after_drop.trim();
-        let if_exists = table_name.to_uppercase().starts_with("IF EXISTS ");
+        let mut rest = sql.trim().trim_end_matches(';').trim()[10..].trim();
+        let if_exists = rest.to_uppercase().starts_with("IF EXISTS ");
         if if_exists {
-            table_name = table_name[10..].trim();
+            rest = rest[10..].trim();
         }
-        let table_name = table_name.trim_matches('"').trim_matches(';').trim().to_string();
-        self.storage.drop_table(&table_name);
+        let mut cascade = false;
+        for kw in [" CASCADE", " RESTRICT"] {
+            if rest.to_uppercase().ends_with(kw) {
+                cascade = kw == " CASCADE";
+                rest = rest[..rest.len() - kw.len()].trim();
+            }
+        }
+        let names: Vec<String> = split_comma_separated_tokens(rest).into_iter().map(strip_schema_keep_case).filter(|n| !n.is_empty()).collect();
+        if names.is_empty() {
+            return Err("Missing table name in DROP TABLE".to_string());
+        }
+        let mut to_drop = Vec::new();
+        for n in &names {
+            if self.storage.get_table(n).is_some() {
+                to_drop.push(n.clone());
+            } else if !if_exists {
+                return Err(format!("table \"{}\" does not exist", n));
+            }
+        }
+        // Khoá ngoại từ bảng khác (không bị xoá cùng) trỏ tới: lỗi, trừ khi CASCADE (khi đó bỏ khoá ngoại đó).
+        let dropping: std::collections::HashSet<String> = to_drop.iter().map(|n| n.to_lowercase()).collect();
+        let mut dependent: Vec<(String, String)> = Vec::new();
+        for (key, t) in &self.storage.tables {
+            if dropping.contains(key) {
+                continue;
+            }
+            for c in &t.constraints {
+                if let crate::storage::catalog::ConstraintKind::ForeignKey { ref_table, .. } = &c.kind {
+                    if dropping.contains(&ref_table.to_lowercase()) {
+                        dependent.push((key.clone(), c.name.clone()));
+                    }
+                }
+            }
+        }
+        if !dependent.is_empty() {
+            if !cascade {
+                return Err(format!(
+                    "cannot drop table {} because other objects depend on it (constraint {} on table {} depends on it)",
+                    to_drop.join(", "),
+                    dependent[0].1,
+                    dependent[0].0
+                ));
+            }
+            for (table, name) in dependent {
+                self.storage.log_schema_op(crate::storage::catalog::SchemaOp::DropConstraint { table, name });
+            }
+        }
+        for n in &to_drop {
+            self.storage.drop_table(n);
+        }
         self.plan_cache.clear();
 
         Ok(QueryResult {
@@ -2230,19 +2356,16 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         if if_not_exists {
             table_name = table_name[14..].trim();
         }
-        let table_name = table_name.trim_matches('"').to_string();
+        let table_name = strip_schema_keep_case(table_name);
 
-        if if_not_exists && self.storage.get_table(&table_name).is_some() {
-            return Ok(QueryResult {
-                rows: vec![],
-                row_count: 0,
-                fields: vec![],
-                command: "CREATE TABLE".to_string(),
-            });
+        let exists = self.storage.get_table(&table_name).is_some();
+        if exists && !if_not_exists {
+            return Err(format!("relation \"{}\" already exists", table_name));
         }
 
         let mut columns = Vec::new();
         let mut table_level_pks = Vec::new();
+        let mut defs: Vec<crate::storage::catalog::ConstraintDef> = Vec::new();
 
         for col_def_str in split_comma_separated_tokens(body_part) {
             let col_def_str = col_def_str.trim();
@@ -2250,46 +2373,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 continue;
             }
 
+            // Ràng buộc cấp bảng: PRIMARY KEY (...), UNIQUE (...), FOREIGN KEY ..., CHECK (...), CONSTRAINT x ...
+            if let Some(def) = crate::engine::constraints::parse_table_constraint(&table_name, col_def_str, &defs) {
+                if let crate::storage::catalog::ConstraintKind::PrimaryKey { cols } = &def.kind {
+                    table_level_pks.extend(cols.iter().cloned());
+                    defs.retain(|d| !matches!(d.kind, crate::storage::catalog::ConstraintKind::PrimaryKey { .. }));
+                }
+                defs.push(def);
+                continue;
+            }
             let upper_def = col_def_str.to_uppercase();
-            // Handle table-level PRIMARY KEY (id) or CONSTRAINT pk PRIMARY KEY (id)
-            if upper_def.starts_with("PRIMARY KEY ") || upper_def.starts_with("PRIMARY KEY(") || (upper_def.starts_with("CONSTRAINT") && upper_def.contains("PRIMARY KEY")) {
-                if let Some(open_p) = col_def_str.find('(') {
-                    if let Some(close_p) = col_def_str.rfind(')') {
-                        let inner = &col_def_str[open_p + 1..close_p];
-                        for pk_col in split_comma_separated_tokens(inner) {
-                            let pk_clean = clean_col_name(pk_col).to_string();
-                            table_level_pks.push(pk_clean);
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Handle table-level UNIQUE (...)
-            if upper_def.starts_with("UNIQUE ") || upper_def.starts_with("UNIQUE(") || (upper_def.starts_with("CONSTRAINT") && upper_def.contains("UNIQUE")) {
-                if let Some(open_p) = col_def_str.find('(') {
-                    if let Some(close_p) = col_def_str.rfind(')') {
-                        let inner = &col_def_str[open_p + 1..close_p];
-                        let cols: Vec<String> = split_comma_separated_tokens(inner).into_iter().map(|c| clean_col_name(c).to_string()).collect();
-                        let c_name = format!("{}_{}_key", table_name, cols.join("_"));
-                        for (ord, c) in cols.iter().enumerate() {
-                            self.custom_constraints.push(TableConstraintDef {
-                                table_name: table_name.clone(),
-                                constraint_name: c_name.clone(),
-                                constraint_type: "UNIQUE".to_string(),
-                                column_name: c.clone(),
-                                ordinal_position: (ord + 1) as i64,
-                                foreign_table_name: None,
-                                foreign_column_name: None,
-                            });
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Ignore other table constraints like FOREIGN KEY, CHECK
-            if upper_def.starts_with("FOREIGN KEY ") || upper_def.starts_with("FOREIGN KEY(") || upper_def.starts_with("CHECK ") || upper_def.starts_with("CHECK(") || (upper_def.starts_with("CONSTRAINT") && !upper_def.contains("PRIMARY KEY")) {
+            if upper_def.starts_with("CONSTRAINT") || upper_def.starts_with("EXCLUDE") || upper_def.starts_with("LIKE ") {
                 continue;
             }
 
@@ -2360,52 +2454,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 None
             };
 
-            if upper_rest.contains("UNIQUE") && !is_primary_key {
-                self.custom_constraints.push(TableConstraintDef {
-                    table_name: table_name.clone(),
-                    constraint_name: format!("{}_{}_key", table_name, col_name),
-                    constraint_type: "UNIQUE".to_string(),
-                    column_name: col_name.clone(),
-                    ordinal_position: 1,
-                    foreign_table_name: None,
-                    foreign_column_name: None,
-                });
-            }
-
-            if let Some(ref_idx) = upper_rest.find("REFERENCES") {
-                let after_ref = rest_def[ref_idx + 10..].trim();
-                let f_table_part = after_ref.split_whitespace().next().unwrap_or("").trim_matches(',').trim_matches(';');
-                let (f_table, f_col) = if let Some(open_p) = f_table_part.find('(') {
-                    let close_p = f_table_part.find(')').unwrap_or(f_table_part.len());
-                    let t = clean_table_name(&f_table_part[..open_p]);
-                    let c = clean_col_name(&f_table_part[open_p + 1..close_p]);
-                    (t.to_string(), c.to_string())
-                } else {
-                    (clean_table_name(f_table_part).to_string(), "id".to_string())
-                };
-
-                self.custom_constraints.push(TableConstraintDef {
-                    table_name: table_name.clone(),
-                    constraint_name: format!("{}_{}_fkey", table_name, col_name),
-                    constraint_type: "FOREIGN KEY".to_string(),
-                    column_name: col_name.clone(),
-                    ordinal_position: 1,
-                    foreign_table_name: Some(f_table),
-                    foreign_column_name: Some(f_col),
-                });
-            }
-
-            if is_primary_key {
-                self.custom_constraints.push(TableConstraintDef {
-                    table_name: table_name.clone(),
-                    constraint_name: format!("{}_pkey", table_name),
-                    constraint_type: "PRIMARY KEY".to_string(),
-                    column_name: col_name.clone(),
-                    ordinal_position: 1,
-                    foreign_table_name: None,
-                    foreign_column_name: None,
-                });
-            }
+            crate::engine::constraints::parse_column_constraints(&table_name, &col_name, rest_def, &mut defs);
 
             columns.push(ColumnDef {
                 name: col_name,
@@ -2417,23 +2466,36 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             });
         }
 
-        // Apply table-level primary keys
-        for (ord, pk_col_name) in table_level_pks.iter().enumerate() {
+        // Khoá chính cấp bảng (một hay nhiều cột)
+        for pk_col_name in &table_level_pks {
             if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pk_col_name)) {
                 col.is_primary_key = true;
+                col.is_nullable = false;
             }
-            self.custom_constraints.push(TableConstraintDef {
-                table_name: table_name.clone(),
-                constraint_name: format!("{}_pkey", table_name),
-                constraint_type: "PRIMARY KEY".to_string(),
-                column_name: pk_col_name.clone(),
-                ordinal_position: (ord + 1) as i64,
-                foreign_table_name: None,
-                foreign_column_name: None,
+        }
+        // Một ràng buộc PRIMARY KEY duy nhất, gom mọi cột khoá.
+        defs.retain(|d| !matches!(d.kind, crate::storage::catalog::ConstraintKind::PrimaryKey { .. }));
+        let pk_cols: Vec<String> = columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
+        if !pk_cols.is_empty() {
+            defs.insert(0, crate::storage::catalog::ConstraintDef {
+                name: format!("{}_pkey", table_name.to_lowercase()),
+                kind: crate::storage::catalog::ConstraintKind::PrimaryKey { cols: pk_cols },
             });
         }
+        let defs = self.finalize_constraints(&table_name, &columns, defs);
 
-        let _ = self.storage.create_table(table_name, columns);
+        if exists {
+            self.adopt_legacy_constraints(&table_name, defs);
+        } else {
+            for d in &defs {
+                if let crate::storage::catalog::ConstraintKind::ForeignKey { ref_table, .. } = &d.kind {
+                    if !ref_table.eq_ignore_ascii_case(&table_name) && self.storage.get_table(ref_table).is_none() {
+                        return Err(format!("relation \"{}\" does not exist", ref_table));
+                    }
+                }
+            }
+            self.storage.create_table_with_catalog(table_name, columns, defs)?;
+        }
 
         Ok(QueryResult {
             rows: vec![],
@@ -2835,9 +2897,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             ]);
         }
 
-        // Add constraints from custom_constraints
+        // Ràng buộc lấy từ catalog đã lưu của từng bảng
+        let all_constraints = self.constraint_rows();
         let mut added_c_names = std::collections::HashSet::new();
-        for cc in &self.custom_constraints {
+        for cc in &all_constraints {
             let tbl_name = &cc.table_name;
             let c_name = &cc.constraint_name;
 
@@ -2896,7 +2959,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         // Group custom_constraints for pg_index and pg_class (indexes)
         let mut index_constraints: std::collections::HashMap<(String, String), (String, Vec<(i64, String)>)> = std::collections::HashMap::new();
-        for cc in &self.custom_constraints {
+        for cc in &all_constraints {
             if cc.constraint_type == "PRIMARY KEY" || cc.constraint_type == "UNIQUE" {
                 index_constraints.entry((cc.table_name.clone(), cc.constraint_name.clone()))
                     .or_insert_with(|| (cc.constraint_type.clone(), Vec::new()))
@@ -3216,12 +3279,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         let groups = extract_value_groups(values_part);
         let count = groups.len();
-        let in_tx = self.storage.in_transaction;
+        let in_tx = self.storage.undo_enabled();
 
         let mut returned_rows = Vec::new();
         let has_wal = self.storage.wal.writer.is_some();
         let wal = &mut self.storage.wal;
         let mut param_cursor = 0;
+        let mut first_row = 0;
 
         if let Some(table) = self.storage.tables.get_mut(&clean_table_name) {
             table.rows.reserve(count);
@@ -3328,6 +3392,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 }
             }
 
+            first_row = table.rows.len();
             for row in built {
                 let _pk = table.insert(row);
                 if let Some(last_row) = table.rows.last() {
@@ -3349,6 +3414,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 table: clean_table_name.clone(),
                 count,
             });
+        }
+        if count > 0 {
+            let inserted: Vec<usize> = (first_row..first_row + count).collect();
+            self.verify_rows(&clean_table_name, &inserted, None)?;
         }
 
         let fields = if let (Some(r_cols), Some(table)) = (returning_cols, self.storage.get_table(&clean_table_name)) {
@@ -6030,7 +6099,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             return Err("Failed to parse WHERE clause in UPDATE statement - aborting to prevent accidental table-wide update".to_string());
         }
 
-        let in_tx = self.storage.in_transaction;
+        let in_tx = self.storage.undo_enabled();
         let mut wal_updates: Vec<(RowIdentity, Vec<(usize, Value)>)> = Vec::new();
         // Dòng bị đổi khoá chính: (khoá cũ, dòng mới).
         let mut moved_rows: Vec<(RowIdentity, Vec<Value>)> = Vec::new();
@@ -6048,6 +6117,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         } else {
             None
         };
+
+        let referenced = self.is_referenced(table_name);
+        let mut updated_rows: Vec<usize> = Vec::new();
+        let mut changed_cols: Vec<usize> = Vec::new();
+        let mut old_rows: Vec<(usize, Vec<Value>)> = Vec::new();
 
         let fields = {
             let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
@@ -6147,7 +6221,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
 
             // Bước 3: áp dụng.
+            changed_cols.extend(raw_assignments.iter().map(|(c, _)| *c));
             for (i, updates) in planned {
+                updated_rows.push(i);
+                if referenced {
+                    old_rows.push((i, table.rows[i].clone()));
+                }
                 let identity = RowIdentity::of(table, i);
                 let moves_key = pk_changed(table, i, &updates);
                 let mut old_vals = Vec::new();
@@ -6224,6 +6303,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 });
             }
         }
+        if !updated_rows.is_empty() {
+            self.verify_rows(table_name, &updated_rows, Some(&changed_cols))?;
+            if referenced {
+                self.fk_on_parent_update(table_name, &old_rows)?;
+            }
+        }
 
         Ok(QueryResult {
             rows: returned_rows,
@@ -6252,7 +6337,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             return Err("Failed to parse WHERE clause in DELETE statement - aborting to prevent accidental table truncation".to_string());
         }
 
-        let in_tx = self.storage.in_transaction;
+        let in_tx = self.storage.undo_enabled();
         let mut row_count = 0;
         let mut returned_rows = Vec::new();
         let mut deleted_pks: Vec<RowIdentity> = Vec::new();
@@ -6342,12 +6427,15 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             });
         }
         if in_tx {
-            for row_idx in deleted_row_indices {
+            for &row_idx in &deleted_row_indices {
                 self.storage.tx_undo_log.push(UndoAction::UndeleteRow {
                     table: table_name.to_string(),
                     row_idx,
                 });
             }
+        }
+        if !deleted_row_indices.is_empty() && self.is_referenced(table_name) {
+            self.fk_on_parent_delete(table_name, &deleted_row_indices)?;
         }
 
         Ok(QueryResult {
@@ -10508,6 +10596,22 @@ fn extract_table_name_and_alias<'a>(raw: &'a str) -> (&'a str, Option<&'a str>) 
     }
 }
 
+/// Tên bảng trong DDL: bỏ tiền tố schema và dấu nháy, giữ nguyên chữ hoa/thường như trước.
+pub(crate) fn strip_schema_keep_case(raw: &str) -> String {
+    let s = raw.trim();
+    let last = if s.starts_with('"') {
+        match s[1..].find('"') {
+            Some(end) if s[end + 2..].starts_with('.') => &s[end + 3..],
+            _ => s,
+        }
+    } else if let Some(dot) = s.find('.') {
+        &s[dot + 1..]
+    } else {
+        s
+    };
+    last.trim().trim_matches('"').to_string()
+}
+
 fn clean_table_name(raw: &str) -> &str {
     extract_table_name_and_alias(raw).0
 }
@@ -12423,7 +12527,7 @@ fn is_single_operand(s: &str) -> bool {
 }
 
 /// Cách nhận diện một dòng trong WAL khi UPDATE/DELETE.
-enum RowIdentity {
+pub(crate) enum RowIdentity {
     /// Khoá chính là số: bản ghi `Update`/`Delete` như định dạng cũ.
     Pk(i64),
     /// Khoá chính UUID/text: `UpdateByKey`/`DeleteByKey`.
@@ -12460,7 +12564,27 @@ fn duplicate_pk_error(table: &crate::storage::table::Table, v: &Value) -> String
 }
 
 impl RowIdentity {
-    fn of(table: &crate::storage::table::Table, row_idx: usize) -> Self {
+    pub(crate) fn delete_record(self, table: String) -> WalRecord {
+        match self {
+            RowIdentity::Pk(pk) => WalRecord::Delete { table, pk },
+            RowIdentity::Key(key) => WalRecord::DeleteByKey { table, key },
+            RowIdentity::Row(row) => WalRecord::DeleteByRow { table, row },
+        }
+    }
+
+    /// Bản ghi UPDATE cho các ô `updates` của dòng này (cột khoá chính phải không đổi).
+    pub(crate) fn update_records(self, table: String, updates: Vec<(usize, Value)>) -> Vec<WalRecord> {
+        match self {
+            RowIdentity::Pk(pk) => updates.into_iter().map(|(col_idx, new_val)| WalRecord::Update { table: table.clone(), pk, col_idx, new_val }).collect(),
+            RowIdentity::Key(key) => updates
+                .into_iter()
+                .map(|(col_idx, new_val)| WalRecord::UpdateByKey { table: table.clone(), key: key.clone(), col_idx, new_val })
+                .collect(),
+            RowIdentity::Row(old_row) => vec![WalRecord::UpdateByRow { table, old_row, updates }],
+        }
+    }
+
+    pub(crate) fn of(table: &crate::storage::table::Table, row_idx: usize) -> Self {
         let row = &table.rows[row_idx];
         match table.pk_col_idx.and_then(|i| row.get(i)) {
             Some(v) if v.as_i64().is_some() => RowIdentity::Pk(v.as_i64().unwrap()),
@@ -12685,6 +12809,28 @@ fn get_returning_fields(
             }
         }
         fields
+    }
+}
+
+/// Giá trị DEFAULT của một cột (cùng quy tắc với INSERT).
+pub(crate) fn eval_default_value(def_str: &str) -> Value {
+    let up = def_str.trim().to_uppercase();
+    if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
+        Value::text(crate::types::generate_uuid_v4())
+    } else if let Some(dt_val) = eval_date_time_keyword(def_str) {
+        dt_val
+    } else if def_str.starts_with('\'') && def_str.ends_with('\'') && def_str.len() >= 2 {
+        Value::text(&def_str[1..def_str.len() - 1])
+    } else if let Ok(n) = def_str.parse::<i64>() {
+        Value::Int(n)
+    } else if let Ok(f) = def_str.parse::<f64>() {
+        Value::Float(f)
+    } else if def_str.eq_ignore_ascii_case("TRUE") {
+        Value::Bool(true)
+    } else if def_str.eq_ignore_ascii_case("FALSE") {
+        Value::Bool(false)
+    } else {
+        eval_sql_expr(def_str, &[], None, &[], None, &[])
     }
 }
 

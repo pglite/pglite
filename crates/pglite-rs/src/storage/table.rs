@@ -1,3 +1,4 @@
+use crate::storage::catalog::{ConstraintDef, ConstraintKind, IndexDef, UniqueIdx};
 use crate::storage::page::SlottedPage;
 use crate::types::{ColumnDef, JoinKey, Value, value_to_join_key};
 use compact_str::CompactString;
@@ -24,6 +25,16 @@ pub struct Table {
     /// Đã từng có hai dòng sống cùng khoá (DB cũ hoặc khoá tự đoán): khi gỡ khoá khỏi index phải
     /// tìm dòng còn lại để trỏ vào.
     pub has_dup_pk: bool,
+    /// Ràng buộc ngoài khoá chính một cột (UNIQUE, PK ghép, CHECK, FK) và index đã khai báo.
+    pub constraints: Vec<ConstraintDef>,
+    pub indexes: Vec<IndexDef>,
+    /// Bảng có catalog được lưu (tạo bởi bản có catalog, hoặc đã nhận lại ràng buộc). Bảng do bản
+    /// cũ tạo thì `false`: `CREATE TABLE IF NOT EXISTS` sẽ nhận lại ràng buộc từ câu lệnh.
+    pub catalog_tracked: bool,
+    /// Bảng do bản cũ tạo (đã nhận lại ràng buộc): dữ liệu cũ có thể vi phạm ràng buộc khai báo.
+    pub legacy_data: bool,
+    /// Index UNIQUE lúc chạy, dựng từ `constraints` + `indexes` (xem `rebuild_unique_indexes`).
+    pub uniq: Vec<UniqueIdx>,
 }
 
 impl Table {
@@ -78,6 +89,93 @@ impl Table {
             pages: Vec::new(),
             pk_enforced,
             has_dup_pk: false,
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+            catalog_tracked: false,
+            legacy_data: false,
+            uniq: Vec::new(),
+        }
+    }
+
+    /// Dựng lại index UNIQUE từ catalog: mọi UNIQUE / PK ghép / CREATE UNIQUE INDEX. Khoá chính một
+    /// cột đã có `pk_index` riêng nên không lặp lại. Ràng buộc trỏ tới cột không còn thì bỏ qua.
+    pub fn rebuild_unique_indexes(&mut self) {
+        let mut specs: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+        for c in &self.constraints {
+            match &c.kind {
+                ConstraintKind::PrimaryKey { cols } | ConstraintKind::Unique { cols } => {
+                    let single_pk = matches!(c.kind, ConstraintKind::PrimaryKey { .. })
+                        && cols.len() == 1
+                        && self.pk_enforced
+                        && self.pk_col_idx.is_some()
+                        && self.pk_col_idx == self.get_column_index(&cols[0]);
+                    if !single_pk {
+                        specs.push((c.name.clone(), cols.clone(), None));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for ix in &self.indexes {
+            if ix.unique {
+                specs.push((ix.name.clone(), ix.cols.clone(), ix.predicate.clone()));
+            }
+        }
+        let mut uniq = Vec::with_capacity(specs.len());
+        for (name, cols, pred) in specs {
+            let Some(col_idx) = cols.iter().map(|c| self.get_column_index(c)).collect::<Option<Vec<usize>>>() else {
+                continue;
+            };
+            let predicate = pred.as_deref().map(|p| crate::engine::expr::compile_expr(p, Some(self), None, None, None));
+            uniq.push(UniqueIdx { name, cols: col_idx, predicate, map: HashMap::new() });
+        }
+        for u in &mut uniq {
+            for (r, row) in self.rows.iter().enumerate() {
+                if !self.is_deleted[r] {
+                    u.add(row, r);
+                }
+            }
+        }
+        self.uniq = uniq;
+    }
+
+    /// Tên index UNIQUE mà dòng `row_idx` (còn sống) đang trùng khoá với một dòng sống khác.
+    pub fn unique_violation(&self, row_idx: usize) -> Option<&str> {
+        let row = self.rows.get(row_idx)?;
+        for u in &self.uniq {
+            if let Some(k) = u.key(row) {
+                if u.map.get(&k).map_or(false, |l| l.iter().any(|&r| r != row_idx)) {
+                    return Some(&u.name);
+                }
+            }
+        }
+        None
+    }
+
+    /// Dòng sống (khác `except`) trùng khoá với `row` trên index UNIQUE `u_idx`.
+    pub fn unique_conflict(&self, u_idx: usize, row: &[Value], except: Option<usize>) -> Option<usize> {
+        let u = self.uniq.get(u_idx)?;
+        let k = u.key(row)?;
+        u.map.get(&k)?.iter().copied().find(|&r| Some(r) != except)
+    }
+
+    fn uniq_add(&mut self, row_idx: usize) {
+        if self.uniq.is_empty() {
+            return;
+        }
+        let row = &self.rows[row_idx];
+        for u in &mut self.uniq {
+            u.add(row, row_idx);
+        }
+    }
+
+    fn uniq_remove(&mut self, row_idx: usize) {
+        if self.uniq.is_empty() {
+            return;
+        }
+        let row = &self.rows[row_idx];
+        for u in &mut self.uniq {
+            u.remove(row, row_idx);
         }
     }
 
@@ -126,6 +224,7 @@ impl Table {
         for c in cols {
             self.add_secondary_index(c);
         }
+        self.rebuild_unique_indexes();
     }
 
     pub fn insert(&mut self, mut row: Vec<Value>) -> i64 {
@@ -209,6 +308,7 @@ impl Table {
         if let Some(v) = pk_val {
             self.add_pk_to_index(&v, row_idx);
         }
+        self.uniq_add(row_idx);
 
         assigned_pk
     }
@@ -409,6 +509,7 @@ impl Table {
                     self.add_pk_to_index(&pk, row_idx);
                 }
             }
+            self.uniq_add(row_idx);
         }
     }
 
@@ -418,7 +519,14 @@ impl Table {
             return None;
         }
         let new_val = val.clone();
+        let live = !self.is_deleted[row_idx];
+        if live {
+            self.uniq_remove(row_idx);
+        }
         let old_val = std::mem::replace(&mut self.rows[row_idx][col_idx], val);
+        if live {
+            self.uniq_add(row_idx);
+        }
         if Some(col_idx) == self.pk_col_idx && !self.is_deleted[row_idx] {
             self.unindex_pk(&old_val, row_idx);
             self.add_pk_to_index(&new_val, row_idx);
@@ -443,6 +551,9 @@ impl Table {
     /// Gỡ dòng chèn cuối cùng (hoàn tác INSERT) khỏi bảng và mọi index.
     pub fn pop_last_row(&mut self) -> Option<Vec<Value>> {
         let row_idx = self.rows.len().checked_sub(1)?;
+        if !self.is_deleted[row_idx] {
+            self.uniq_remove(row_idx);
+        }
         let row = self.rows.pop()?;
         let was_deleted = self.is_deleted.pop().unwrap_or(false);
         if !was_deleted {
@@ -501,6 +612,7 @@ impl Table {
 
     pub fn delete_row(&mut self, row_idx: usize) -> bool {
         if row_idx < self.rows.len() && !self.is_deleted[row_idx] {
+            self.uniq_remove(row_idx);
             self.is_deleted[row_idx] = true;
             self.active_count = self.active_count.saturating_sub(1);
             if let Some(pk_idx) = self.pk_col_idx {
@@ -544,6 +656,11 @@ impl Table {
             if Some(pos) == self.pk_col_idx {
                 self.pk_enforced = false;
             }
+            let dropped = self.columns[pos].name.clone();
+            let uses = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(&dropped));
+            // Như PostgreSQL: ràng buộc / index dùng cột bị xoá cũng bị xoá theo.
+            self.constraints.retain(|c| !uses(c.columns()));
+            self.indexes.retain(|ix| !uses(&ix.cols));
             self.columns.remove(pos);
             for row in &mut self.rows {
                 if pos < row.len() {
@@ -564,6 +681,32 @@ impl Table {
             return true;
         }
         false
+    }
+
+    /// Đổi tên cột (và tên cột trong ràng buộc / index của bảng). Dữ liệu không đổi.
+    pub fn rename_column(&mut self, from: &str, to: &str) -> bool {
+        let Some(idx) = self.get_column_index(from) else {
+            return false;
+        };
+        let old = self.columns[idx].name.clone();
+        self.columns[idx].name = to.to_string();
+        let fix = |cols: &mut Vec<String>| {
+            for c in cols.iter_mut().filter(|c| c.eq_ignore_ascii_case(&old)) {
+                *c = to.to_string();
+            }
+        };
+        for c in &mut self.constraints {
+            match &mut c.kind {
+                ConstraintKind::PrimaryKey { cols } | ConstraintKind::Unique { cols } => fix(cols),
+                ConstraintKind::ForeignKey { cols, .. } => fix(cols),
+                ConstraintKind::Check { .. } => {}
+            }
+        }
+        for ix in &mut self.indexes {
+            fix(&mut ix.cols);
+        }
+        self.rebuild_unique_indexes();
+        true
     }
 
     pub fn find_first_by_col(&self, col_idx: usize, target: &Value) -> Option<&Vec<Value>> {
