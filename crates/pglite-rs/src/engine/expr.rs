@@ -119,6 +119,14 @@ pub enum CompiledExpr {
     JsonHasAllKeys(Box<CompiledExpr>, Box<CompiledExpr>),
     ArrayOverlap(Box<CompiledExpr>, Box<CompiledExpr>),
 
+    /// `lhs <op> ANY|ALL (mảng)`
+    AnyAll {
+        lhs: Box<CompiledExpr>,
+        op: &'static str,
+        all: bool,
+        rhs: Box<CompiledExpr>,
+    },
+
     // Function Calls
     FuncCall {
         name: String,
@@ -337,6 +345,9 @@ impl CompiledExpr {
             CompiledExpr::Add(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if let Some(v) = crate::engine::temporal::temporal_arith('+', &vl, &vr) {
+                    return v;
+                }
                 match (vl.as_f64(), vr.as_f64()) {
                     (Some(a), Some(b)) => {
                         let res = a + b;
@@ -348,6 +359,9 @@ impl CompiledExpr {
             CompiledExpr::Sub(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if let Some(v) = crate::engine::temporal::temporal_arith('-', &vl, &vr) {
+                    return v;
+                }
                 match (vl.as_f64(), vr.as_f64()) {
                     (Some(a), Some(b)) => {
                         let res = a - b;
@@ -701,6 +715,11 @@ impl CompiledExpr {
                 let evaluated_args: Vec<Value> = args.iter().map(|a| a.eval(primary_row, joined_row, params)).collect();
                 eval_func_call(name, &evaluated_args)
             }
+            CompiledExpr::AnyAll { lhs, op, all, rhs } => {
+                let l = lhs.eval(primary_row, joined_row, params);
+                let r = rhs.eval(primary_row, joined_row, params);
+                crate::engine::executor::eval_any_all(&l, op, *all, &r)
+            }
 
             CompiledExpr::Raw(s) => {
                 crate::engine::executor::eval_sql_expr(s, primary_row, None, &[], None, params)
@@ -1027,11 +1046,14 @@ pub fn compile_expr(
     }
 
     let upper = s.to_uppercase();
+    if let Some(v) = crate::engine::temporal::typed_literal(s) {
+        return CompiledExpr::Literal(v);
+    }
 
     // 1. CASE WHEN ... THEN ... ELSE ... END
     if upper.starts_with("CASE") && upper.ends_with("END") {
         let inside = s[4..s.len() - 3].trim();
-        let (when_part, else_part) = if let Some(else_idx) = crate::engine::executor::find_top_level_keyword(inside, "ELSE") {
+        let (when_part, else_part) = if let Some(else_idx) = crate::engine::executor::find_case_else(inside) {
             (&inside[..else_idx], Some(inside[else_idx + 4..].trim()))
         } else {
             (inside, None)
@@ -1127,6 +1149,16 @@ pub fn compile_expr(
             let expr = compile_expr(left_str, table, table_alias, joined_table, joined_alias);
             return CompiledExpr::Between { expr: Box::new(expr), low: Box::new(low), high: Box::new(high), negated: false };
         }
+    }
+
+    // 7b. x = ANY(...) / x <> ALL(...)
+    if let Some((lhs, op, all, inner)) = crate::engine::executor::split_any_all(s) {
+        return CompiledExpr::AnyAll {
+            lhs: Box::new(compile_expr(lhs, table, table_alias, joined_table, joined_alias)),
+            op,
+            all,
+            rhs: Box::new(compile_expr(inner, table, table_alias, joined_table, joined_alias)),
+        };
     }
 
     // 8. IN (...)
@@ -1428,11 +1460,14 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     let upper = s.to_uppercase();
+    if let Some(v) = crate::engine::temporal::typed_literal(s) {
+        return CompiledExpr::Literal(v);
+    }
 
     // CASE WHEN ... THEN ... ELSE ... END
     if upper.starts_with("CASE") && upper.ends_with("END") {
         let inside = s[4..s.len() - 3].trim();
-        let (when_part, else_part) = if let Some(else_idx) = crate::engine::executor::find_top_level_keyword(inside, "ELSE") {
+        let (when_part, else_part) = if let Some(else_idx) = crate::engine::executor::find_case_else(inside) {
             (&inside[..else_idx], Some(inside[else_idx + 4..].trim()))
         } else {
             (inside, None)
@@ -1490,6 +1525,14 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     // IN / NOT IN
+    if let Some((lhs, op, all, inner)) = crate::engine::executor::split_any_all(s) {
+        return CompiledExpr::AnyAll {
+            lhs: Box::new(compile_expr_for_joined(lhs, joined_schema)),
+            op,
+            all,
+            rhs: Box::new(compile_expr_for_joined(inner, joined_schema)),
+        };
+    }
     if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "NOT IN") {
         let left_str = s[..pos].trim();
         let right_str = s[pos + 6..].trim();

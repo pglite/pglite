@@ -994,7 +994,24 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
             };
 
             let before = resolved[..pos].trim_end();
-            if before.to_uppercase().ends_with("IN") {
+            let up_before = before.to_uppercase();
+            if (up_before.ends_with("ANY") || up_before.ends_with("SOME") || up_before.ends_with("ALL"))
+                && !up_before.ends_with("UNION ALL")
+            {
+                let items: Vec<String> = sub_res
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.as_object().and_then(|m| m.values().next().cloned()))
+                    .map(|v| match v {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Null => "NULL".to_string(),
+                        other => format!("'{}'", other.to_string().replace('\'', "''")),
+                    })
+                    .collect();
+                resolved = format!("{}(ARRAY[{}]){}", &resolved[..pos], items.join(", "), &resolved[close_idx + 1..]);
+            } else if up_before.ends_with("IN") {
                 let mut seen = std::collections::HashSet::new();
                 let mut items = Vec::new();
                 for r in sub_res.rows {
@@ -2995,9 +3012,30 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_select(&mut self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
+        // Tên cột mặc định / alias không có AS theo quy tắc PostgreSQL
+        if let Some(normalized) = crate::engine::select_list::normalize_select_sql(sql) {
+            return self.handle_select(&normalized, params);
+        }
         let from_idx_opt = find_top_level_keyword(sql, "FROM");
         if from_idx_opt.is_none() {
-            let select_clause = sql[6..].trim().trim_end_matches(';').trim();
+            let mut select_clause = sql[6..].trim().trim_end_matches(';').trim();
+            // SELECT ... WHERE <điều kiện> (không có FROM): điều kiện sai thì không có dòng nào
+            let tail_kw = ["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"].iter().filter_map(|kw| find_top_level_keyword(select_clause, kw)).min();
+            let mut where_false = false;
+            let mut limit_zero = false;
+            if let Some(p) = tail_kw {
+                let tail = select_clause[p..].to_string();
+                select_clause = select_clause[..p].trim();
+                if let Some(w) = find_top_level_keyword(&tail, "WHERE") {
+                    let w_end = ["ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"].iter().filter_map(|kw| find_top_level_keyword(&tail[w + 5..], kw)).min().map(|e| w + 5 + e).unwrap_or(tail.len());
+                    let cond = tail[w + 5..w_end].trim().to_string();
+                    let resolved = if cond.to_uppercase().contains("SELECT") { self.resolve_subqueries_in_where(&cond, params)? } else { cond };
+                    where_false = eval_sql_expr(&resolved, &[], None, &[], None, params).as_bool() != Some(true);
+                }
+                if let Some(l) = find_top_level_keyword(&tail, "LIMIT") {
+                    limit_zero = tail[l + 5..].split_whitespace().next().map_or(false, |n| n == "0");
+                }
+            }
             let items = split_projection_items(select_clause);
             let mut map = serde_json::Map::new();
             let mut fields = Vec::new();
@@ -3051,6 +3089,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     name: alias,
                     data_type,
                 });
+            }
+            if where_false || limit_zero {
+                return Ok((QueryResult { rows: vec![], row_count: 0, fields, command: "SELECT".to_string() }, None));
             }
             return Ok((QueryResult {
                 rows: vec![serde_json::Value::Object(map)],
@@ -7383,7 +7424,7 @@ fn eval_joined_scalar_expr(
     // 2. CASE WHEN ... THEN ... ELSE ... END
     if upper.starts_with("CASE") && upper.ends_with("END") {
         let inside = t[4..t.len() - 3].trim();
-        let (when_part, else_part) = if let Some(else_idx) = find_top_level_keyword(inside, "ELSE") {
+        let (when_part, else_part) = if let Some(else_idx) = find_case_else(inside) {
             (&inside[..else_idx], Some(inside[else_idx + 4..].trim()))
         } else {
             (inside, None)
@@ -7653,6 +7694,11 @@ fn eval_joined_scalar_expr(
         let lhs = eval_joined_scalar_expr(t[..op_idx].trim(), row, params, storage);
         let rhs = eval_joined_scalar_expr(t[op_idx + 1..].trim(), row, params, storage);
         if lhs.is_null() || rhs.is_null() { return serde_json::Value::Null; }
+        if let (serde_json::Value::String(a), serde_json::Value::String(b)) = (&lhs, &rhs) {
+            if let Some(v) = crate::engine::temporal::temporal_arith(op, &Value::text(a), &Value::text(b)) {
+                return value_to_json(&v);
+            }
+        }
         if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
             let res = if op == '+' { l_num + r_num } else { l_num - r_num };
             return if res.fract() == 0.0 { serde_json::json!(res as i64) } else { serde_json::json!(res) };
@@ -9154,6 +9200,14 @@ struct SelectClauses<'a> {
     offset: Option<OperandTemplate>,
 }
 
+pub(crate) fn split_projection_items_pub(s: &str) -> Vec<String> {
+    split_projection_items(s)
+}
+
+pub(crate) fn is_fully_enclosed_pub(s: &str) -> bool {
+    is_fully_enclosed_in_parens(s)
+}
+
 fn split_projection_items(s: &str) -> Vec<String> {
     let mut items = Vec::new();
     let mut current = String::new();
@@ -10625,20 +10679,20 @@ pub(crate) fn split_top_level_and(s: &str) -> Vec<&str> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DateTimeParts {
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
-    millisecond: u32,
-    has_time: bool,
-    is_iso_z: bool,
-    separator: char,
+pub(crate) struct DateTimeParts {
+    pub(crate) year: i32,
+    pub(crate) month: u32,
+    pub(crate) day: u32,
+    pub(crate) hour: u32,
+    pub(crate) minute: u32,
+    pub(crate) second: u32,
+    pub(crate) millisecond: u32,
+    pub(crate) has_time: bool,
+    pub(crate) is_iso_z: bool,
+    pub(crate) separator: char,
 }
 
-fn parse_datetime_components(s: &str) -> Option<DateTimeParts> {
+pub(crate) fn parse_datetime_components(s: &str) -> Option<DateTimeParts> {
     let mut trimmed = s.trim().trim_matches('\'').trim_matches('"').trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
         return None;
@@ -10731,7 +10785,7 @@ fn parse_datetime_components(s: &str) -> Option<DateTimeParts> {
     })
 }
 
-fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { (y - 1) as i64 } else { y as i64 };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = (y - era * 400) as u32;
@@ -12130,6 +12184,67 @@ fn is_complete_array_constructor(s: &str) -> bool {
     false
 }
 
+/// `lhs <op> ANY|SOME|ALL (inner)` ở cấp ngoài cùng: (lhs, op, là ALL, inner).
+pub(crate) fn split_any_all(s: &str) -> Option<(&str, &'static str, bool, &str)> {
+    for (kw, all) in [("ANY", false), ("SOME", false), ("ALL", true)] {
+        let mut from = 0;
+        while let Some(rel) = find_top_level_keyword(&s[from..], kw) {
+            let pos = from + rel;
+            from = pos + kw.len();
+            let after = s[pos + kw.len()..].trim_start();
+            if !after.starts_with('(') || !after.ends_with(')') {
+                continue;
+            }
+            let close = crate::engine::constraints::matching_paren(after, 0)?;
+            if close != after.len() - 1 {
+                continue;
+            }
+            let before = s[..pos].trim_end();
+            for op in ["<>", "!=", "<=", ">=", "=", "<", ">"] {
+                if before.ends_with(op) {
+                    let lhs = before[..before.len() - op.len()].trim();
+                    if lhs.is_empty() {
+                        return None;
+                    }
+                    let op: &'static str = match op { "!=" => "<>", "<>" => "<>", "<=" => "<=", ">=" => ">=", "=" => "=", "<" => "<", _ => ">" };
+                    return Some((lhs, op, all, after[1..close].trim()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Tính `lhs <op> ANY|ALL (mảng)` theo logic 3 giá trị của PostgreSQL.
+pub(crate) fn eval_any_all(lhs: &Value, op: &str, all: bool, rhs: &Value) -> Value {
+    if lhs.is_null() || rhs.is_null() {
+        return Value::Null;
+    }
+    let items = val_to_array_items(rhs);
+    let mut saw_null = false;
+    for item in &items {
+        if item.is_null() {
+            saw_null = true;
+            continue;
+        }
+        let r = match op {
+            "=" => lhs.is_equal(item),
+            "<>" => !lhs.is_equal(item),
+            "<" => lhs.cmp_value(item) == std::cmp::Ordering::Less,
+            "<=" => lhs.cmp_value(item) != std::cmp::Ordering::Greater,
+            ">" => lhs.cmp_value(item) == std::cmp::Ordering::Greater,
+            _ => lhs.cmp_value(item) != std::cmp::Ordering::Less,
+        };
+        if all && !r {
+            return Value::Bool(false);
+        }
+        if !all && r {
+            return Value::Bool(true);
+        }
+    }
+    if saw_null { Value::Null } else { Value::Bool(all) }
+}
+
 pub(crate) fn val_to_array_items(val: &Value) -> Vec<Value> {
     match val {
         Value::Null => vec![],
@@ -12665,6 +12780,11 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
             })
             .collect();
         Value::text(serde_json::to_string(&casted_items).unwrap_or_default())
+    } else if tt.starts_with("INTERVAL") {
+        match crate::engine::temporal::parse_interval(&val.as_str()) {
+            Some(iv) => Value::text(crate::engine::temporal::format_interval(iv)),
+            None => Value::Null,
+        }
     } else if tt.starts_with("INT") || tt == "BIGINT" || tt == "SERIAL" {
         if let Some(i) = val.as_i64() {
             Value::Int(i)
@@ -12731,28 +12851,76 @@ pub(crate) fn split_function_args(inner: &str) -> Vec<String> {
     args
 }
 
+/// Vị trí từ khoá `kw` ở cấp ngoài cùng của một biểu thức CASE: bỏ qua chuỗi, ngoặc và cả các
+/// CASE ... END lồng bên trong (WHEN/THEN của CASE con không được tính).
+fn find_case_level_keyword(s: &str, kw: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut case_depth, mut in_sq, mut in_dq) = (0i32, 0i32, false, false);
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' && !in_dq {
+            in_sq = !in_sq;
+        } else if c == b'"' && !in_sq {
+            in_dq = !in_dq;
+        } else if !in_sq && !in_dq {
+            if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+            } else if depth == 0 && is_word(c) && (i == 0 || !is_word(b[i - 1])) {
+                let mut j = i;
+                while j < b.len() && is_word(b[j]) {
+                    j += 1;
+                }
+                let word = &s[i..j];
+                if word.eq_ignore_ascii_case("CASE") {
+                    case_depth += 1;
+                } else if word.eq_ignore_ascii_case("END") && case_depth > 0 {
+                    case_depth -= 1;
+                } else if case_depth == 0 && word.eq_ignore_ascii_case(kw) {
+                    return Some(i);
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 pub(crate) fn split_when_clauses(when_part: &str) -> Vec<(String, String)> {
     let mut clauses = Vec::new();
     let s = when_part.trim();
+    // CASE <toán hạng> WHEN v1 THEN ...: đổi thành điều kiện (toán hạng) = (v1)
+    let operand = match find_case_level_keyword(s, "WHEN") {
+        Some(p) if !s[..p].trim().is_empty() => Some(s[..p].trim().to_string()),
+        _ => None,
+    };
     let mut i = 0;
     let len = s.len();
 
     while i < len {
         let remaining = &s[i..];
-        let when_kw = find_top_level_keyword(remaining, "WHEN");
+        let when_kw = find_case_level_keyword(remaining, "WHEN");
         if when_kw.is_none() {
             break;
         }
         let when_start = i + when_kw.unwrap() + 4;
-        let then_kw = find_top_level_keyword(&s[when_start..], "THEN");
+        let then_kw = find_case_level_keyword(&s[when_start..], "THEN");
         if then_kw.is_none() {
             break;
         }
         let then_pos = when_start + then_kw.unwrap();
-        let cond_str = s[when_start..then_pos].trim().to_string();
+        let mut cond_str = s[when_start..then_pos].trim().to_string();
+        if let Some(op) = &operand {
+            cond_str = format!("({}) = ({})", op, cond_str);
+        }
 
         let res_start = then_pos + 4;
-        let next_when_kw = find_top_level_keyword(&s[res_start..], "WHEN");
+        let next_when_kw = find_case_level_keyword(&s[res_start..], "WHEN");
         let res_end = if let Some(nw) = next_when_kw {
             res_start + nw
         } else {
@@ -12763,6 +12931,11 @@ pub(crate) fn split_when_clauses(when_part: &str) -> Vec<(String, String)> {
         i = res_end;
     }
     clauses
+}
+
+/// ELSE của một CASE (bỏ qua ELSE của CASE lồng bên trong).
+pub(crate) fn find_case_else(inside: &str) -> Option<usize> {
+    find_case_level_keyword(inside, "ELSE")
 }
 
 pub(crate) fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
@@ -13339,7 +13512,7 @@ pub(crate) fn eval_sql_expr(
     // 1. CASE WHEN ... THEN ... ELSE ... END
     if upper.starts_with("CASE") && upper.ends_with("END") {
         let inside = s[4..s.len() - 3].trim();
-        let (when_part, else_part) = if let Some(else_idx) = find_top_level_keyword(inside, "ELSE") {
+        let (when_part, else_part) = if let Some(else_idx) = find_case_else(inside) {
             (&inside[..else_idx], Some(inside[else_idx + 4..].trim()))
         } else {
             (inside, None)
@@ -14204,6 +14377,9 @@ pub(crate) fn eval_sql_expr(
         let lhs = eval_sql_expr(s[..op_idx].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let rhs = eval_sql_expr(s[op_idx + 1..].trim(), primary_row, primary_table, joined_row, joined_table, params);
         if lhs.is_null() || rhs.is_null() { return Value::Null; }
+        if let Some(v) = crate::engine::temporal::temporal_arith(op, &lhs, &rhs) {
+            return v;
+        }
         if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
             let res = if op == '+' { l_num + r_num } else { l_num - r_num };
             return if res.fract() == 0.0 { Value::Int(res as i64) } else { Value::Float(res) };
@@ -14262,6 +14438,19 @@ pub(crate) fn eval_sql_expr(
             if let Some(i) = val.as_i64() {
                 return Value::Int(!i);
             }
+        }
+    }
+
+    if let Some(v) = crate::engine::temporal::typed_literal(s) {
+        return v;
+    }
+
+    // x = ANY(arr), x <> ALL(arr)
+    if upper.contains("ANY") || upper.contains("ALL") || upper.contains("SOME") {
+        if let Some((lhs, op, all, inner)) = split_any_all(s) {
+            let l = eval_sql_expr(lhs, primary_row, primary_table, joined_row, joined_table, params);
+            let r = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
+            return eval_any_all(&l, op, all, &r);
         }
     }
 

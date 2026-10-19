@@ -4,6 +4,8 @@ pub mod expr;
 pub mod executor;
 pub mod plan;
 pub mod plpgsql;
+pub mod select_list;
+pub mod temporal;
 pub mod upsert;
 pub use expr::CompiledExpr;
 pub use executor::Executor;
