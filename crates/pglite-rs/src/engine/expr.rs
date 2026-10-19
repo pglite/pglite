@@ -456,6 +456,8 @@ impl CompiledExpr {
                 let vr = r.eval(primary_row, joined_row, params);
                 if vl.is_null() || vr.is_null() {
                     Value::Null
+                } else if let Some(j) = crate::engine::executor::jsonb_concat(&vl.as_str(), &vr.as_str()) {
+                    Value::text(j)
                 } else {
                     Value::text(format!("{}{}", vl.as_str(), vr.as_str()))
                 }
@@ -1048,6 +1050,9 @@ pub fn compile_expr(
     let upper = s.to_uppercase();
     if let Some(v) = crate::engine::temporal::typed_literal(s) {
         return CompiledExpr::Literal(v);
+    }
+    if s.starts_with('+') && !s.starts_with("++") && s.len() > 1 && crate::engine::executor::find_top_level_math_op_pub(s, &['+', '-']).map_or(true, |(i, _)| i == 0) {
+        return compile_expr(&s[1..], table, table_alias, joined_table, joined_alias);
     }
 
     // 1. CASE WHEN ... THEN ... ELSE ... END
