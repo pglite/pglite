@@ -127,6 +127,12 @@ pub enum CompiledExpr {
 
     // Fallback for subqueries or raw expressions
     Raw(String),
+    /// Biểu thức (thường là hàm) mà bộ biên dịch không hỗ trợ: đánh giá bằng `eval_sql_expr` với cột
+    /// của bảng, thay vì trả NULL như `FuncCall` không biết tên hàm.
+    RawCtx {
+        expr: String,
+        table: std::sync::Arc<crate::storage::table::Table>,
+    },
 }
 
 impl CompiledExpr {
@@ -698,6 +704,9 @@ impl CompiledExpr {
 
             CompiledExpr::Raw(s) => {
                 crate::engine::executor::eval_sql_expr(s, primary_row, None, &[], None, params)
+            }
+            CompiledExpr::RawCtx { expr, table } => {
+                crate::engine::executor::eval_sql_expr(expr, primary_row, Some(table), &[], None, params)
             }
         }
     }
@@ -1327,6 +1336,17 @@ pub fn compile_expr(
     if let Some(open_p) = s.find('(') {
         if s.ends_with(')') {
             let fn_name = s[..open_p].trim().to_uppercase();
+            const COMPILED_FUNCS: &[&str] = &["ABS", "FLOOR", "CEIL", "CEILING", "ROUND", "MD5", "SHA256"];
+            if !COMPILED_FUNCS.contains(&fn_name.as_str()) && joined_table.is_none() {
+                if let Some(t) = table {
+                    // Hàm khác (length, to_char, extract, jsonb_build_object...): bộ đánh giá đầy đủ
+                    return CompiledExpr::RawCtx {
+                        expr: s.to_string(),
+                        table: std::sync::Arc::new(crate::storage::table::Table::new(t.name.clone(), t.columns.clone())),
+                    };
+                }
+                return CompiledExpr::Raw(s.to_string());
+            }
             let inner = &s[open_p + 1..s.len() - 1];
             let args = crate::engine::executor::split_function_args(inner)
                 .into_iter()

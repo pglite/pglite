@@ -560,23 +560,7 @@ impl Executor {
                         let clean = clean_col_name(spec.col_name);
                         let va = a.get(clean);
                         let vb = b.get(clean);
-                        let ord = match (va, vb) {
-                            (Some(serde_json::Value::Number(n1)), Some(serde_json::Value::Number(n2))) => {
-                                let f1 = n1.as_f64().unwrap_or(0.0);
-                                let f2 = n2.as_f64().unwrap_or(0.0);
-                                f1.partial_cmp(&f2).unwrap_or(std::cmp::Ordering::Equal)
-                            }
-                            (Some(serde_json::Value::String(s1)), Some(serde_json::Value::String(s2))) => {
-                                s1.cmp(s2)
-                            }
-                            (Some(serde_json::Value::Bool(b1)), Some(serde_json::Value::Bool(b2))) => {
-                                b1.cmp(b2)
-                            }
-                            (Some(_), None) => std::cmp::Ordering::Greater,
-                            (None, Some(_)) => std::cmp::Ordering::Less,
-                            _ => std::cmp::Ordering::Equal,
-                        };
-                        let final_ord = if spec.is_desc { ord.reverse() } else { ord };
+                        let final_ord = json_order_cmp(va, vb, spec.is_desc, spec.nulls_first);
                         if final_ord != std::cmp::Ordering::Equal {
                             return final_ord;
                         }
@@ -1802,8 +1786,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         for spec in &order_specs {
                             let va = a.get_val(spec.col_name);
                             let vb = b.get_val(spec.col_name);
-                            let ord = va.cmp_value(&vb);
-                            let directed = if spec.is_desc { ord.reverse() } else { ord };
+                            let directed = order_cmp(&va, &vb, spec.is_desc, spec.nulls_first);
                             if directed != std::cmp::Ordering::Equal {
                                 return directed;
                             }
@@ -3215,6 +3198,14 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
 
 
+        // Hàm gộp có FILTER (WHERE ...) mà không GROUP BY: đường GROUP BY (một nhóm) hỗ trợ FILTER.
+        {
+            let up_sel = select_clause.to_uppercase();
+            if (up_sel.contains(" FILTER (") || up_sel.contains(" FILTER(")) && !up_sel.contains(" OVER") && clauses.join_clause.is_none() {
+                return Ok((self.handle_group_by_query(table, select_clause, &clauses, params)?, None));
+            }
+        }
+
         // 1. Check if SELECT has aggregate functions (COUNT, SUM, AVG, MIN, MAX)
         let agg_specs = if !select_clause.to_uppercase().contains("SELECT")
             && !select_clause.to_uppercase().contains(" OVER (")
@@ -3535,7 +3526,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         // 5. ORDER BY sorting
         if !clauses.order_by_specs.is_empty() {
             let alias_exprs = projection_exprs_by_alias(select_clause);
+            let proj_items = split_projection_items(select_clause);
             let resolve_spec_name = |spec_name: &str| -> String {
+                // ORDER BY 1, 2: số thứ tự cột trong SELECT
+                if let Ok(n) = spec_name.trim().parse::<usize>() {
+                    if select_clause.trim() == "*" {
+                        if n >= 1 && n <= table.columns.len() {
+                            return table.columns[n - 1].name.clone();
+                        }
+                    } else if n >= 1 && n <= proj_items.len() {
+                        let item = proj_items[n - 1].trim();
+                        return match find_top_level_keyword(item, "AS") {
+                            Some(p) => item[..p].trim().to_string(),
+                            None => item.to_string(),
+                        };
+                    }
+                }
                 for p in &projected_exprs {
                     match p {
                         ProjectedExpr::PrimaryCol { col_idx, alias } if alias.eq_ignore_ascii_case(spec_name) => {
@@ -3560,23 +3566,19 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 .all(|spec| table.get_column_index(&resolve_spec_name(spec.col_name)).is_some());
 
             if all_simple_cols {
-                let resolved_order: Vec<(usize, bool)> = clauses.order_by_specs.iter()
+                let resolved_order: Vec<(usize, bool, bool)> = clauses.order_by_specs.iter()
                     .filter_map(|spec| {
                         let actual_col = resolve_spec_name(spec.col_name);
-                        table.get_column_index(&actual_col).map(|idx| (idx, spec.is_desc))
+                        table.get_column_index(&actual_col).map(|idx| (idx, spec.is_desc, spec.nulls_first))
                     })
                     .collect();
 
                 if matched_indices.len() > 10_000 {
                     matched_indices.par_sort_by(|&a, &b| {
-                        for &(col_idx, desc) in &resolved_order {
+                        for &(col_idx, desc, nulls_first) in &resolved_order {
                             let va = &table.rows[a][col_idx];
                             let vb = &table.rows[b][col_idx];
-                            let ord = if desc {
-                                vb.cmp_value(va)
-                            } else {
-                                va.cmp_value(vb)
-                            };
+                            let ord = order_cmp(va, vb, desc, nulls_first);
                             if ord != std::cmp::Ordering::Equal {
                                 return ord;
                             }
@@ -3585,14 +3587,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     });
                 } else {
                     matched_indices.sort_by(|&a, &b| {
-                        for &(col_idx, desc) in &resolved_order {
+                        for &(col_idx, desc, nulls_first) in &resolved_order {
                             let va = &table.rows[a][col_idx];
                             let vb = &table.rows[b][col_idx];
-                            let ord = if desc {
-                                vb.cmp_value(va)
-                            } else {
-                                va.cmp_value(vb)
-                            };
+                            let ord = order_cmp(va, vb, desc, nulls_first);
                             if ord != std::cmp::Ordering::Equal {
                                 return ord;
                             }
@@ -3607,6 +3605,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         if let Some(ref jc) = clauses.join_clause {
                             if let Some(p_col_idx) = table.get_column_index(jc.primary_join_col) {
                                 let desc = spec.is_desc;
+                                let nulls_first = spec.nulls_first;
                                 matched_indices.sort_by(|&a, &b| {
                                     let get_val = |row_idx: usize| -> Option<&Value> {
                                         let key = table.rows[row_idx].get(p_col_idx)?;
@@ -3615,11 +3614,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                     };
                                     let va = get_val(a).unwrap_or(&Value::Null);
                                     let vb = get_val(b).unwrap_or(&Value::Null);
-                                    if desc {
-                                        vb.cmp_value(va)
-                                    } else {
-                                        va.cmp_value(vb)
-                                    }
+                                    order_cmp(va, vb, desc, nulls_first)
                                 });
                             }
                         }
@@ -3627,14 +3622,14 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 }
             } else {
                 // Tính khoá sắp xếp một lần cho mỗi dòng, không tính lại ở mỗi phép so sánh
-                let exprs: Vec<(String, bool)> = clauses.order_by_specs.iter().map(|spec| (resolve_spec_name(spec.col_name), spec.is_desc)).collect();
+                let exprs: Vec<(String, bool, bool)> = clauses.order_by_specs.iter().map(|spec| (resolve_spec_name(spec.col_name), spec.is_desc, spec.nulls_first)).collect();
                 let mut keyed: Vec<(usize, Vec<Value>)> = matched_indices
                     .iter()
-                    .map(|&idx| (idx, exprs.iter().map(|(e, _)| eval_sql_expr(e, &table.rows[idx], Some(table), &[], None, params)).collect()))
+                    .map(|&idx| (idx, exprs.iter().map(|(e, _, _)| eval_sql_expr(e, &table.rows[idx], Some(table), &[], None, params)).collect()))
                     .collect();
                 keyed.sort_by(|(_, ka), (_, kb)| {
-                    for (i, (_, desc)) in exprs.iter().enumerate() {
-                        let ord = if *desc { kb[i].cmp_value(&ka[i]) } else { ka[i].cmp_value(&kb[i]) };
+                    for (i, (_, desc, nulls_first)) in exprs.iter().enumerate() {
+                        let ord = order_cmp(&ka[i], &kb[i], *desc, *nulls_first);
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
@@ -3933,7 +3928,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 };
 
                 let order_by_info = if let Some(spec) = clauses.order_by_specs.first() {
-                    table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc))
+                    table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc, spec.nulls_first))
                 } else {
                     None
                 };
@@ -3973,7 +3968,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             };
 
             let order_by_info = if let Some(spec) = clauses.order_by_specs.first() {
-                table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc))
+                table.get_column_index(clean_col_name(spec.col_name)).map(|idx| (idx, spec.is_desc, spec.nulls_first))
             } else {
                 None
             };
@@ -4150,15 +4145,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 }
 
                 // Sorting
-                if let Some((order_idx, is_desc)) = order_by {
+                if let Some((order_idx, is_desc, nulls_first)) = order_by {
                     matched_indices.sort_by(|&a, &b| {
                         let val_a = table.rows[a].get(*order_idx).unwrap_or(&Value::Null);
                         let val_b = table.rows[b].get(*order_idx).unwrap_or(&Value::Null);
-                        if *is_desc {
-                            val_b.cmp_value(val_a)
-                        } else {
-                            val_a.cmp_value(val_b)
-                        }
+                        order_cmp(val_a, val_b, *is_desc, *nulls_first)
                     });
                 }
 
@@ -4338,10 +4329,25 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         clauses: &SelectClauses,
         params: &[Value],
     ) -> Result<QueryResult, String> {
-        let gb_str = clauses.group_by_clause.unwrap();
+        // Không có GROUP BY (hàm gộp có FILTER): cả bảng là một nhóm.
+        let gb_str = clauses.group_by_clause.unwrap_or("");
+        let proj_items_for_ordinal = split_projection_items(select_clause);
         let group_tokens: Vec<String> = split_comma_separated_tokens(gb_str)
             .into_iter()
-            .map(|c| c.trim().to_string())
+            .map(|c| {
+                let c = c.trim();
+                // GROUP BY 1, 2: số thứ tự cột trong SELECT
+                match c.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= proj_items_for_ordinal.len() => {
+                        let item = proj_items_for_ordinal[n - 1].trim();
+                        match find_top_level_keyword(item, "AS") {
+                            Some(p) => item[..p].trim().to_string(),
+                            None => item.to_string(),
+                        }
+                    }
+                    _ => c.to_string(),
+                }
+            })
             .collect();
 
         let where_expr = match clauses.where_clause {
@@ -4381,6 +4387,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 group_map.insert(key_str, g_idx);
                 groups.push((key_vals, vec![row_idx]));
             }
+        }
+        if group_tokens.is_empty() && groups.is_empty() {
+            // Hàm gộp không GROUP BY luôn trả đúng một dòng (count = 0) kể cả khi không có dòng nào.
+            groups.push((Vec::new(), Vec::new()));
         }
 
         struct GroupProjItem {
@@ -4870,25 +4880,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             group_rows.sort_by(|a, b| {
                 if let (serde_json::Value::Object(map_a), serde_json::Value::Object(map_b)) = (a, b) {
                     for spec in &clauses.order_by_specs {
-                        let va = map_a.get(spec.col_name);
-                        let vb = map_b.get(spec.col_name);
-                        let ord = match (va, vb) {
-                            (Some(x), Some(y)) => {
-                                if let (Some(fx), Some(fy)) = (x.as_f64(), y.as_f64()) {
-                                    fx.partial_cmp(&fy).unwrap_or(std::cmp::Ordering::Equal)
-                                } else if let (Some(sx), Some(sy)) = (x.as_str(), y.as_str()) {
-                                    sx.cmp(sy)
-                                } else if let (Some(bx), Some(by)) = (x.as_bool(), y.as_bool()) {
-                                    bx.cmp(&by)
-                                } else {
-                                    std::cmp::Ordering::Equal
-                                }
-                            }
-                            (Some(_), None) => std::cmp::Ordering::Greater,
-                            (None, Some(_)) => std::cmp::Ordering::Less,
-                            (None, None) => std::cmp::Ordering::Equal,
-                        };
-                        let final_ord = if spec.is_desc { ord.reverse() } else { ord };
+                        let va = json_sort_value(a, spec.col_name).or_else(|| map_a.get(spec.col_name));
+                        let vb = json_sort_value(b, spec.col_name).or_else(|| map_b.get(spec.col_name));
+                        let final_ord = json_order_cmp(va, vb, spec.is_desc, spec.nulls_first);
                         if final_ord != std::cmp::Ordering::Equal {
                             return final_ord;
                         }
@@ -8805,37 +8799,26 @@ fn has_top_level_join(after_from: &str) -> bool {
     find_top_level_keyword(from_part, "JOIN").is_some() || split_comma_separated_tokens(from_part).len() > 1
 }
 
+/// Giá trị cột ORDER BY trong một dòng kết quả JSON: theo tên, hoặc theo số thứ tự (`ORDER BY 1`).
+fn json_sort_value<'a>(row: &'a serde_json::Value, spec_name: &str) -> Option<&'a serde_json::Value> {
+    if let Ok(n) = spec_name.trim().parse::<usize>() {
+        if let serde_json::Value::Object(map) = row {
+            return if n >= 1 { map.values().nth(n - 1) } else { None };
+        }
+    }
+    let clean = clean_col_name(spec_name).replace('"', "");
+    row.get(&clean).or_else(|| row.get(spec_name.replace('"', "")))
+}
+
 fn sort_json_rows(rows: &mut [serde_json::Value], specs: &[OrderBySpec]) {
     if specs.is_empty() {
         return;
     }
     rows.sort_by(|a, b| {
         for spec in specs {
-            let clean = clean_col_name(spec.col_name).replace('"', "");
-            let mut va = a.get(&clean);
-            let mut vb = b.get(&clean);
-            if va.is_none() {
-                let unquoted = spec.col_name.replace('"', "");
-                va = a.get(&unquoted);
-                vb = b.get(&unquoted);
-            }
-            let ord = match (va, vb) {
-                (Some(serde_json::Value::Number(n1)), Some(serde_json::Value::Number(n2))) => {
-                    let f1 = n1.as_f64().unwrap_or(0.0);
-                    let f2 = n2.as_f64().unwrap_or(0.0);
-                    f1.partial_cmp(&f2).unwrap_or(std::cmp::Ordering::Equal)
-                }
-                (Some(serde_json::Value::String(s1)), Some(serde_json::Value::String(s2))) => {
-                    s1.cmp(s2)
-                }
-                (Some(serde_json::Value::Bool(b1)), Some(serde_json::Value::Bool(b2))) => {
-                    b1.cmp(b2)
-                }
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            };
-            let directed = if spec.is_desc { ord.reverse() } else { ord };
+            let va = json_sort_value(a, spec.col_name);
+            let vb = json_sort_value(b, spec.col_name);
+            let directed = json_order_cmp(va, vb, spec.is_desc, spec.nulls_first);
             if directed != std::cmp::Ordering::Equal {
                 return directed;
             }
@@ -8912,21 +8895,7 @@ fn eval_window_functions(rows: &mut [serde_json::Value], select_clause: &str) {
                             let clean = clean_col_name(spec.col_name);
                             let va = ra.get(clean);
                             let vb = rb.get(clean);
-                            let ord = match (va, vb) {
-                                (Some(serde_json::Value::Number(n1)), Some(serde_json::Value::Number(n2))) => {
-                                    let f1 = n1.as_f64().unwrap_or(0.0);
-                                    let f2 = n2.as_f64().unwrap_or(0.0);
-                                    f1.partial_cmp(&f2).unwrap_or(std::cmp::Ordering::Equal)
-                                }
-                                (Some(serde_json::Value::String(s1)), Some(serde_json::Value::String(s2))) => {
-                                    s1.cmp(s2)
-                                }
-                                (Some(serde_json::Value::Bool(b1)), Some(serde_json::Value::Bool(b2))) => {
-                                    b1.cmp(b2)
-                                }
-                                _ => std::cmp::Ordering::Equal,
-                            };
-                            let directed = if spec.is_desc { ord.reverse() } else { ord };
+                            let directed = json_order_cmp(va, vb, spec.is_desc, spec.nulls_first);
                             if directed != std::cmp::Ordering::Equal {
                                 return directed;
                             }
@@ -9114,13 +9083,48 @@ struct JoinClause<'a> {
 struct OrderBySpec<'a> {
     col_name: &'a str,
     is_desc: bool,
+    /// NULLS FIRST / NULLS LAST; mặc định như PostgreSQL: NULL lớn nhất (ASC -> cuối, DESC -> đầu).
+    nulls_first: bool,
+}
+
+/// So sánh hai giá trị cho ORDER BY, xử lý NULL theo `nulls_first`.
+pub(crate) fn order_cmp(a: &Value, b: &Value, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Equal,
+        (true, false) => if nulls_first { Less } else { Greater },
+        (false, true) => if nulls_first { Greater } else { Less },
+        _ => {
+            let o = a.cmp_value(b);
+            if desc { o.reverse() } else { o }
+        }
+    }
+}
+
+/// Như `order_cmp` nhưng trên giá trị JSON của dòng kết quả (thiếu khoá = NULL).
+fn json_order_cmp(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+    let to_val = |v: Option<&serde_json::Value>| -> Value {
+        match v {
+            None | Some(serde_json::Value::Null) => Value::Null,
+            Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => Value::text(v.unwrap().to_string()),
+            Some(j) => json_to_value(j),
+        }
+    };
+    order_cmp(&to_val(a), &to_val(b), desc, nulls_first)
 }
 
 fn parse_order_by_specs<'a>(order_part: &'a str) -> Vec<OrderBySpec<'a>> {
     split_comma_separated_tokens(order_part)
         .into_iter()
         .filter_map(|item| {
-            let item_trimmed = item.trim();
+            let mut item_trimmed = item.trim();
+            let mut nulls: Option<bool> = None;
+            for (kw, first) in [(" NULLS FIRST", true), (" NULLS LAST", false)] {
+                if item_trimmed.len() > kw.len() && item_trimmed.get(item_trimmed.len() - kw.len()..).map_or(false, |x| x.eq_ignore_ascii_case(kw)) {
+                    item_trimmed = item_trimmed[..item_trimmed.len() - kw.len()].trim();
+                    nulls = Some(first);
+                }
+            }
             let upper = item_trimmed.to_uppercase();
             let (raw_col, desc) = if upper.ends_with(" DESC") {
                 (item_trimmed[..item_trimmed.len() - 5].trim(), true)
@@ -9133,7 +9137,7 @@ fn parse_order_by_specs<'a>(order_part: &'a str) -> Vec<OrderBySpec<'a>> {
             if col.is_empty() {
                 return None;
             }
-            Some(OrderBySpec { col_name: raw_col, is_desc: desc })
+            Some(OrderBySpec { col_name: raw_col, is_desc: desc, nulls_first: nulls.unwrap_or(desc) })
         })
         .collect()
 }

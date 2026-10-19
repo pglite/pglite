@@ -94,7 +94,7 @@ pub enum ExecutionPlan {
         table_name: String,
         join: Option<PlannedJoin>,
         where_expr: Option<CompiledExpr>,
-        order_by: Option<(usize, bool)>, // (col_idx, is_desc)
+        order_by: Option<(usize, bool, bool)>, // (col_idx, is_desc, nulls_first)
         limit: Option<OperandTemplate>,
         offset: Option<OperandTemplate>,
         projections: Vec<PlannedProjectedExpr>,
