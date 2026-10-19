@@ -73,7 +73,7 @@ impl Executor {
         res
     }
 
-    fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+    pub(crate) fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = strip_sql_comments(sql);
         let normalized_sql = normalize_named_sql_params(&clean_sql);
 
@@ -3233,204 +3233,6 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             row_count,
             fields,
             command: "SELECT".to_string(),
-        })
-    }
-
-    fn handle_insert(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        // Format: INSERT INTO <table> (<col1>, <col2>) VALUES ($1, $2), ($3, $4) [RETURNING <cols>]
-        let (sql_before_returning, returning_cols) = extract_returning_clause(sql);
-
-        let values_idx = find_top_level_keyword(sql_before_returning, "VALUES").ok_or("Missing VALUES clause in INSERT")?;
-        let into_idx = find_top_level_keyword(sql_before_returning, "INTO").unwrap_or(6);
-        let table_part = sql_before_returning[into_idx + 4..values_idx].trim();
-
-        let (table_name, target_cols) = if let Some(open_p) = table_part.find('(') {
-            let close_p = table_part.find(')').ok_or("Missing closing parenthesis for columns")?;
-            let name = table_part[..open_p].trim().trim_matches('"');
-            let cols: Vec<String> = split_comma_separated_tokens(&table_part[open_p + 1..close_p])
-                .into_iter()
-                .map(|c| c.trim().trim_matches('"').to_string())
-                .collect();
-            (name, Some(cols))
-        } else {
-            (table_part.trim_matches('"'), None)
-        };
-
-        let values_part = sql_before_returning[values_idx + 6..].trim();
-
-        // Borrow table
-        let (col_indices, num_table_cols, _pk_idx, clean_table_name, col_defaults, col_defs) = {
-            let table = self.storage.get_table(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-            let mut indices = Vec::new();
-            if let Some(target) = &target_cols {
-                for col in target {
-                    let idx = table.get_column_index(col).ok_or_else(|| format!("Column {} not found in {}", col, table_name))?;
-                    indices.push(idx);
-                }
-            } else {
-                for i in 0..table.columns.len() {
-                    indices.push(i);
-                }
-            }
-            let defaults: Vec<Option<String>> = table.columns.iter().map(|c| c.default_value.clone()).collect();
-            let col_defs: Vec<crate::types::ColumnDef> = table.columns.clone();
-            (indices, table.columns.len(), table.pk_col_idx, table.name.clone(), defaults, col_defs)
-        };
-
-        let groups = extract_value_groups(values_part);
-        let count = groups.len();
-        let in_tx = self.storage.undo_enabled();
-
-        let mut returned_rows = Vec::new();
-        let has_wal = self.storage.wal.writer.is_some();
-        let wal = &mut self.storage.wal;
-        let mut param_cursor = 0;
-        let mut first_row = 0;
-
-        if let Some(table) = self.storage.tables.get_mut(&clean_table_name) {
-            table.rows.reserve(count);
-            table.is_deleted.reserve(count);
-
-            let mut built: Vec<Vec<Value>> = Vec::with_capacity(count);
-            for group in groups {
-                let mut row = vec![Value::Null; num_table_cols];
-                for (i, def_opt) in col_defaults.iter().enumerate() {
-                    if let Some(def_str) = def_opt {
-                        let up = def_str.trim().to_uppercase();
-                        if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
-                            row[i] = Value::text(crate::types::generate_uuid_v4());
-                        } else if let Some(dt_val) = eval_date_time_keyword(def_str) {
-                            row[i] = dt_val;
-                        } else if def_str.starts_with('\'') && def_str.ends_with('\'') && def_str.len() >= 2 {
-                            row[i] = Value::text(&def_str[1..def_str.len() - 1]);
-                        } else if let Ok(n) = def_str.parse::<i64>() {
-                            row[i] = Value::Int(n);
-                        } else if let Ok(f) = def_str.parse::<f64>() {
-                            row[i] = Value::Float(f);
-                        } else if def_str.eq_ignore_ascii_case("TRUE") {
-                            row[i] = Value::Bool(true);
-                        } else if def_str.eq_ignore_ascii_case("FALSE") {
-                            row[i] = Value::Bool(false);
-                        } else {
-                            row[i] = eval_sql_expr(def_str, &[], None, &[], None, params);
-                        }
-                    }
-                }
-                let mut col_ptr = 0;
-                let tokens = split_comma_separated_tokens(group);
-
-                for token in tokens {
-                    let token = token.trim();
-                    if col_ptr >= col_indices.len() {
-                        break;
-                    }
-                    let target_idx = col_indices[col_ptr];
-
-                    let val = if token.starts_with('$') {
-                        if let Ok(p_num) = token[1..].parse::<usize>() {
-                            if p_num >= 1 && p_num <= params.len() {
-                                params[p_num - 1].clone()
-                            } else if param_cursor < params.len() {
-                                let v = params[param_cursor].clone();
-                                param_cursor += 1;
-                                v
-                            } else {
-                                Value::Null
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    } else if token.eq_ignore_ascii_case("DEFAULT") {
-                        if let Some(def_str) = col_defaults.get(target_idx).and_then(|d| d.as_ref()) {
-                            let up = def_str.trim().to_uppercase();
-                            if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
-                                Value::text(crate::types::generate_uuid_v4())
-                            } else {
-                                eval_sql_expr(def_str, &[], None, &[], None, params)
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    } else if let Some(dt_val) = eval_date_time_keyword(token) {
-                        dt_val
-                    } else if token.eq_ignore_ascii_case("NULL") {
-                        Value::Null
-                    } else if token.eq_ignore_ascii_case("TRUE") {
-                        Value::Bool(true)
-                    } else if token.eq_ignore_ascii_case("FALSE") {
-                        Value::Bool(false)
-                    } else if token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2 {
-                        Value::text(token[1..token.len() - 1].replace("''", "'"))
-                    } else if let Ok(int_val) = token.parse::<i64>() {
-                        Value::Int(int_val)
-                    } else if let Ok(flt_val) = token.parse::<f64>() {
-                        Value::Float(flt_val)
-                    } else {
-                        eval_sql_expr(token, &[], None, &[], None, params)
-                    };
-
-                    row[target_idx] = coerce_update_val(&col_defs[target_idx], val);
-                    col_ptr += 1;
-                }
-
-                built.push(row);
-            }
-
-            // Kiểm tra khoá trùng cho cả lệnh trước khi chèn dòng nào, để lệnh lỗi không để lại gì.
-            if table.pk_enforced {
-                if let Some(pk_idx) = table.pk_col_idx {
-                    let mut seen = std::collections::HashSet::new();
-                    for row in &built {
-                        let Some(v) = row.get(pk_idx) else { continue };
-                        if v.is_null() || matches!(v, Value::Text(t) if t.trim().is_empty()) {
-                            continue; // khoá tự sinh trong Table::insert
-                        }
-                        if table.live_row_with_pk(v, None).is_some() || !seen.insert(pk_dedup_key(v)) {
-                            return Err(duplicate_pk_error(table, v));
-                        }
-                    }
-                }
-            }
-
-            first_row = table.rows.len();
-            for row in built {
-                let _pk = table.insert(row);
-                if let Some(last_row) = table.rows.last() {
-                    if let Some(r_cols) = returning_cols {
-                        returned_rows.push(project_returning_row(table, last_row, r_cols));
-                    }
-                    if has_wal {
-                        wal.append_ref(crate::storage::wal::WalRecordRef::Insert {
-                            table: &clean_table_name,
-                            row: last_row,
-                        });
-                    }
-                }
-            }
-        }
-
-        if in_tx && count > 0 {
-            self.storage.tx_undo_log.push(UndoAction::DeleteInsertedRows {
-                table: clean_table_name.clone(),
-                count,
-            });
-        }
-        if count > 0 {
-            let inserted: Vec<usize> = (first_row..first_row + count).collect();
-            self.verify_rows(&clean_table_name, &inserted, None)?;
-        }
-
-        let fields = if let (Some(r_cols), Some(table)) = (returning_cols, self.storage.get_table(&clean_table_name)) {
-            get_returning_fields(table, r_cols)
-        } else {
-            vec![]
-        };
-
-        Ok(QueryResult {
-            rows: returned_rows,
-            row_count: count,
-            fields,
-            command: "INSERT".to_string(),
         })
     }
 
@@ -10509,7 +10311,7 @@ fn extract_literal_after_key(where_str: &str, key: &str) -> Option<String> {
     None
 }
 
-fn extract_value_groups(values_part: &str) -> Vec<&str> {
+pub(crate) fn extract_value_groups(values_part: &str) -> Vec<&str> {
     let bytes = values_part.as_bytes();
     let mut groups = Vec::new();
     let mut depth = 0;
@@ -12513,6 +12315,18 @@ fn projection_exprs_by_alias(select_clause: &str) -> HashMap<String, String> {
 
 /// Vế phải chỉ gồm đúng một toán hạng: `$n`, một chuỗi '...' hoặc một số.
 /// (Không có AND/OR/toán tử theo sau, kể cả viết thường.)
+/// `col`, `"Col"`, `t.col`, `t."Col"`: tham chiếu cột đơn (không phải biểu thức).
+fn is_column_ref(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.split('.').count() <= 2
+        && t.split('.').all(|part| {
+            let p = part.trim();
+            (p.len() >= 2 && p.starts_with('"') && p.ends_with('"') && !p[1..p.len() - 1].contains('"'))
+                || (p.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') && p.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        })
+}
+
 fn is_single_operand(s: &str) -> bool {
     let t = s.trim();
     if let Some(n) = t.strip_prefix('$') {
@@ -12537,7 +12351,7 @@ pub(crate) enum RowIdentity {
 }
 
 /// Khoá dùng để phát hiện trùng trong cùng một lệnh (cùng quy tắc với index khoá chính).
-fn pk_dedup_key(v: &Value) -> String {
+pub(crate) fn pk_dedup_key(v: &Value) -> String {
     match v {
         Value::Text(t) if t.trim().parse::<i64>().is_err() => {
             if t.len() == 36 { format!("s:{}", t.to_lowercase()) } else { format!("s:{}", t) }
@@ -12546,7 +12360,7 @@ fn pk_dedup_key(v: &Value) -> String {
     }
 }
 
-fn duplicate_pk_error(table: &crate::storage::table::Table, v: &Value) -> String {
+pub(crate) fn duplicate_pk_error(table: &crate::storage::table::Table, v: &Value) -> String {
     let col = table.pk_col_idx.map(|i| table.columns[i].name.as_str()).unwrap_or("id");
     let shown = match v {
         Value::Text(t) => t.to_string(),
@@ -12747,73 +12561,83 @@ fn extract_returning_clause(sql: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn project_returning_row(
-    table: &crate::storage::table::Table,
-    row: &[Value],
-    r_cols: &str,
-) -> serde_json::Value {
-    let trimmed = r_cols.trim();
-    if trimmed == "*" {
-        return row_to_json(table, row);
-    }
-    let mut map = serde_json::Map::new();
-    for item in trimmed.split(',') {
+/// Một phần tử của RETURNING: (biểu thức, tên cột kết quả, chỉ số cột nếu là cột đơn).
+fn returning_items(table: &crate::storage::table::Table, r_cols: &str) -> Vec<(String, String, Option<usize>)> {
+    let mut out = Vec::new();
+    for item in split_projection_items(r_cols.trim()) {
         let item = item.trim();
         if item.is_empty() {
             continue;
         }
-        let upper_item = item.to_uppercase();
-        let (expr_col, alias) = if let Some(as_pos) = upper_item.find(" AS ") {
-            (item[..as_pos].trim(), item[as_pos + 4..].trim().trim_matches('"'))
-        } else {
-            (item, clean_col_name(item))
-        };
-        let col_name = clean_col_name(expr_col);
-        if let Some(col_idx) = table.get_column_index(col_name) {
-            let v = row.get(col_idx).unwrap_or(&Value::Null);
-            map.insert(alias.to_string(), value_to_json(v));
+        if item == "*" || item.ends_with(".*") {
+            for (i, c) in table.columns.iter().enumerate() {
+                out.push((c.name.clone(), c.name.clone(), Some(i)));
+            }
+            continue;
         }
+        let (expr, alias) = match find_top_level_keyword(item, "AS") {
+            Some(p) => (item[..p].trim(), Some(item[p + 2..].trim().trim_matches('"').to_string())),
+            None => (item, None),
+        };
+        let col_idx = if is_column_ref(expr) { table.get_column_index(clean_col_name(expr)) } else { None };
+        let name = alias.unwrap_or_else(|| match col_idx {
+            Some(i) => table.columns[i].name.clone(),
+            None => {
+                let e = expr.trim();
+                match e.find('(') {
+                    Some(p) if p > 0 && e[..p].chars().all(|c| c.is_alphanumeric() || c == '_') => e[..p].to_lowercase(),
+                    _ => match e.rfind("::") {
+                        Some(p) => clean_col_name(&e[..p]).to_string(),
+                        None => "?column?".to_string(),
+                    },
+                }
+            }
+        });
+        out.push((expr.to_string(), name, col_idx));
+    }
+    out
+}
+
+/// Một dòng RETURNING: cột, `*`, hay biểu thức bất kỳ trên dòng vừa ghi.
+pub(crate) fn returning_row(table: &crate::storage::table::Table, row: &[Value], r_cols: &str, params: &[Value]) -> serde_json::Value {
+    if r_cols.trim() == "*" {
+        return row_to_json(table, row);
+    }
+    let mut map = serde_json::Map::new();
+    for (expr, name, col_idx) in returning_items(table, r_cols) {
+        let v = match col_idx {
+            Some(i) => row.get(i).cloned().unwrap_or(Value::Null),
+            None => eval_sql_expr(&expr, row, Some(table), &[], None, params),
+        };
+        map.insert(name, value_to_json(&v));
     }
     serde_json::Value::Object(map)
 }
 
-fn get_returning_fields(
-    table: &crate::storage::table::Table,
-    r_cols: &str,
-) -> Vec<FieldInfo> {
-    let trimmed = r_cols.trim();
-    if trimmed == "*" {
-        table.columns.iter().map(|c| FieldInfo {
-            name: c.name.clone(),
-            data_type: format!("{:?}", c.data_type).to_lowercase(),
-        }).collect()
-    } else {
-        let mut fields = Vec::new();
-        for item in trimmed.split(',') {
-            let item = item.trim();
-            if item.is_empty() {
-                continue;
-            }
-            let upper_item = item.to_uppercase();
-            let (expr_col, alias) = if let Some(as_pos) = upper_item.find(" AS ") {
-                (item[..as_pos].trim(), item[as_pos + 4..].trim().trim_matches('"'))
-            } else {
-                (item, clean_col_name(item))
-            };
-            let col_name = clean_col_name(expr_col);
-            if let Some(col_idx) = table.get_column_index(col_name) {
-                fields.push(FieldInfo {
-                    name: alias.to_string(),
-                    data_type: format!("{:?}", table.columns[col_idx].data_type).to_lowercase(),
-                });
-            }
-        }
-        fields
-    }
+fn project_returning_row(table: &crate::storage::table::Table, row: &[Value], r_cols: &str) -> serde_json::Value {
+    returning_row(table, row, r_cols, &[])
 }
 
-/// Giá trị DEFAULT của một cột (cùng quy tắc với INSERT).
-pub(crate) fn eval_default_value(def_str: &str) -> Value {
+/// Kiểu cột của RETURNING: theo cột nếu là cột đơn, theo giá trị đã tính nếu là biểu thức.
+pub(crate) fn returning_fields(table: &crate::storage::table::Table, r_cols: &str, rows: &[serde_json::Value]) -> Vec<FieldInfo> {
+    returning_items(table, r_cols)
+        .into_iter()
+        .map(|(_, name, col_idx)| {
+            let data_type = match col_idx {
+                Some(i) => format!("{:?}", table.columns[i].data_type).to_lowercase(),
+                None => rows.iter().find_map(|r| r.get(&name).filter(|v| !v.is_null()).map(type_str_from_json_value)).unwrap_or_else(|| "text".to_string()),
+            };
+            FieldInfo { name, data_type }
+        })
+        .collect()
+}
+
+fn get_returning_fields(table: &crate::storage::table::Table, r_cols: &str) -> Vec<FieldInfo> {
+    returning_fields(table, r_cols, &[])
+}
+
+/// Giá trị DEFAULT khi INSERT (tham số của lệnh dùng được trong biểu thức).
+pub(crate) fn eval_default_for_insert(def_str: &str, params: &[Value]) -> Value {
     let up = def_str.trim().to_uppercase();
     if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
         Value::text(crate::types::generate_uuid_v4())
@@ -12830,8 +12654,17 @@ pub(crate) fn eval_default_value(def_str: &str) -> Value {
     } else if def_str.eq_ignore_ascii_case("FALSE") {
         Value::Bool(false)
     } else {
-        eval_sql_expr(def_str, &[], None, &[], None, &[])
+        eval_sql_expr(def_str, &[], None, &[], None, params)
     }
+}
+
+/// Giá trị DEFAULT của một cột (cùng quy tắc với INSERT).
+pub(crate) fn eval_default_value(def_str: &str) -> Value {
+    eval_default_for_insert(def_str, &[])
+}
+
+pub(crate) fn evaluate_assignment_val_pub(val_str: &str, row: &[Value], table: &crate::storage::table::Table, params: &[Value]) -> Value {
+    evaluate_assignment_val(val_str, row, table, params)
 }
 
 fn evaluate_assignment_val(
@@ -12847,7 +12680,7 @@ fn evaluate_assignment_val(
     eval_sql_expr(s, row, Some(table), &[], None, params)
 }
 
-fn coerce_update_val(col_def: &crate::types::ColumnDef, val: Value) -> Value {
+pub(crate) fn coerce_update_val(col_def: &crate::types::ColumnDef, val: Value) -> Value {
     if val.is_null() {
         return Value::Null;
     }
