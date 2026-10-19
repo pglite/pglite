@@ -862,6 +862,11 @@ impl Executor {
 /// Lỗi kiểu khi giá trị dạng chuỗi không hợp lệ với kiểu cột.
 fn type_error(col: &ColumnDef, v: &Value) -> Option<String> {
     use crate::types::DataType;
+    if let (DataType::Integer, Value::Int(i)) = (&col.data_type, v) {
+        if *i < i32::MIN as i64 || *i > i32::MAX as i64 {
+            return Some("integer out of range".to_string());
+        }
+    }
     let Value::Text(t) = v else { return None };
     let s = t.trim();
     let bad = |ty: &str| Some(format!("invalid input syntax for type {}: \"{}\"", ty, t));

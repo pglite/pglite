@@ -18,7 +18,16 @@ fn nested_begin_keeps_outer_work_rollbackable_and_replays() {
         db.exec("BEGIN", &[]).unwrap();
         db.exec("INSERT INTO t VALUES (4)", &[]).unwrap();
         assert!(db.exec("ROLLBACK TO SAVEPOINT nope", &[]).is_err());
+        // Như PostgreSQL: lỗi làm transaction bị abort (25P02) tới khi ROLLBACK
+        let e = db.exec("RELEASE SAVEPOINT nope", &[]).unwrap_err();
+        assert_eq!(pglite_rs::sqlstate(&e), "25P02", "{e}");
+        db.exec("ROLLBACK", &[]).unwrap();
+        db.exec("BEGIN", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (4)", &[]).unwrap();
         assert!(db.exec("RELEASE SAVEPOINT nope", &[]).is_err());
+        db.exec("ROLLBACK", &[]).unwrap();
+        db.exec("BEGIN", &[]).unwrap();
+        db.exec("INSERT INTO t VALUES (4)", &[]).unwrap();
         db.exec("SAVEPOINT s1", &[]).unwrap();
         db.exec("INSERT INTO t VALUES (5)", &[]).unwrap();
         db.exec("ROLLBACK TO SAVEPOINT s1", &[]).unwrap();

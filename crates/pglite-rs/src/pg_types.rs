@@ -654,6 +654,18 @@ pub fn sqlstate(message: &str) -> &'static str {
         "23502"
     } else if has("violates check constraint") || has("is violated by some row") {
         "23514"
+    } else if has("current transaction is aborted") {
+        "25P02"
+    } else if has("out of range") {
+        "22003"
+    } else if has("value too long") {
+        "22001"
+    } else if has("invalid input value for enum") || has("invalid input syntax") {
+        "22P02"
+    } else if has("is not supported") || has("not supported") && has("feature") {
+        "0A000"
+    } else if has("read-only transaction") {
+        "25006"
     } else if has("cannot affect row a second time") {
         "21000"
     } else if has("invalid input syntax for type") {

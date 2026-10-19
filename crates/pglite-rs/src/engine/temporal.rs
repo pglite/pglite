@@ -296,3 +296,56 @@ pub(crate) fn typed_literal(s: &str) -> Option<Value> {
     }
     None
 }
+
+
+fn valid_parts(dt: &DateTimeParts) -> bool {
+    (1..=12).contains(&dt.month) && dt.day >= 1 && dt.day <= days_in_month(dt.year, dt.month) && dt.hour < 25 && dt.minute < 60 && dt.second < 61
+}
+
+/// Giá trị đặc biệt của PostgreSQL cho date/timestamp.
+fn special_datetime(s: &str) -> Option<String> {
+    let l = s.trim().to_lowercase();
+    let now = super::executor::get_current_timestamp();
+    Some(match l.as_str() {
+        "epoch" => "1970-01-01 00:00:00".to_string(),
+        "infinity" | "+infinity" => "infinity".to_string(),
+        "-infinity" => "-infinity".to_string(),
+        "now" => now,
+        "today" => now[..10].to_string(),
+        "tomorrow" | "yesterday" => {
+            let dt = parse_datetime_components(&now[..10])?;
+            let micros = to_micros(&dt) + if l == "tomorrow" { 86_400_000_000 } else { -86_400_000_000 };
+            format_like(&dt, micros, false)
+        }
+        _ => return None,
+    })
+}
+
+/// `'...'::date`: kiểm tra và chuẩn hoá về `YYYY-MM-DD`. `None` nếu không hợp lệ.
+pub(crate) fn cast_date(s: &str) -> Option<String> {
+    if let Some(sp) = special_datetime(s) {
+        return Some(if sp.len() >= 10 && sp.as_bytes()[4] == b'-' { sp[..10].to_string() } else { sp });
+    }
+    let dt = parse_datetime_components(s.trim())?;
+    let b = s.trim().as_bytes();
+    if b.len() < 8 || !b[0].is_ascii_digit() || !valid_parts(&dt) {
+        return None;
+    }
+    Some(format!("{:04}-{:02}-{:02}", dt.year, dt.month, dt.day))
+}
+
+/// Chuỗi có phải timestamp hợp lệ (ngày tháng có thật) không.
+pub(crate) fn is_valid_timestamp(s: &str) -> bool {
+    if special_datetime(s).is_some() {
+        return true;
+    }
+    let t = s.trim();
+    let b = t.as_bytes();
+    if b.len() < 8 || !b[0].is_ascii_digit() {
+        return false;
+    }
+    match parse_datetime_components(t) {
+        Some(dt) => valid_parts(&dt),
+        None => false,
+    }
+}

@@ -55,11 +55,29 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        let top = self.storage.stmt_depth == 0;
+        if top {
+            crate::engine::errors::clear();
+            if self.storage.in_transaction && self.storage.tx_aborted {
+                if let Some(res) = self.aborted_transaction_gate(sql) {
+                    return res;
+                }
+            }
+        }
         let appended_before = self.storage.wal.appended;
         // Lệnh lỗi giữa chừng (vi phạm ràng buộc ở dòng thứ n, cascade lỗi...) được hoàn tác hết.
         let mark = self.storage.begin_statement();
-        let res = self.execute_statement(sql, params);
+        let mut res = self.execute_statement(sql, params);
+        // Lỗi lúc đánh giá biểu thức (chia cho 0, ép kiểu sai...) được ghi qua kênh lỗi.
+        if let Some(e) = crate::engine::errors::take() {
+            if res.is_ok() {
+                res = Err(e);
+            }
+        }
         self.storage.end_statement(mark, res.is_ok());
+        if top && res.is_err() && self.storage.in_transaction {
+            self.storage.tx_aborted = true;
+        }
         // Lệnh ngoài giao dịch (autocommit) phải nằm trong file (và được fsync, nếu bật `sync`)
         // trước khi trả kết quả, nếu không tiến trình bị kill hay mất điện sẽ làm mất nó.
         // Trong giao dịch thì COMMIT/ROLLBACK tự làm điều đó.
@@ -76,6 +94,25 @@ impl Executor {
         res
     }
 
+    /// Giao dịch đang ở trạng thái lỗi: chỉ ROLLBACK [TO SAVEPOINT] được chạy; COMMIT = ROLLBACK.
+    /// `None` = cho câu lệnh chạy tiếp.
+    fn aborted_transaction_gate(&mut self, sql: &str) -> Option<Result<QueryResult, String>> {
+        let up = strip_sql_comments(sql).trim().to_uppercase();
+        let first = up.split_whitespace().next().unwrap_or("").trim_end_matches(';').to_string();
+        match first.as_str() {
+            "ROLLBACK" | "ABORT" => None,
+            "COMMIT" | "END" => {
+                // Như PostgreSQL: COMMIT trong giao dịch lỗi thực chất là ROLLBACK
+                if let Err(e) = self.storage.rollback() {
+                    return Some(Err(e));
+                }
+                self.plan_cache.clear();
+                Some(Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "ROLLBACK".to_string() }))
+            }
+            _ => Some(Err("current transaction is aborted, commands ignored until end of transaction block".to_string())),
+        }
+    }
+
     pub(crate) fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = strip_sql_comments(sql);
         let normalized_sql = normalize_named_sql_params(&clean_sql);
@@ -88,8 +125,30 @@ impl Executor {
                 fields: vec![],
                 command: String::new(),
             };
+            // Nhiều câu trong một lần gửi (simple query) mà không tự điều khiển giao dịch: chạy như một
+            // giao dịch ngầm, câu sau lỗi thì cả chuỗi bị huỷ (như PostgreSQL).
+            let controls_tx = stmts.iter().any(|st| {
+                let u = st.trim_start().to_uppercase();
+                ["BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE TRANSACTION", "VACUUM", "CHECKPOINT"].iter().any(|k| u.starts_with(k))
+            });
+            let implicit = !self.storage.in_transaction && !controls_tx;
+            if implicit {
+                self.storage.begin_transaction();
+            }
             for stmt in stmts {
-                last_res = self.execute(&stmt, params)?;
+                match self.execute(&stmt, params) {
+                    Ok(r) => last_res = r,
+                    Err(e) => {
+                        if implicit {
+                            let _ = self.storage.rollback();
+                            self.plan_cache.clear();
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            if implicit {
+                self.storage.commit()?;
             }
             return Ok(last_res);
         }
@@ -8021,8 +8080,12 @@ fn eval_joined_scalar_expr(
         if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
             let res = match op {
                 '*' => l_num * r_num,
-                '/' => if r_num != 0.0 { l_num / r_num } else { 0.0 },
-                '%' => if r_num != 0.0 { l_num % r_num } else { 0.0 },
+                '/' | '%' if r_num == 0.0 => {
+                    crate::engine::errors::division_by_zero();
+                    return Default::default();
+                }
+                '/' => l_num / r_num,
+                '%' => l_num % r_num,
                 _ => 0.0,
             };
             return if res.fract() == 0.0 { serde_json::json!(res as i64) } else { serde_json::json!(res) };
@@ -10870,7 +10933,7 @@ fn is_aggregate_projection_item(item: &str) -> bool {
         || upper.contains("STRING_AGG(")
 }
 
-fn is_fully_enclosed_in_parens(s: &str) -> bool {
+pub(crate) fn is_fully_enclosed_in_parens(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
         return false;
@@ -13153,11 +13216,41 @@ pub(crate) fn coerce_update_val(col_def: &crate::types::ColumnDef, val: Value) -
     }
 }
 
+/// Ép kiểu `val::type` như PostgreSQL. Giá trị không hợp lệ báo lỗi qua kênh lỗi (22P02 / 22003) và
+/// trả NULL, thay vì âm thầm ra NULL như trước.
 pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
+    use crate::engine::errors::raise;
     if val.is_null() {
         return Value::Null;
     }
     let tt = target_type.trim().to_uppercase();
+    let tt = tt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let base = tt.split('(').next().unwrap_or("").trim().to_string();
+    let typmod: Vec<i64> = tt.find('(').and_then(|o| tt.rfind(')').map(|c| &tt[o + 1..c])).map(|m| m.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+    let shown = || match &val {
+        Value::Text(t) => t.to_string(),
+        other => other.as_str().to_string(),
+    };
+    let int_like = |v: &Value, ty: &str, min: i64, max: i64| -> Value {
+        let n = match v {
+            Value::Int(i) => Some(*i),
+            Value::Float(f) if f.is_finite() => Some(f.round() as i64),
+            Value::Bool(b) => Some(*b as i64),
+            Value::Text(t) => t.trim().parse::<i64>().ok(),
+            _ => None,
+        };
+        match n {
+            Some(i) if i < min || i > max => {
+                raise(format!("{} out of range", ty));
+                Value::Null
+            }
+            Some(i) => Value::Int(i),
+            None => {
+                raise(format!("invalid input syntax for type {}: \"{}\"", ty, match v { Value::Text(t) => t.to_string(), o => o.as_str().to_string() }));
+                Value::Null
+            }
+        }
+    };
     if tt.ends_with("[]") || tt.starts_with("ARRAY") {
         let items = val_to_array_items(&val);
         let inner_type = tt.trim_end_matches("[]").trim_start_matches("ARRAY").trim();
@@ -13168,40 +13261,135 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
                 value_to_json(&c)
             })
             .collect();
-        Value::text(serde_json::to_string(&casted_items).unwrap_or_default())
-    } else if tt.starts_with("INTERVAL") {
-        match crate::engine::temporal::parse_interval(&val.as_str()) {
+        return Value::text(serde_json::to_string(&casted_items).unwrap_or_default());
+    }
+    match base.as_str() {
+        "INTERVAL" => match crate::engine::temporal::parse_interval(&val.as_str()) {
             Some(iv) => Value::text(crate::engine::temporal::format_interval(iv)),
-            None => Value::Null,
+            None => {
+                raise(format!("invalid input syntax for type interval: \"{}\"", shown()));
+                Value::Null
+            }
+        },
+        "SMALLINT" | "INT2" => int_like(&val, "smallint", i16::MIN as i64, i16::MAX as i64),
+        "INT" | "INTEGER" | "INT4" | "SERIAL" => int_like(&val, "integer", i32::MIN as i64, i32::MAX as i64),
+        "BIGINT" | "INT8" | "BIGSERIAL" => int_like(&val, "bigint", i64::MIN, i64::MAX),
+        "TEXT" | "NAME" | "CITEXT" => Value::text(val.as_str()),
+        "VARCHAR" | "CHARACTER VARYING" => {
+            let s = val.as_str();
+            match typmod.first() {
+                // Ép kiểu tường minh sang varchar(n) cắt bớt (không lỗi), như PostgreSQL
+                Some(&n) if s.chars().count() > n as usize => Value::text(s.chars().take(n as usize).collect::<String>()),
+                _ => Value::text(s),
+            }
         }
-    } else if tt.starts_with("INT") || tt == "BIGINT" || tt == "SERIAL" {
-        if let Some(i) = val.as_i64() {
-            Value::Int(i)
-        } else {
-            Value::Null
+        "CHAR" | "CHARACTER" | "BPCHAR" => {
+            let s = val.as_str();
+            let n = typmod.first().copied().unwrap_or(1) as usize;
+            let mut out: String = s.chars().take(n).collect();
+            while out.chars().count() < n {
+                out.push(' ');
+            }
+            Value::text(out)
         }
-    } else if tt.starts_with("TEXT") || tt.starts_with("VARCHAR") || tt == "CHAR" {
-        Value::text(val.as_str())
-    } else if tt.starts_with("NUMERIC") || tt.starts_with("FLOAT") || tt.starts_with("DOUBLE") || tt.starts_with("DECIMAL") {
-        if let Some(f) = val.as_f64() {
-            Value::Float(f)
-        } else {
-            Value::Null
+        "NUMERIC" | "DECIMAL" => {
+            let f = match &val {
+                Value::Int(i) => Some(*i as f64),
+                Value::Float(f) => Some(*f),
+                Value::Text(t) => t.trim().parse::<f64>().ok(),
+                Value::Bool(_) => None,
+                _ => None,
+            };
+            match f {
+                None => {
+                    raise(format!("invalid input syntax for type numeric: \"{}\"", shown()));
+                    Value::Null
+                }
+                Some(f) => match (typmod.first(), typmod.get(1)) {
+                    (Some(&p), scale) => {
+                        let sc = scale.copied().unwrap_or(0).max(0) as i32;
+                        let factor = 10f64.powi(sc);
+                        let r = (f * factor).round() / factor;
+                        if r.abs() >= 10f64.powi((p as i32) - sc) {
+                            raise("numeric field overflow");
+                            return Value::Null;
+                        }
+                        if sc == 0 { Value::Int(r as i64) } else { Value::Float(r) }
+                    }
+                    _ => match &val {
+                        Value::Int(i) => Value::Int(*i),
+                        _ => Value::Float(f),
+                    },
+                },
+            }
         }
-    } else if tt.starts_with("BOOL") {
-        if let Some(b) = val.as_bool() {
-            Value::Bool(b)
-        } else {
-            Value::Null
+        "FLOAT" | "FLOAT4" | "FLOAT8" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" => match val.as_f64() {
+            Some(f) => Value::Float(f),
+            None => {
+                raise(format!("invalid input syntax for type double precision: \"{}\"", shown()));
+                Value::Null
+            }
+        },
+        "BOOL" | "BOOLEAN" => {
+            let b = match &val {
+                Value::Bool(b) => Some(*b),
+                Value::Int(i) => Some(*i != 0),
+                Value::Text(t) => match t.trim().to_lowercase().as_str() {
+                    "t" | "true" | "y" | "yes" | "on" | "1" => Some(true),
+                    "f" | "false" | "n" | "no" | "off" | "0" => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match b {
+                Some(b) => Value::Bool(b),
+                None => {
+                    raise(format!("invalid input syntax for type boolean: \"{}\"", shown()));
+                    Value::Null
+                }
+            }
         }
-    } else if tt.starts_with("UUID") {
-        Value::text(val.as_str())
-    } else if tt.starts_with("BYTEA") {
-        let raw = get_raw_bytes(&val);
-        let items: Vec<serde_json::Value> = raw.iter().map(|&b| serde_json::json!(b)).collect();
-        Value::text(serde_json::to_string(&items).unwrap_or_default())
-    } else {
-        val
+        "UUID" => {
+            let s = val.as_str();
+            let hex: String = s.trim().trim_matches(|c| c == '{' || c == '}').chars().filter(|c| *c != '-').collect();
+            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                raise(format!("invalid input syntax for type uuid: \"{}\"", s));
+                return Value::Null;
+            }
+            let h = hex.to_lowercase();
+            Value::text(format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]))
+        }
+        "JSON" | "JSONB" => {
+            if let Value::Text(t) = &val {
+                if serde_json::from_str::<serde_json::Value>(t).is_err() {
+                    raise(format!("invalid input syntax for type json: \"{}\"", t));
+                    return Value::Null;
+                }
+            }
+            val
+        }
+        "DATE" => match crate::engine::temporal::cast_date(&val.as_str()) {
+            Some(d) => Value::text(d),
+            None => {
+                raise(format!("invalid input syntax for type date: \"{}\"", shown()));
+                Value::Null
+            }
+        },
+        "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITHOUT TIME ZONE" | "TIMESTAMP WITH TIME ZONE" => {
+            let s = val.as_str();
+            if crate::engine::temporal::is_valid_timestamp(&s) {
+                val
+            } else {
+                raise(format!("invalid input syntax for type timestamp: \"{}\"", s));
+                Value::Null
+            }
+        }
+        "BYTEA" => {
+            let raw = get_raw_bytes(&val);
+            let items: Vec<serde_json::Value> = raw.iter().map(|&b| serde_json::json!(b)).collect();
+            Value::text(serde_json::to_string(&items).unwrap_or_default())
+        }
+        _ => val,
     }
 }
 
@@ -14787,8 +14975,12 @@ pub(crate) fn eval_sql_expr(
         if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
             let res = match op {
                 '*' => l_num * r_num,
-                '/' => if r_num != 0.0 { l_num / r_num } else { 0.0 },
-                '%' => if r_num != 0.0 { l_num % r_num } else { 0.0 },
+                '/' | '%' if r_num == 0.0 => {
+                    crate::engine::errors::division_by_zero();
+                    return Value::Null;
+                }
+                '/' => l_num / r_num,
+                '%' => l_num % r_num,
                 _ => 0.0,
             };
             return if res.fract() == 0.0 { Value::Int(res as i64) } else { Value::Float(res) };

@@ -389,6 +389,10 @@ impl CompiledExpr {
                         let res = a / b;
                         if res.fract() == 0.0 { Value::Int(res as i64) } else { Value::Float(res) }
                     }
+                    (Some(_), Some(_)) => {
+                        crate::engine::errors::division_by_zero();
+                        Value::Null
+                    }
                     _ => Value::Null,
                 }
             }
@@ -397,6 +401,10 @@ impl CompiledExpr {
                 let vr = r.eval(primary_row, joined_row, params);
                 match (vl.as_i64(), vr.as_i64()) {
                     (Some(a), Some(b)) if b != 0 => Value::Int(a % b),
+                    (Some(_), Some(_)) => {
+                        crate::engine::errors::division_by_zero();
+                        Value::Null
+                    }
                     _ => Value::Null,
                 }
             }
@@ -1307,6 +1315,10 @@ pub fn compile_expr(
         let target_type = s[colon_pos + 2..].trim().to_uppercase();
         return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
     }
+    if let Some((inner, target_type)) = split_cast_call(s) {
+        let target_expr = compile_expr(inner, table, table_alias, joined_table, joined_alias);
+        return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
+    }
 
     // 15. JSON extract operators (->, ->>, #>, #>>)
     if let Some((op_idx, op)) = crate::engine::executor::find_last_top_level_json_op(s) {
@@ -1659,6 +1671,10 @@ pub(crate) fn compile_expr_for_joined(
         let target_type = s[colon_pos + 2..].trim().to_uppercase();
         return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
     }
+    if let Some((inner, target_type)) = split_cast_call(s) {
+        let target_expr = compile_expr_for_joined(inner, joined_schema);
+        return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
+    }
 
     // Comparisons
     for op in &[">=", "<=", "!=", "<>", "=", ">", "<"] {
@@ -1839,4 +1855,13 @@ fn eval_func_call(name: &str, args: &[Value]) -> Value {
         }
         _ => Value::Null,
     }
+}
+/// `CAST(expr AS type)` → (`expr`, `TYPE`) khi cả chuỗi là đúng một lời gọi CAST.
+fn split_cast_call(s: &str) -> Option<(&str, String)> {
+    if !s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("CAST(")) || !s.ends_with(')') || !crate::engine::executor::is_fully_enclosed_in_parens(&s[4..]) {
+        return None;
+    }
+    let inner = &s[5..s.len() - 1];
+    let as_pos = crate::engine::executor::find_top_level_keyword(inner, "AS")?;
+    Some((inner[..as_pos].trim(), inner[as_pos + 2..].trim().to_uppercase()))
 }

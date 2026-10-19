@@ -717,9 +717,10 @@ describe("100 Comprehensive In-Depth PostgreSQL NUMERIC, MATH & BITWISE Test Cas
       expect(Number(res[0].dec_val)).toBeCloseTo(789.10, 2);
     });
 
-    test("94. Float to Integer truncation cast: 45.89::int", async () => {
+    test("94. Numeric to Integer cast rounds like PostgreSQL: 45.89::int", async () => {
+      // PostgreSQL 17: numeric→int làm tròn (45.89 → 46), không cắt bớt
       const res = await db.query(`SELECT 45.89::int AS casted_int;`);
-      expect(Math.floor(Number(res[0].casted_int))).toBe(45);
+      expect(Number(res[0].casted_int)).toBe(46);
     });
 
     test("95. Parameterized query passing numerical parameters $1, $2", async () => {

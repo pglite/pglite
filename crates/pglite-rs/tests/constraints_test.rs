@@ -102,10 +102,17 @@ fn failed_statement_leaves_nothing_in_memory_or_on_disk() {
         let e = err(&mut db, "INSERT INTO users (email, full_name) VALUES ('new@x.vn', 'New'), ('a@x.vn', 'Dup')");
         assert!(e.contains("users_email_key"), "{e}");
         assert_eq!(count(&mut db, "users"), 2);
-        // Trong giao dịch: lệnh lỗi bị huỷ, các lệnh trước vẫn còn
-        exec_all(&mut db, &["BEGIN", "INSERT INTO users (email, full_name) VALUES ('tx@x.vn', 'Tx')"]);
+        // Trong giao dịch, như PostgreSQL: lệnh lỗi làm giao dịch "aborted" (25P02), COMMIT = ROLLBACK
+        exec_all(&mut db, &["BEGIN", "INSERT INTO users (email, full_name) VALUES ('lost@x.vn', 'Lost')"]);
         assert!(db.exec("INSERT INTO users (email, full_name) VALUES ('tx2@x.vn', NULL)", &[]).is_err());
-        exec_all(&mut db, &["COMMIT"]);
+        let e = err(&mut db, "SELECT 1");
+        assert!(e.contains("current transaction is aborted"), "{e}");
+        assert_eq!(db.exec("COMMIT", &[]).unwrap().command, "ROLLBACK");
+        assert_eq!(count(&mut db, "users"), 2);
+        // Savepoint cứu được phần trước của giao dịch
+        exec_all(&mut db, &["BEGIN", "INSERT INTO users (email, full_name) VALUES ('tx@x.vn', 'Tx')", "SAVEPOINT s"]);
+        assert!(db.exec("INSERT INTO users (email, full_name) VALUES ('tx2@x.vn', NULL)", &[]).is_err());
+        exec_all(&mut db, &["ROLLBACK TO SAVEPOINT s", "COMMIT"]);
         assert_eq!(count(&mut db, "users"), 3);
     }
     let mut db = PGlite::open(&path).unwrap();

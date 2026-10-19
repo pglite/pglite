@@ -22,6 +22,9 @@ pub struct StorageEngine {
     /// Số câu lệnh đang chạy (lồng nhau khi một chuỗi có nhiều lệnh). Trong lúc đó undo log luôn
     /// được ghi, kể cả ngoài giao dịch, để lệnh lỗi giữa chừng không để lại thay đổi dở.
     pub stmt_depth: u32,
+    /// Một câu lệnh trong giao dịch đã lỗi: như PostgreSQL, mọi lệnh sau đó báo 25P02 cho tới
+    /// ROLLBACK / ROLLBACK TO SAVEPOINT (COMMIT lúc này tương đương ROLLBACK).
+    pub tx_aborted: bool,
 }
 
 /// Mốc đầu một câu lệnh (xem `StorageEngine::begin_statement`).
@@ -43,6 +46,7 @@ impl StorageEngine {
             savepoints: HashMap::new(),
             wal,
             stmt_depth: 0,
+            tx_aborted: false,
         };
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
@@ -525,6 +529,7 @@ impl StorageEngine {
             return;
         }
         self.in_transaction = true;
+        self.tx_aborted = false;
         self.tx_undo_log.clear();
         self.savepoints.clear();
         // `Begin` cho binary cũ (chúng bỏ qua `TxBegin`), rồi `TxBegin` để bản này biết giao dịch
@@ -550,6 +555,7 @@ impl StorageEngine {
                 }
             }
             self.wal.append(WalRecord::RollbackToSavepoint { name: clean });
+            self.tx_aborted = false;
             true
         } else {
             false
@@ -593,6 +599,7 @@ impl StorageEngine {
     }
 
     pub fn commit(&mut self) -> Result<(), String> {
+        self.tx_aborted = false;
         if self.in_transaction {
             self.wal.append(WalRecord::Commit);
             self.in_transaction = false;
@@ -605,6 +612,7 @@ impl StorageEngine {
     }
 
     pub fn rollback(&mut self) -> Result<(), String> {
+        self.tx_aborted = false;
         if self.in_transaction {
             // Revert actions in reverse order
             while let Some(undo) = self.tx_undo_log.pop() {
