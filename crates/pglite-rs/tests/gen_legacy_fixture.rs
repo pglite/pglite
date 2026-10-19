@@ -174,3 +174,70 @@ pub const LEGACY_CONSTRAINTS_SCRIPT: &[&str] = &[
     "UPDATE users SET full_name = 'Quan tri vien' WHERE id = 1",
     "UPDATE tenant_roles SET name = 'Doi ten' WHERE name = 'Quan tri 2'",
 ];
+
+/// Fixture do bản 7db3c5a ghi (đã có catalog ràng buộc, upsert, ALTER/RENAME, DO): bản sau phải đọc y nguyên.
+///   cargo test --test gen_legacy_fixture generate_legacy_v3_fixture -- --ignored
+#[test]
+#[ignore]
+fn generate_legacy_v3_fixture() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let name = "legacy_v3";
+    let path = dir.join(format!("{name}.db")).to_str().unwrap().to_string();
+    for suffix in ["", ".rwal", ".v2.rwal", ".wal"] {
+        let _ = std::fs::remove_file(format!("{}{}", path, suffix));
+    }
+    let mut db = PGlite::open(&path).unwrap();
+    for sql in LEGACY_V3_SCRIPT {
+        db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.flush();
+    drop(db);
+    let mut db = PGlite::open(&path).unwrap();
+    let mut snap = serde_json::Map::new();
+    for (k, q) in LEGACY_V3_QUERIES {
+        snap.insert(k.to_string(), serde_json::Value::Array(db.execute(q, &[]).unwrap().rows));
+    }
+    std::fs::write(dir.join(format!("{name}.expected.json")), serde_json::to_string_pretty(&snap).unwrap()).unwrap();
+}
+
+pub const LEGACY_V3_QUERIES: &[(&str, &str)] = &[
+    ("tenants", "SELECT * FROM tenants ORDER BY id"),
+    ("members", "SELECT * FROM members ORDER BY id"),
+    ("roles", "SELECT * FROM roles ORDER BY code, tenant_id"),
+    ("items", "SELECT * FROM items ORDER BY id"),
+    ("logs", "SELECT * FROM logs ORDER BY id"),
+];
+
+pub const LEGACY_V3_SCRIPT: &[&str] = &[
+    "CREATE TABLE tenants (id SERIAL PRIMARY KEY, code VARCHAR(50) NOT NULL UNIQUE, name TEXT NOT NULL, settings JSONB DEFAULT '{}'::jsonb)",
+    "CREATE TABLE members (id SERIAL PRIMARY KEY, tenant_id INT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, email TEXT NOT NULL, role TEXT DEFAULT 'member' CHECK (role IN ('member','owner')), UNIQUE (tenant_id, email))",
+    "CREATE TABLE roles (code VARCHAR(20) NOT NULL, tenant_id INT NOT NULL, label TEXT, PRIMARY KEY (code, tenant_id))",
+    "CREATE TABLE stock (id SERIAL PRIMARY KEY, sku TEXT, qty TEXT, deleted_at TIMESTAMP)",
+    "CREATE UNIQUE INDEX uq_stock_sku ON stock(sku) WHERE deleted_at IS NULL",
+    "CREATE TABLE logs (id SERIAL PRIMARY KEY, msg TEXT)",
+    "INSERT INTO tenants (code, name) VALUES ('a', 'Công ty A'), ('b', 'Công ty B'), ('c', 'Xoá')",
+    "INSERT INTO members (tenant_id, email, role) VALUES (1, 'x@a.vn', 'owner'), (1, 'y@a.vn', 'member'), (3, 'z@c.vn', 'member')",
+    "INSERT INTO members (tenant_id, email, role) VALUES (1, 'x@a.vn', 'member') ON CONFLICT (tenant_id, email) DO UPDATE SET role = EXCLUDED.role",
+    "INSERT INTO tenants (code, name) VALUES ('a', 'trùng') ON CONFLICT (code) DO NOTHING",
+    "INSERT INTO roles VALUES ('admin', 1, 'Quản trị'), ('admin', 2, 'Admin B')",
+    "DELETE FROM tenants WHERE code = 'c'",
+    "INSERT INTO stock (sku, qty) VALUES ('s1', '5'), ('s2', '7')",
+    "UPDATE stock SET deleted_at = '2026-01-01 00:00:00' WHERE sku = 's1'",
+    "INSERT INTO stock (sku, qty) VALUES ('s1', '9')",
+    "ALTER TABLE stock ALTER COLUMN qty TYPE INTEGER USING qty::integer",
+    "ALTER TABLE stock ADD COLUMN price NUMERIC DEFAULT 0 NOT NULL, ALTER COLUMN sku SET NOT NULL",
+    "ALTER TABLE stock RENAME COLUMN sku TO code",
+    "ALTER TABLE stock RENAME TO items",
+    "BEGIN",
+    "INSERT INTO logs (msg) VALUES ('rolled back')",
+    "ROLLBACK",
+    "BEGIN",
+    "INSERT INTO logs (msg) VALUES ('kept')",
+    "SAVEPOINT s1",
+    "INSERT INTO logs (msg) VALUES ('undone')",
+    "ROLLBACK TO SAVEPOINT s1",
+    "COMMIT",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM logs WHERE msg = 'do') THEN INSERT INTO logs (msg) VALUES ('do'); END IF; END $$",
+    "TRUNCATE roles",
+    "INSERT INTO roles VALUES ('owner', 2, 'Sau truncate')",
+];

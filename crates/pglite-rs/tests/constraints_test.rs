@@ -339,3 +339,32 @@ fn write_new_format_db() {
     ]);
     assert!(db.exec("INSERT INTO users (email, full_name) VALUES ('b@x.vn', 'dup')", &[]).is_err());
 }
+
+/// Fixture do bản 7db3c5a ghi (catalog ràng buộc, upsert, ALTER/RENAME, DO, TRUNCATE, ROLLBACK).
+#[test]
+fn previous_release_db_opens_identically() {
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let (dir, path) = temp_db("legacy_v3");
+    std::fs::copy(fx.join("legacy_v3.db.rwal"), format!("{path}.rwal")).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fx.join("legacy_v3.expected.json")).unwrap()).unwrap();
+    let queries = [
+        ("tenants", "SELECT * FROM tenants ORDER BY id"),
+        ("members", "SELECT * FROM members ORDER BY id"),
+        ("roles", "SELECT * FROM roles ORDER BY code, tenant_id"),
+        ("items", "SELECT * FROM items ORDER BY id"),
+        ("logs", "SELECT * FROM logs ORDER BY id"),
+    ];
+    for round in 0..2 {
+        let mut db = PGlite::open(&path).unwrap();
+        let mut m = serde_json::Map::new();
+        for (k, q) in queries {
+            m.insert(k.to_string(), serde_json::Value::Array(rows(&mut db, q)));
+        }
+        assert_eq!(serde_json::Value::Object(m), expected, "lần mở {round}");
+        assert!(db.exec("INSERT INTO tenants (code, name) VALUES ('a', 'dup')", &[]).is_err(), "UNIQUE còn");
+        assert!(db.exec("INSERT INTO members (tenant_id, email) VALUES (99, 'q')", &[]).is_err(), "FK còn");
+        assert!(db.exec("INSERT INTO items (code, qty) VALUES ('s2', 1)", &[]).is_err(), "unique index một phần còn");
+        assert!(db.exec("INSERT INTO roles VALUES ('owner', 2, 'x')", &[]).is_err(), "PK ghép còn sau TRUNCATE");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

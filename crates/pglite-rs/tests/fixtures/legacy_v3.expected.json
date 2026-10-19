@@ -1,0 +1,70 @@
+{
+  "tenants": [
+    {
+      "id": 1,
+      "code": "a",
+      "name": "Công ty A",
+      "settings": {}
+    },
+    {
+      "id": 2,
+      "code": "b",
+      "name": "Công ty B",
+      "settings": {}
+    }
+  ],
+  "members": [
+    {
+      "id": 1,
+      "tenant_id": 1,
+      "email": "x@a.vn",
+      "role": "member"
+    },
+    {
+      "id": 2,
+      "tenant_id": 1,
+      "email": "y@a.vn",
+      "role": "member"
+    }
+  ],
+  "roles": [
+    {
+      "code": "owner",
+      "tenant_id": 2,
+      "label": "Sau truncate"
+    }
+  ],
+  "items": [
+    {
+      "id": 1,
+      "code": "s1",
+      "qty": 5,
+      "deleted_at": "2026-01-01 00:00:00",
+      "price": 0
+    },
+    {
+      "id": 2,
+      "code": "s2",
+      "qty": 7,
+      "deleted_at": null,
+      "price": 0
+    },
+    {
+      "id": 3,
+      "code": "s1",
+      "qty": 9,
+      "deleted_at": null,
+      "price": 0
+    }
+  ],
+  "logs": [
+    {
+      "id": 2,
+      "msg": "kept"
+    },
+    {
+      "id": 4,
+      "msg": "do"
+    }
+  ]
+}

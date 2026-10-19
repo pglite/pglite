@@ -3229,8 +3229,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
         // Tên cột mặc định / alias không có AS theo quy tắc PostgreSQL
-        if let Some(normalized) = crate::engine::select_list::normalize_select_sql(sql) {
-            return self.handle_select(&normalized, params);
+        // Chỉ chuẩn hoá một lần: câu đã chuẩn hoá không được chuẩn hoá lại (tránh đệ quy vô hạn khi
+        // bộ tách không hiểu hết cú pháp của câu).
+        if !SELECT_NORMALIZED.with(|f| f.get()) {
+            if let Some(normalized) = crate::engine::select_list::normalize_select_sql(sql) {
+                SELECT_NORMALIZED.with(|f| f.set(true));
+                let res = self.handle_select(&normalized, params);
+                SELECT_NORMALIZED.with(|f| f.set(false));
+                return res;
+            }
+        } else {
+            SELECT_NORMALIZED.with(|f| f.set(false));
         }
         // Window function: tính sau WHERE/GROUP BY, trước ORDER BY/LIMIT
         if contains_ci(sql, "OVER") {
@@ -12824,6 +12833,11 @@ fn type_str_from_json_value(v: &serde_json::Value) -> String {
         _ => "text",
     }
     .to_string()
+}
+
+thread_local! {
+    /// Câu SELECT sắp xử lý đã qua `normalize_select_sql` (chặn chuẩn hoá lặp lại).
+    static SELECT_NORMALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
