@@ -41,3 +41,17 @@ test("named params are not substituted inside string literals or dollar quotes",
   await db.exec("DO $$ BEGIN INSERT INTO j (id, note) VALUES (2, 'x;y'); END $$; INSERT INTO j (id) VALUES (3)");
   expect((await db.query("SELECT count(*) AS n FROM j"))[0].n).toBe(3);
 });
+
+test("errors carry PostgreSQL SQLSTATE codes", async () => {
+  const db = new PGLite(":memory:");
+  await db.exec("CREATE TABLE p (id INT PRIMARY KEY, email TEXT UNIQUE NOT NULL)");
+  await db.exec("CREATE TABLE c (id INT PRIMARY KEY, p_id INT REFERENCES p(id), n INT CHECK (n > 0))");
+  await db.exec("INSERT INTO p VALUES (1, 'a')");
+  const code = async (sql: string) => { try { await db.exec(sql); return "ok"; } catch (e: any) { return e.code; } };
+  expect(await code("INSERT INTO p VALUES (2, 'a')")).toBe("23505");
+  expect(await code("INSERT INTO p VALUES (3, NULL)")).toBe("23502");
+  expect(await code("INSERT INTO c VALUES (1, 99, 1)")).toBe("23503");
+  expect(await code("INSERT INTO c VALUES (1, 1, -1)")).toBe("23514");
+  expect(await code("SELECT * FROM nope")).toBe("42P01");
+  expect(await code("CREATE TABLE p (id INT)")).toBe("42P07");
+});

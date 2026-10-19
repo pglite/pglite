@@ -639,3 +639,52 @@ mod tests {
         assert_eq!(infer_expr_type("a || b", &cols), None);
     }
 }
+
+
+/// Mã SQLSTATE của PostgreSQL cho một thông báo lỗi của engine (để driver/ORM nhận biết loại lỗi,
+/// vd. bắt `unique_violation`). `XX000` nếu không nhận ra.
+pub fn sqlstate(message: &str) -> &'static str {
+    let m = message.to_lowercase();
+    let has = |s: &str| m.contains(s);
+    if has("duplicate key value violates unique constraint") || has("could not create unique index") {
+        "23505"
+    } else if has("violates foreign key constraint") {
+        "23503"
+    } else if has("violates not-null constraint") || (has("contains null values") && has("column")) {
+        "23502"
+    } else if has("violates check constraint") || has("is violated by some row") {
+        "23514"
+    } else if has("cannot affect row a second time") {
+        "21000"
+    } else if has("invalid input syntax for type") {
+        "22P02"
+    } else if has("division by zero") {
+        "22012"
+    } else if has("savepoint") && has("does not exist") {
+        "3B001"
+    } else if has("can only be used in transaction blocks") {
+        "25P01"
+    } else if has("relation") && has("already exists") {
+        "42P07"
+    } else if has("column") && has("already exists") {
+        "42701"
+    } else if has("constraint") && has("already exists") {
+        "42710"
+    } else if (has("column") && has("does not exist")) || has("not found in") {
+        "42703"
+    } else if has("constraint") && has("does not exist") {
+        "42704"
+    } else if (has("relation") || has("table")) && (has("does not exist") || has("not found")) {
+        "42P01"
+    } else if has("other objects depend on it") || has("cannot truncate a table referenced") {
+        "2BP01"
+    } else if has("syntax error") || has("unsupported") {
+        "42601"
+    } else if has("must have the same number of columns") || has("more expressions than target columns") {
+        "42601"
+    } else if has("wal write failed") {
+        "58030"
+    } else {
+        "XX000"
+    }
+}

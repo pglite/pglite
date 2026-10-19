@@ -234,6 +234,23 @@ export class PGLiteNative {
     }
 
     this.nativeInstance = new binding.LitePostgresNative(filepath);
+    this.sqlstateFn = typeof (binding as any).sqlstate === "function" ? (binding as any).sqlstate : null;
+  }
+
+  private sqlstateFn: ((message: string) => string) | null = null;
+
+  /** Gọi engine; lỗi được gắn `code` = SQLSTATE của PostgreSQL (23505, 23503, ...) như node-postgres. */
+  private callNative<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (err: any) {
+      if (err && typeof err === "object" && this.sqlstateFn && (!err.code || err.code === "GenericFailure")) {
+        try {
+          err.code = this.sqlstateFn(String(err.message ?? err));
+        } catch {}
+      }
+      throw err;
+    }
   }
 
   public get native(): any {
@@ -255,7 +272,7 @@ export class PGLiteNative {
     const normalized = normalizeQueryParams(singleSql, params);
     let p = normalized.params;
     let db = typeof params === "string" ? params : dbName;
-    const res = this.nativeInstance.exec(normalized.sql, p, db) as T;
+    const res = this.callNative(() => this.nativeInstance.exec(normalized.sql, p, db)) as T;
     if (res && typeof res === "object" && (res as any).success === undefined) {
       (res as any).success = true;
     }
@@ -277,7 +294,7 @@ export class PGLiteNative {
     const normalized = normalizeQueryParams(singleSql, params);
     let p = normalized.params;
     let db = typeof params === "string" ? params : dbName;
-    return this.nativeInstance.exec2(normalized.sql, p, db) as T;
+    return this.callNative(() => this.nativeInstance.exec2(normalized.sql, p, db)) as T;
   }
 
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
@@ -295,7 +312,7 @@ export class PGLiteNative {
     const normalized = normalizeQueryParams(singleSql, params);
     let p = normalized.params;
     let db = typeof params === "string" ? params : dbName;
-    return this.nativeInstance.query(normalized.sql, p, db) as T[];
+    return this.callNative(() => this.nativeInstance.query(normalized.sql, p, db)) as T[];
   }
 
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
@@ -313,21 +330,21 @@ export class PGLiteNative {
     const normalized = normalizeQueryParams(singleSql, params);
     let p = normalized.params;
     let db = typeof params === "string" ? params : dbName;
-    return this.nativeInstance.query2(normalized.sql, p, db) as QueryResult<T>;
+    return this.callNative(() => this.nativeInstance.query2(normalized.sql, p, db)) as QueryResult<T>;
   }
 
   public query_json(sql: string, params?: any, dbName?: string): string {
     const normalized = normalizeQueryParams(sql, params);
     let p = normalized.params;
     let db = typeof params === "string" ? params : dbName;
-    return this.nativeInstance.query_json(normalized.sql, p, db);
+    return this.callNative(() => this.nativeInstance.query_json(normalized.sql, p, db));
   }
 
   public query2_json(sql: string, params?: any, dbName?: string): string {
     const normalized = normalizeQueryParams(sql, params);
     let p = normalized.params;
     let db = typeof params === "string" ? params : dbName;
-    return this.nativeInstance.query2_json(normalized.sql, p, db);
+    return this.callNative(() => this.nativeInstance.query2_json(normalized.sql, p, db));
   }
 
   public async transaction<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {

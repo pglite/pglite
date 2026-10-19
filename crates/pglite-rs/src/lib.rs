@@ -49,7 +49,7 @@ pub use binding::LitePostgresNative;
 pub use wasm_binding::PGliteWasm;
 pub use engine::Executor;
 pub use storage::StorageEngine;
-pub use pg_types::{DescribeResult, WireField, WireResult};
+pub use pg_types::{sqlstate, DescribeResult, WireField, WireResult};
 pub use types::{ColumnDef, DataType, FieldInfo, QueryResult, Value};
 
 /// High-level embedded PostgreSQL database client for native Rust applications.

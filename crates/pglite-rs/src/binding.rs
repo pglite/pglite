@@ -8,6 +8,12 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Mã SQLSTATE của PostgreSQL cho một thông báo lỗi của engine.
+#[napi(js_name = "sqlstate")]
+pub fn sqlstate_js(message: String) -> String {
+    crate::pg_types::sqlstate(&message).to_string()
+}
+
 #[napi(js_name = "LitePostgresNative")]
 pub struct LitePostgresNative {
     executor: Arc<Mutex<Executor>>,
