@@ -101,3 +101,76 @@ pub const LEGACY_DUP_PK_SCRIPT: &[&str] = &[
     "TRUNCATE c",
     "INSERT INTO c (v) VALUES ('kept')",
 ];
+
+/// Fixture do engine 8f9b56c ghi (trước khi có catalog ràng buộc): schema kiểu waiki (UNIQUE, NOT NULL, FK
+/// CASCADE, CHECK, PK ghép, khoá text, index) nhưng dữ liệu VI PHẠM các ràng buộc đó, vì engine cũ không
+/// kiểm tra. Code mới phải mở ra y hệt và không được từ chối replay.
+///   cargo test --test gen_legacy_fixture generate_legacy_constraints_fixture -- --ignored
+#[test]
+#[ignore]
+fn generate_legacy_constraints_fixture() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let name = "legacy_constraints";
+    let path = dir.join(format!("{name}.db")).to_str().unwrap().to_string();
+    for suffix in ["", ".rwal", ".v2.rwal", ".wal"] {
+        let _ = std::fs::remove_file(format!("{}{}", path, suffix));
+    }
+    let mut db = PGlite::open(&path).unwrap();
+    for sql in LEGACY_CONSTRAINTS_SCRIPT {
+        db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.flush();
+    drop(db);
+    let mut db = PGlite::open(&path).unwrap();
+    let mut snap = serde_json::Map::new();
+    for (k, q) in LEGACY_CONSTRAINTS_QUERIES {
+        snap.insert(k.to_string(), serde_json::Value::Array(db.execute(q, &[]).unwrap().rows));
+    }
+    std::fs::write(dir.join(format!("{name}.expected.json")), serde_json::to_string_pretty(&snap).unwrap()).unwrap();
+}
+
+pub const LEGACY_CONSTRAINTS_QUERIES: &[(&str, &str)] = &[
+    ("tenants", "SELECT * FROM tenants ORDER BY id"),
+    ("users", "SELECT * FROM users ORDER BY id"),
+    ("tenant_members", "SELECT * FROM tenant_members ORDER BY id"),
+    ("auth_sessions", "SELECT * FROM auth_sessions ORDER BY id"),
+    ("tenant_roles", "SELECT * FROM tenant_roles ORDER BY id, tenant_id"),
+    ("mfa", "SELECT * FROM mfa ORDER BY id"),
+];
+
+/// DDL lấy từ waiki core/auth-basic/lifecycle.ts (+ CHECK từ core/customer-auth/lifecycle.ts).
+pub const LEGACY_CONSTRAINTS_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS tenants (id SERIAL PRIMARY KEY, code VARCHAR(50) NOT NULL UNIQUE, name VARCHAR(255) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'active', settings JSONB DEFAULT '{}'::jsonb, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(100) UNIQUE, email VARCHAR(255) NOT NULL UNIQUE, full_name VARCHAR(150) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'active', deleted_at TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS tenant_members (id SERIAL PRIMARY KEY, tenant_id INT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE, role VARCHAR(50) NOT NULL DEFAULT 'member', UNIQUE (tenant_id, user_id))",
+    "CREATE TABLE IF NOT EXISTS auth_sessions (id VARCHAR(128) PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE, tenant_id INT NOT NULL, expires_at TIMESTAMP NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)",
+    "CREATE TABLE IF NOT EXISTS tenant_roles (id VARCHAR(50) NOT NULL, tenant_id INT NOT NULL, name VARCHAR(100) NOT NULL, PRIMARY KEY (id, tenant_id))",
+    "CREATE TABLE IF NOT EXISTS mfa (id SERIAL PRIMARY KEY, user_id INT REFERENCES users(id) ON DELETE SET NULL, kind VARCHAR(10) NOT NULL CHECK (kind IN ('totp','sms')))",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_live ON users(email) WHERE deleted_at IS NULL",
+];
+
+pub const LEGACY_CONSTRAINTS_SCRIPT: &[&str] = &[
+    LEGACY_CONSTRAINTS_DDL[0], LEGACY_CONSTRAINTS_DDL[1], LEGACY_CONSTRAINTS_DDL[2], LEGACY_CONSTRAINTS_DDL[3],
+    LEGACY_CONSTRAINTS_DDL[4], LEGACY_CONSTRAINTS_DDL[5], LEGACY_CONSTRAINTS_DDL[6], LEGACY_CONSTRAINTS_DDL[7],
+    "INSERT INTO tenants (code, name) VALUES ('default', 'Mac dinh')",
+    "INSERT INTO tenants (code, name) VALUES ('default', 'Trung code')",
+    "INSERT INTO users (username, email, full_name) VALUES ('admin', 'a@x.vn', 'Admin')",
+    "INSERT INTO users (username, email, full_name) VALUES ('admin2', 'a@x.vn', 'Trung email')",
+    "INSERT INTO users (username, email, full_name) VALUES (NULL, 'c@x.vn', NULL)",
+    "INSERT INTO users (username, email, full_name) VALUES ('del', 'd@x.vn', 'Se xoa')",
+    "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES (1, 1, 'owner')",
+    "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES (1, 1, 'trung')",
+    "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES (1, 999, 'mo coi')",
+    "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES (1, 4, 'cha bi xoa')",
+    "INSERT INTO auth_sessions (id, user_id, tenant_id, expires_at) VALUES ('s-1', 1, 1, '2026-12-01 00:00:00')",
+    "INSERT INTO auth_sessions (id, user_id, tenant_id, expires_at) VALUES ('s-4', 4, 1, '2026-12-01 00:00:00')",
+    "INSERT INTO tenant_roles (id, tenant_id, name) VALUES ('admin', 1, 'Quan tri')",
+    "INSERT INTO tenant_roles (id, tenant_id, name) VALUES ('admin', 2, 'Quan tri 2')",
+    "INSERT INTO tenant_roles (id, tenant_id, name) VALUES ('admin', 1, 'Trung PK ghep')",
+    "INSERT INTO mfa (user_id, kind) VALUES (1, 'totp')",
+    "INSERT INTO mfa (user_id, kind) VALUES (4, 'email')",
+    "DELETE FROM users WHERE id = 4",
+    "UPDATE users SET full_name = 'Quan tri vien' WHERE id = 1",
+    "UPDATE tenant_roles SET name = 'Doi ten' WHERE name = 'Quan tri 2'",
+];

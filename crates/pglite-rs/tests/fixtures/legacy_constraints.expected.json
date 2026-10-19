@@ -1,0 +1,115 @@
+{
+  "tenants": [
+    {
+      "id": 1,
+      "code": "default",
+      "name": "Mac dinh",
+      "status": "active",
+      "settings": {},
+      "created_at": "2026-10-19T18:41:39.737Z"
+    },
+    {
+      "id": 2,
+      "code": "default",
+      "name": "Trung code",
+      "status": "active",
+      "settings": {},
+      "created_at": "2026-10-19T18:41:39.741Z"
+    }
+  ],
+  "users": [
+    {
+      "id": 1,
+      "username": "admin",
+      "email": "a@x.vn",
+      "full_name": "Quan tri vien",
+      "status": "active",
+      "deleted_at": null
+    },
+    {
+      "id": 2,
+      "username": "admin2",
+      "email": "a@x.vn",
+      "full_name": "Trung email",
+      "status": "active",
+      "deleted_at": null
+    },
+    {
+      "id": 3,
+      "username": null,
+      "email": "c@x.vn",
+      "full_name": null,
+      "status": "active",
+      "deleted_at": null
+    }
+  ],
+  "tenant_members": [
+    {
+      "id": 1,
+      "tenant_id": 1,
+      "user_id": 1,
+      "role": "owner"
+    },
+    {
+      "id": 2,
+      "tenant_id": 1,
+      "user_id": 1,
+      "role": "trung"
+    },
+    {
+      "id": 3,
+      "tenant_id": 1,
+      "user_id": 999,
+      "role": "mo coi"
+    },
+    {
+      "id": 4,
+      "tenant_id": 1,
+      "user_id": 4,
+      "role": "cha bi xoa"
+    }
+  ],
+  "auth_sessions": [
+    {
+      "id": "s-1",
+      "user_id": 1,
+      "tenant_id": 1,
+      "expires_at": "2026-12-01 00:00:00"
+    },
+    {
+      "id": "s-4",
+      "user_id": 4,
+      "tenant_id": 1,
+      "expires_at": "2026-12-01 00:00:00"
+    }
+  ],
+  "tenant_roles": [
+    {
+      "id": "admin",
+      "tenant_id": 1,
+      "name": "Quan tri"
+    },
+    {
+      "id": "admin",
+      "tenant_id": 1,
+      "name": "Trung PK ghep"
+    },
+    {
+      "id": "admin",
+      "tenant_id": 2,
+      "name": "Doi ten"
+    }
+  ],
+  "mfa": [
+    {
+      "id": 1,
+      "user_id": 1,
+      "kind": "totp"
+    },
+    {
+      "id": 2,
+      "user_id": 4,
+      "kind": "email"
+    }
+  ]
+}

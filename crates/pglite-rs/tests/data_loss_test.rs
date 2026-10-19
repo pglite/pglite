@@ -164,7 +164,7 @@ fn known_variant_count_matches_enum() {
 #[test]
 fn legacy_fixtures_are_never_repaired() {
     let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    for name in ["legacy_v2", "legacy_tx", "legacy_open_begin", "legacy_dup_pk"] {
+    for name in ["legacy_v2", "legacy_tx", "legacy_open_begin", "legacy_dup_pk", "legacy_constraints"] {
         let bytes = std::fs::read(fx.join(format!("{name}.db.rwal"))).unwrap();
         let (records, skipped, repair) = pglite_rs::storage::wal::recover_frames(&bytes[4..]);
         assert_eq!(repair, pglite_rs::storage::wal::Repair::None, "{name}");
