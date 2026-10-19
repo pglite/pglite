@@ -32,6 +32,8 @@ pub struct Executor {
     pub custom_constraints: Vec<TableConstraintDef>,
     /// Tham số phiên đặt bằng SET (SHOW đọc lại).
     pub settings: HashMap<String, String>,
+    /// SELECT đã qua kiểm tra tên cột: câu SQL → (bảng, dấu vân tay cột) hoặc None = không thuộc diện.
+    column_check_cache: HashMap<String, Option<(String, u64)>>,
 }
 
 impl Executor {
@@ -41,6 +43,7 @@ impl Executor {
             plan_cache: HashMap::new(),
             custom_constraints: Vec::new(),
             settings: HashMap::new(),
+            column_check_cache: HashMap::new(),
         }
     }
 
@@ -62,6 +65,14 @@ impl Executor {
                 if let Some(res) = self.aborted_transaction_gate(sql) {
                     return res;
                 }
+            }
+        }
+        if top && sql.len() > 7 && sql.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("SELECT ")) {
+            if let Err(e) = self.check_select_columns_cached(sql) {
+                if self.storage.in_transaction {
+                    self.storage.tx_aborted = true;
+                }
+                return decode_quoted_idents(Err(e));
             }
         }
         let appended_before = self.storage.wal.appended;
@@ -95,6 +106,30 @@ impl Executor {
             return decode_quoted_idents(res);
         }
         res
+    }
+
+    /// Kiểm tra tên cột của SELECT (`validate.rs`), cache theo câu SQL để truy vấn lặp lại không tốn thêm.
+    fn check_select_columns_cached(&mut self, sql: &str) -> Result<(), String> {
+        use crate::engine::validate::{check_select_columns, columns_fingerprint, Checked};
+        match self.column_check_cache.get(sql) {
+            Some(None) => return Ok(()),
+            Some(Some((t, fp))) if columns_fingerprint(&self.storage, t) == Some(*fp) => return Ok(()),
+            _ => {}
+        }
+        let Ok(lexed) = crate::engine::frontend::lex(sql) else { return Ok(()) };
+        let entry = match check_select_columns(&lexed, &self.storage)? {
+            Checked::NotApplicable => None,
+            Checked::Table(t) => match columns_fingerprint(&self.storage, &t) {
+                Some(fp) => Some((t, fp)),
+                None => return Ok(()),
+            },
+            Checked::NoTable => return Ok(()),
+        };
+        if self.column_check_cache.len() >= 4096 {
+            self.column_check_cache.clear();
+        }
+        self.column_check_cache.insert(sql.to_string(), entry);
+        Ok(())
     }
 
     /// Giao dịch đang ở trạng thái lỗi: chỉ ROLLBACK [TO SAVEPOINT] được chạy; COMMIT = ROLLBACK.
