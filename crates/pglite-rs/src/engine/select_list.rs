@@ -205,6 +205,11 @@ pub(crate) fn normalize_select_sql(sql: &str) -> Option<String> {
     if t.len() < 7 || !t[..6].eq_ignore_ascii_case("SELECT") {
         return None;
     }
+    // SELECT * FROM ...: không có gì để đặt tên (đường nóng của tra cứu theo khoá)
+    let after_kw = t[6..].trim_start();
+    if after_kw.starts_with('*') && after_kw[1..].starts_with(char::is_whitespace) && !after_kw[1..].trim_start().starts_with(',') {
+        return None;
+    }
     let end = select_list_end(t);
     if end <= 6 {
         return None;

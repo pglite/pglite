@@ -1157,7 +1157,7 @@ pub fn compile_expr(
     }
 
     // 7b. x = ANY(...) / x <> ALL(...)
-    if let Some((lhs, op, all, inner)) = crate::engine::executor::split_any_all(s) {
+    if let Some((lhs, op, all, inner)) = crate::engine::executor::may_have_any_all(&upper).then(|| crate::engine::executor::split_any_all(s)).flatten() {
         return CompiledExpr::AnyAll {
             lhs: Box::new(compile_expr(lhs, table, table_alias, joined_table, joined_alias)),
             op,
@@ -1530,7 +1530,7 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     // IN / NOT IN
-    if let Some((lhs, op, all, inner)) = crate::engine::executor::split_any_all(s) {
+    if let Some((lhs, op, all, inner)) = crate::engine::executor::may_have_any_all(&upper).then(|| crate::engine::executor::split_any_all(s)).flatten() {
         return CompiledExpr::AnyAll {
             lhs: Box::new(compile_expr_for_joined(lhs, joined_schema)),
             op,

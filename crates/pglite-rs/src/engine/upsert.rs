@@ -28,6 +28,17 @@ struct OnConflict {
     action: ConflictAction,
 }
 
+/// Có chuỗi `needle` (không phân biệt hoa thường, ASCII) ở đâu đó trong `hay` không: lọc nhanh trước
+/// khi quét theo ngoặc/chuỗi.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    let (f_up, f_low) = (n[0].to_ascii_uppercase(), n[0].to_ascii_lowercase());
+    (0..=h.len() - n.len()).any(|i| (h[i] == f_up || h[i] == f_low) && h[i..i + n.len()].eq_ignore_ascii_case(n))
+}
+
 /// Vị trí `ON CONFLICT` ở cấp ngoài cùng (không nằm trong chuỗi / ngoặc).
 fn find_on_conflict(s: &str) -> Option<usize> {
     let mut from = 0;
@@ -220,12 +231,13 @@ fn eval_value_token(token: &str, params: &[Value], param_cursor: &mut usize, def
 
 impl Executor {
     pub(crate) fn handle_insert(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        // RETURNING ở cấp ngoài cùng (sau ON CONFLICT nếu có)
-        let (body, returning) = match find_top_level_keyword(sql, "RETURNING") {
+        // RETURNING ở cấp ngoài cùng (sau ON CONFLICT nếu có). Kiểm tra nhanh trước khi quét đầy đủ:
+        // câu INSERT nhiều dòng rất dài, mỗi lần quét theo ngoặc/chuỗi đều tốn.
+        let (body, returning) = match contains_ci(sql, "RETURNING").then(|| find_top_level_keyword(sql, "RETURNING")).flatten() {
             Some(p) => (sql[..p].trim(), Some(sql[p + 9..].trim().trim_end_matches(';').trim())),
             None => (sql.trim().trim_end_matches(';').trim(), None),
         };
-        let (body, on_conflict) = match find_on_conflict(body) {
+        let (body, on_conflict) = match contains_ci(body, "CONFLICT").then(|| find_on_conflict(body)).flatten() {
             Some(p) => (body[..p].trim(), Some(parse_on_conflict(&body[p..])?)),
             None => (body, None),
         };
@@ -233,9 +245,13 @@ impl Executor {
         let into = find_top_level_keyword(body, "INTO").ok_or("Missing INTO in INSERT")?;
         let after_into = body[into + 4..].trim_start();
         // Nguồn dữ liệu: VALUES / SELECT / WITH / DEFAULT VALUES
-        let src_pos = ["VALUES", "SELECT", "WITH", "DEFAULT", "OVERRIDING"]
+        // VALUES thường nằm ngay sau danh sách cột: các từ khoá nguồn khác chỉ cần tìm ở đoạn trước nó.
+        let values_pos = find_top_level_keyword(after_into, "VALUES");
+        let prefix = &after_into[..values_pos.unwrap_or(after_into.len())];
+        let src_pos = ["SELECT", "WITH", "DEFAULT", "OVERRIDING"]
             .iter()
-            .filter_map(|kw| find_top_level_keyword(after_into, kw))
+            .filter_map(|kw| find_top_level_keyword(prefix, kw))
+            .chain(values_pos)
             .min()
             .ok_or("Missing VALUES clause in INSERT")?;
         let head = after_into[..src_pos].trim();

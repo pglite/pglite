@@ -276,6 +276,10 @@ pub(crate) fn temporal_arith(op: char, l: &Value, r: &Value) -> Option<Value> {
 /// Literal có kiểu: `INTERVAL '1 day'`, `TIMESTAMP '...'`, `TIMESTAMPTZ '...'`, `DATE '...'`, `TIME '...'`.
 pub(crate) fn typed_literal(s: &str) -> Option<Value> {
     let t = s.trim();
+    // Lọc nhanh: literal có kiểu luôn kết thúc bằng nháy đơn và bắt đầu bằng chữ cái
+    if !t.ends_with('\'') || !t.as_bytes().first().map_or(false, |b| b.is_ascii_alphabetic()) {
+        return None;
+    }
     let up_prefix: String = t.chars().take(30).collect::<String>().to_uppercase();
     for kw in ["INTERVAL", "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP", "DATE", "TIME"] {
         if up_prefix.starts_with(kw) {

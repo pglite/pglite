@@ -3215,7 +3215,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     fn handle_select(&mut self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
         // FOR UPDATE / FOR SHARE / ... [OF t] [NOWAIT | SKIP LOCKED]: engine nhúng chạy tuần tự, khoá dòng
         // không có ý nghĩa; bỏ đi thay vì để nó làm hỏng điều kiện (trước đây trả 0 dòng).
-        if let Some(p) = last_top_level_keyword(sql, "FOR") {
+        if let Some(p) = contains_ci(sql, " FOR ").then(|| last_top_level_keyword(sql, "FOR")).flatten() {
             let tail = sql[p + 3..].trim_start().to_uppercase();
             if ["UPDATE", "SHARE", "NO KEY UPDATE", "KEY SHARE"].iter().any(|k| tail.starts_with(k)) {
                 return self.handle_select(sql[..p].trim_end(), params);
@@ -3233,7 +3233,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             return self.handle_select(&normalized, params);
         }
         // Window function: tính sau WHERE/GROUP BY, trước ORDER BY/LIMIT
-        if sql.to_uppercase().contains("OVER") {
+        if contains_ci(sql, "OVER") {
             if let Some(res) = self.try_handle_window_select(sql, params) {
                 return res.map(|r| (r, None));
             }
@@ -12537,6 +12537,25 @@ pub(crate) fn jsonb_concat(l: &str, r: &str) -> Option<String> {
     None
 }
 
+/// Có `needle` (ASCII, không phân biệt hoa thường) ở đâu đó trong `hay`: lọc nhanh trước khi quét theo
+/// ngoặc/chuỗi, không cấp phát.
+pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    let (f_up, f_low) = (n[0].to_ascii_uppercase(), n[0].to_ascii_lowercase());
+    (0..=h.len() - n.len()).any(|i| (h[i] == f_up || h[i] == f_low) && h[i..i + n.len()].eq_ignore_ascii_case(n))
+}
+
+/// Lọc nhanh (chuỗi đã viết hoa) trước khi tìm ANY/SOME/ALL theo ngoặc: chạy cho mọi biểu thức con.
+#[inline]
+pub(crate) fn may_have_any_all(upper: &str) -> bool {
+    let b = upper.as_bytes();
+    b.len() >= 5 && b.contains(&b'(') && b.windows(3).any(|w| w == b"ANY" || w == b"ALL" || w == b"SOM")
+}
+
+/// `lhs <op> ANY|SOME|ALL (inner)` ở cấp ngoài cùng: (lhs, op, là ALL, inner).
 pub(crate) fn split_any_all(s: &str) -> Option<(&str, &'static str, bool, &str)> {
     for (kw, all) in [("ANY", false), ("SOME", false), ("ALL", true)] {
         let mut from = 0;
@@ -14860,7 +14879,7 @@ pub(crate) fn eval_sql_expr(
     }
 
     // x = ANY(arr), x <> ALL(arr)
-    if upper.contains("ANY") || upper.contains("ALL") || upper.contains("SOME") {
+    if may_have_any_all(&upper) {
         if let Some((lhs, op, all, inner)) = split_any_all(s) {
             let l = eval_sql_expr(lhs, primary_row, primary_table, joined_row, joined_table, params);
             let r = eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params);
