@@ -91,6 +91,9 @@ impl Executor {
                 return Err(e.to_string());
             }
         }
+        if top {
+            return decode_quoted_idents(res);
+        }
         res
     }
 
@@ -114,7 +117,7 @@ impl Executor {
     }
 
     pub(crate) fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let clean_sql = strip_sql_comments(sql);
+        let clean_sql = crate::engine::frontend::lex(sql)?;
         let normalized_sql = normalize_named_sql_params(&clean_sql);
 
         let stmts = split_sql_statements(&normalized_sql);
@@ -11460,6 +11463,13 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
         }
         t = inside;
     }
+    // Tương thích bản cũ: giá trị viết bằng nháy kép (`VALUES ("2026-09-09T15:32:34Z")`) được coi là
+    // chuỗi; lexer đã mã hoá nó thành định danh `__q.._`.
+    if t.starts_with("__q") {
+        if let Some(d) = crate::engine::frontend::decode_ident(t) {
+            return Value::text(d);
+        }
+    }
     if let Some(colon_pos) = find_last_top_level_op(t, "::") {
         let target_type = t[colon_pos + 2..].trim();
         let val = parse_value(&t[..colon_pos], params);
@@ -16196,7 +16206,7 @@ impl Executor {
     /// SELECT/WITH được chạy với tham số NULL (chỉ đọc); INSERT/UPDATE/DELETE … RETURNING
     /// lấy cột từ định nghĩa bảng, không thực thi.
     pub fn describe(&mut self, sql: &str) -> Result<crate::pg_types::DescribeResult, String> {
-        let clean = strip_sql_comments(sql);
+        let clean = crate::engine::frontend::lex(sql).map_err(|e| crate::engine::frontend::decode_all(&e).into_owned())?;
         let normalized = normalize_named_sql_params(&clean);
         let trimmed = normalized.trim().trim_end_matches(';').trim();
         let param_count = crate::pg_types::count_params(trimmed);
@@ -16302,4 +16312,43 @@ pub(crate) fn query_result_to_wire(res: &QueryResult) -> crate::pg_types::WireRe
         command: crate::pg_types::command_tag(&res.command, row_count),
         row_count,
     }
+}
+
+/// Định danh có nháy được lexer mã hoá (`frontend::encode_ident`): trả tên gốc ở tên cột, khoá
+/// của dòng, ô dữ liệu là đúng một tên mã hoá (catalog) và thông báo lỗi.
+fn decode_quoted_idents(res: Result<QueryResult, String>) -> Result<QueryResult, String> {
+    use crate::engine::frontend::{decode_all, decode_ident, encoded_seen};
+    if !encoded_seen() {
+        return res;
+    }
+    let mut r = match res {
+        Ok(r) => r,
+        Err(e) => return Err(decode_all(&e).into_owned()),
+    };
+    let names_encoded = r.fields.iter().any(|f| f.name.contains("__q") || f.name.contains("__Q"));
+    if names_encoded {
+        for f in &mut r.fields {
+            if let std::borrow::Cow::Owned(d) = decode_all(&f.name) {
+                f.name = d;
+            }
+        }
+    }
+    for row in &mut r.rows {
+        if let serde_json::Value::Object(map) = row {
+            let needs = names_encoded || map.values().any(|v| matches!(v, serde_json::Value::String(s) if s.starts_with("__q")));
+            if !needs {
+                continue;
+            }
+            let old = std::mem::take(map);
+            for (k, v) in old {
+                let k = decode_all(&k).into_owned();
+                let v = match v {
+                    serde_json::Value::String(s) if s.starts_with("__q") => serde_json::Value::String(decode_ident(&s).unwrap_or(s)),
+                    other => other,
+                };
+                map.insert(k, v);
+            }
+        }
+    }
+    Ok(r)
 }

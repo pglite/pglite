@@ -690,8 +690,12 @@ pub fn sqlstate(message: &str) -> &'static str {
         "42P01"
     } else if has("other objects depend on it") || has("cannot truncate a table referenced") {
         "2BP01"
-    } else if has("syntax error") || has("unsupported") {
+    } else if has("syntax error") || has("unsupported") || has("unterminated") || has("zero-length delimited identifier") || has("trailing junk after numeric literal") {
         "42601"
+    } else if has("is not a valid binary digit") || has("is not a valid hexadecimal digit") {
+        "22P02"
+    } else if has("invalid byte sequence for encoding") {
+        "22021"
     } else if has("must have the same number of columns") || has("more expressions than target columns") {
         "42601"
     } else if has("wal write failed") {

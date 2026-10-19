@@ -513,11 +513,20 @@ impl StorageEngine {
 
     pub fn get_table(&self, name: &str) -> Option<&Table> {
         let clean_name = name.to_lowercase();
-        self.tables.get(&clean_name)
+        match self.tables.get(&clean_name) {
+            Some(t) => Some(t),
+            // Tên có nháy được lexer mã hoá; DB cũ có thể lưu tên gốc
+            None => crate::engine::frontend::decode_ident(&clean_name).and_then(|d| self.tables.get(&d.to_lowercase())),
+        }
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> Option<&mut Table> {
         let clean_name = name.to_lowercase();
+        if !self.tables.contains_key(&clean_name) {
+            if let Some(d) = crate::engine::frontend::decode_ident(&clean_name) {
+                return self.tables.get_mut(&d.to_lowercase());
+            }
+        }
         self.tables.get_mut(&clean_name)
     }
 

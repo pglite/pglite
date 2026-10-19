@@ -648,6 +648,8 @@ impl Table {
         self.columns
             .iter()
             .position(|c| c.name.to_lowercase() == clean)
+            // Tên có nháy được lexer mã hoá; DB cũ có thể lưu tên gốc (vd. "x-y")
+            .or_else(|| crate::engine::frontend::decode_ident(&clean).and_then(|d| self.columns.iter().position(|c| c.name.to_lowercase() == d.to_lowercase())))
     }
 
     pub fn drop_column(&mut self, name: &str) -> bool {

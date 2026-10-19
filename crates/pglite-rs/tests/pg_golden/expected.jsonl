@@ -878,3 +878,14 @@
 {"id":"K_O15","ok":false,"error":"invalid input syntax for type integer: \"x\"","sqlstate":"22P02","failed_stmt":0}
 {"id":"K_O16","ok":false,"fields":[],"rows":[],"error":"division by zero","sqlstate":"22012","failed_stmt":1}
 {"id":"K_O17","ok":false,"fields":[],"rows":[],"error":"division by zero","sqlstate":"22012","failed_stmt":2}
+{"id":"K_L07","ok":true,"fields":["s","h","bs"],"rows":[["a\nb","AAé","x\\y"]]}
+{"id":"K_L08","ok":true,"fields":["u","v"],"rows":[["data","dat"]]}
+{"id":"K_L09","ok":true,"fields":["n","f","h"],"rows":[["1000000","1000.5","31"]]}
+{"id":"K_L10","ok":true,"fields":["x"],"rows":[["3"]]}
+{"id":"K_L11","ok":true,"fields":["s","t","z"],"rows":[["a'b","x$$y","0"]]}
+{"id":"K_L12","ok":true,"fields":["a b","r s"],"rows":[["v","3"]]}
+{"id":"K_L13","ok":false,"error":"trailing junk after numeric literal at or near \"0xZZ\"","sqlstate":"42601","failed_stmt":0}
+{"id":"K_L14","ok":false,"error":"zero-length delimited identifier at or near \"\"\"\"","sqlstate":"42601","failed_stmt":0}
+{"id":"K_L15","ok":false,"error":"unterminated quoted string at or near \"'unterminated\"","sqlstate":"42601","failed_stmt":0}
+{"id":"K_L16","ok":true,"fields":["id","Unit Price"],"rows":[["1","19.0"]]}
+{"id":"K_L17","ok":true,"fields":["a","b"],"rows":[["it's","it's"]]}
