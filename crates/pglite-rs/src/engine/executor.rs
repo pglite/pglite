@@ -690,7 +690,22 @@ impl Executor {
         Ok((names, rows, fields))
     }
 
+    /// WITH ...: bảng CTE được đặt tạm vào storage. Bảng thật trùng tên bị che chỉ trong lúc chạy và
+    /// luôn được trả lại (kể cả khi lệnh lỗi), trước đây nó bị xoá khỏi bộ nhớ.
     fn handle_cte(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        let mut shadow: Vec<(String, Option<crate::storage::table::Table>)> = Vec::new();
+        let res = self.handle_cte_inner(sql, params, &mut shadow);
+        for (name, prev) in shadow.into_iter().rev() {
+            self.storage.tables.remove(&name);
+            if let Some(t) = prev {
+                self.storage.tables.insert(name, t);
+            }
+        }
+        self.plan_cache.clear();
+        res
+    }
+
+    fn handle_cte_inner(&mut self, sql: &str, params: &[Value], shadow: &mut Vec<(String, Option<crate::storage::table::Table>)>) -> Result<QueryResult, String> {
         let mut without_with = sql.trim()[4..].trim();
         let is_recursive = if without_with.to_uppercase().starts_with("RECURSIVE") {
             let rest = &without_with[9..];
@@ -812,7 +827,7 @@ impl Executor {
                         for r in &working_rows {
                             working_table.insert(r.clone());
                         }
-                        self.storage.tables.insert(cte_name.to_lowercase(), working_table);
+                        { let prev = self.storage.tables.insert(cte_name.to_lowercase(), working_table); shadow.push((cte_name.to_lowercase(), prev)); }
 
                         let rec_res = match self.execute(rec_sql, params) {
                             Ok(res) => res,
@@ -845,7 +860,7 @@ impl Executor {
                     for r in accumulated_rows {
                         full_cte_table.insert(r);
                     }
-                    self.storage.tables.insert(cte_name.to_lowercase(), full_cte_table);
+                    { let prev = self.storage.tables.insert(cte_name.to_lowercase(), full_cte_table); shadow.push((cte_name.to_lowercase(), prev)); }
                     created_tables.push(cte_name);
                 } else {
                     let res = self.execute(cte_query, params)?;
@@ -885,7 +900,7 @@ impl Executor {
                     }
                     let mut cte_table = crate::storage::table::Table::new(cte_name.clone(), cols);
                     for r in rows { cte_table.insert(r); }
-                    self.storage.tables.insert(cte_name.to_lowercase(), cte_table);
+                    { let prev = self.storage.tables.insert(cte_name.to_lowercase(), cte_table); shadow.push((cte_name.to_lowercase(), prev)); }
                     created_tables.push(cte_name);
                 }
             } else {
@@ -926,7 +941,7 @@ impl Executor {
                 }
                 let mut cte_table = crate::storage::table::Table::new(cte_name.clone(), cols);
                 for r in rows { cte_table.insert(r); }
-                self.storage.tables.insert(cte_name.to_lowercase(), cte_table);
+                { let prev = self.storage.tables.insert(cte_name.to_lowercase(), cte_table); shadow.push((cte_name.to_lowercase(), prev)); }
                 created_tables.push(cte_name);
             }
 
@@ -5836,6 +5851,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_update(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        if let Some((head, set_part, from_list, where_clause, returning)) = crate::engine::dml_join::split_update_from(sql) {
+            return self.handle_update_from(head, set_part, from_list, where_clause, returning, params);
+        }
         let set_idx = find_top_level_keyword(sql, "SET").ok_or("Missing SET in UPDATE")?;
         let where_idx = find_top_level_keyword(sql, "WHERE");
         let returning_idx = find_top_level_keyword(sql, "RETURNING");
@@ -5922,7 +5940,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             // Bước 1: tính giá trị mới cho mọi dòng khớp (mỗi dòng chỉ đọc chính nó), chưa sửa gì.
             let compute_updates = |table: &crate::storage::table::Table, i: usize| -> Vec<(usize, Value)> {
                 raw_assignments.iter().map(|&(c_idx, ref v_str)| {
-                    let raw_val = evaluate_assignment_val(v_str, &table.rows[i], table, params);
+                    // SET col = DEFAULT: giá trị mặc định của cột (trước đây ghi chữ "DEFAULT")
+                    let raw_val = if v_str.trim().eq_ignore_ascii_case("DEFAULT") {
+                        table.columns[c_idx].default_value.as_deref().map(eval_default_value).unwrap_or(Value::Null)
+                    } else {
+                        evaluate_assignment_val(v_str, &table.rows[i], table, params)
+                    };
                     let coerced = coerce_update_val(&table.columns[c_idx], raw_val);
                     (c_idx, coerced)
                 }).collect()
@@ -6076,6 +6099,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_delete(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        if let Some((head, using_list, where_clause, returning)) = crate::engine::dml_join::split_delete_using(sql) {
+            return self.handle_delete_using(head, using_list, where_clause, returning, params);
+        }
         let from_idx = find_top_level_keyword(sql, "FROM").ok_or("Missing FROM in DELETE")?;
         let where_idx = find_top_level_keyword(sql, "WHERE");
         let returning_idx = find_top_level_keyword(sql, "RETURNING");
@@ -12882,6 +12908,10 @@ pub(crate) fn eval_default_for_insert(def_str: &str, params: &[Value]) -> Value 
 /// Giá trị DEFAULT của một cột (cùng quy tắc với INSERT).
 pub(crate) fn eval_default_value(def_str: &str) -> Value {
     eval_default_for_insert(def_str, &[])
+}
+
+pub(crate) fn value_to_json_pub(v: &Value) -> serde_json::Value {
+    value_to_json(v)
 }
 
 pub(crate) fn evaluate_assignment_val_pub(val_str: &str, row: &[Value], table: &crate::storage::table::Table, params: &[Value]) -> Value {

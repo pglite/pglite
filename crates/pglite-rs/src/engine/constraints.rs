@@ -459,6 +459,21 @@ impl Executor {
         let Some(t) = self.storage.get_table(table) else {
             return Ok(());
         };
+        // Kiểu dữ liệu: chuỗi không đọc được thành số/bool/uuid/ngày giờ thì lỗi như PostgreSQL (trước
+        // đây 'abc' được lưu thẳng vào cột INT).
+        for &r in rows {
+            if r >= t.rows.len() || t.is_deleted[r] {
+                continue;
+            }
+            for (c, col) in t.columns.iter().enumerate() {
+                if changed.map_or(false, |ch| !ch.contains(&c)) {
+                    continue;
+                }
+                if let Some(e) = type_error(col, &t.rows[r][c]) {
+                    return Err(e);
+                }
+            }
+        }
         let not_null: Vec<usize> = t
             .columns
             .iter()
@@ -842,6 +857,45 @@ impl Executor {
         }
         Ok(())
     }
+}
+
+/// Lỗi kiểu khi giá trị dạng chuỗi không hợp lệ với kiểu cột.
+fn type_error(col: &ColumnDef, v: &Value) -> Option<String> {
+    use crate::types::DataType;
+    let Value::Text(t) = v else { return None };
+    let s = t.trim();
+    let bad = |ty: &str| Some(format!("invalid input syntax for type {}: \"{}\"", ty, t));
+    match col.data_type {
+        DataType::Integer | DataType::Serial | DataType::BigInt => {
+            if s.parse::<i64>().is_err() && !s.parse::<f64>().map_or(false, |f| f.fract() == 0.0) {
+                return bad(if col.data_type == DataType::BigInt { "bigint" } else { "integer" });
+            }
+        }
+        DataType::Numeric => {
+            if s.parse::<f64>().is_err() && !matches!(s.to_lowercase().as_str(), "nan" | "infinity" | "-infinity") {
+                return bad("numeric");
+            }
+        }
+        DataType::Boolean => {
+            if !matches!(s.to_lowercase().as_str(), "t" | "true" | "f" | "false" | "1" | "0" | "y" | "yes" | "n" | "no" | "on" | "off") {
+                return bad("boolean");
+            }
+        }
+        DataType::Uuid => {
+            let hex: String = s.trim_matches(|c| c == '{' || c == '}').chars().filter(|c| *c != '-').collect();
+            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return bad("uuid");
+            }
+        }
+        DataType::Date | DataType::Timestamp => {
+            let special = matches!(s.to_lowercase().as_str(), "infinity" | "-infinity" | "now" | "today" | "epoch" | "tomorrow" | "yesterday");
+            if !special && super::executor::parse_datetime_components(s).is_none() {
+                return bad(if col.data_type == DataType::Date { "date" } else { "timestamp" });
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 fn still_referenced(fk: &ResolvedFk, key: &[Value], ex: &Executor) -> String {

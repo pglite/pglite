@@ -283,7 +283,11 @@ impl Executor {
             let mut param_cursor = 0;
             for group in extract_value_groups(&source[6..]) {
                 let mut row = defaults_row(params);
-                for (ptr, token) in split_comma_separated_tokens(group).into_iter().enumerate() {
+                let tokens = split_comma_separated_tokens(group);
+                if tokens.len() > col_indices.len() {
+                    return Err("INSERT has more expressions than target columns".to_string());
+                }
+                for (ptr, token) in tokens.into_iter().enumerate() {
                     let Some(&target_idx) = col_indices.get(ptr) else { break };
                     let val = eval_value_token(token, params, &mut param_cursor, col_defs[target_idx].default_value.as_ref());
                     row[target_idx] = coerce_update_val(&col_defs[target_idx], val);

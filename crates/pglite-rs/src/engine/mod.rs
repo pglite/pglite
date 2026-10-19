@@ -1,5 +1,6 @@
 pub mod alter;
 pub mod constraints;
+pub mod dml_join;
 pub mod expr;
 pub mod executor;
 pub mod plan;

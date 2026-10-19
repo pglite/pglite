@@ -253,7 +253,7 @@ pub(crate) fn normalize_select_sql(sql: &str) -> Option<String> {
             continue;
         }
         let name = default_column_name(it);
-        if used.iter().any(|u| u == &name.to_lowercase()) || items.iter().filter(|o| default_column_name(o) == name && !is_column_ref(o)).count() > 1 {
+        if used.iter().any(|u| u == &name.to_lowercase()) || items.iter().filter(|o| find_top_level_keyword(o, "AS").is_none() && implicit_alias(o).is_none() && !is_column_ref(o) && default_column_name(o) == name).count() > 1 {
             // tên trùng: giữ cách đặt tên cũ để hai cột không đè nhau trong object kết quả
             out_items.push(it.to_string());
             continue;
