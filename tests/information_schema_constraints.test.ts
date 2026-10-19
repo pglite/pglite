@@ -10,6 +10,7 @@ describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", 
   beforeAll(async () => {
     if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
     if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
+    if (existsSync(DB_FILE + ".rwal")) unlinkSync(DB_FILE + ".rwal");
     db = new PGLite(DB_FILE);
 
     await db.exec(`
@@ -38,6 +39,7 @@ describe("LEVEL 94: information_schema Constraint Views & Compatibility Suite", 
   afterAll(() => {
     if (existsSync(DB_FILE)) unlinkSync(DB_FILE);
     if (existsSync(DB_FILE + ".wal")) unlinkSync(DB_FILE + ".wal");
+    if (existsSync(DB_FILE + ".rwal")) unlinkSync(DB_FILE + ".rwal");
   });
 
   test("94.1 User Query 1: Foreign Key Introspection via 3-way join", async () => {

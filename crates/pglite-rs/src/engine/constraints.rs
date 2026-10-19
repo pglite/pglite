@@ -122,7 +122,7 @@ fn unique_name(base: String, taken: &[ConstraintDef]) -> String {
 /// `CONSTRAINT name ...` ở đầu: (Some(name), phần còn lại).
 fn split_constraint_name(def: &str) -> (Option<String>, &str) {
     let t = def.trim_start();
-    if t.len() > 11 && t[..10].eq_ignore_ascii_case("CONSTRAINT") && t.as_bytes()[10].is_ascii_whitespace() {
+    if t.len() > 11 && t.get(..10).map_or(false, |p| p.eq_ignore_ascii_case("CONSTRAINT")) && t.as_bytes()[10].is_ascii_whitespace() {
         let rest = t[10..].trim_start();
         let end = if rest.starts_with('"') {
             rest[1..].find('"').map(|i| i + 2).unwrap_or(rest.len())
@@ -135,7 +135,7 @@ fn split_constraint_name(def: &str) -> (Option<String>, &str) {
 }
 
 fn starts_with_kw(s: &str, kw: &str) -> bool {
-    s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw) && s[kw.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_')
+    s.len() >= kw.len() && s.get(..kw.len()).map_or(false, |p| p.eq_ignore_ascii_case(kw)) && s[kw.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_')
 }
 
 /// Ràng buộc cấp bảng (một phần tử trong danh sách của CREATE TABLE, hoặc sau ALTER TABLE ADD).

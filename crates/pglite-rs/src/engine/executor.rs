@@ -30,6 +30,8 @@ pub struct Executor {
     pub storage: StorageEngine,
     pub plan_cache: HashMap<String, ExecutionPlan>,
     pub custom_constraints: Vec<TableConstraintDef>,
+    /// Tham số phiên đặt bằng SET (SHOW đọc lại).
+    pub settings: HashMap<String, String>,
 }
 
 impl Executor {
@@ -38,6 +40,7 @@ impl Executor {
             storage,
             plan_cache: HashMap::new(),
             custom_constraints: Vec::new(),
+            settings: HashMap::new(),
         }
     }
 
@@ -94,6 +97,13 @@ impl Executor {
         let trimmed = normalized_sql.trim().trim_end_matches(|c: char| c == ';' || c == '.').trim();
         let upper = trimmed.to_uppercase();
 
+        if upper.starts_with("DO ") || upper.starts_with("DO$") || upper.starts_with("DO\n") || upper.starts_with("DO\t") {
+            return self.handle_do_block(trimmed);
+        }
+        if let Some(res) = self.handle_session_statement(trimmed, &upper) {
+            return res;
+        }
+
         if upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION") {
             self.storage.begin_transaction();
             return Ok(QueryResult {
@@ -116,6 +126,9 @@ impl Executor {
 
         if upper.starts_with("SAVEPOINT") {
             let sp_name = trimmed["SAVEPOINT".len()..].trim().trim_matches(';');
+            if !self.storage.in_transaction {
+                return Err("SAVEPOINT can only be used in transaction blocks".to_string());
+            }
             self.storage.savepoint(sp_name);
             return Ok(QueryResult {
                 rows: vec![],
@@ -139,7 +152,13 @@ impl Executor {
             } else {
                 sp_name
             }.trim().trim_matches(';');
-            self.storage.rollback_to_savepoint(sp_name);
+            if !self.storage.in_transaction {
+                return Err("ROLLBACK TO SAVEPOINT can only be used in transaction blocks".to_string());
+            }
+            if !self.storage.rollback_to_savepoint(sp_name) {
+                return Err(format!("savepoint \"{}\" does not exist", sp_name.trim_matches('"')));
+            }
+            self.plan_cache.clear();
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -167,7 +186,9 @@ impl Executor {
                 &trimmed["RELEASE".len()..]
             };
             let sp_name = after.trim().trim_matches(';');
-            self.storage.release_savepoint(sp_name);
+            if !self.storage.release_savepoint(sp_name) {
+                return Err(format!("savepoint \"{}\" does not exist", sp_name.trim_matches('"')));
+            }
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -255,7 +276,11 @@ impl Executor {
                 return self.handle_pg_constraint_introspection_query(trimmed, params);
             }
 
-            if upper.contains("FROM INFORMATION_SCHEMA.COLUMNS") {
+            // Chỉ khi information_schema.columns là FROM của chính câu này; nằm trong truy vấn con
+            // (EXISTS (SELECT 1 FROM information_schema.columns ...)) thì để câu ngoài tính bình thường.
+            let top_from_is_columns = find_top_level_keyword(trimmed, "FROM")
+                .map_or(false, |p| trimmed[p..].to_uppercase().starts_with("FROM INFORMATION_SCHEMA.COLUMNS"));
+            if top_from_is_columns {
                 return self.handle_information_schema_columns_query(trimmed, params);
             }
 
@@ -938,7 +963,7 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
     result
 }
 
-    fn resolve_subqueries_in_where(&mut self, where_str: &str, params: &[Value]) -> Result<String, String> {
+    pub(crate) fn resolve_subqueries_in_where(&mut self, where_str: &str, params: &[Value]) -> Result<String, String> {
         let mut resolved = where_str.to_string();
         loop {
             let mut found_start = None;
@@ -2078,7 +2103,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             rest = rest[10..].trim();
         }
         for kw in [" CASCADE", " RESTRICT"] {
-            if rest.to_uppercase().ends_with(kw) {
+            if rest.get(rest.len().saturating_sub(kw.len())..).map_or(false, |x| x.eq_ignore_ascii_case(kw)) {
                 rest = rest[..rest.len() - kw.len()].trim();
             }
         }
@@ -2107,7 +2132,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         }
         let mut cascade = false;
         for kw in [" CASCADE", " RESTRICT"] {
-            if rest.to_uppercase().ends_with(kw) {
+            if rest.get(rest.len().saturating_sub(kw.len())..).map_or(false, |x| x.eq_ignore_ascii_case(kw)) {
                 cascade = kw == " CASCADE";
                 rest = rest[..rest.len() - kw.len()].trim();
             }
@@ -3027,6 +3052,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     } else {
                         serde_json::Value::Null
                     }
+                } else if expr_part.to_uppercase().contains("SELECT") {
+                    // Biểu thức chứa truy vấn con: (SELECT count(*) ...) = 2, EXISTS (...), x IN (SELECT ...)
+                    let resolved = self.resolve_subqueries_in_where(expr_part, params)?;
+                    value_to_json(&eval_sql_expr(&resolved, &[], None, &[], None, params))
                 } else {
                     let val = eval_sql_expr(expr_part, &[], None, &[], None, params);
                     value_to_json(&val)
@@ -10014,6 +10043,30 @@ pub(crate) fn split_comma_separated_tokens(s: &str) -> Vec<&str> {
     tokens
 }
 
+/// Chuỗi `$tag$ ... $tag$` bắt đầu tại `i`: trả về vị trí ngay sau thẻ đóng. `$1` (tham số) không
+/// phải chuỗi dollar.
+pub(crate) fn dollar_quote_end(sql: &str, i: usize) -> Option<usize> {
+    let b = sql.as_bytes();
+    if b.get(i) != Some(&b'$') {
+        return None;
+    }
+    if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+        return None;
+    }
+    let mut j = i + 1;
+    if j < b.len() && b[j].is_ascii_digit() {
+        return None;
+    }
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'$') {
+        return None;
+    }
+    let tag = &sql[i..=j];
+    sql[j + 1..].find(tag).map(|p| j + 1 + p + tag.len())
+}
+
 fn split_sql_statements(sql: &str) -> Vec<String> {
     // Chỉ cắt tại byte ';' (ASCII) nên luôn đúng ranh giới ký tự UTF-8; mỗi câu được chép
     // nguyên lát chuỗi gốc để không làm hỏng tiếng Việt.
@@ -10021,11 +10074,20 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut in_str = false;
     let mut depth: i32 = 0;
     let mut seg_start = 0;
+    let mut skip_to = 0usize;
     for (i, &b) in sql.as_bytes().iter().enumerate() {
+        if i < skip_to {
+            continue;
+        }
         if b == b'\'' {
             in_str = !in_str;
         } else if in_str {
             continue;
+        } else if b == b'$' {
+            // Thân `DO $$ ... $$` chứa ';' bên trong
+            if let Some(end) = dollar_quote_end(sql, i) {
+                skip_to = end;
+            }
         } else if b == b'(' || b == b'[' {
             depth += 1;
         } else if b == b')' || b == b']' {

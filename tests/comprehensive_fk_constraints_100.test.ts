@@ -671,16 +671,19 @@ describe("100 Comprehensive In-Depth PostgreSQL Foreign Keys & Constraints Test 
     });
 
     test("53. Finding orphaned items with Anti-Join", async () => {
-      await db.query("INSERT INTO store_products (id, category_id, product_name, price) VALUES (999, 999, 'Ghost Item', 99);");
+      // PostgreSQL không cho chèn sản phẩm trỏ tới danh mục không tồn tại (khoá ngoại), nên kiểm tra
+      // anti-join theo chiều ngược lại: danh mục không có sản phẩm nào.
+      await db.query("INSERT INTO store_categories (id, category_name) VALUES (999, 'Ghost Category');");
       const res = await db.query(`
-        SELECT p.product_name
-        FROM store_products p
-        LEFT JOIN store_categories c ON p.category_id = c.id
-        WHERE c.id IS NULL;
+        SELECT c.category_name
+        FROM store_categories c
+        LEFT JOIN store_products p ON p.category_id = c.id
+        WHERE p.id IS NULL AND c.id = 999;
       `);
       expect(res.length).toBe(1);
-      expect(res[0].product_name).toBe("Ghost Item");
-      await db.query("DELETE FROM store_products WHERE id = 999;");
+      expect(res[0].category_name).toBe("Ghost Category");
+      await expect(db.query("INSERT INTO store_products (id, category_id, product_name, price) VALUES (998, 12345, 'Ghost Item', 99);")).rejects.toThrow();
+      await db.query("DELETE FROM store_categories WHERE id = 999;");
     });
 
     test("54. Clean deletion of child without affecting parent", async () => {

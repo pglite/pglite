@@ -123,3 +123,22 @@ fn insert_forms_params_casts_and_returning_expressions() {
     exec_all(&mut db, &["INSERT INTO b (a_id, v) VALUES (1, 'x ON CONFLICT (id) DO NOTHING RETURNING y')"]);
     assert_eq!(rows(&mut db, "SELECT v FROM b WHERE id = 3"), vec![json!({"v": "x ON CONFLICT (id) DO NOTHING RETURNING y"})]);
 }
+
+/// Chuỗi tiếng Việt ở mọi vị trí không được làm panic (cắt chuỗi giữa ký tự UTF-8).
+#[test]
+fn vietnamese_text_everywhere() {
+    let mut db = PGlite::in_memory().unwrap();
+    exec_all(&mut db, &[
+        "CREATE TABLE tỉnh (id SERIAL PRIMARY KEY, tên TEXT UNIQUE NOT NULL DEFAULT 'Hà Nội', ghi_chú TEXT CHECK (ghi_chú <> 'cấm'))",
+        "INSERT INTO tỉnh (tên) VALUES ('Đà Nẵng'), ('Cần Thơ'), ('An Giang'), ('Bình Dương')",
+        "INSERT INTO tỉnh (tên, ghi_chú) VALUES ('Đà Nẵng', 'trùng') ON CONFLICT (tên) DO UPDATE SET ghi_chú = EXCLUDED.ghi_chú || ' — đã gộp'",
+        "ALTER TABLE tỉnh ADD COLUMN vùng TEXT DEFAULT 'Miền Trung'",
+        "ALTER TABLE tỉnh ALTER COLUMN vùng SET DEFAULT 'Đồng bằng sông Cửu Long'",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM tỉnh WHERE tên = 'Huế') THEN INSERT INTO tỉnh (tên) VALUES ('Huế'); END IF; END $$",
+        "DROP TABLE IF EXISTS bảng_không_có CASCADE",
+        "DROP INDEX IF EXISTS chỉ_mục_ố",
+    ]);
+    assert!(db.exec("INSERT INTO tỉnh (tên, ghi_chú) VALUES ('Lào Cai', 'cấm')", &[]).is_err());
+    assert_eq!(rows(&mut db, "SELECT ghi_chú FROM tỉnh WHERE tên = 'Đà Nẵng'"), vec![json!({"ghi_chú": "trùng — đã gộp"})]);
+    assert_eq!(rows(&mut db, "SELECT vùng FROM tỉnh WHERE tên = 'Huế'"), vec![json!({"vùng": "Đồng bằng sông Cửu Long"})]);
+}

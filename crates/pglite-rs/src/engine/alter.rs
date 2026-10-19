@@ -13,7 +13,7 @@ use crate::storage::wal::WalRecord;
 use crate::types::{ColumnDef, DataType, QueryResult, Value};
 
 fn starts_kw(s: &str, kw: &str) -> bool {
-    s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw) && s[kw.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_')
+    s.len() >= kw.len() && s.get(..kw.len()).map_or(false, |p| p.eq_ignore_ascii_case(kw)) && s[kw.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_')
 }
 
 /// Cắt từ khoá ở đầu chuỗi (nếu có).
@@ -41,7 +41,7 @@ fn done() -> Result<QueryResult, String> {
 fn drop_suffix<'a>(s: &'a str, kws: &[&str]) -> (&'a str, Option<String>) {
     let t = s.trim_end();
     for kw in kws {
-        if t.len() > kw.len() && t[t.len() - kw.len()..].eq_ignore_ascii_case(kw) && t.as_bytes()[t.len() - kw.len() - 1].is_ascii_whitespace() {
+        if t.len() > kw.len() && t.get(t.len() - kw.len()..).map_or(false, |x| x.eq_ignore_ascii_case(kw)) && t.as_bytes()[t.len() - kw.len() - 1].is_ascii_whitespace() {
             return (t[..t.len() - kw.len()].trim_end(), Some(kw.to_uppercase()));
         }
     }
@@ -169,7 +169,7 @@ impl Executor {
         }
         // Thao tác không ảnh hưởng dữ liệu trong engine nhúng: chấp nhận, không làm gì.
         for kw in ["OWNER TO", "SET SCHEMA", "SET (", "RESET (", "SET LOGGED", "SET UNLOGGED", "ENABLE", "DISABLE", "REPLICA IDENTITY", "CLUSTER", "SET WITHOUT", "FORCE ROW", "NO FORCE"] {
-            if a.len() >= kw.len() && a[..kw.len()].eq_ignore_ascii_case(kw) {
+            if a.len() >= kw.len() && a.get(..kw.len()).map_or(false, |p| p.eq_ignore_ascii_case(kw)) {
                 return Ok(());
             }
         }
@@ -402,7 +402,7 @@ impl Executor {
         }
         // SET STATISTICS / SET STORAGE / SET (...) / RESET: không ảnh hưởng dữ liệu
         for kw in ["SET STATISTICS", "SET STORAGE", "SET (", "RESET (", "SET COMPRESSION", "DROP IDENTITY", "ADD GENERATED", "SET GENERATED", "DROP EXPRESSION"] {
-            if op.len() >= kw.len() && op[..kw.len()].eq_ignore_ascii_case(kw) {
+            if op.len() >= kw.len() && op.get(..kw.len()).map_or(false, |p| p.eq_ignore_ascii_case(kw)) {
                 return Ok(());
             }
         }

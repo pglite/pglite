@@ -519,7 +519,10 @@ impl StorageEngine {
 
     pub fn begin_transaction(&mut self) {
         if self.in_transaction {
+            // Như PostgreSQL: chỉ cảnh báo, giữ nguyên giao dịch đang mở. Trước đây BEGIN thứ hai xoá
+            // undo log nên ROLLBACK sau đó không hoàn tác được phần việc trước của giao dịch.
             eprintln!("[pglite-rs] WARNING: there is already a transaction in progress");
+            return;
         }
         self.in_transaction = true;
         self.tx_undo_log.clear();

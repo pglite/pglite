@@ -1,4 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { getNativeBinding } from "./native-loader";
+
+/** Instance đang chạy transaction() trong ngữ cảnh async hiện tại (để lệnh bên trong không phải chờ). */
+const txContext = new AsyncLocalStorage<object>();
 
 export interface QueryResult<R = any> {
   rows: R[];
@@ -79,50 +83,74 @@ function sanitizeParamValue(v: any): any {
   return v;
 }
 
+/**
+ * Đổi tham số có tên `:name` thành `$n`, chỉ ở ngoài chuỗi ('...', "...", $$...$$) và không đụng
+ * `::type`. Trước đây regex chạy trên cả chuỗi literal nên `'{"a":true}'` bị đổi thành `'{"a"$1}'`.
+ */
+function rewriteNamedParams(sql: string): { sql: string; names: string[] } {
+  const names: string[] = [];
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const ch = sql[i];
+    if (ch === "'" || ch === '"') {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === ch) {
+          if (sql[j + 1] === ch) { j += 2; continue; }
+          break;
+        }
+        j++;
+      }
+      out += sql.slice(i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (ch === "$") {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
+      if (m && !(i > 0 && /[A-Za-z0-9_]/.test(sql[i - 1]))) {
+        const close = sql.indexOf(m[0], i + m[0].length);
+        const end = close === -1 ? n : close + m[0].length;
+        out += sql.slice(i, end);
+        i = end;
+        continue;
+      }
+    }
+    if (ch === ":" && sql[i + 1] !== ":" && (i === 0 || sql[i - 1] !== ":")) {
+      const m = /^:([a-zA-Z_][a-zA-Z0-9_]*)\b/.exec(sql.slice(i));
+      if (m) {
+        let idx = names.indexOf(m[1]);
+        if (idx === -1) { names.push(m[1]); idx = names.length - 1; }
+        out += `$${idx + 1}`;
+        i += m[0].length;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return { sql: out, names };
+}
+
 function normalizeQueryParams(sql: string, params: any): { sql: string; params: any[] | undefined } {
   sql = stripSqlComments(sql);
   if (!params) return { sql, params: undefined };
 
   if (Array.isArray(params)) {
     const sanitizedParams = params.map(sanitizeParamValue);
-    const paramNames: string[] = [];
-    const regex = /(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
-    let match;
-    while ((match = regex.exec(sql)) !== null) {
-      if (!paramNames.includes(match[1])) {
-        paramNames.push(match[1]);
-      }
-    }
-    if (paramNames.length > 0) {
-      let replacedSql = sql;
-      paramNames.forEach((name, idx) => {
-        const nameRegex = new RegExp(`(?<!:):${name}\\b`, "g");
-        replacedSql = replacedSql.replace(nameRegex, `$${idx + 1}`);
-      });
-      return { sql: replacedSql, params: sanitizedParams };
-    }
-    return { sql, params: sanitizedParams };
+    const rewritten = rewriteNamedParams(sql);
+    return { sql: rewritten.names.length > 0 ? rewritten.sql : sql, params: sanitizedParams };
   }
 
   if (typeof params === "object") {
-    const paramNames: string[] = [];
-    const regex = /(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
-    let match;
-    while ((match = regex.exec(sql)) !== null) {
-      if (!paramNames.includes(match[1])) {
-        paramNames.push(match[1]);
-      }
-    }
-    if (paramNames.length > 0) {
-      let replacedSql = sql;
-      const paramArray: any[] = [];
-      paramNames.forEach((name, idx) => {
+    const rewritten = rewriteNamedParams(sql);
+    if (rewritten.names.length > 0) {
+      const paramArray = rewritten.names.map((name) => {
         const raw = params[name];
-        paramArray.push(sanitizeParamValue(raw !== undefined ? raw : null));
-        const nameRegex = new RegExp(`(?<!:):${name}\\b`, "g");
-        replacedSql = replacedSql.replace(nameRegex, `$${idx + 1}`);
+        return sanitizeParamValue(raw !== undefined ? raw : null);
       });
-      return { sql: replacedSql, params: paramArray };
+      return { sql: rewritten.sql, params: paramArray };
     }
   }
 
@@ -152,6 +180,19 @@ function splitStatements(sql: string): string[] {
     } else if (ch === '"' && !inSingleQuote) {
       inDoubleQuote = !inDoubleQuote;
       current += ch;
+    } else if (ch === "$" && !inSingleQuote && !inDoubleQuote) {
+      // Chuỗi $tag$...$tag$ (thân DO / hàm) chứa ';' bên trong; $1 là tham số, không phải chuỗi.
+      const prev = i > 0 ? stripped[i - 1] : "";
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(stripped.slice(i));
+      if (m && !/[A-Za-z0-9_]/.test(prev)) {
+        const tag = m[0];
+        const close = stripped.indexOf(tag, i + tag.length);
+        const end = close === -1 ? stripped.length : close + tag.length;
+        current += stripped.slice(i, end);
+        i = end - 1;
+      } else {
+        current += ch;
+      }
     } else if (ch === ";" && !inSingleQuote && !inDoubleQuote) {
       const trimmed = current.trim();
       if (trimmed) stmts.push(trimmed);
@@ -169,6 +210,16 @@ export class PGLiteNative {
   private nativeInstance: any = null;
   private filepath: string;
   private options: any;
+  /**
+   * Engine chỉ có một trạng thái giao dịch cho mỗi instance. transaction() giữ lượt từ BEGIN tới
+   * COMMIT/ROLLBACK; lệnh từ nơi khác chờ tới khi giao dịch xong, thay vì lọt vào giữa giao dịch.
+   */
+  private txTail: Promise<void> = Promise.resolve();
+
+  private async waitTurn(): Promise<void> {
+    if (txContext.getStore() === this) return;
+    await this.txTail;
+  }
 
   constructor(filepath: string = ":memory:", options: any = {}) {
     this.filepath = filepath;
@@ -190,6 +241,7 @@ export class PGLiteNative {
   }
 
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
+    await this.waitTurn();
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
       let lastRes: any = null;
@@ -211,6 +263,7 @@ export class PGLiteNative {
   }
 
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
+    await this.waitTurn();
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
       let lastRes: any = null;
@@ -228,6 +281,7 @@ export class PGLiteNative {
   }
 
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
+    await this.waitTurn();
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
       let lastRes: any = [];
@@ -245,6 +299,7 @@ export class PGLiteNative {
   }
 
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
+    await this.waitTurn();
     const stmts = splitStatements(sql);
     if (stmts.length > 1) {
       let lastRes: any = null;
@@ -276,6 +331,22 @@ export class PGLiteNative {
   }
 
   public async transaction<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {
+    if (txContext.getStore() === this) {
+      throw new Error("Nested transactions not supported");
+    }
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const prev = this.txTail;
+    this.txTail = prev.then(() => gate);
+    await prev;
+    try {
+      return await txContext.run(this, () => this.runTransaction(callback, dbName));
+    } finally {
+      release();
+    }
+  }
+
+  private async runTransaction<T = any>(callback: (tx: any) => Promise<T>, dbName?: string): Promise<T> {
     await this.exec("BEGIN", undefined, dbName);
     let finished = false;
     const txObj = {

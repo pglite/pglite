@@ -34,7 +34,7 @@ fn find_on_conflict(s: &str) -> Option<usize> {
     while let Some(rel) = find_top_level_keyword(&s[from..], "CONFLICT") {
         let pos = from + rel;
         let before = s[..pos].trim_end();
-        if before.len() >= 2 && before[before.len() - 2..].eq_ignore_ascii_case("ON") {
+        if before.len() >= 2 && before.get(before.len() - 2..).map_or(false, |x| x.eq_ignore_ascii_case("ON")) {
             let on_pos = before.len() - 2;
             if on_pos == 0 || !s.as_bytes()[on_pos - 1].is_ascii_alphanumeric() {
                 return Some(on_pos);
@@ -61,17 +61,17 @@ fn parse_on_conflict(clause: &str) -> Result<OnConflict, String> {
         target = ConflictTarget::Columns(cols);
         rest = rest[close + 1..].trim_start();
         // ON CONFLICT (cols) WHERE pred: điều kiện chọn index một phần, bỏ qua (chọn theo cột)
-        if rest.len() > 5 && rest[..5].eq_ignore_ascii_case("WHERE") {
+        if rest.len() > 5 && rest.get(..5).map_or(false, |p| p.eq_ignore_ascii_case("WHERE")) {
             let do_pos = find_top_level_keyword(rest, "DO").ok_or("Missing DO in ON CONFLICT")?;
             rest = rest[do_pos..].trim_start();
         }
-    } else if rest.len() > 13 && rest[..13].eq_ignore_ascii_case("ON CONSTRAINT") {
+    } else if rest.len() > 13 && rest.get(..13).map_or(false, |p| p.eq_ignore_ascii_case("ON CONSTRAINT")) {
         let after = rest[13..].trim_start();
         let end = after.find(char::is_whitespace).unwrap_or(after.len());
         target = ConflictTarget::Constraint(strip_schema(&after[..end]));
         rest = after[end..].trim_start();
     }
-    if !(rest.len() >= 2 && rest[..2].eq_ignore_ascii_case("DO")) {
+    if !(rest.len() >= 2 && rest.get(..2).map_or(false, |p| p.eq_ignore_ascii_case("DO"))) {
         return Err("syntax error at or near ON CONFLICT: expected DO NOTHING or DO UPDATE".to_string());
     }
     rest = rest[2..].trim_start();
@@ -86,7 +86,7 @@ fn parse_on_conflict(clause: &str) -> Result<OnConflict, String> {
         return Err("ON CONFLICT DO UPDATE requires inference specification or constraint name".to_string());
     }
     rest = rest[6..].trim_start();
-    if !(rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("SET")) {
+    if !(rest.len() >= 3 && rest.get(..3).map_or(false, |p| p.eq_ignore_ascii_case("SET"))) {
         return Err("syntax error in ON CONFLICT DO UPDATE: expected SET".to_string());
     }
     rest = rest[3..].trim_start();
@@ -139,13 +139,13 @@ fn substitute_excluded(expr: &str, columns: &[crate::types::ColumnDef], base: us
             i += 1;
             continue;
         }
-        if !sq && i + 9 <= bytes.len() && expr[i..i + 9].eq_ignore_ascii_case("excluded.") && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.')) {
+        if !sq && i + 9 <= bytes.len() && expr.get(i..i + 9).map_or(false, |x| x.eq_ignore_ascii_case("excluded.")) && (i == 0 || !(ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.')) {
             let start = i + 9;
             let (name, end) = if bytes.get(start) == Some(&b'"') {
                 let close = expr[start + 1..].find('"').map(|p| start + 1 + p).unwrap_or(bytes.len() - 1);
                 (expr[start + 1..close].to_string(), close + 1)
             } else {
-                let end = (start..bytes.len()).find(|&j| !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')).unwrap_or(bytes.len());
+                let end = (start..bytes.len()).find(|&j| !ident_byte(bytes[j])).unwrap_or(bytes.len());
                 (expr[start..end].to_string(), end)
             };
             if let Some(idx) = columns.iter().position(|c| c.name.eq_ignore_ascii_case(&name)) {
@@ -160,6 +160,11 @@ fn substitute_excluded(expr: &str, columns: &[crate::types::ColumnDef], base: us
         i += ch_len;
     }
     out
+}
+
+/// Byte thuộc một định danh: chữ, số, `_`, hoặc byte của ký tự không phải ASCII (tên cột tiếng Việt).
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
 fn utf8_len(b: u8) -> usize {
@@ -235,7 +240,7 @@ impl Executor {
             .ok_or("Missing VALUES clause in INSERT")?;
         let head = after_into[..src_pos].trim();
         let mut source = after_into[src_pos..].trim();
-        if source.len() > 10 && source[..10].eq_ignore_ascii_case("OVERRIDING") {
+        if source.len() > 10 && source.get(..10).map_or(false, |p| p.eq_ignore_ascii_case("OVERRIDING")) {
             // OVERRIDING SYSTEM|USER VALUE: bỏ qua
             let v = find_top_level_keyword(source, "VALUE").map(|p| p + 5).unwrap_or(source.len());
             source = source[v..].trim();

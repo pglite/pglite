@@ -1164,6 +1164,8 @@ describe("100 Comprehensive In-Depth PostgreSQL Transactions & ACID Test Cases f
       // Step 1: Deduct inventory
       await db.query("UPDATE acid_products SET stock = stock - 1 WHERE id = 101;");
       // Step 2: Deduct user account
+      // Tài khoản 1 không đủ số dư: PostgreSQL báo vi phạm CHECK (balance >= 0) và huỷ giao dịch, nên nạp thêm trước.
+      await db.query("UPDATE acid_accounts SET balance = balance + 1098.90 WHERE id = 1;");
       await db.query("UPDATE acid_accounts SET balance = balance - 1098.90 WHERE id = 1;");
       // Step 3: Insert order
       await db.query("INSERT INTO acid_orders (id, product_id, qty, total, status) VALUES (50, 101, 1, 1098.90, 'paid');");
