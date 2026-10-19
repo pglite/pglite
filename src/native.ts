@@ -157,6 +157,14 @@ function normalizeQueryParams(sql: string, params: any): { sql: string; params: 
   return { sql, params: undefined };
 }
 
+/**
+ * Chuỗi nhiều câu lệnh không kèm tham số được gửi nguyên cho engine (như simple query của PostgreSQL):
+ * engine tự tách câu (hiểu E'..', $$..$$, comment lồng nhau) và chạy cả chuỗi trong một giao dịch ngầm.
+ */
+function noParams(params: any): boolean {
+  return params === undefined || params === null || typeof params === "string" || (Array.isArray(params) && params.length === 0);
+}
+
 function splitStatements(sql: string): string[] {
   if (!sql.includes(";") && !sql.includes("--") && !sql.includes("/*")) {
     const trimmed = sql.trim();
@@ -260,6 +268,14 @@ export class PGLiteNative {
   public async exec<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
     await this.waitTurn();
     const stmts = splitStatements(sql);
+    if (stmts.length > 1 && noParams(params)) {
+      const db = typeof params === "string" ? params : dbName;
+      const res = this.callNative(() => this.nativeInstance.exec(sql, undefined, db)) as T;
+      if (res && typeof res === "object" && (res as any).success === undefined) {
+        (res as any).success = true;
+      }
+      return res;
+    }
     if (stmts.length > 1) {
       let lastRes: any = null;
       for (const stmt of stmts) {
@@ -282,6 +298,10 @@ export class PGLiteNative {
   public async exec2<T = any>(sql: string, params?: any, dbName?: string): Promise<T> {
     await this.waitTurn();
     const stmts = splitStatements(sql);
+    if (stmts.length > 1 && noParams(params)) {
+      const db = typeof params === "string" ? params : dbName;
+      return this.callNative(() => this.nativeInstance.exec2(sql, undefined, db));
+    }
     if (stmts.length > 1) {
       let lastRes: any = null;
       for (const stmt of stmts) {
@@ -300,6 +320,10 @@ export class PGLiteNative {
   public async query<T = any>(sql: string, params?: any, dbName?: string): Promise<T[]> {
     await this.waitTurn();
     const stmts = splitStatements(sql);
+    if (stmts.length > 1 && noParams(params)) {
+      const db = typeof params === "string" ? params : dbName;
+      return this.callNative(() => this.nativeInstance.query(sql, undefined, db));
+    }
     if (stmts.length > 1) {
       let lastRes: any = [];
       for (const stmt of stmts) {
@@ -318,6 +342,10 @@ export class PGLiteNative {
   public async query2<T = any>(sql: string, params?: any, dbName?: string): Promise<QueryResult<T>> {
     await this.waitTurn();
     const stmts = splitStatements(sql);
+    if (stmts.length > 1 && noParams(params)) {
+      const db = typeof params === "string" ? params : dbName;
+      return this.callNative(() => this.nativeInstance.query2(sql, undefined, db));
+    }
     if (stmts.length > 1) {
       let lastRes: any = null;
       for (const stmt of stmts) {
