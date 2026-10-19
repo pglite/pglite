@@ -8,5 +8,6 @@ pub mod plpgsql;
 pub mod select_list;
 pub mod temporal;
 pub mod upsert;
+pub mod window;
 pub use expr::CompiledExpr;
 pub use executor::Executor;

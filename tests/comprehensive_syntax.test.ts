@@ -753,7 +753,7 @@ describe("Comprehensive SQL Syntax Test Suite (Unified PGLite & JS Fallback)", (
           id,
           amount,
           FIRST_VALUE(amount) OVER (ORDER BY id ASC) AS first_amt,
-          LAST_VALUE(amount) OVER (ORDER BY id ASC) AS last_amt
+          LAST_VALUE(amount) OVER (ORDER BY id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amt
         FROM orders
         WHERE user_id = 1
         ORDER BY id ASC

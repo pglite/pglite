@@ -367,7 +367,7 @@ describe("100 Comprehensive In-Depth PostgreSQL Window Functions & Analytics Tes
 
     test("24. LAST_VALUE(salary) per department", async () => {
       const res = await db.query(`
-        SELECT name, dept, salary, LAST_VALUE(salary) OVER (PARTITION BY dept ORDER BY salary DESC) AS min_dept_salary
+        SELECT name, dept, salary, LAST_VALUE(salary) OVER (PARTITION BY dept ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS min_dept_salary
         FROM staff_salaries
         ORDER BY dept ASC, salary DESC;
       `);
@@ -377,7 +377,7 @@ describe("100 Comprehensive In-Depth PostgreSQL Window Functions & Analytics Tes
 
     test("25. NTH_VALUE(salary, 2) getting 2nd highest salary per department", async () => {
       const res = await db.query(`
-        SELECT name, dept, salary, NTH_VALUE(salary, 2) OVER (PARTITION BY dept ORDER BY salary DESC) AS second_sal
+        SELECT name, dept, salary, NTH_VALUE(salary, 2) OVER (PARTITION BY dept ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second_sal
         FROM staff_salaries
         WHERE dept = 'Engineering'
         ORDER BY salary DESC;
@@ -439,7 +439,7 @@ describe("100 Comprehensive In-Depth PostgreSQL Window Functions & Analytics Tes
 
     test("30. LAST_VALUE() string column (lowest earner name in department)", async () => {
       const res = await db.query(`
-        SELECT dept, name, LAST_VALUE(name) OVER (PARTITION BY dept ORDER BY salary DESC) AS lowest_earner_name
+        SELECT dept, name, LAST_VALUE(name) OVER (PARTITION BY dept ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lowest_earner_name
         FROM staff_salaries
         WHERE dept = 'Engineering'
         ORDER BY salary DESC;
@@ -948,7 +948,7 @@ describe("100 Comprehensive In-Depth PostgreSQL Window Functions & Analytics Tes
 
     test("73. LAST_VALUE partitioned by region", async () => {
       const res = await db.query(`
-        SELECT region, sale_date, revenue, LAST_VALUE(revenue) OVER (PARTITION BY region ORDER BY sale_date ASC) AS end_rev
+        SELECT region, sale_date, revenue, LAST_VALUE(revenue) OVER (PARTITION BY region ORDER BY sale_date ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS end_rev
         FROM daily_sales
         ORDER BY region ASC, sale_date ASC;
       `);
@@ -996,7 +996,8 @@ describe("100 Comprehensive In-Depth PostgreSQL Window Functions & Analytics Tes
         ORDER BY salary ASC;
       `);
       expect(res.length).toBe(4);
-      expect(Number(res[0].c_dist)).toBe(0.25);
+      // Charlie và David cùng lương 80000 nên ngang hàng: CUME_DIST = 2/4 cho cả hai (như PostgreSQL)
+      expect(Number(res[0].c_dist)).toBe(0.5);
       expect(Number(res[3].c_dist)).toBe(1.0);
     });
 

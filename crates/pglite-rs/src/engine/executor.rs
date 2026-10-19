@@ -3232,6 +3232,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         if let Some(normalized) = crate::engine::select_list::normalize_select_sql(sql) {
             return self.handle_select(&normalized, params);
         }
+        // Window function: tính sau WHERE/GROUP BY, trước ORDER BY/LIMIT
+        if sql.to_uppercase().contains("OVER") {
+            if let Some(res) = self.try_handle_window_select(sql, params) {
+                return res.map(|r| (r, None));
+            }
+        }
         let from_idx_opt = find_top_level_keyword(sql, "FROM");
         if from_idx_opt.is_none() {
             let mut select_clause = sql[6..].trim().trim_end_matches(';').trim();
@@ -12495,6 +12501,14 @@ fn is_complete_array_constructor(s: &str) -> bool {
 
 /// `lhs <op> ANY|SOME|ALL (inner)` ở cấp ngoài cùng: (lhs, op, là ALL, inner).
 /// `a || b` khi cả hai là object JSON (gộp, vế phải đè) hoặc mảng JSON `[...]` (nối).
+pub(crate) fn json_order_cmp_pub(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+    json_order_cmp(a, b, desc, nulls_first)
+}
+
+pub(crate) fn type_str_from_json_value_pub(v: &serde_json::Value) -> String {
+    type_str_from_json_value(v)
+}
+
 pub(crate) fn find_top_level_math_op_pub(s: &str, ops: &[char]) -> Option<(usize, char)> {
     find_top_level_math_op(s, ops)
 }
