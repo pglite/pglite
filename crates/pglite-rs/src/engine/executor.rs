@@ -52,12 +52,20 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        let appended_before = self.storage.wal.appended;
         let res = self.execute_statement(sql, params);
-        // Lệnh ngoài giao dịch (autocommit) phải nằm trong file ngay khi trả kết quả, nếu không
-        // tiến trình bị kill (pm2 restart, deploy) sẽ làm mất nó. Đây là write vào page cache,
-        // không fsync. Trong giao dịch thì COMMIT/ROLLBACK đã tự flush.
+        // Lệnh ngoài giao dịch (autocommit) phải nằm trong file (và được fsync, nếu bật `sync`)
+        // trước khi trả kết quả, nếu không tiến trình bị kill hay mất điện sẽ làm mất nó.
+        // Trong giao dịch thì COMMIT/ROLLBACK tự làm điều đó.
         if !self.storage.in_transaction && self.storage.wal.has_pending() {
-            self.storage.wal.flush();
+            let _ = self.storage.wal.commit_point();
+        }
+        // Lệnh có ghi WAL mà WAL đã hỏng (lúc ghi hay lúc fsync) thì không được báo thành công.
+        // Lệnh chỉ đọc vẫn chạy bình thường.
+        if self.storage.wal.appended != appended_before {
+            if let Some(e) = self.storage.wal.error() {
+                return Err(e.to_string());
+            }
         }
         res
     }
@@ -94,7 +102,7 @@ impl Executor {
         }
 
         if upper.starts_with("COMMIT") || upper == "END" {
-            self.storage.commit();
+            self.storage.commit()?;
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -138,7 +146,7 @@ impl Executor {
         }
 
         if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
-            self.storage.rollback();
+            self.storage.rollback()?;
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -344,26 +352,89 @@ impl Executor {
         if rest.to_uppercase().starts_with("TABLE") {
             rest = rest[5..].trim();
         }
-        let table_name = rest.trim_matches('"').trim_matches(';').trim();
-        let (columns, count) = {
-            let table = self.storage.get_table_mut(table_name)
-                .ok_or_else(|| format!("Table {} not found", table_name))?;
-            let count = table.active_count;
-            table.rows.clear();
-            table.is_deleted.clear();
-            table.pk_index.clear();
-            table.active_count = 0;
-            table.auto_increment = 1;
-            (table.columns.clone(), count)
-        };
-        self.storage.wal.append(WalRecord::DropTable {
-            name: table_name.to_string(),
-        });
-        self.storage.wal.append(WalRecord::CreateTable {
-            name: table_name.to_string(),
-            columns,
-        });
-        self.storage.wal.flush();
+        let rest = rest.trim_end_matches(';').trim();
+        // Bỏ các tuỳ chọn cuối lệnh: RESTART/CONTINUE IDENTITY, CASCADE/RESTRICT.
+        let mut names_part = rest;
+        let upper = rest.to_uppercase();
+        for kw in [" RESTART IDENTITY", " CONTINUE IDENTITY", " CASCADE", " RESTRICT"] {
+            if let Some(pos) = upper.find(kw) {
+                names_part = &rest[..pos.min(names_part.len())];
+            }
+        }
+        let table_names: Vec<String> = names_part
+            .split(',')
+            .map(|n| n.trim().trim_start_matches("ONLY ").trim_start_matches("only ").trim().trim_matches('"').to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        if table_names.is_empty() {
+            return Err("Missing table name in TRUNCATE".to_string());
+        }
+        for name in &table_names {
+            if self.storage.get_table(name).is_none() {
+                return Err(format!("Table {} not found", name));
+            }
+        }
+
+        let mut count = 0;
+        for table_name in &table_names {
+            if self.storage.in_transaction {
+                // Trong giao dịch: xoá từng dòng bằng chính bản ghi DELETE để ROLLBACK (lúc chạy
+                // và khi replay) hoàn tác được. Không cần biến thể WAL mới.
+                let (identities, deleted) = {
+                    let table = self.storage.get_table_mut(table_name).unwrap();
+                    let mut identities = Vec::new();
+                    let mut deleted = Vec::new();
+                    for i in 0..table.rows.len() {
+                        if !table.is_deleted[i] {
+                            identities.push(RowIdentity::of(table, i));
+                            table.delete_row(i);
+                            deleted.push(i);
+                        }
+                    }
+                    (identities, deleted)
+                };
+                count += deleted.len();
+                for identity in identities {
+                    let table = table_name.to_string();
+                    self.storage.wal.append(match identity {
+                        RowIdentity::Pk(pk) => WalRecord::Delete { table, pk },
+                        RowIdentity::Key(key) => WalRecord::DeleteByKey { table, key },
+                        RowIdentity::Row(row) => WalRecord::DeleteByRow { table, row },
+                    });
+                }
+                for row_idx in deleted {
+                    self.storage.tx_undo_log.push(UndoAction::UndeleteRow {
+                        table: table_name.to_string(),
+                        row_idx,
+                    });
+                }
+            } else {
+                let (columns, comment) = {
+                    let table = self.storage.get_table_mut(table_name).unwrap();
+                    count += table.active_count;
+                    table.rows.clear();
+                    table.is_deleted.clear();
+                    table.active_count = 0;
+                    table.auto_increment = 1;
+                    // Mọi index (kể cả khoá text/UUID và index phụ) phải rỗng theo bảng.
+                    table.rebuild_indexes();
+                    (table.declared_columns(), table.comment.clone())
+                };
+                self.storage.wal.append(WalRecord::DropTable {
+                    name: table_name.to_string(),
+                });
+                self.storage.wal.append(WalRecord::CreateTable {
+                    name: table_name.to_string(),
+                    columns,
+                });
+                if comment.is_some() {
+                    self.storage.wal.append(WalRecord::CommentOnTable {
+                        table: table_name.to_string(),
+                        comment,
+                    });
+                }
+            }
+        }
         self.plan_cache.clear();
 
         Ok(QueryResult {
@@ -440,6 +511,10 @@ impl Executor {
                     comment: None,
                 };
 
+                // Dòng có giá trị khác `default_val` (DEFAULT như gen_random_uuid(), now() được tính
+                // lại cho từng dòng): replay chỉ biết `default_val`, nên ghi thêm UPDATE cho chúng.
+                let mut fixups: Vec<(RowIdentity, Value)> = Vec::new();
+                let new_col_idx;
                 {
                     let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
                     if table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col_name)) {
@@ -450,6 +525,7 @@ impl Executor {
                     }
 
                     table.columns.push(col_def.clone());
+                    new_col_idx = table.columns.len() - 1;
                     for row in &mut table.rows {
                         let cell = if let Some(ref expr_str) = col_def.default_value {
                             eval_sql_expr(expr_str, &[], None, &[], None, &[])
@@ -458,6 +534,18 @@ impl Executor {
                         };
                         row.push(cell);
                     }
+                    for i in 0..table.rows.len() {
+                        if !table.is_deleted[i] && table.rows[i][new_col_idx] != default_val {
+                            let identity = match RowIdentity::of(table, i) {
+                                RowIdentity::Row(mut r) => {
+                                    r[new_col_idx] = default_val.clone();
+                                    RowIdentity::Row(r)
+                                }
+                                other => other,
+                            };
+                            fixups.push((identity, table.rows[i][new_col_idx].clone()));
+                        }
+                    }
                 }
 
                 self.storage.wal.append(WalRecord::AlterTableAddColumn {
@@ -465,6 +553,15 @@ impl Executor {
                     column: col_def,
                     default_val,
                 });
+                for (identity, new_val) in fixups {
+                    let table = table_name.to_string();
+                    let col_idx = new_col_idx;
+                    self.storage.wal.append(match identity {
+                        RowIdentity::Pk(pk) => WalRecord::Update { table, pk, col_idx, new_val },
+                        RowIdentity::Key(key) => WalRecord::UpdateByKey { table, key, col_idx, new_val },
+                        RowIdentity::Row(old_row) => WalRecord::UpdateByRow { table, old_row, updates: vec![(col_idx, new_val)] },
+                    });
+                }
             }
 
             Ok(QueryResult {
@@ -3130,6 +3227,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             table.rows.reserve(count);
             table.is_deleted.reserve(count);
 
+            let mut built: Vec<Vec<Value>> = Vec::with_capacity(count);
             for group in groups {
                 let mut row = vec![Value::Null; num_table_cols];
                 for (i, def_opt) in col_defaults.iter().enumerate() {
@@ -3211,6 +3309,26 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     col_ptr += 1;
                 }
 
+                built.push(row);
+            }
+
+            // Kiểm tra khoá trùng cho cả lệnh trước khi chèn dòng nào, để lệnh lỗi không để lại gì.
+            if table.pk_enforced {
+                if let Some(pk_idx) = table.pk_col_idx {
+                    let mut seen = std::collections::HashSet::new();
+                    for row in &built {
+                        let Some(v) = row.get(pk_idx) else { continue };
+                        if v.is_null() || matches!(v, Value::Text(t) if t.trim().is_empty()) {
+                            continue; // khoá tự sinh trong Table::insert
+                        }
+                        if table.live_row_with_pk(v, None).is_some() || !seen.insert(pk_dedup_key(v)) {
+                            return Err(duplicate_pk_error(table, v));
+                        }
+                    }
+                }
+            }
+
+            for row in built {
                 let _pk = table.insert(row);
                 if let Some(last_row) = table.rows.last() {
                     if let Some(r_cols) = returning_cols {
@@ -5914,6 +6032,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         let in_tx = self.storage.in_transaction;
         let mut wal_updates: Vec<(RowIdentity, Vec<(usize, Value)>)> = Vec::new();
+        // Dòng bị đổi khoá chính: (khoá cũ, dòng mới).
+        let mut moved_rows: Vec<(RowIdentity, Vec<Value>)> = Vec::new();
         let mut undo_restores = Vec::new();
         let mut row_count = 0;
         let mut returned_rows = Vec::new();
@@ -5968,6 +6088,15 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 None
             };
 
+            // Bước 1: tính giá trị mới cho mọi dòng khớp (mỗi dòng chỉ đọc chính nó), chưa sửa gì.
+            let compute_updates = |table: &crate::storage::table::Table, i: usize| -> Vec<(usize, Value)> {
+                raw_assignments.iter().map(|&(c_idx, ref v_str)| {
+                    let raw_val = evaluate_assignment_val(v_str, &table.rows[i], table, params);
+                    let coerced = coerce_update_val(&table.columns[c_idx], raw_val);
+                    (c_idx, coerced)
+                }).collect()
+            };
+            let mut planned: Vec<(usize, Vec<(usize, Value)>)> = Vec::new();
             if let Some(target_pk) = pk_target {
                 if let Some(&row_idx) = table.pk_index.get(&target_pk) {
                     let matches = match &where_expr {
@@ -5975,28 +6104,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         None => true,
                     };
                     if !table.is_deleted[row_idx] && matches {
-                        let updates: Vec<(usize, Value)> = raw_assignments.iter().map(|&(c_idx, ref v_str)| {
-                            let raw_val = evaluate_assignment_val(v_str, &table.rows[row_idx], table, params);
-                            let coerced = coerce_update_val(&table.columns[c_idx], raw_val);
-                            (c_idx, coerced)
-                        }).collect();
-
-                        let mut old_vals = Vec::new();
-                        for (c_idx, _) in &updates {
-                            old_vals.push((*c_idx, table.rows[row_idx][*c_idx].clone()));
-                        }
-                        let identity = RowIdentity::of(table, row_idx);
-                        table.update_row_multi(row_idx, &updates);
-                        row_count = 1;
-                        if let Some(r_cols) = returning_cols {
-                            returned_rows.push(project_returning_row(table, &table.rows[row_idx], r_cols));
-                        }
-                        wal_updates.push((identity, updates));
-                        if in_tx {
-                            for (col_idx, old_val) in old_vals {
-                                undo_restores.push((row_idx, col_idx, old_val));
-                            }
-                        }
+                        planned.push((row_idx, compute_updates(table, row_idx)));
                     }
                 }
             } else {
@@ -6007,28 +6115,58 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         None => true,
                     };
                     if !table.is_deleted[i] && matches {
-                        let updates: Vec<(usize, Value)> = raw_assignments.iter().map(|&(c_idx, ref v_str)| {
-                            let raw_val = evaluate_assignment_val(v_str, &table.rows[i], table, params);
-                            let coerced = coerce_update_val(&table.columns[c_idx], raw_val);
-                            (c_idx, coerced)
-                        }).collect();
+                        planned.push((i, compute_updates(table, i)));
+                    }
+                }
+            }
 
-                        let identity = RowIdentity::of(table, i);
-                        let mut old_vals = Vec::new();
-                        for (c_idx, _) in &updates {
-                            old_vals.push((*c_idx, table.rows[i][*c_idx].clone()));
-                        }
-                        table.update_row_multi(i, &updates);
-                        row_count += 1;
-                        if let Some(r_cols) = returning_cols {
-                            returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
-                        }
-                        wal_updates.push((identity, updates));
-                        if in_tx {
-                            for (col_idx, old_val) in old_vals {
-                                undo_restores.push((i, col_idx, old_val));
+            // Bước 2: lệnh đổi khoá chính thì kiểm tra trùng trên trạng thái cuối của cả lệnh.
+            let pk_idx = table.pk_col_idx;
+            let pk_changed = |table: &crate::storage::table::Table, i: usize, updates: &[(usize, Value)]| -> bool {
+                updates.iter().any(|(c, v)| Some(*c) == pk_idx && pk_dedup_key(v) != pk_dedup_key(&table.rows[i][*c]))
+            };
+            if table.pk_enforced {
+                if let Some(pk_i) = pk_idx {
+                    if planned.iter().any(|(i, u)| pk_changed(table, *i, u)) {
+                        let updated: std::collections::HashSet<usize> = planned.iter().map(|(i, _)| *i).collect();
+                        let mut final_keys = std::collections::HashSet::new();
+                        for (i, updates) in &planned {
+                            let new_val = updates.iter().rev().find(|(c, _)| *c == pk_i).map(|(_, v)| v);
+                            let val = new_val.unwrap_or(&table.rows[*i][pk_i]);
+                            if val.is_null() {
+                                continue;
+                            }
+                            let clash_outside = new_val.is_some()
+                                && table.live_row_with_pk(val, Some(*i)).map_or(false, |r| !updated.contains(&r));
+                            if clash_outside || !final_keys.insert(pk_dedup_key(val)) {
+                                return Err(duplicate_pk_error(table, val));
                             }
                         }
+                    }
+                }
+            }
+
+            // Bước 3: áp dụng.
+            for (i, updates) in planned {
+                let identity = RowIdentity::of(table, i);
+                let moves_key = pk_changed(table, i, &updates);
+                let mut old_vals = Vec::new();
+                for (c_idx, _) in &updates {
+                    old_vals.push((*c_idx, table.rows[i][*c_idx].clone()));
+                }
+                table.update_row_multi(i, &updates);
+                row_count += 1;
+                if let Some(r_cols) = returning_cols {
+                    returned_rows.push(project_returning_row(table, &table.rows[i], r_cols));
+                }
+                if moves_key {
+                    moved_rows.push((identity, table.rows[i].clone()));
+                } else {
+                    wal_updates.push((identity, updates));
+                }
+                if in_tx {
+                    for (col_idx, old_val) in old_vals {
+                        undo_restores.push((i, col_idx, old_val));
                     }
                 }
             }
@@ -6059,6 +6197,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     self.storage.wal.append(WalRecord::UpdateByRow { table: table_name.to_string(), old_row, updates });
                 }
             }
+        }
+        // Dòng đổi khoá chính được ghi thành DELETE theo khoá cũ rồi INSERT dòng mới, mọi DELETE
+        // trước mọi INSERT: khi replay, khoá cũ không bao giờ đã bị dòng khác trong cùng lệnh
+        // chiếm (vd. SET id = id + 1, hay đổi chỗ hai khoá). Chỉ dùng bản ghi mà mọi bản cũ đều đọc được.
+        let mut new_rows = Vec::with_capacity(moved_rows.len());
+        for (identity, new_row) in moved_rows {
+            let table = table_name.to_string();
+            self.storage.wal.append(match identity {
+                RowIdentity::Pk(pk) => WalRecord::Delete { table, pk },
+                RowIdentity::Key(key) => WalRecord::DeleteByKey { table, key },
+                RowIdentity::Row(row) => WalRecord::DeleteByRow { table, row },
+            });
+            new_rows.push(new_row);
+        }
+        for row in new_rows {
+            self.storage.wal.append(WalRecord::Insert { table: table_name.to_string(), row });
         }
         if in_tx {
             for (row_idx, col_idx, old_val) in undo_restores {
@@ -12276,6 +12430,33 @@ enum RowIdentity {
     Key(Value),
     /// Không có khoá chính (hoặc khoá NULL): nhận diện bằng toàn bộ giá trị dòng.
     Row(Vec<Value>),
+}
+
+/// Khoá dùng để phát hiện trùng trong cùng một lệnh (cùng quy tắc với index khoá chính).
+fn pk_dedup_key(v: &Value) -> String {
+    match v {
+        Value::Text(t) if t.trim().parse::<i64>().is_err() => {
+            if t.len() == 36 { format!("s:{}", t.to_lowercase()) } else { format!("s:{}", t) }
+        }
+        other => format!("i:{}", other.as_i64().unwrap_or_default()),
+    }
+}
+
+fn duplicate_pk_error(table: &crate::storage::table::Table, v: &Value) -> String {
+    let col = table.pk_col_idx.map(|i| table.columns[i].name.as_str()).unwrap_or("id");
+    let shown = match v {
+        Value::Text(t) => t.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+    };
+    format!(
+        "duplicate key value violates unique constraint \"{}_pkey\" (Key ({})=({}) already exists.)",
+        table.name.to_lowercase(),
+        col,
+        shown
+    )
 }
 
 impl RowIdentity {

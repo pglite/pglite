@@ -202,13 +202,26 @@ impl PGlite {
     }
 
     /// Flush all memory-buffered WAL and table pages to disk.
+    /// Write errors are reported by [`PGlite::try_flush`] and by the next write statement.
     pub fn flush(&mut self) {
-        self.executor.storage.flush();
+        let _ = self.executor.storage.flush();
+    }
+
+    /// Like [`PGlite::flush`], but reports a failed write or fsync.
+    pub fn try_flush(&mut self) -> Result<(), String> {
+        self.executor.storage.flush()
     }
 
     /// Persist pending data and close database handle.
     pub fn close(&mut self) {
-        self.executor.storage.flush();
+        let _ = self.executor.storage.flush();
+    }
+
+    /// Bật/tắt fsync ở mỗi điểm commit (COMMIT, ROLLBACK, lệnh autocommit). Mặc định bật,
+    /// trừ khi đặt biến môi trường `PGLITE_SYNC=off`. Tắt thì nhanh hơn nhưng có thể mất các
+    /// giao dịch vừa commit khi mất điện hoặc hệ điều hành bị crash.
+    pub fn set_sync(&mut self, enabled: bool) {
+        self.executor.storage.wal.sync = enabled;
     }
 
     /// Get the database filepath.

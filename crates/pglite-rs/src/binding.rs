@@ -98,15 +98,13 @@ impl LitePostgresNative {
     #[napi]
     pub fn flush(&self) -> Result<()> {
         let mut exec = self.executor.lock();
-        exec.storage.flush();
-        Ok(())
+        exec.storage.flush().map_err(napi::Error::from_reason)
     }
 
     #[napi]
     pub fn close(&self) -> Result<()> {
         let mut exec = self.executor.lock();
-        exec.storage.flush();
-        Ok(())
+        exec.storage.flush().map_err(napi::Error::from_reason)
     }
 }
 

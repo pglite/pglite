@@ -33,6 +33,8 @@ impl StorageEngine {
         };
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
+        // Giao dịch đang mở trong lúc replay được mở bằng `TxBegin` (bản mới) hay `Begin` (bản cũ).
+        let mut open_tx_is_new = false;
 
         // Replay WAL records recovered via zero-copy mmap.
         // Giao dịch được mô phỏng bằng đúng cơ chế undo lúc chạy, nên trạng thái sau replay
@@ -100,6 +102,13 @@ impl StorageEngine {
                     engine.in_transaction = true;
                     engine.tx_undo_log.clear();
                     engine.savepoints.clear();
+                    open_tx_is_new = false;
+                }
+                WalRecord::TxBegin => {
+                    engine.in_transaction = true;
+                    engine.tx_undo_log.clear();
+                    engine.savepoints.clear();
+                    open_tx_is_new = true;
                 }
                 WalRecord::Commit => engine.end_replayed_transaction(),
                 // ROLLBACK ghi bởi bản cũ: giữ đúng hành vi cũ (dữ liệu không bị hoàn tác),
@@ -168,9 +177,29 @@ impl StorageEngine {
             }
         }
 
-        // Giao dịch còn dang dở ở cuối file (BEGIN không có COMMIT/ROLLBACK) được giữ
-        // nguyên như bản cũ: db-rs dùng chung một engine nên một BEGIN bị bỏ quên khiến mọi
-        // lệnh ghi sau đó nằm "trong giao dịch"; bỏ chúng đi sẽ làm mất dữ liệu thật.
+        // Giao dịch còn dang dở ở cuối file (BEGIN không có COMMIT/ROLLBACK):
+        // - mở bằng `Begin` (file do bản cũ ghi): giữ nguyên như bản cũ đọc, vì bản cũ không
+        //   phân biệt được BEGIN bị bỏ quên với crash giữa giao dịch;
+        // - mở bằng `TxBegin`: chưa từng COMMIT nên hoàn tác, như PostgreSQL sau crash.
+        // Đóng giao dịch đó lại trong file, nếu không các lệnh ghi sau này sẽ bị replay như thể
+        // vẫn nằm trong nó. Bản ghi đóng được chọn để mọi bản (cũ lẫn mới) đọc ra cùng kết quả.
+        if engine.in_transaction {
+            if open_tx_is_new {
+                if !engine.tx_undo_log.is_empty() {
+                    eprintln!(
+                        "[pglite-rs] WARNING: uncommitted transaction at the end of the WAL for {} was rolled back",
+                        engine.filepath
+                    );
+                }
+                while let Some(undo) = engine.tx_undo_log.pop() {
+                    engine.apply_undo(undo);
+                }
+                engine.wal.append(WalRecord::TxRollback);
+            } else {
+                engine.wal.append(WalRecord::Commit);
+            }
+            let _ = engine.wal.commit_point();
+        }
         engine.end_replayed_transaction();
 
         engine
@@ -282,10 +311,16 @@ impl StorageEngine {
     }
 
     pub fn begin_transaction(&mut self) {
+        if self.in_transaction {
+            eprintln!("[pglite-rs] WARNING: there is already a transaction in progress");
+        }
         self.in_transaction = true;
         self.tx_undo_log.clear();
         self.savepoints.clear();
+        // `Begin` cho binary cũ (chúng bỏ qua `TxBegin`), rồi `TxBegin` để bản này biết giao dịch
+        // được mở từ bản mới: nếu không được đóng thì hoàn tác khi replay.
         self.wal.append(WalRecord::Begin);
+        self.wal.append(WalRecord::TxBegin);
     }
 
     pub fn savepoint(&mut self, name: &str) {
@@ -341,32 +376,25 @@ impl StorageEngine {
             }
             UndoAction::UndeleteRow { table, row_idx } => {
                 if let Some(t) = self.get_table_mut(&table) {
-                    if row_idx < t.rows.len() && t.is_deleted[row_idx] {
-                        t.is_deleted[row_idx] = false;
-                        t.active_count += 1;
-                        if let Some(pk_idx) = t.pk_col_idx {
-                            if let Some(pk) = t.rows[row_idx].get(pk_idx).cloned() {
-                                t.add_pk_to_index(&pk, row_idx);
-                            }
-                        }
-                    }
+                    t.undelete_row(row_idx);
                 }
             }
         }
     }
 
-    pub fn commit(&mut self) {
+    pub fn commit(&mut self) -> Result<(), String> {
         if self.in_transaction {
             self.wal.append(WalRecord::Commit);
-            self.wal.flush();
             self.in_transaction = false;
             self.tx_undo_log.clear();
             self.tx_undo_log.shrink_to_fit();
             self.savepoints.clear();
+            return self.wal.commit_point();
         }
+        Ok(())
     }
 
-    pub fn rollback(&mut self) {
+    pub fn rollback(&mut self) -> Result<(), String> {
         if self.in_transaction {
             // Revert actions in reverse order
             while let Some(undo) = self.tx_undo_log.pop() {
@@ -374,14 +402,27 @@ impl StorageEngine {
             }
             // TxRollback (không phải Rollback cũ) để lần mở lại sau hoàn tác đúng giao dịch này
             self.wal.append(WalRecord::TxRollback);
-            self.wal.flush();
             self.in_transaction = false;
             self.tx_undo_log.shrink_to_fit();
             self.savepoints.clear();
+            return self.wal.commit_point();
         }
+        Ok(())
     }
 
-    pub fn flush(&mut self) {
-        self.wal.flush();
+    /// Ghi và fsync mọi thứ đang chờ. Giao dịch còn mở thì vẫn chưa được chốt.
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.wal.commit_point()
+    }
+}
+
+impl Drop for StorageEngine {
+    fn drop(&mut self) {
+        if self.in_transaction && self.wal.filepath.is_some() {
+            eprintln!(
+                "[pglite-rs] WARNING: closing {} with an open transaction; it was not committed and will be rolled back on next open",
+                self.filepath
+            );
+        }
     }
 }

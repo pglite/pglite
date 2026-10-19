@@ -86,6 +86,10 @@ pub enum WalRecord {
         table: String,
         row: Vec<Value>,
     },
+    /// Luôn ghi ngay sau `Begin`, đánh dấu giao dịch mở từ bản này trở đi: nếu không có
+    /// COMMIT/ROLLBACK ở cuối file (crash giữa giao dịch) thì bị hoàn tác khi replay. Giao dịch
+    /// chỉ có `Begin` (file cũ) vẫn được giữ như trước. Binary cũ bỏ qua bản ghi này và vẫn thấy `Begin`.
+    TxBegin,
 }
 
 #[derive(Serialize)]
@@ -161,7 +165,9 @@ pub enum WalRecordRef<'a> {
         table: &'a str,
         row: &'a [Value],
     },
+    TxBegin,
 }
+
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -170,27 +176,251 @@ const BATCH_FLUSH_SIZE: usize = 64 * 1024; // 64 KB in-memory buffer
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FLUSH_INTERVAL_MS: u128 = 20;   // 20 ms batch interval
 
+/// Số biến thể `WalRecord` mà bản này biết (chỉ số bincode 0..KNOWN_VARIANTS).
+pub const KNOWN_VARIANTS: u32 = 21;
+/// Khoảng rác tối đa được quét để tìm lại ranh giới khung sau một chỗ hỏng.
+const RESYNC_WINDOW: usize = 64 * 1024 * 1024;
+
+/// Khung đủ độ dài, không giải mã được nhưng có chỉ số biến thể "của tương lai": nhiều khả năng
+/// do binary mới hơn ghi. Loại khung này luôn được bỏ qua nguyên vẹn, không bao giờ bị xoá.
+fn is_future_variant(frame: &[u8]) -> bool {
+    frame.len() >= 4 && {
+        let idx = u32::from_le_bytes(frame[0..4].try_into().unwrap());
+        (KNOWN_VARIANTS..KNOWN_VARIANTS + 64).contains(&idx)
+    }
+}
+
+/// Kết quả đọc chuỗi khung `[u32 len][bincode]` (không gồm 4 byte magic).
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    pub records: Vec<WalRecord>,
+    /// Số khung đủ độ dài nhưng không giải mã được (bị bỏ qua như trước).
+    pub undecodable: usize,
+    /// Offset của chỗ hỏng đáng ngờ đầu tiên: khung không giải mã được (trừ biến thể tương lai)
+    /// hoặc khung cụt.
+    pub first_suspicious: Option<usize>,
+    /// Khung cuối bị cụt (ghi dở khi crash/đầy đĩa); `valid_end` là chỗ cắt an toàn.
+    pub truncated_tail: bool,
+    pub valid_end: usize,
+}
+
+/// Đọc khung theo đúng cách bản cũ đọc: khung không giải mã được thì bỏ qua, dừng ở khung cụt.
+pub fn scan_frames(data: &[u8]) -> ScanResult {
+    let mut res = ScanResult::default();
+    let mut cursor = 0usize;
+    while cursor < data.len() {
+        if cursor + 4 > data.len() {
+            res.truncated_tail = true;
+            res.first_suspicious.get_or_insert(cursor);
+            break;
+        }
+        let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let body = cursor + 4;
+        if len > data.len() - body {
+            res.truncated_tail = true;
+            res.first_suspicious.get_or_insert(cursor);
+            break;
+        }
+        let frame = &data[body..body + len];
+        match bincode::deserialize::<WalRecord>(frame) {
+            Ok(record) => {
+                // Giải mã được nhưng mã hoá lại không ra đúng byte: có thể là khung cụt cũ bị
+                // ghi nối phía sau. Vẫn đọc như bản cũ, chỉ đánh dấu để thử tìm lại ranh giới.
+                if res.first_suspicious.is_none() && !roundtrips(&record, frame) {
+                    res.first_suspicious = Some(cursor);
+                }
+                res.records.push(record)
+            }
+            Err(_) => {
+                res.undecodable += 1;
+                if !is_future_variant(frame) {
+                    res.first_suspicious.get_or_insert(cursor);
+                }
+            }
+        }
+        cursor = body + len;
+        res.valid_end = cursor;
+    }
+    res
+}
+
+fn roundtrips(record: &WalRecord, frame: &[u8]) -> bool {
+    bincode::serialize(record).map_or(false, |b| b.as_slice() == frame)
+}
+
+/// Chuỗi khung từ `start` có hợp lệ tới đúng EOF không. Khung đầu phải giải mã được và mã hoá
+/// lại ra đúng từng byte, nên rác ngẫu nhiên gần như không thể khớp nhầm; các khung sau chỉ cần
+/// giải mã được hoặc là biến thể tương lai (giống khi đọc bình thường).
+fn exact_chain(data: &[u8], start: usize) -> Option<Vec<WalRecord>> {
+    let mut cursor = start;
+    let mut records = Vec::new();
+    while cursor < data.len() {
+        if cursor + 4 > data.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let body = cursor + 4;
+        if len == 0 || len > data.len() - body {
+            return None;
+        }
+        let frame = &data[body..body + len];
+        match bincode::deserialize::<WalRecord>(frame) {
+            Ok(record) => {
+                if cursor == start && !roundtrips(&record, frame) {
+                    return None;
+                }
+                records.push(record);
+            }
+            Err(_) if cursor != start && is_future_variant(frame) => {}
+            Err(_) => return None,
+        }
+        cursor = body + len;
+    }
+    if records.is_empty() { None } else { Some(records) }
+}
+
+/// Cách sửa file WAL sau khi đọc.
+#[derive(Debug, PartialEq)]
+pub enum Repair {
+    None,
+    /// Cắt bỏ khung cụt ở cuối: data[..at] giữ nguyên.
+    TruncateAt(usize),
+    /// Bỏ đoạn rác data[from..to] (khung cụt mà bản cũ đã ghi nối tiếp phía sau), giữ phần còn lại.
+    DropRange(usize, usize),
+}
+
+/// Đọc khung và quyết định có cần sửa file không. Trả về (records, số khung bị bỏ qua, cách sửa).
+/// File lành đọc ra đúng như bản cũ đọc.
+pub fn recover_frames(data: &[u8]) -> (Vec<WalRecord>, usize, Repair) {
+    let scan = scan_frames(data);
+    let Some(p) = scan.first_suspicious else {
+        return (scan.records, scan.undecodable, Repair::None);
+    };
+    // Khung tại p có độ dài hợp lệ thì khung kế tiếp bắt đầu đúng ranh giới.
+    let boundary_after_p = (p + 4 <= data.len())
+        .then(|| u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize)
+        .filter(|&len| len <= data.len() - p - 4)
+        .map(|len| p + 4 + len);
+    let end = data.len().min(p.saturating_add(4 + RESYNC_WINDOW));
+    for o in p + 1..end {
+        if Some(o) == boundary_after_p {
+            if exact_chain(data, o).is_some() {
+                // Chỉ một khung hỏng được bỏ qua, phần sau vẫn đúng ranh giới: giữ cách đọc cũ.
+                break;
+            }
+            continue;
+        }
+        if let Some(chain) = exact_chain(data, o) {
+            let mut records = scan_frames(&data[..p]).records;
+            records.extend(chain);
+            return (records, scan.undecodable, Repair::DropRange(p, o));
+        }
+    }
+    if scan.truncated_tail {
+        return (scan.records, scan.undecodable, Repair::TruncateAt(scan.valid_end));
+    }
+    (scan.records, scan.undecodable, Repair::None)
+}
+
+fn sync_disabled_by_env() -> bool {
+    std::env::var("PGLITE_SYNC")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+        .unwrap_or(false)
+}
+
+fn frame_bytes(records: &[WalRecord]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(WAL_MAGIC);
+    for r in records {
+        if let Ok(bytes) = bincode::serialize(r) {
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
+}
+
+/// Ghi file mới qua file tạm + fsync + rename để không bao giờ để lại file dở.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("wal")
+    ));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn backup_path(path: &std::path::Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    PathBuf::from(format!("{}.corrupt-{}.bak", path.display(), ts))
+}
+
+fn parse_json_lines(bytes: &[u8]) -> Vec<WalRecord> {
+    let mut out = Vec::new();
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                if let Ok(record) = serde_json::from_str::<WalRecord>(line) {
+                    out.push(record);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub struct WalManager {
     pub filepath: Option<PathBuf>,
     pub writer: Option<BufWriter<File>>,
     pub pending_bytes: Vec<u8>,
+    /// fsync tại mỗi điểm commit (COMMIT, ROLLBACK, lệnh autocommit). Mặc định bật;
+    /// tắt bằng `PGLITE_SYNC=off` hoặc `PGlite::set_sync(false)`.
+    pub sync: bool,
+    /// Lỗi ghi đầu tiên. Sau đó mọi lệnh ghi đều báo lỗi để bộ nhớ không lệch thêm khỏi đĩa.
+    poisoned: Option<String>,
+    /// Độ dài file sau lần ghi thành công gần nhất (để cắt bỏ khung dở khi ghi lỗi).
+    durable_len: u64,
+    unsynced: bool,
+    /// Tăng mỗi khi có bản ghi được thêm; executor dùng để biết lệnh có ghi gì không.
+    pub appended: u64,
     #[cfg(not(target_arch = "wasm32"))]
     pub last_flush: Instant,
 }
 
 impl WalManager {
+    fn empty(filepath: Option<PathBuf>, writer: Option<BufWriter<File>>, durable_len: u64) -> Self {
+        Self {
+            filepath,
+            writer,
+            pending_bytes: Vec::with_capacity(BATCH_FLUSH_SIZE),
+            sync: !sync_disabled_by_env(),
+            poisoned: None,
+            durable_len,
+            unsynced: false,
+            appended: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_flush: Instant::now(),
+        }
+    }
+
     pub fn new(db_path: &str) -> (Self, Vec<WalRecord>) {
         if db_path == ":memory:" || db_path.starts_with(":memory:") {
-            return (
-                Self {
-                    filepath: None,
-                    writer: None,
-                    pending_bytes: Vec::new(),
-                    #[cfg(not(target_arch = "wasm32"))]
-                    last_flush: Instant::now(),
-                },
-                Vec::new(),
-            );
+            return (Self::empty(None, None, 0), Vec::new());
         }
 
         let v2_rwal_path = PathBuf::from(format!("{}.v2.rwal", db_path));
@@ -201,15 +431,18 @@ impl WalManager {
         let wal_path = if v2_rwal_path.exists() {
             v2_rwal_path
         } else if rwal_path.exists() {
+            if std::fs::read(&legacy_wal_path).map(|b| b.first() == Some(&b'{')).unwrap_or(false) {
+                // Bản trước bỏ qua file JSON này và tạo .rwal riêng: không trộn hai nguồn.
+                eprintln!(
+                    "[pglite-rs] WARNING: legacy JSON WAL {} was not loaded because {} already exists",
+                    legacy_wal_path.display(),
+                    rwal_path.display()
+                );
+            }
             rwal_path
         } else if legacy_wal_path.exists() {
-            #[cfg(not(target_arch = "wasm32"))]
-            let has_pgl_magic = File::open(&legacy_wal_path).ok().and_then(|f| {
-                unsafe { memmap2::Mmap::map(&f).ok() }
-            }).map(|mmap| mmap.len() >= 4 && (&mmap[0..4] == WAL_MAGIC || &mmap[0..4] == WAL_MAGIC_V1)).unwrap_or(false);
-
-            #[cfg(target_arch = "wasm32")]
-            let has_pgl_magic = false;
+            let head = std::fs::read(&legacy_wal_path).unwrap_or_default();
+            let has_pgl_magic = head.len() >= 4 && (&head[0..4] == WAL_MAGIC || &head[0..4] == WAL_MAGIC_V1);
 
             if has_pgl_magic {
                 let _ = std::fs::rename(&legacy_wal_path, &rwal_path);
@@ -217,6 +450,19 @@ impl WalManager {
                     rwal_path
                 } else {
                     legacy_wal_path
+                }
+            } else if head.first() == Some(&b'{') {
+                // WAL JSON cũ: chuyển sang .rwal nhị phân, giữ file gốc làm bản lưu.
+                let records = parse_json_lines(&head);
+                match write_atomic(&rwal_path, &frame_bytes(&records)) {
+                    Ok(()) => {
+                        let _ = std::fs::rename(&legacy_wal_path, format!("{}.migrated", legacy_wal_path.display()));
+                        rwal_path
+                    }
+                    Err(e) => {
+                        eprintln!("[pglite-rs] WARNING: could not migrate legacy JSON WAL {}: {}", legacy_wal_path.display(), e);
+                        legacy_wal_path
+                    }
                 }
             } else {
                 rwal_path
@@ -228,31 +474,14 @@ impl WalManager {
         #[allow(unused_mut)]
         let mut recovered_records: Vec<WalRecord> = Vec::new();
 
-        // Zero-Copy WAL Recovery via Memory-Mapped File (mmap)
         #[cfg(not(target_arch = "wasm32"))]
         if let Ok(file) = File::open(&wal_path) {
             if file.metadata().map(|m| m.len() > 0).unwrap_or(false) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
                     if mmap.len() >= 4 && (&mmap[0..4] == WAL_MAGIC || &mmap[0..4] == WAL_MAGIC_V1) {
-                        // High-Speed Binary Zero-Copy Stream Deserialization
-                        let mut cursor = 4;
-                        let mut skipped = 0usize;
-                        while cursor + 4 <= mmap.len() {
-                            let len = u32::from_le_bytes(
-                                mmap[cursor..cursor + 4].try_into().unwrap_or([0; 4])
-                            ) as usize;
-                            cursor += 4;
-                            if cursor + len <= mmap.len() {
-                                match bincode::deserialize::<WalRecord>(&mmap[cursor..cursor + len]) {
-                                    Ok(record) => recovered_records.push(record),
-                                    Err(_) => skipped += 1,
-                                }
-                                cursor += len;
-                            } else {
-                                break;
-                            }
-                        }
-                        if skipped > 0 {
+                        let (records, skipped, repair) = recover_frames(&mmap[4..]);
+                        recovered_records = records;
+                        if skipped > 0 && repair == Repair::None {
                             // Vẫn mở DB như trước, nhưng không còn bỏ qua trong im lặng.
                             eprintln!(
                                 "[pglite-rs] WARNING: {} WAL record(s) in {} could not be decoded and were skipped",
@@ -260,18 +489,23 @@ impl WalManager {
                                 wal_path.display()
                             );
                         }
+                        if repair != Repair::None {
+                            let fixed: Vec<u8> = match repair {
+                                Repair::TruncateAt(at) => mmap[..4 + at].to_vec(),
+                                Repair::DropRange(from, to) => {
+                                    let mut v = mmap[..4 + from].to_vec();
+                                    v.extend_from_slice(&mmap[4 + to..]);
+                                    v
+                                }
+                                Repair::None => unreachable!(),
+                            };
+                            let original = mmap.to_vec();
+                            drop(mmap);
+                            Self::repair_file(&wal_path, &original, &fixed, &repair);
+                        }
                     } else if !mmap.is_empty() && mmap[0] == b'{' {
                         // Legacy JSON format fallback
-                        if let Ok(text) = std::str::from_utf8(&mmap) {
-                            for line in text.lines() {
-                                let line = line.trim();
-                                if !line.is_empty() {
-                                    if let Ok(record) = serde_json::from_str::<WalRecord>(line) {
-                                        recovered_records.push(record);
-                                    }
-                                }
-                            }
-                        }
+                        recovered_records = parse_json_lines(&mmap);
                     }
                 }
             }
@@ -287,110 +521,164 @@ impl WalManager {
         if is_new {
             if let Some(f) = &mut file {
                 let _ = f.write_all(WAL_MAGIC);
-                let _ = f.flush();
+                let _ = f.sync_all();
             }
         }
+        let durable_len = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
 
         let writer = file.map(BufWriter::new);
+        (Self::empty(Some(wal_path), writer, durable_len), recovered_records)
+    }
 
-        let manager = Self {
-            filepath: Some(wal_path),
-            writer,
-            pending_bytes: Vec::with_capacity(BATCH_FLUSH_SIZE),
+    /// Lưu bản sao file gốc rồi thay bằng bản đã sửa. Lỗi ở đây không chặn việc mở DB.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn repair_file(path: &std::path::Path, original: &[u8], fixed: &[u8], repair: &Repair) {
+        let backup = backup_path(path);
+        if let Err(e) = write_atomic(&backup, original) {
+            eprintln!("[pglite-rs] WARNING: WAL {} needs repair ({:?}) but backup failed: {}", path.display(), repair, e);
+            return;
+        }
+        match write_atomic(path, fixed) {
+            Ok(()) => eprintln!(
+                "[pglite-rs] WARNING: repaired WAL {} ({:?}, {} -> {} bytes); original saved to {}",
+                path.display(),
+                repair,
+                original.len(),
+                fixed.len(),
+                backup.display()
+            ),
+            Err(e) => eprintln!("[pglite-rs] WARNING: could not repair WAL {}: {}", path.display(), e),
+        }
+    }
+
+    fn push_frame(&mut self, bytes: &[u8]) {
+        self.pending_bytes.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.pending_bytes.extend_from_slice(bytes);
+    }
+
+    fn maybe_flush(&mut self) {
+        let should_flush = {
             #[cfg(not(target_arch = "wasm32"))]
-            last_flush: Instant::now(),
+            {
+                self.pending_bytes.len() >= BATCH_FLUSH_SIZE || self.last_flush.elapsed().as_millis() >= MAX_FLUSH_INTERVAL_MS
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.pending_bytes.len() >= BATCH_FLUSH_SIZE
+            }
         };
 
-        (manager, recovered_records)
+        if should_flush {
+            // Lỗi được giữ trong `poisoned` và trả về ở lệnh hiện tại (xem `Executor::execute`).
+            let _ = self.flush_pending();
+        }
     }
 
     pub fn append(&mut self, record: WalRecord) {
+        self.appended += 1;
         if self.writer.is_some() {
             if let Ok(bytes) = bincode::serialize(&record) {
-                let len = bytes.len() as u32;
-                self.pending_bytes.extend_from_slice(&len.to_le_bytes());
-                self.pending_bytes.extend_from_slice(&bytes);
+                self.push_frame(&bytes);
             }
         }
-
-        // Asynchronous Batching: Flush when buffer threshold reached or interval elapsed
-        let should_flush = {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                self.pending_bytes.len() >= BATCH_FLUSH_SIZE || self.last_flush.elapsed().as_millis() >= MAX_FLUSH_INTERVAL_MS
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                self.pending_bytes.len() >= BATCH_FLUSH_SIZE
-            }
-        };
-
-        if should_flush {
-            self.flush_pending();
-        }
+        self.maybe_flush();
     }
 
     pub fn append_ref<'a>(&mut self, record: WalRecordRef<'a>) {
+        self.appended += 1;
         if self.writer.is_some() {
             if let Ok(bytes) = bincode::serialize(&record) {
-                let len = bytes.len() as u32;
-                self.pending_bytes.extend_from_slice(&len.to_le_bytes());
-                self.pending_bytes.extend_from_slice(&bytes);
+                self.push_frame(&bytes);
             }
         }
-
-        let should_flush = {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                self.pending_bytes.len() >= BATCH_FLUSH_SIZE || self.last_flush.elapsed().as_millis() >= MAX_FLUSH_INTERVAL_MS
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                self.pending_bytes.len() >= BATCH_FLUSH_SIZE
-            }
-        };
-
-        if should_flush {
-            self.flush_pending();
-        }
+        self.maybe_flush();
     }
 
-    fn flush_pending(&mut self) {
+    /// Lỗi ghi đã xảy ra (nếu có). DB cần được mở lại.
+    pub fn error(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    fn poison(&mut self, msg: String) -> String {
+        let full = format!("WAL write failed, database must be reopened: {}", msg);
+        self.poisoned.get_or_insert(full.clone());
+        self.pending_bytes.clear();
+        full
+    }
+
+    fn flush_pending(&mut self) -> Result<(), String> {
+        if let Some(e) = &self.poisoned {
+            return Err(e.clone());
+        }
         if self.pending_bytes.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Some(writer) = &mut self.writer {
-            let _ = writer.write_all(&self.pending_bytes);
-            let _ = writer.flush();
+        let n = self.pending_bytes.len() as u64;
+        let result = match &mut self.writer {
+            Some(writer) => writer.write_all(&self.pending_bytes).and_then(|_| writer.flush()),
+            None => Ok(()),
+        };
+        if let Err(e) = result {
+            // Cắt khung dở để file luôn kết thúc đúng ranh giới.
+            if let Some(writer) = &mut self.writer {
+                let _ = writer.get_ref().set_len(self.durable_len);
+            }
+            return Err(self.poison(e.to_string()));
         }
+        self.durable_len += n;
+        self.unsynced = true;
         self.pending_bytes.clear();
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.last_flush = Instant::now();
         }
+        Ok(())
     }
 
-    pub fn flush(&mut self) {
-        self.flush_pending();
+    /// Ghi buffer xuống file (chưa fsync).
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.flush_pending()
     }
 
-    /// Còn dữ liệu trong buffer chưa ghi xuống file.
+    /// Điểm commit: ghi buffer và fsync (nếu bật `sync`).
+    pub fn commit_point(&mut self) -> Result<(), String> {
+        self.flush_pending()?;
+        if self.unsynced {
+            if self.sync {
+                if let Some(writer) = &self.writer {
+                    if let Err(e) = writer.get_ref().sync_data() {
+                        return Err(self.poison(e.to_string()));
+                    }
+                }
+            }
+            self.unsynced = false;
+        }
+        Ok(())
+    }
+
+    /// Còn dữ liệu chưa ghi hoặc chưa fsync.
     pub fn has_pending(&self) -> bool {
-        !self.pending_bytes.is_empty()
+        self.poisoned.is_none() && (!self.pending_bytes.is_empty() || self.unsynced)
     }
 
     pub fn clear(&mut self) {
         self.pending_bytes.clear();
         if let Some(path) = &self.filepath {
             let _ = std::fs::remove_file(path);
-            let file = OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .create(true)
-                .write(true)
-                .truncate(true)
+                .append(true)
                 .open(path)
                 .ok();
+            if let Some(f) = &mut file {
+                // Thiếu magic thì lần mở sau bỏ qua toàn bộ file.
+                let _ = f.write_all(WAL_MAGIC);
+                let _ = f.sync_all();
+            }
+            self.durable_len = WAL_MAGIC.len() as u64;
             self.writer = file.map(BufWriter::new);
         }
+        self.unsynced = false;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.last_flush = Instant::now();
@@ -400,6 +688,6 @@ impl WalManager {
 
 impl Drop for WalManager {
     fn drop(&mut self) {
-        self.flush_pending();
+        let _ = self.commit_point();
     }
 }

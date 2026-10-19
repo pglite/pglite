@@ -92,12 +92,12 @@ impl PGliteWasm {
 
     #[wasm_bindgen]
     pub fn flush(&mut self) {
-        self.executor.storage.flush();
+        let _ = self.executor.storage.flush();
     }
 
     #[wasm_bindgen]
     pub fn close(&mut self) {
-        self.executor.storage.flush();
+        let _ = self.executor.storage.flush();
     }
 }
 

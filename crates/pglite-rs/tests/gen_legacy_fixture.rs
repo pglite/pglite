@@ -49,3 +49,55 @@ pub const LEGACY_SCRIPT: &[&str] = &[
     "DELETE FROM schools WHERE id = 3",
     "COMMENT ON TABLE schools IS 'truong hoc'",
 ];
+
+/// Fixture do engine 6427da5 ghi: BEGIN không đóng, PK trùng, UPDATE đổi PK và TRUNCATE.
+/// Code mới phải đọc ra đúng như snapshot do chính code cũ đọc.
+///   cargo test --test gen_legacy_fixture generate_legacy_edge_fixtures -- --ignored
+#[test]
+#[ignore]
+fn generate_legacy_edge_fixtures() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for (name, script, queries) in [
+        ("legacy_open_begin", LEGACY_OPEN_BEGIN_SCRIPT, &[("t", "SELECT * FROM t ORDER BY id")][..]),
+        ("legacy_dup_pk", LEGACY_DUP_PK_SCRIPT, &[("d", "SELECT * FROM d ORDER BY id, v"), ("s", "SELECT * FROM s ORDER BY v"), ("c", "SELECT * FROM c ORDER BY id")][..]),
+    ] {
+        let path = dir.join(format!("{name}.db")).to_str().unwrap().to_string();
+        for suffix in ["", ".rwal", ".v2.rwal", ".wal"] {
+            let _ = std::fs::remove_file(format!("{}{}", path, suffix));
+        }
+        let mut db = PGlite::open(&path).unwrap();
+        for sql in script {
+            db.execute(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        db.flush();
+        drop(db);
+        let mut db = PGlite::open(&path).unwrap();
+        let mut snap = serde_json::Map::new();
+        for (k, q) in queries {
+            snap.insert(k.to_string(), serde_json::Value::Array(db.execute(q, &[]).unwrap().rows));
+        }
+        std::fs::write(dir.join(format!("{name}.expected.json")), serde_json::to_string_pretty(&snap).unwrap()).unwrap();
+    }
+}
+
+pub const LEGACY_OPEN_BEGIN_SCRIPT: &[&str] = &[
+    "CREATE TABLE t (id SERIAL PRIMARY KEY, v TEXT)",
+    "INSERT INTO t (v) VALUES ('committed')",
+    "BEGIN",
+    "INSERT INTO t (v) VALUES ('forgotten-begin')",
+];
+
+pub const LEGACY_DUP_PK_SCRIPT: &[&str] = &[
+    "CREATE TABLE d (id INT PRIMARY KEY, v TEXT)",
+    "INSERT INTO d VALUES (1, 'a')",
+    "INSERT INTO d VALUES (1, 'b')",
+    "INSERT INTO d VALUES (2, 'c')",
+    "CREATE TABLE s (id INT PRIMARY KEY, v TEXT)",
+    "INSERT INTO s VALUES (1, 'a')",
+    "INSERT INTO s VALUES (2, 'b')",
+    "UPDATE s SET id = id + 1",
+    "CREATE TABLE c (id SERIAL PRIMARY KEY, v TEXT)",
+    "INSERT INTO c (v) VALUES ('gone')",
+    "TRUNCATE c",
+    "INSERT INTO c (v) VALUES ('kept')",
+];

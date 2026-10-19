@@ -17,6 +17,13 @@ pub struct Table {
     pub is_deleted: Vec<bool>,
     pub active_count: usize,
     pub pages: Vec<SlottedPage>,
+    /// Đúng một cột được khai báo PRIMARY KEY: INSERT/UPDATE trùng khoá bị từ chối. Cột `id`,
+    /// `_id`, SERIAL được tự đoán làm khoá thì không bị ép (giữ hành vi cũ). Chỉ kiểm tra lúc
+    /// thực thi, không bao giờ lúc replay, nên DB cũ có sẵn dòng trùng vẫn mở được.
+    pub pk_enforced: bool,
+    /// Đã từng có hai dòng sống cùng khoá (DB cũ hoặc khoá tự đoán): khi gỡ khoá khỏi index phải
+    /// tìm dòng còn lại để trỏ vào.
+    pub has_dup_pk: bool,
 }
 
 impl Table {
@@ -32,6 +39,7 @@ impl Table {
         let mut columns = deduped_columns;
 
         let pk_count = columns.iter().filter(|c| c.is_primary_key).count();
+        let pk_enforced = pk_count == 1;
         let pk_col_idx = if pk_count == 1 {
             columns.iter().position(|c| c.is_primary_key)
         } else if pk_count > 1 {
@@ -68,6 +76,55 @@ impl Table {
             is_deleted: Vec::new(),
             active_count: 0,
             pages: Vec::new(),
+            pk_enforced,
+            has_dup_pk: false,
+        }
+    }
+
+    /// Cột cho bản ghi `CreateTable` (TRUNCATE): khoá tự đoán không được ghi thành khoá khai báo.
+    pub fn declared_columns(&self) -> Vec<ColumnDef> {
+        let mut cols = self.columns.clone();
+        if !self.pk_enforced {
+            if let Some(i) = self.pk_col_idx {
+                cols[i].is_primary_key = false;
+            }
+        }
+        cols
+    }
+
+    /// Dòng sống (khác `except`) đang giữ khoá `val`, nếu có.
+    pub fn live_row_with_pk(&self, val: &Value, except: Option<usize>) -> Option<usize> {
+        let idx = match val {
+            Value::Text(s) => self.get_row_idx_by_pk_str(s),
+            v => v.as_i64().and_then(|i| self.pk_index.get(&i).copied()).filter(|&r| !self.is_deleted.get(r).copied().unwrap_or(true)),
+        };
+        match idx {
+            Some(r) if Some(r) != except => Some(r),
+            _ if self.has_dup_pk => {
+                let pk_idx = self.pk_col_idx?;
+                (0..self.rows.len()).find(|&r| Some(r) != except && !self.is_deleted[r] && pk_eq(&self.rows[r][pk_idx], val))
+            }
+            _ => None,
+        }
+    }
+
+    /// Dựng lại mọi index từ các dòng còn sống (sau DROP COLUMN, TRUNCATE).
+    pub fn rebuild_indexes(&mut self) {
+        self.pk_index.clear();
+        self.pk_index_str.clear();
+        self.has_dup_pk = false;
+        if let Some(pk_idx) = self.pk_col_idx {
+            for r in 0..self.rows.len() {
+                if !self.is_deleted[r] {
+                    if let Some(v) = self.rows[r].get(pk_idx).cloned() {
+                        self.add_pk_to_index(&v, r);
+                    }
+                }
+            }
+        }
+        let cols: Vec<usize> = self.col_indexes.keys().copied().collect();
+        for c in cols {
+            self.add_secondary_index(c);
         }
     }
 
@@ -135,22 +192,8 @@ impl Table {
         }
 
         let row_idx = self.rows.len();
-        if let Some(pk_idx) = self.pk_col_idx {
-            if let Some(val) = row.get(pk_idx) {
-                if let Some(pk_val) = val.as_i64() {
-                    self.pk_index.insert(pk_val, row_idx);
-                }
-                match val {
-                    Value::Text(s) => {
-                        self.pk_index_str.insert(s.clone(), row_idx);
-                        if s.len() == 36 {
-                            self.pk_index_str.insert(CompactString::new(s.to_lowercase()), row_idx);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // Dòng phải có mặt trước khi index để add_pk_to_index nhận ra khoá trùng.
+        let pk_val = self.pk_col_idx.and_then(|i| row.get(i).cloned());
 
         for (&col_idx, map) in &mut self.col_indexes {
             if let Some(val) = row.get(col_idx) {
@@ -163,6 +206,9 @@ impl Table {
         self.rows.push(row);
         self.is_deleted.push(false);
         self.active_count += 1;
+        if let Some(v) = pk_val {
+            self.add_pk_to_index(&v, row_idx);
+        }
 
         assigned_pk
     }
@@ -308,13 +354,60 @@ impl Table {
     }
 
     pub fn add_pk_to_index(&mut self, val: &Value, row_idx: usize) {
+        let mut replaced = Vec::new();
         if let Some(i) = val.as_i64() {
-            self.pk_index.insert(i, row_idx);
+            replaced.extend(self.pk_index.insert(i, row_idx));
         }
         if let Value::Text(s) = val {
-            self.pk_index_str.insert(s.clone(), row_idx);
+            replaced.extend(self.pk_index_str.insert(s.clone(), row_idx));
             if s.len() == 36 {
-                self.pk_index_str.insert(CompactString::new(s.to_lowercase()), row_idx);
+                replaced.extend(self.pk_index_str.insert(CompactString::new(s.to_lowercase()), row_idx));
+            }
+        }
+        if replaced.iter().any(|&r| r != row_idx && !self.is_deleted.get(r).copied().unwrap_or(true)) {
+            self.has_dup_pk = true;
+        }
+    }
+
+    /// Gỡ khoá của dòng `row_idx` khỏi index (chỉ khi index đang trỏ tới đúng dòng này), rồi trỏ
+    /// lại vào dòng sống khác cùng khoá nếu có.
+    fn unindex_pk(&mut self, val: &Value, row_idx: usize) {
+        if let Some(i) = val.as_i64() {
+            if self.pk_index.get(&i) == Some(&row_idx) {
+                self.pk_index.remove(&i);
+            }
+        }
+        if let Value::Text(s) = val {
+            if self.pk_index_str.get(s) == Some(&row_idx) {
+                self.pk_index_str.remove(s);
+            }
+            if s.len() == 36 {
+                let lower = CompactString::new(s.to_lowercase());
+                if self.pk_index_str.get(&lower) == Some(&row_idx) {
+                    self.pk_index_str.remove(&lower);
+                }
+            }
+        }
+        if self.has_dup_pk {
+            if let Some(pk_idx) = self.pk_col_idx {
+                if let Some(other) = (0..self.rows.len())
+                    .find(|&r| r != row_idx && !self.is_deleted[r] && pk_eq(&self.rows[r][pk_idx], val))
+                {
+                    self.add_pk_to_index(val, other);
+                }
+            }
+        }
+    }
+
+    /// Hoàn tác DELETE của một dòng.
+    pub fn undelete_row(&mut self, row_idx: usize) {
+        if row_idx < self.rows.len() && self.is_deleted[row_idx] {
+            self.is_deleted[row_idx] = false;
+            self.active_count += 1;
+            if let Some(pk_idx) = self.pk_col_idx {
+                if let Some(pk) = self.rows[row_idx].get(pk_idx).cloned() {
+                    self.add_pk_to_index(&pk, row_idx);
+                }
             }
         }
     }
@@ -326,8 +419,8 @@ impl Table {
         }
         let new_val = val.clone();
         let old_val = std::mem::replace(&mut self.rows[row_idx][col_idx], val);
-        if Some(col_idx) == self.pk_col_idx {
-            self.remove_pk_from_index(&old_val);
+        if Some(col_idx) == self.pk_col_idx && !self.is_deleted[row_idx] {
+            self.unindex_pk(&old_val, row_idx);
             self.add_pk_to_index(&new_val, row_idx);
         }
         if let Some(map) = self.col_indexes.get_mut(&col_idx) {
@@ -357,12 +450,7 @@ impl Table {
         }
         if let Some(pk_idx) = self.pk_col_idx {
             if let Some(pk_val) = row.get(pk_idx) {
-                // Chỉ gỡ nếu index đang trỏ đúng dòng này
-                let points_here = pk_val.as_i64().map_or(false, |i| self.pk_index.get(&i) == Some(&row_idx))
-                    || matches!(pk_val, Value::Text(t) if self.pk_index_str.get(t) == Some(&row_idx));
-                if points_here {
-                    self.remove_pk_from_index(pk_val);
-                }
+                self.unindex_pk(pk_val, row_idx);
             }
         }
         for (&col_idx, map) in &mut self.col_indexes {
@@ -381,8 +469,15 @@ impl Table {
         Some(row)
     }
 
-    /// Dòng còn sống đầu tiên có giá trị đúng bằng `values` (bảng không có khoá chính).
+    /// Dòng còn sống đầu tiên có giá trị đúng bằng `values`. Thử trước dòng mà index khoá chính
+    /// trỏ tới (tránh quét cả bảng khi replay UPDATE đổi khoá).
     pub fn find_live_row(&self, values: &[Value]) -> Option<usize> {
+        if let Some(hint) = self.pk_col_idx.and_then(|i| values.get(i)).and_then(|v| self.live_row_with_pk(v, None)) {
+            if self.rows[hint].as_slice() == values {
+                let first = (0..hint).find(|&i| !self.is_deleted[i] && self.rows[i].as_slice() == values);
+                return first.or(Some(hint));
+            }
+        }
         (0..self.rows.len()).find(|&i| !self.is_deleted[i] && self.rows[i].as_slice() == values)
     }
 
@@ -410,7 +505,7 @@ impl Table {
             self.active_count = self.active_count.saturating_sub(1);
             if let Some(pk_idx) = self.pk_col_idx {
                 if let Some(val) = self.rows[row_idx].get(pk_idx).cloned() {
-                    self.remove_pk_from_index(&val);
+                    self.unindex_pk(&val, row_idx);
                 }
             }
             return true;
@@ -446,6 +541,9 @@ impl Table {
     pub fn drop_column(&mut self, name: &str) -> bool {
         let clean = name.trim_matches('"').to_lowercase();
         if let Some(pos) = self.columns.iter().position(|c| c.name.to_lowercase() == clean) {
+            if Some(pos) == self.pk_col_idx {
+                self.pk_enforced = false;
+            }
             self.columns.remove(pos);
             for row in &mut self.rows {
                 if pos < row.len() {
@@ -456,6 +554,13 @@ impl Table {
                 .or_else(|| self.columns.iter().position(|c| c.data_type == crate::types::DataType::Serial))
                 .or_else(|| self.columns.iter().position(|c| c.name.eq_ignore_ascii_case("id")))
                 .or_else(|| self.columns.iter().position(|c| c.name.eq_ignore_ascii_case("_id")));
+            // Index phụ được đánh theo vị trí cột: dời các cột sau cột bị xoá.
+            self.col_indexes = std::mem::take(&mut self.col_indexes)
+                .into_iter()
+                .filter(|(c, _)| *c != pos)
+                .map(|(c, m)| (if c > pos { c - 1 } else { c }, m))
+                .collect();
+            self.rebuild_indexes();
             return true;
         }
         false
@@ -498,5 +603,14 @@ impl Table {
         let final_min = if min.is_infinite() { 0.0 } else { min };
         let final_max = if max.is_infinite() { 0.0 } else { max };
         (sum, avg, final_min, final_max, count)
+    }
+}
+
+/// Hai giá trị khoá chính có trỏ cùng một khoá trong index không.
+fn pk_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => x == y || (x.len() == 36 && x.eq_ignore_ascii_case(y)),
+        (Value::Text(_), _) | (_, Value::Text(_)) => false,
+        _ => a.as_i64().is_some() && a.as_i64() == b.as_i64(),
     }
 }

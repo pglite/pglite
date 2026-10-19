@@ -37,6 +37,24 @@ fn reopen_same(path: &str, check: &[&str], f: impl FnOnce(&mut PGlite)) -> PGlit
     db
 }
 
+fn open_fixture(name: &str) -> (PathBuf, String) {
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let (dir, path) = temp_db(name);
+    std::fs::copy(fx.join(format!("{name}.db.rwal")), format!("{path}.rwal")).unwrap();
+    (dir, path)
+}
+
+fn fixture_expected(name: &str) -> serde_json::Value {
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    serde_json::from_str(&std::fs::read_to_string(fx.join(format!("{name}.expected.json"))).unwrap()).unwrap()
+}
+
+/// Không có bản sao lưu nào được tạo: file WAL không bị sửa.
+fn assert_no_repair(dir: &Path) {
+    let baks: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".corrupt-")).collect();
+    assert!(baks.is_empty(), "WAL bị sửa ngoài ý muốn: {:?}", baks.iter().map(|e| e.file_name()).collect::<Vec<_>>());
+}
+
 fn exec_all(db: &mut PGlite, sqls: &[&str]) {
     for sql in sqls {
         db.exec(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -107,18 +125,42 @@ fn ddl_inside_rolled_back_transaction_matches_live_state() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// BEGIN không đóng trong file do bản cũ ghi (bản ghi `Begin`): vẫn giữ như bản cũ đọc.
 #[test]
-fn unterminated_transaction_is_kept_like_before() {
+fn unterminated_legacy_transaction_is_kept_like_before() {
+    let (dir, path) = open_fixture("legacy_open_begin");
+    let expected = fixture_expected("legacy_open_begin");
+    let mut db = PGlite::open(&path).unwrap();
+    assert_eq!(serde_json::Value::Array(rows(&mut db, "SELECT * FROM t ORDER BY id")), expected["t"]);
+    drop(db);
+    let mut db = PGlite::open(&path).unwrap();
+    assert_eq!(serde_json::Value::Array(rows(&mut db, "SELECT * FROM t ORDER BY id")), expected["t"]);
+    assert_no_repair(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BEGIN ghi từ bản mới (`TxBegin`) mà chưa COMMIT khi tiến trình dừng: bị hoàn tác.
+#[test]
+fn unterminated_new_transaction_is_rolled_back() {
     let (dir, path) = temp_db("open_tx");
-    let mut db = reopen_same(&path, &[], |db| {
-        exec_all(db, &[
+    {
+        let mut db = PGlite::open(&path).unwrap();
+        exec_all(&mut db, &[
             "CREATE TABLE t (id SERIAL PRIMARY KEY, v TEXT)",
+            "INSERT INTO t (v) VALUES ('committed')",
             "BEGIN",
             "INSERT INTO t (v) VALUES ('never-committed')",
+            "UPDATE t SET v = 'changed' WHERE id = 1",
         ]);
         db.flush();
-    });
-    assert_eq!(col(&mut db, "SELECT v FROM t", "v"), vec!["never-committed"]);
+    }
+    let mut db = PGlite::open(&path).unwrap();
+    assert_eq!(col(&mut db, "SELECT v FROM t ORDER BY id", "v"), vec!["committed"]);
+    // Ghi tiếp sau đó vẫn bền
+    exec_all(&mut db, &["INSERT INTO t (v) VALUES ('later')"]);
+    drop(db);
+    let mut db = PGlite::open(&path).unwrap();
+    assert_eq!(col(&mut db, "SELECT v FROM t ORDER BY id", "v"), vec!["committed", "later"]);
     let _ = std::fs::remove_dir_all(dir);
 }
 
