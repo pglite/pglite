@@ -699,11 +699,14 @@ impl Table {
             match &mut c.kind {
                 ConstraintKind::PrimaryKey { cols } | ConstraintKind::Unique { cols } => fix(cols),
                 ConstraintKind::ForeignKey { cols, .. } => fix(cols),
-                ConstraintKind::Check { .. } => {}
+                ConstraintKind::Check { expr } => *expr = crate::storage::catalog::rename_identifier(expr, &old, to),
             }
         }
         for ix in &mut self.indexes {
             fix(&mut ix.cols);
+            if let Some(p) = &mut ix.predicate {
+                *p = crate::storage::catalog::rename_identifier(p, &old, to);
+            }
         }
         self.rebuild_unique_indexes();
         true

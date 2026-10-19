@@ -491,182 +491,6 @@ impl Executor {
         })
     }
 
-    fn handle_alter_table(&mut self, sql: &str) -> Result<QueryResult, String> {
-        let upper = sql.to_uppercase();
-        let after_alter = if upper.starts_with("ALTER TABLE") {
-            sql[11..].trim()
-        } else {
-            sql.trim()
-        };
-
-        let add_kw_pos = find_top_level_keyword(after_alter, "ADD");
-        let drop_kw_pos = find_top_level_keyword(after_alter, "DROP");
-
-        if let Some(pos) = add_kw_pos {
-            let table_name = clean_table_name(after_alter[..pos].trim());
-            let actions_raw = &after_alter[pos..];
-            let actions = split_comma_separated_tokens(actions_raw);
-
-            for action_part in actions {
-                let act_trim = action_part.trim();
-                let mut after_add = if act_trim.to_uppercase().starts_with("ADD") {
-                    act_trim[3..].trim()
-                } else {
-                    act_trim
-                };
-                if after_add.to_uppercase().starts_with("COLUMN") {
-                    after_add = after_add[6..].trim();
-                }
-
-                let mut if_not_exists = false;
-                if after_add.to_uppercase().starts_with("IF NOT EXISTS") {
-                    if_not_exists = true;
-                    after_add = after_add[13..].trim();
-                }
-
-                if after_add.to_uppercase().starts_with("CONSTRAINT")
-                    || after_add.to_uppercase().starts_with("PRIMARY KEY")
-                    || after_add.to_uppercase().starts_with("FOREIGN KEY")
-                    || after_add.to_uppercase().starts_with("UNIQUE")
-                {
-                    continue;
-                }
-
-                let tokens: Vec<&str> = after_add.split_whitespace().collect();
-                if tokens.is_empty() {
-                    continue;
-                }
-                let col_name = clean_col_name(tokens[0]).to_string();
-                let type_str = if tokens.len() > 1 { tokens[1] } else { "TEXT" };
-                let data_type = crate::types::DataType::from_sql_str(type_str);
-
-                let (default_val, default_str) = if let Some(def_pos) = after_add.to_uppercase().find("DEFAULT") {
-                    let def_str = after_add[def_pos + 7..].trim();
-                    let fmt = format_attdef_to_sql(def_str);
-                    (eval_sql_expr(&fmt, &[], None, &[], None, &[]), Some(fmt))
-                } else {
-                    (Value::Null, None)
-                };
-
-                let col_def = crate::types::ColumnDef {
-                    name: col_name.clone(),
-                    data_type,
-                    is_primary_key: false,
-                    is_nullable: true,
-                    default_value: default_str,
-                    comment: None,
-                };
-
-                // Dòng có giá trị khác `default_val` (DEFAULT như gen_random_uuid(), now() được tính
-                // lại cho từng dòng): replay chỉ biết `default_val`, nên ghi thêm UPDATE cho chúng.
-                let mut fixups: Vec<(RowIdentity, Value)> = Vec::new();
-                let new_col_idx;
-                {
-                    let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-                    if table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                        if if_not_exists {
-                            continue;
-                        }
-                        return Err(format!("Column \"{}\" of relation \"{}\" already exists", col_name, table_name));
-                    }
-
-                    table.columns.push(col_def.clone());
-                    new_col_idx = table.columns.len() - 1;
-                    for row in &mut table.rows {
-                        let cell = if let Some(ref expr_str) = col_def.default_value {
-                            eval_sql_expr(expr_str, &[], None, &[], None, &[])
-                        } else {
-                            default_val.clone()
-                        };
-                        row.push(cell);
-                    }
-                    for i in 0..table.rows.len() {
-                        if !table.is_deleted[i] && table.rows[i][new_col_idx] != default_val {
-                            let identity = match RowIdentity::of(table, i) {
-                                RowIdentity::Row(mut r) => {
-                                    r[new_col_idx] = default_val.clone();
-                                    RowIdentity::Row(r)
-                                }
-                                other => other,
-                            };
-                            fixups.push((identity, table.rows[i][new_col_idx].clone()));
-                        }
-                    }
-                }
-
-                self.storage.wal.append(WalRecord::AlterTableAddColumn {
-                    table: table_name.to_string(),
-                    column: col_def,
-                    default_val,
-                });
-                for (identity, new_val) in fixups {
-                    let table = table_name.to_string();
-                    let col_idx = new_col_idx;
-                    self.storage.wal.append(match identity {
-                        RowIdentity::Pk(pk) => WalRecord::Update { table, pk, col_idx, new_val },
-                        RowIdentity::Key(key) => WalRecord::UpdateByKey { table, key, col_idx, new_val },
-                        RowIdentity::Row(old_row) => WalRecord::UpdateByRow { table, old_row, updates: vec![(col_idx, new_val)] },
-                    });
-                }
-            }
-
-            Ok(QueryResult {
-                rows: vec![],
-                row_count: 0,
-                fields: vec![],
-                command: "ALTER TABLE".to_string(),
-            })
-        } else if let Some(pos) = drop_kw_pos {
-            let table_name = clean_table_name(after_alter[..pos].trim());
-            let mut after_drop = after_alter[pos + 4..].trim();
-            if after_drop.to_uppercase().starts_with("COLUMN") {
-                after_drop = after_drop[6..].trim();
-            }
-
-            let mut if_exists = false;
-            if after_drop.to_uppercase().starts_with("IF EXISTS") {
-                if_exists = true;
-                after_drop = after_drop[9..].trim();
-            }
-
-            let tokens: Vec<&str> = after_drop.split_whitespace().collect();
-            if tokens.is_empty() {
-                return Err("Missing column name in ALTER TABLE DROP".to_string());
-            }
-            let col_name = clean_col_name(tokens[0]).to_string();
-
-            {
-                let table = self.storage.get_table_mut(table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
-                let dropped = table.drop_column(&col_name);
-                if !dropped {
-                    if if_exists {
-                        return Ok(QueryResult {
-                            rows: vec![],
-                            row_count: 0,
-                            fields: vec![],
-                            command: "ALTER TABLE".to_string(),
-                        });
-                    }
-                    return Err(format!("Column \"{}\" of relation \"{}\" does not exist", col_name, table_name));
-                }
-            }
-
-            self.storage.wal.append(WalRecord::AlterTableDropColumn {
-                table: table_name.to_string(),
-                column: col_name,
-            });
-
-            Ok(QueryResult {
-                rows: vec![],
-                row_count: 0,
-                fields: vec![],
-                command: "ALTER TABLE".to_string(),
-            })
-        } else {
-            Err("Unsupported ALTER TABLE statement".to_string())
-        }
-    }
-
     fn handle_union(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let (order_by_part, query_part) = if let Some(order_pos) = find_top_level_keyword(sql, "ORDER BY") {
             (Some(&sql[order_pos + 8..]), &sql[..order_pos])
@@ -2387,83 +2211,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 continue;
             }
 
-            let (col_name, rest_def) = if col_def_str.starts_with('"') {
-                if let Some(close_q) = col_def_str[1..].find('"') {
-                    let name = &col_def_str[1..1 + close_q];
-                    (name.to_string(), &col_def_str[2 + close_q..])
-                } else {
-                    let parts: Vec<&str> = col_def_str.split_whitespace().collect();
-                    (parts[0].trim_matches('"').to_string(), &col_def_str[parts[0].len()..])
-                }
-            } else {
-                let parts: Vec<&str> = col_def_str.split_whitespace().collect();
-                (parts[0].trim_matches('"').to_string(), &col_def_str[parts[0].len()..])
-            };
-
-            let upper_rest = rest_def.to_uppercase();
-
-            let data_type = DataType::from_sql_str(rest_def);
-
-            let is_primary_key = upper_rest.contains("PRIMARY KEY");
-            let is_nullable = !upper_rest.contains("NOT NULL") && !is_primary_key;
-
-            let default_value = if let Some(def_idx) = upper_rest.find("DEFAULT ") {
-                let after_def = rest_def[def_idx + 8..].trim();
-                if after_def.starts_with('\'') {
-                    if let Some(end_quote) = after_def[1..].find('\'') {
-                        Some(after_def[..=end_quote + 1].to_string())
-                    } else {
-                        Some(after_def.split_whitespace().next().unwrap_or("").trim_matches(';').trim_matches(',').to_string())
-                    }
-                } else if after_def.starts_with('{') {
-                    let mut depth = 0;
-                    let mut end_pos = None;
-                    for (i, b) in after_def.bytes().enumerate() {
-                        if b == b'{' {
-                            depth += 1;
-                        } else if b == b'}' {
-                            depth -= 1;
-                            if depth == 0 {
-                                end_pos = Some(i);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(end_p) = end_pos {
-                        let json_str = &after_def[..=end_p];
-                        Some(format_attdef_to_sql(json_str))
-                    } else {
-                        Some(format_attdef_to_sql(after_def))
-                    }
-                } else {
-                    let mut tokens = Vec::new();
-                    for part in after_def.split_whitespace() {
-                        let p = part.trim_matches(';').trim_matches(',');
-                        if p.eq_ignore_ascii_case("NOT") || p.eq_ignore_ascii_case("NULL") || p.eq_ignore_ascii_case("PRIMARY") || p.eq_ignore_ascii_case("KEY") || p.eq_ignore_ascii_case("REFERENCES") || p.eq_ignore_ascii_case("CHECK") || p.eq_ignore_ascii_case("CONSTRAINT") {
-                            break;
-                        }
-                        tokens.push(p);
-                    }
-                    if tokens.is_empty() {
-                        None
-                    } else {
-                        Some(format_attdef_to_sql(&tokens.join(" ")))
-                    }
-                }
-            } else {
-                None
-            };
-
-            crate::engine::constraints::parse_column_constraints(&table_name, &col_name, rest_def, &mut defs);
-
-            columns.push(ColumnDef {
-                name: col_name,
-                data_type,
-                is_primary_key,
-                is_nullable,
-                default_value,
-                comment: None,
-            });
+            let (col, rest_def) = parse_column_definition(col_def_str);
+            crate::engine::constraints::parse_column_constraints(&table_name, &col.name, rest_def, &mut defs);
+            columns.push(col);
         }
 
         // Khoá chính cấp bảng (một hay nhiều cột)
@@ -10162,6 +9912,11 @@ pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
     None
 }
 
+/// Biểu thức DEFAULT lưu trong ColumnDef (cùng dạng với CREATE TABLE).
+pub(crate) fn normalize_default_expr(expr: &str) -> String {
+    format_attdef_to_sql(expr.trim().trim_end_matches(';'))
+}
+
 fn format_attdef_to_sql(attdef_str: &str) -> String {
     let trimmed = attdef_str.trim();
     if trimmed.starts_with('{') {
@@ -10396,6 +10151,104 @@ fn extract_table_name_and_alias<'a>(raw: &'a str) -> (&'a str, Option<&'a str>) 
     } else {
         (tbl, None)
     }
+}
+
+/// Một định nghĩa cột `name type [DEFAULT ...] [NOT NULL] [PRIMARY KEY] ...` (CREATE TABLE, ALTER
+/// TABLE ADD COLUMN). Trả về cột và phần sau tên cột (để đọc ràng buộc cấp cột).
+pub(crate) fn parse_column_definition(col_def_str: &str) -> (ColumnDef, &str) {
+    let (col_name, rest_def) = if col_def_str.starts_with('"') {
+        if let Some(close_q) = col_def_str[1..].find('"') {
+            let name = &col_def_str[1..1 + close_q];
+            (name.to_string(), &col_def_str[2 + close_q..])
+        } else {
+            let parts: Vec<&str> = col_def_str.split_whitespace().collect();
+            (parts[0].trim_matches('"').to_string(), &col_def_str[parts[0].len()..])
+        }
+    } else {
+        let parts: Vec<&str> = col_def_str.split_whitespace().collect();
+        (parts[0].trim_matches('"').to_string(), &col_def_str[parts[0].len()..])
+    };
+
+    let upper_rest = rest_def.to_uppercase();
+
+    let data_type = DataType::from_sql_str(rest_def);
+
+    let is_primary_key = upper_rest.contains("PRIMARY KEY");
+    let is_nullable = !upper_rest.contains("NOT NULL") && !is_primary_key;
+
+    let default_value = if let Some(def_idx) = upper_rest.find("DEFAULT ") {
+        let after_def = rest_def[def_idx + 8..].trim();
+        if after_def.starts_with('\'') {
+            // Dấu nháy đóng: bỏ qua '' (nháy được escape bên trong chuỗi)
+            let b = after_def.as_bytes();
+            let mut j = 1;
+            let mut end_quote = None;
+            while j < b.len() {
+                if b[j] == b'\'' {
+                    if b.get(j + 1) == Some(&b'\'') {
+                        j += 2;
+                        continue;
+                    }
+                    end_quote = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(end_quote) = end_quote {
+                Some(after_def[..=end_quote].to_string())
+            } else {
+                Some(after_def.split_whitespace().next().unwrap_or("").trim_matches(';').trim_matches(',').to_string())
+            }
+        } else if after_def.starts_with('{') {
+            let mut depth = 0;
+            let mut end_pos = None;
+            for (i, b) in after_def.bytes().enumerate() {
+                if b == b'{' {
+                    depth += 1;
+                } else if b == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_pos = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(end_p) = end_pos {
+                let json_str = &after_def[..=end_p];
+                Some(format_attdef_to_sql(json_str))
+            } else {
+                Some(format_attdef_to_sql(after_def))
+            }
+        } else {
+            let mut tokens = Vec::new();
+            for part in after_def.split_whitespace() {
+                let p = part.trim_matches(';').trim_matches(',');
+                if p.eq_ignore_ascii_case("NOT") || p.eq_ignore_ascii_case("NULL") || p.eq_ignore_ascii_case("PRIMARY") || p.eq_ignore_ascii_case("KEY") || p.eq_ignore_ascii_case("REFERENCES") || p.eq_ignore_ascii_case("CHECK") || p.eq_ignore_ascii_case("CONSTRAINT") {
+                    break;
+                }
+                tokens.push(p);
+            }
+            if tokens.is_empty() {
+                None
+            } else {
+                Some(format_attdef_to_sql(&tokens.join(" ")))
+            }
+        }
+    } else {
+        None
+    };
+
+    (
+        ColumnDef {
+            name: col_name,
+            data_type,
+            is_primary_key,
+            is_nullable,
+            default_value,
+            comment: None,
+        },
+        rest_def,
+    )
 }
 
 /// Tên bảng trong DDL: bỏ tiền tố schema và dấu nháy, giữ nguyên chữ hoa/thường như trước.
@@ -12644,7 +12497,7 @@ pub(crate) fn eval_default_for_insert(def_str: &str, params: &[Value]) -> Value 
     } else if let Some(dt_val) = eval_date_time_keyword(def_str) {
         dt_val
     } else if def_str.starts_with('\'') && def_str.ends_with('\'') && def_str.len() >= 2 {
-        Value::text(&def_str[1..def_str.len() - 1])
+        Value::text(def_str[1..def_str.len() - 1].replace("''", "'"))
     } else if let Ok(n) = def_str.parse::<i64>() {
         Value::Int(n)
     } else if let Ok(f) = def_str.parse::<f64>() {

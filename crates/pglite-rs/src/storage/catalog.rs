@@ -205,3 +205,41 @@ impl UniqueIdx {
         }
     }
 }
+
+/// Đổi tên định danh `from` thành `to` trong một biểu thức SQL (CHECK, điều kiện index một phần),
+/// bỏ qua chuỗi trong nháy đơn. Không phân biệt hoa thường, chỉ thay nguyên từ.
+pub fn rename_identifier(expr: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.char_indices().peekable();
+    let mut in_str = false;
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let bytes = expr.as_bytes();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            in_str = !in_str;
+            out.push(c);
+            continue;
+        }
+        if !in_str && is_ident(c) && (i == 0 || !is_ident(expr[..i].chars().next_back().unwrap())) {
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if is_ident(d) {
+                    end = j + d.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let word = &expr[i..end];
+            let quoted = i > 0 && bytes[i - 1] == b'"';
+            if word.eq_ignore_ascii_case(from) && !quoted {
+                out.push_str(to);
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}

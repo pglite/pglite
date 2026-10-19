@@ -1,3 +1,4 @@
+pub mod alter;
 pub mod constraints;
 pub mod expr;
 pub mod executor;

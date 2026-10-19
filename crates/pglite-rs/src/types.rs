@@ -25,6 +25,10 @@ impl DataType {
         let first_word = upper.split_whitespace().next().unwrap_or("");
         let base_type = first_word.split('(').next().unwrap_or(first_word).trim_matches(';');
 
+        if first_word.ends_with("[]") && !upper.ends_with("[]") {
+            // `int[] NOT NULL`, `text[] DEFAULT ...`: kiểu mảng nằm ở từ đầu tiên
+            return DataType::Array(first_word.trim_end_matches("[]").split('(').next().unwrap_or("").to_string());
+        }
         if upper.ends_with("[]") || upper.starts_with("ARRAY") {
             let elem = upper.trim_end_matches("[]").trim();
             return DataType::Array(elem.to_string());

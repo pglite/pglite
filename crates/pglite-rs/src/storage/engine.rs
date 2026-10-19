@@ -360,6 +360,10 @@ impl StorageEngine {
                 if let Some(t) = self.get_table_mut(table) {
                     t.constraints.retain(|c| !c.name.eq_ignore_ascii_case(&def.name));
                     t.constraints.push(def.clone());
+                    if !t.catalog_tracked {
+                        // Bảng do bản cũ tạo: dữ liệu cũ có thể vi phạm các ràng buộc khác đã khai báo.
+                        t.legacy_data = true;
+                    }
                     t.catalog_tracked = true;
                     Self::index_catalog_columns(t);
                     if matches!(def.kind, ConstraintKind::PrimaryKey { .. } | ConstraintKind::Unique { .. }) {
