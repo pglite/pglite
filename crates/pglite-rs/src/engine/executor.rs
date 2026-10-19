@@ -215,7 +215,9 @@ impl Executor {
             return self.handle_cte(trimmed, params);
         }
 
-        if find_top_level_keyword(trimmed, "UNION").is_some() {
+        if (upper.starts_with("SELECT") || upper.starts_with("("))
+            && ["UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| find_top_level_keyword(trimmed, kw).is_some())
+        {
             return self.handle_union(trimmed, params);
         }
 
@@ -516,67 +518,176 @@ impl Executor {
         })
     }
 
+    /// UNION / INTERSECT / EXCEPT [ALL]: ghép cột theo VỊ TRÍ (không theo tên), INTERSECT ưu tiên hơn
+    /// UNION/EXCEPT, và ORDER BY / LIMIT / OFFSET / FETCH ở cuối áp cho cả kết quả.
     fn handle_union(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
-        let (order_by_part, query_part) = if let Some(order_pos) = find_top_level_keyword(sql, "ORDER BY") {
-            (Some(&sql[order_pos + 8..]), &sql[..order_pos])
-        } else {
-            (None, sql)
+        let sql = sql.trim().trim_end_matches(';').trim();
+        // Mệnh đề cuối chỉ tính sau phép tập hợp cuối cùng ở cấp ngoài cùng
+        let last_op_end = ["UNION", "INTERSECT", "EXCEPT"].iter().filter_map(|kw| last_top_level_keyword(sql, kw).map(|p| p + kw.len())).max().unwrap_or(0);
+        let tail_start = ["ORDER BY", "LIMIT", "OFFSET", "FETCH"]
+            .iter()
+            .filter_map(|kw| find_top_level_keyword(&sql[last_op_end..], kw).map(|p| last_op_end + p))
+            .min();
+        let (body, tail) = match tail_start {
+            Some(p) => (&sql[..p], &sql[p..]),
+            None => (sql, ""),
         };
+        let (names, mut rows, fields) = self.eval_set_expr(body.trim(), params)?;
 
-        let (union_pos, is_all) = if let Some(pos) = find_top_level_keyword(query_part, "UNION ALL") {
-            (pos, true)
-        } else if let Some(pos) = find_top_level_keyword(query_part, "UNION") {
-            (pos, false)
-        } else {
-            return Err("Expected UNION in query".to_string());
-        };
-
-        let kw_len = if is_all { 9 } else { 5 };
-        let left_sql = query_part[..union_pos].trim();
-        let right_sql = query_part[union_pos + kw_len..].trim();
-
-        let left_res = self.execute(left_sql, params)?;
-        let right_res = self.execute(right_sql, params)?;
-
-        let mut combined_rows = Vec::new();
-        if is_all {
-            combined_rows.extend(left_res.rows);
-            combined_rows.extend(right_res.rows);
-        } else {
-            let mut seen = std::collections::HashSet::new();
-            for r in left_res.rows.into_iter().chain(right_res.rows.into_iter()) {
-                let key = serde_json::to_string(&r).unwrap_or_default();
-                if seen.insert(key) {
-                    combined_rows.push(r);
-                }
-            }
-        }
-
-        if let Some(order_str) = order_by_part {
-            let specs = parse_order_by_specs(order_str);
-            if !specs.is_empty() {
-                combined_rows.sort_by(|a, b| {
-                    for spec in &specs {
-                        let clean = clean_col_name(spec.col_name);
-                        let va = a.get(clean);
-                        let vb = b.get(clean);
-                        let final_ord = json_order_cmp(va, vb, spec.is_desc, spec.nulls_first);
-                        if final_ord != std::cmp::Ordering::Equal {
-                            return final_ord;
-                        }
+        if let Some(o) = find_top_level_keyword(tail, "ORDER BY") {
+            let o_end = ["LIMIT", "OFFSET", "FETCH"].iter().filter_map(|kw| find_top_level_keyword(&tail[o + 8..], kw).map(|p| o + 8 + p)).min().unwrap_or(tail.len());
+            let specs = parse_order_by_specs(&tail[o + 8..o_end]);
+            rows.sort_by(|a, b| {
+                for spec in &specs {
+                    let idx = spec.col_name.trim().parse::<usize>().ok().map(|n| n.saturating_sub(1)).or_else(|| {
+                        let c = clean_col_name(spec.col_name).trim_matches('"').to_string();
+                        names.iter().position(|n| n.eq_ignore_ascii_case(&c))
+                    });
+                    let (va, vb) = match idx {
+                        Some(i) => (a.get(i), b.get(i)),
+                        None => (None, None),
+                    };
+                    let ord = json_order_cmp(va, vb, spec.is_desc, spec.nulls_first);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
                     }
-                    std::cmp::Ordering::Equal
-                });
-            }
+                }
+                std::cmp::Ordering::Equal
+            });
         }
+        let num_after = |kw: &str| -> Option<usize> {
+            let p = find_top_level_keyword(tail, kw)?;
+            let tok = tail[p + kw.len()..].split_whitespace().next()?;
+            let v = if let Some(n) = tok.strip_prefix('$') { params.get(n.parse::<usize>().ok()?.checked_sub(1)?)?.as_i64()? } else { tok.parse::<i64>().ok()? };
+            Some(v.max(0) as usize)
+        };
+        let offset = num_after("OFFSET").unwrap_or(0);
+        let limit = num_after("LIMIT").or_else(|| {
+            // FETCH FIRST|NEXT n ROWS ONLY
+            let p = find_top_level_keyword(tail, "FETCH")?;
+            let rest: Vec<&str> = tail[p + 5..].split_whitespace().collect();
+            rest.get(1).and_then(|t| t.parse::<usize>().ok()).or(Some(1))
+        });
+        let rows: Vec<Vec<serde_json::Value>> = rows.into_iter().skip(offset).take(limit.unwrap_or(usize::MAX)).collect();
+        let out: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| {
+                let mut m = serde_json::Map::new();
+                for (n, v) in names.iter().zip(r) {
+                    m.insert(n.clone(), v);
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        Ok(QueryResult { row_count: out.len(), rows: out, fields, command: "SELECT".to_string() })
+    }
 
-        let row_count = combined_rows.len();
-        Ok(QueryResult {
-            rows: combined_rows,
-            row_count,
-            fields: left_res.fields,
-            command: "SELECT".to_string(),
-        })
+    /// Tính một biểu thức tập hợp: (tên cột, các dòng theo vị trí, kiểu cột của vế trái).
+    fn eval_set_expr(&mut self, s: &str, params: &[Value]) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>, Vec<FieldInfo>), String> {
+        let s = s.trim();
+        // UNION/EXCEPT ưu tiên thấp nhất, kết hợp trái: tách ở lần xuất hiện cuối; sau đó INTERSECT.
+        let split = ["UNION", "EXCEPT"]
+            .iter()
+            .filter_map(|kw| last_top_level_keyword(s, kw).map(|p| (p, *kw)))
+            .max_by_key(|(p, _)| *p)
+            .or_else(|| last_top_level_keyword(s, "INTERSECT").map(|p| (p, "INTERSECT")));
+        let Some((pos, op)) = split else {
+            let mut q = s;
+            while q.starts_with('(') && q.ends_with(')') && is_fully_enclosed_in_parens(q) {
+                q = q[1..q.len() - 1].trim();
+            }
+            let res = self.execute(q, params)?;
+            let names: Vec<String> = if !res.fields.is_empty() {
+                res.fields.iter().map(|f| f.name.clone()).collect()
+            } else {
+                res.rows.first().and_then(|r| r.as_object()).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+            };
+            let rows = res
+                .rows
+                .iter()
+                .map(|r| match r.as_object() {
+                    Some(m) => names.iter().map(|n| m.get(n).cloned().unwrap_or(serde_json::Value::Null)).collect(),
+                    None => vec![r.clone()],
+                })
+                .collect();
+            return Ok((names, rows, res.fields));
+        };
+        let left = &s[..pos];
+        let mut right = s[pos + op.len()..].trim_start();
+        let mut all = false;
+        if right.len() > 3 && right[..3].eq_ignore_ascii_case("ALL") && right.as_bytes()[3].is_ascii_whitespace() {
+            all = true;
+            right = right[3..].trim_start();
+        } else if right.len() > 8 && right[..8].eq_ignore_ascii_case("DISTINCT") && right.as_bytes()[8].is_ascii_whitespace() {
+            right = right[8..].trim_start();
+        }
+        let (names, lrows, fields) = self.eval_set_expr(left, params)?;
+        let (rnames, rrows, _) = self.eval_set_expr(right, params)?;
+        if !lrows.is_empty() && !rrows.is_empty() && rnames.len() != names.len() {
+            return Err(format!("each {} query must have the same number of columns", op));
+        }
+        let key = |r: &Vec<serde_json::Value>| serde_json::to_string(r).unwrap_or_default();
+        let rows: Vec<Vec<serde_json::Value>> = match op {
+            "UNION" => {
+                let mut out = lrows;
+                out.extend(rrows);
+                if !all {
+                    let mut seen = std::collections::HashSet::new();
+                    out.retain(|r| seen.insert(key(r)));
+                }
+                out
+            }
+            "INTERSECT" => {
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                for r in &rrows {
+                    *counts.entry(key(r)).or_default() += 1;
+                }
+                let mut seen = std::collections::HashSet::new();
+                lrows
+                    .into_iter()
+                    .filter(|r| {
+                        let k = key(r);
+                        match counts.get_mut(&k) {
+                            Some(c) if *c > 0 => {
+                                if all {
+                                    *c -= 1;
+                                    true
+                                } else {
+                                    seen.insert(k)
+                                }
+                            }
+                            _ => false,
+                        }
+                    })
+                    .collect()
+            }
+            _ => {
+                // EXCEPT
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                for r in &rrows {
+                    *counts.entry(key(r)).or_default() += 1;
+                }
+                let mut seen = std::collections::HashSet::new();
+                lrows
+                    .into_iter()
+                    .filter(|r| {
+                        let k = key(r);
+                        if all {
+                            match counts.get_mut(&k) {
+                                Some(c) if *c > 0 => {
+                                    *c -= 1;
+                                    false
+                                }
+                                _ => true,
+                            }
+                        } else {
+                            !counts.contains_key(&k) && seen.insert(k)
+                        }
+                    })
+                    .collect()
+            }
+        };
+        Ok((names, rows, fields))
     }
 
     fn handle_cte(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
@@ -1380,7 +1491,16 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         }
 
         let joined_schema = std::sync::Arc::new(JoinedSchema::new(&all_tables_meta));
-        let pushdown = plan_predicate_pushdown(resolved_where.as_deref(), &all_tables_meta, &joins);
+        let mut pushdown = plan_predicate_pushdown(resolved_where.as_deref(), &all_tables_meta, &joins);
+        if joins.iter().any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full)) {
+            // WHERE áp sau JOIN: không lọc trước bảng có thể bị bổ sung dòng NULL
+            let base = std::mem::take(&mut pushdown.base_predicates);
+            pushdown.remaining_where.extend(base);
+            for preds in pushdown.intermediate_predicates.iter_mut() {
+                let moved = std::mem::take(preds);
+                pushdown.remaining_where.extend(moved);
+            }
+        }
         let compiled_base_preds: Vec<CompiledExpr> = pushdown.base_predicates.iter()
             .map(|p| compile_expr_for_joined(p, &joined_schema))
             .collect();
@@ -1418,7 +1538,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         }
 
         for (j_idx, j) in joins.iter().enumerate() {
-            if current_rows.is_empty() {
+            if current_rows.is_empty() && !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
                 break;
             }
 
@@ -1454,7 +1574,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                     }
 
-                    if match_count == 0 && j.kind == JoinKind::Left {
+                    if match_count == 0 && matches!(j.kind, JoinKind::Left | JoinKind::Full) {
                         let mut null_comb = base_comb.clone();
                         for field in &sub_res.fields {
                             let col_name = field.name.to_lowercase();
@@ -1509,7 +1629,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 equi.left_slot = joined_schema.get_slot(&equi.left_expr)
                     .or_else(|| joined_schema.get_slot(&clean_col_name(&equi.left_expr)));
 
-                let should_build_left = j.kind != JoinKind::Left && current_rows.len() < j_table.rows.len();
+                let should_build_left = !matches!(j.kind, JoinKind::Left | JoinKind::Full) && current_rows.len() < j_table.rows.len();
 
                 if should_build_left {
                     // Adaptive Hash Join: Build hash table on current_rows (smaller), Probe j_table
@@ -1639,7 +1759,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
                         }
 
-                        if match_count == 0 && j.kind == JoinKind::Left {
+                        if match_count == 0 && matches!(j.kind, JoinKind::Left | JoinKind::Full) {
                             let null_comb = base_comb.with_null_table(j_table.columns.len());
                             next_rows.push(null_comb);
                         }
@@ -1686,9 +1806,30 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
                         }
                     }
-                    if match_count == 0 && j.kind == JoinKind::Left {
+                    if match_count == 0 && matches!(j.kind, JoinKind::Left | JoinKind::Full) {
                         let null_comb = base_comb.with_null_table(j_table.columns.len());
                         next_rows.push(null_comb);
+                    }
+                }
+            }
+
+            // RIGHT / FULL: dòng bên phải không khớp dòng nào bên trái -> bên trái NULL
+            if matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+                for (jr_idx, jr) in j_table.rows.iter().enumerate() {
+                    if j_table.is_deleted[jr_idx] {
+                        continue;
+                    }
+                    let matched = current_rows.iter().any(|base_comb| {
+                        let candidate = base_comb.with_joined_table(jr);
+                        match &compiled_on_cond {
+                            Some(expr) => expr.eval_joined(&candidate, params) == Some(true),
+                            None => true,
+                        }
+                    });
+                    if !matched {
+                        let mut null_base = CombinedRow::new_with_schema(joined_schema.clone());
+                        null_base.values.resize(table_offset, Value::Null);
+                        next_rows.push(null_base.with_joined_table(jr));
                     }
                 }
             }
@@ -6068,6 +6209,10 @@ enum JoinKind {
     Inner,
     Left,
     Cross,
+    /// RIGHT [OUTER] JOIN: như INNER, thêm các dòng bên phải không khớp (bên trái NULL).
+    Right,
+    /// FULL [OUTER] JOIN: như LEFT, thêm các dòng bên phải không khớp.
+    Full,
 }
 
 #[derive(Clone, Debug)]
@@ -6103,7 +6248,12 @@ impl JoinedSchema {
                 let col_name_lower = col.name.to_lowercase();
 
                 let full_tbl = format!("{}.{}", tbl_name_lower, col_name_lower);
-                col_map.insert(full_tbl, slot);
+                if alias_lower.is_some() {
+                    // Bảng có alias (vd. `JOIN t t2`): tên gốc không được đè lên cùng bảng xuất hiện không alias
+                    col_map.entry(full_tbl).or_insert(slot);
+                } else {
+                    col_map.insert(full_tbl, slot);
+                }
 
                 if let Some(ref a_key) = alias_lower {
                     let alias_tbl = format!("{}.{}", a_key, col_name_lower);
@@ -6626,9 +6776,9 @@ fn parse_from_and_joins(s: &str) -> Result<(String, Option<String>, Option<Strin
             continue;
         }
 
-        if depth == 0 {
+        if depth == 0 && s.is_char_boundary(i) && (b == b',' || b.is_ascii_alphabetic()) && (b == b',' || i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_') {
             let rest = &s[i..];
-            let upper = rest.to_uppercase();
+            let upper: String = rest.chars().take(20).collect::<String>().to_uppercase();
             if b == b',' {
                 positions.push((i, 1, JoinKind::Cross));
                 i += 1;
@@ -6646,6 +6796,15 @@ fn parse_from_and_joins(s: &str) -> Result<(String, Option<String>, Option<Strin
             } else if upper.starts_with("LEFT JOIN") && rest[9..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
                 let ws_len = 9 + rest[9..].chars().take_while(|c| c.is_ascii_whitespace()).count();
                 positions.push((i, ws_len, JoinKind::Left));
+                i += ws_len;
+                continue;
+            } else if let Some((kw_len, kind)) = [("RIGHT OUTER JOIN", JoinKind::Right), ("RIGHT JOIN", JoinKind::Right), ("FULL OUTER JOIN", JoinKind::Full), ("FULL JOIN", JoinKind::Full)]
+                .iter()
+                .find(|(kw, _)| upper.starts_with(kw) && rest[kw.len()..].chars().next().map_or(false, |c| c.is_ascii_whitespace()))
+                .map(|(kw, k)| (kw.len(), k.clone()))
+            {
+                let ws_len = kw_len + rest[kw_len..].chars().take_while(|c| c.is_ascii_whitespace()).count();
+                positions.push((i, ws_len, kind));
                 i += ws_len;
                 continue;
             } else if upper.starts_with("INNER JOIN") && rest[10..].chars().next().map_or(false, |c| c.is_ascii_whitespace()) {
@@ -6692,6 +6851,18 @@ fn parse_from_and_joins(s: &str) -> Result<(String, Option<String>, Option<Strin
                 is_lateral,
             });
         } else {
+            // JOIN ... USING (a, b): đổi thành ON <bảng trước>.a = <bảng này>.a AND ...
+            if let Some(u_pos) = find_top_level_keyword(seg, "USING").filter(|_| find_top_level_keyword(seg, "ON").is_none()) {
+                let tbl_part = seg[..u_pos].trim();
+                let cols_part = seg[u_pos + 5..].trim();
+                let (tbl, alias, subquery, is_lateral) = parse_join_target(tbl_part)?;
+                let inner = cols_part.trim_start_matches('(').trim_end_matches(')');
+                let prev = if k == 0 { base_alias.clone().unwrap_or_else(|| base_name.clone()) } else { joins.last().map(|pj: &ParsedJoin| pj.alias.clone().unwrap_or_else(|| pj.table_name.clone())).unwrap_or_default() };
+                let this = alias.clone().unwrap_or_else(|| tbl.clone());
+                let cond = split_comma_separated_tokens(inner).into_iter().map(|c| format!("{}.{} = {}.{}", prev, c.trim(), this, c.trim())).collect::<Vec<_>>().join(" AND ");
+                joins.push(ParsedJoin { kind: kind.clone(), table_name: tbl, alias, on_condition: Some(cond), subquery, is_lateral });
+                continue;
+            }
             let on_pos = find_top_level_keyword(seg, "ON").ok_or_else(|| format!("Missing ON clause in JOIN: {}", seg))?;
             let tbl_part = seg[..on_pos].trim();
             let on_part = seg[on_pos + 2..].trim();
@@ -9952,6 +10123,22 @@ enum ColOp {
 struct Condition {
     col_idx: usize,
     op: ColOp,
+}
+
+/// Lần xuất hiện CUỐI của từ khoá ở cấp ngoài cùng.
+pub(crate) fn last_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
+    let mut from = 0;
+    let mut last = None;
+    while from < sql.len() {
+        match find_top_level_keyword(&sql[from..], kw) {
+            Some(p) => {
+                last = Some(from + p);
+                from += p + kw.len();
+            }
+            None => break,
+        }
+    }
+    last
 }
 
 pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
