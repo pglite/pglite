@@ -6481,6 +6481,8 @@ pub(crate) struct JoinedSchema {
     pub(crate) col_map: std::collections::HashMap<String, usize>,
     pub(crate) table_offsets: Vec<usize>,
     pub(crate) total_cols: usize,
+    /// Kiểu nguyên khai báo theo slot (chia nguyên / tràn số như PostgreSQL)
+    pub(crate) int_kinds: Vec<Option<crate::engine::inttype::IntKind>>,
 }
 
 impl JoinedSchema {
@@ -6488,6 +6490,7 @@ impl JoinedSchema {
         let mut col_map = std::collections::HashMap::new();
         let mut table_offsets = Vec::with_capacity(tables.len());
         let mut offset = 0;
+        let mut int_kinds = Vec::new();
 
         for (table, alias) in tables {
             table_offsets.push(offset);
@@ -6512,6 +6515,7 @@ impl JoinedSchema {
                 }
 
                 col_map.entry(col_name_lower).or_insert(slot);
+                int_kinds.push(crate::engine::inttype::column_kind_at(table, col_idx));
             }
             offset += table.columns.len();
         }
@@ -6520,6 +6524,7 @@ impl JoinedSchema {
             col_map,
             table_offsets,
             total_cols: offset,
+            int_kinds,
         }
     }
 
@@ -13432,6 +13437,10 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
         }
         "DATE" => match crate::engine::temporal::cast_date(&val.as_str()) {
             Some(d) => Value::text(d),
+            None if crate::engine::temporal::field_out_of_range(&val.as_str()) => {
+                raise(format!("date/time field value out of range: \"{}\"", shown()));
+                Value::Null
+            }
             None => {
                 raise(format!("invalid input syntax for type date: \"{}\"", shown()));
                 Value::Null
@@ -13441,11 +13450,26 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
             let s = val.as_str();
             if crate::engine::temporal::is_valid_timestamp(&s) {
                 val
+            } else if crate::engine::temporal::field_out_of_range(&s) {
+                raise(format!("date/time field value out of range: \"{}\"", s));
+                Value::Null
             } else {
                 raise(format!("invalid input syntax for type timestamp: \"{}\"", s));
                 Value::Null
             }
         }
+        "BOX" => {
+            // PostgreSQL lưu box theo (góc trên phải),(góc dưới trái)
+            let t = val.as_str();
+            let nums: Vec<f64> = t.split(|c: char| matches!(c, '(' | ')' | ',') || c.is_whitespace()).filter(|x| !x.is_empty()).map(|x| x.parse::<f64>()).collect::<Result<_, _>>().unwrap_or_default();
+            if nums.len() != 4 {
+                raise(format!("invalid input syntax for type box: \"{}\"", t));
+                return Value::Null;
+            }
+            let (x1, y1, x2, y2) = (nums[0], nums[1], nums[2], nums[3]);
+            Value::text(format!("({},{}),({},{})", x1.max(x2), y1.max(y2), x1.min(x2), y1.min(y2)))
+        }
+        "JSONPATH" => Value::text(normalize_jsonpath(&val.as_str())),
         "BYTEA" => {
             let raw = get_raw_bytes(&val);
             let items: Vec<serde_json::Value> = raw.iter().map(|&b| serde_json::json!(b)).collect();
@@ -13453,6 +13477,34 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
         }
         _ => val,
     }
+}
+
+/// Text output của jsonpath như PostgreSQL ở dạng đơn giản: khoá sau dấu chấm được đặt trong nháy kép
+/// (`$.a.b[0]` → `$."a"."b"[0]`).
+fn normalize_jsonpath(p: &str) -> String {
+    let mut out = String::with_capacity(p.len() + 4);
+    let mut chars = p.trim().chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '"' {
+            in_str = !in_str;
+        } else if c == '.' && !in_str && chars.peek().is_some_and(|n| n.is_alphabetic() || *n == '_') {
+            let mut key = String::new();
+            while let Some(&n) = chars.peek() {
+                if n.is_alphanumeric() || n == '_' {
+                    key.push(n);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push('"');
+            out.push_str(&key);
+            out.push('"');
+        }
+    }
+    out
 }
 
 pub(crate) fn split_function_args(inner: &str) -> Vec<String> {
@@ -14125,6 +14177,56 @@ fn evaluate_custom_condition(
     eval_sql_expr(cond, primary_row, primary_table, joined_row, joined_table, params).as_bool() == Some(true)
 }
 
+/// Kết quả `pg_typeof(inner)`: suy tĩnh (cột, ép kiểu, literal, hàm quen thuộc), không được thì theo giá
+/// trị lúc chạy.
+fn pg_typeof_value(
+    inner: &str,
+    primary_row: &[Value],
+    primary_table: Option<&crate::storage::table::Table>,
+    joined_row: &[Value],
+    joined_table: Option<&crate::storage::table::Table>,
+    params: &[Value],
+) -> String {
+    let col = |c: &str| {
+        let name = c.rsplit('.').next().unwrap_or(c).trim_matches('"');
+        [primary_table, joined_table]
+            .into_iter()
+            .flatten()
+            .find_map(|t| t.get_column_index(name).and_then(|i| crate::engine::coltypes::column_decl(t, i)))
+    };
+    if let Some(t) = crate::engine::coltypes::pg_typeof(inner, &col) {
+        return t;
+    }
+    match eval_sql_expr(inner, primary_row, primary_table, joined_row, joined_table, params) {
+        Value::Int(i) if i32::try_from(i).is_ok() => "integer",
+        Value::Int(_) => "bigint",
+        Value::Float(_) => "numeric",
+        Value::Bool(_) => "boolean",
+        Value::Null => "unknown",
+        Value::Text(t) if t.starts_with('{') && t.ends_with('}') && t.contains(':') => "jsonb",
+        _ => "text",
+    }
+    .to_string()
+}
+
+/// `a op b` khi cả hai là số nguyên và biểu thức chắc chắn có kiểu nguyên (literal, cột khai báo
+/// INT/BIGINT...): tính theo PostgreSQL (chia nguyên, tràn số 22003). Ngược lại `None` → tính như cũ.
+fn typed_int_arith(
+    op: char,
+    lhs: &Value,
+    rhs: &Value,
+    expr: &str,
+    primary_table: Option<&crate::storage::table::Table>,
+    joined_table: Option<&crate::storage::table::Table>,
+) -> Option<Value> {
+    let (Value::Int(a), Value::Int(b)) = (lhs, rhs) else { return None };
+    let col = |c: &str| {
+        crate::engine::inttype::column_int_kind(primary_table, c).or_else(|| crate::engine::inttype::column_int_kind(joined_table, c))
+    };
+    let kind = crate::engine::inttype::int_kind(expr, &col)?;
+    Some(crate::engine::inttype::int_arith(op, *a, *b, kind))
+}
+
 pub(crate) fn eval_sql_expr(
     expr: &str,
     primary_row: &[Value],
@@ -14571,7 +14673,7 @@ pub(crate) fn eval_sql_expr(
     }
 
     // ROW(...) constructor
-    if upper.starts_with("ROW(") && s.ends_with(')') {
+    if upper.starts_with("ROW(") && s.ends_with(')') && is_fully_enclosed_in_parens(&s[3..]) {
         let inner = &s[4..s.len() - 1].trim();
         if inner.is_empty() {
             return Value::text("[]");
@@ -14587,7 +14689,8 @@ pub(crate) fn eval_sql_expr(
     }
 
     // Anonymous tuple: (10, 20, 30)
-    if s.starts_with('(') && s.ends_with(')') && !upper.starts_with("SELECT") {
+    // `(x)::numeric(5,0)` bắt đầu bằng `(` và kết thúc bằng `)` nhưng không phải tuple
+    if s.starts_with('(') && s.ends_with(')') && !upper.starts_with("SELECT") && is_fully_enclosed_in_parens(s) {
         let inner = &s[1..s.len() - 1].trim();
         let args = split_function_args(inner);
         if args.len() > 1 {
@@ -14600,6 +14703,10 @@ pub(crate) fn eval_sql_expr(
                 .collect();
             return Value::text(serde_json::to_string(&items).unwrap_or_default());
         }
+    }
+
+    if upper.starts_with("PG_TYPEOF(") && s.ends_with(')') && is_fully_enclosed_in_parens(&s[9..]) {
+        return Value::text(pg_typeof_value(&s[10..s.len() - 1], primary_row, primary_table, joined_row, joined_table, params));
     }
 
     // Cryptographic Hashes: MD5, SHA256, SHA224, SHA384, SHA512
@@ -15020,6 +15127,9 @@ pub(crate) fn eval_sql_expr(
         let lhs = eval_sql_expr(s[..op_idx].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let rhs = eval_sql_expr(s[op_idx + 1..].trim(), primary_row, primary_table, joined_row, joined_table, params);
         if lhs.is_null() || rhs.is_null() { return Value::Null; }
+        if let Some(v) = typed_int_arith(op, &lhs, &rhs, s, primary_table, joined_table) {
+            return v;
+        }
         if let Some(v) = crate::engine::temporal::temporal_arith(op, &lhs, &rhs) {
             return v;
         }
@@ -15034,6 +15144,9 @@ pub(crate) fn eval_sql_expr(
         let lhs = eval_sql_expr(s[..op_idx].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let rhs = eval_sql_expr(s[op_idx + 1..].trim(), primary_row, primary_table, joined_row, joined_table, params);
         if lhs.is_null() || rhs.is_null() { return Value::Null; }
+        if let Some(v) = typed_int_arith(op, &lhs, &rhs, s, primary_table, joined_table) {
+            return v;
+        }
         if let (Some(l_num), Some(r_num)) = (lhs.as_f64(), rhs.as_f64()) {
             let res = match op {
                 '*' => l_num * r_num,
@@ -16253,8 +16366,12 @@ impl Executor {
         };
         let mut wire = query_result_to_wire(&res);
         if !wire.rows.is_empty() || !wire.fields.is_empty() {
-            let decls = crate::engine::coltypes::wire_decls(sql, &self.storage, res.fields.len());
+            // INSERT/UPDATE/DELETE ... RETURNING: định dạng như `SELECT <returning> FROM <bảng đích>`
+            let returning_sql = returning_as_select(sql);
+            let shape_sql = returning_sql.as_deref().unwrap_or(sql);
+            let decls = crate::engine::coltypes::wire_decls(shape_sql, &self.storage, res.fields.len());
             apply_wire_decls(&mut wire, &res, &decls);
+            apply_wire_items(&mut wire, &res, shape_sql);
         }
         Ok(wire)
     }
@@ -16309,6 +16426,19 @@ fn fields_to_wire(fields: &[FieldInfo]) -> Vec<crate::pg_types::WireField> {
             type_oid: crate::pg_types::oid_for_type_str(&f.data_type),
         })
         .collect()
+}
+
+/// `INSERT INTO t ... RETURNING a, b` → `SELECT a, b FROM t` (chỉ để suy kiểu / tên cột wire).
+fn returning_as_select(sql: &str) -> Option<String> {
+    let first = sql.trim_start().get(..6)?;
+    if !["INSERT", "UPDATE", "DELETE"].iter().any(|k| first.eq_ignore_ascii_case(k)) || !contains_ci(sql, "RETURNING") {
+        return None;
+    }
+    let lexed = crate::engine::frontend::lex(sql).ok()?;
+    let t = lexed.trim().trim_end_matches(';').trim();
+    let (_, ret) = extract_returning_clause(t);
+    let table = dml_target_table(t)?;
+    Some(format!("SELECT {} FROM {}", ret?, table))
 }
 
 /// Tên bảng đích của INSERT INTO t / UPDATE t / DELETE FROM t.
@@ -16411,6 +16541,79 @@ fn decode_quoted_idents(res: Result<QueryResult, String>) -> Result<QueryResult,
 }
 
 /// Định dạng lại các cột wire có kiểu khai báo (OID, scale numeric, timestamp, char(n)...).
+/// Đặt tên cột wire theo quy tắc PostgreSQL (kể cả nhiều cột cùng tên `?column?`) và in mảng / record /
+/// bytea do hàm trả về theo định dạng PostgreSQL. Chỉ áp khi chắc thứ tự cột khớp danh sách SELECT: mọi
+/// phần tử có alias / là cột đã mang đúng tên đó.
+fn apply_wire_items(wire: &mut crate::pg_types::WireResult, res: &QueryResult, sql: &str) {
+    use crate::engine::select_list::WireShape;
+    let Some(items) = crate::engine::select_list::wire_names(sql) else { return };
+    if items.len() != wire.fields.len() {
+        return;
+    }
+    let aligned = items.iter().zip(&wire.fields).all(|((n, certain, _), f)| {
+        if *certain {
+            f.name.eq_ignore_ascii_case(n)
+        } else {
+            !items.iter().any(|(m, c, _)| *c && f.name.eq_ignore_ascii_case(m))
+        }
+    });
+    if !aligned {
+        return;
+    }
+    for (i, (_, _, expr)) in items.iter().enumerate() {
+        let Some(shape) = crate::engine::select_list::wire_shape(expr) else { continue };
+        let key = wire.fields[i].name.clone();
+        let mut oid = None;
+        for (r, row) in res.rows.iter().enumerate() {
+            let Some(v) = row.get(&key) else { continue };
+            // chế độ raw text: mảng / record đến dưới dạng chuỗi JSON
+            let parsed;
+            let v = match v {
+                serde_json::Value::String(t) if t.starts_with('[') && !matches!(shape, WireShape::ByteaText | WireShape::ByteaHex) => {
+                    match serde_json::from_str::<serde_json::Value>(t) {
+                        Ok(p) => {
+                            parsed = p;
+                            &parsed
+                        }
+                        Err(_) => v,
+                    }
+                }
+                _ => v,
+            };
+            let Some(cell) = wire.rows.get_mut(r).and_then(|w| w.get_mut(i)) else { continue };
+            let text = match (shape, v) {
+                (WireShape::Array { constructor }, serde_json::Value::Array(a)) => {
+                    let (t, o) = crate::pg_types::json_to_pg_array(a, constructor);
+                    oid = oid.or(Some(o));
+                    t
+                }
+                (WireShape::Record, serde_json::Value::Array(a)) => {
+                    oid = Some(crate::pg_types::OID_RECORD);
+                    crate::pg_types::json_to_pg_record(a)
+                }
+                (WireShape::ByteaText, serde_json::Value::String(s)) => {
+                    oid = Some(crate::pg_types::OID_BYTEA);
+                    if s.starts_with("\\x") { s.clone() } else { crate::pg_types::bytes_to_hex(s.as_bytes()) }
+                }
+                (WireShape::ByteaHex, serde_json::Value::String(s)) if s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    oid = Some(crate::pg_types::OID_BYTEA);
+                    format!("\\x{}", s)
+                }
+                _ => continue,
+            };
+            *cell = Some(text);
+        }
+        if let Some(o) = oid {
+            if !matches!(shape, WireShape::Array { .. }) || !crate::pg_types::is_array_oid_pub(wire.fields[i].type_oid) {
+                wire.fields[i].type_oid = o;
+            }
+        }
+    }
+    for ((n, _, _), f) in items.into_iter().zip(wire.fields.iter_mut()) {
+        f.name = n;
+    }
+}
+
 fn apply_wire_decls(wire: &mut crate::pg_types::WireResult, res: &QueryResult, decls: &[Option<crate::engine::coltypes::DeclType>]) {
     if decls.is_empty() {
         return;

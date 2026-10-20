@@ -42,6 +42,8 @@ pub enum CompiledExpr {
     Div(Box<CompiledExpr>, Box<CompiledExpr>),
     Mod(Box<CompiledExpr>, Box<CompiledExpr>),
     Pow(Box<CompiledExpr>, Box<CompiledExpr>),
+    /// + - * / % giữa hai biểu thức chắc chắn có kiểu nguyên (chia nguyên, tràn số 22003)
+    IntArith(char, crate::engine::inttype::IntKind, Box<CompiledExpr>, Box<CompiledExpr>),
     BitAnd(Box<CompiledExpr>, Box<CompiledExpr>),
     BitOr(Box<CompiledExpr>, Box<CompiledExpr>),
     BitXor(Box<CompiledExpr>, Box<CompiledExpr>),
@@ -406,6 +408,23 @@ impl CompiledExpr {
                         Value::Null
                     }
                     _ => Value::Null,
+                }
+            }
+            CompiledExpr::IntArith(op, kind, l, r) => {
+                let vl = l.eval(primary_row, joined_row, params);
+                let vr = r.eval(primary_row, joined_row, params);
+                match (&vl, &vr) {
+                    (Value::Int(a), Value::Int(b)) => crate::engine::inttype::int_arith(*op, *a, *b, *kind),
+                    _ => {
+                        let fallback = match op {
+                            '+' => CompiledExpr::Add(Box::new(CompiledExpr::Literal(vl)), Box::new(CompiledExpr::Literal(vr))),
+                            '-' => CompiledExpr::Sub(Box::new(CompiledExpr::Literal(vl)), Box::new(CompiledExpr::Literal(vr))),
+                            '*' => CompiledExpr::Mul(Box::new(CompiledExpr::Literal(vl)), Box::new(CompiledExpr::Literal(vr))),
+                            '/' => CompiledExpr::Div(Box::new(CompiledExpr::Literal(vl)), Box::new(CompiledExpr::Literal(vr))),
+                            _ => CompiledExpr::Mod(Box::new(CompiledExpr::Literal(vl)), Box::new(CompiledExpr::Literal(vr))),
+                        };
+                        fallback.eval(primary_row, joined_row, params)
+                    }
                 }
             }
             CompiledExpr::Pow(l, r) => {
@@ -1293,6 +1312,14 @@ pub fn compile_expr(
     }
 
     // 13. Arithmetic (+, -, *, /, %)
+    if let Some(kind) = arith_int_kind(s, &|c| {
+        crate::engine::inttype::column_int_kind(table, c).or_else(|| crate::engine::inttype::column_int_kind(joined_table, c))
+    }) {
+        let (op_idx, op) = kind.1;
+        let l = compile_expr(&s[..op_idx], table, table_alias, joined_table, joined_alias);
+        let r = compile_expr(&s[op_idx + 1..], table, table_alias, joined_table, joined_alias);
+        return CompiledExpr::IntArith(op, kind.0, Box::new(l), Box::new(r));
+    }
     if let Some((op_idx, op)) = crate::engine::executor::find_top_level_math_op(s, &['+', '-']) {
         let l = compile_expr(&s[..op_idx], table, table_alias, joined_table, joined_alias);
         let r = compile_expr(&s[op_idx + 1..], table, table_alias, joined_table, joined_alias);
@@ -1649,6 +1676,12 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     // Arithmetic (+, -, *, /, %)
+    if let Some(kind) = arith_int_kind(s, &|c| joined_schema.get_slot(c).and_then(|i| joined_schema.int_kinds.get(i).copied().flatten())) {
+        let (op_idx, op) = kind.1;
+        let l = compile_expr_for_joined(&s[..op_idx], joined_schema);
+        let r = compile_expr_for_joined(&s[op_idx + 1..], joined_schema);
+        return CompiledExpr::IntArith(op, kind.0, Box::new(l), Box::new(r));
+    }
     if let Some((op_idx, op)) = crate::engine::executor::find_top_level_math_op(s, &['+', '-']) {
         let l = compile_expr_for_joined(&s[..op_idx], joined_schema);
         let r = compile_expr_for_joined(&s[op_idx + 1..], joined_schema);
@@ -1780,6 +1813,16 @@ pub(crate) fn compile_expr_for_joined(
     }
 
     CompiledExpr::Raw(s.to_string())
+}
+
+/// Phép tính số học ở cấp ngoài cùng của `s` mà hai vế chắc chắn là số nguyên: (kiểu, (vị trí, toán tử)).
+fn arith_int_kind(s: &str, col: &dyn Fn(&str) -> Option<crate::engine::inttype::IntKind>) -> Option<(crate::engine::inttype::IntKind, (usize, char))> {
+    let pos = crate::engine::executor::find_top_level_math_op(s, &['+', '-']).or_else(|| crate::engine::executor::find_top_level_math_op(s, &['*', '/', '%']))?;
+    if s[..pos.0].trim().is_empty() {
+        return None;
+    }
+    let kind = crate::engine::inttype::int_kind(s, col)?;
+    Some((kind, pos))
 }
 
 fn is_enclosed(s: &str) -> bool {

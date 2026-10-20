@@ -142,6 +142,10 @@ pub fn oid_for_type_str(s: &str) -> u32 {
     }
 }
 
+pub fn is_array_oid_pub(oid: u32) -> bool {
+    is_array_oid(oid)
+}
+
 fn is_array_oid(oid: u32) -> bool {
     matches!(
         oid,
@@ -173,6 +177,7 @@ pub fn to_pg_text(v: &serde_json::Value, oid: u32) -> Option<String> {
             Some(n.to_string())
         }
         J::String(s) => Some(string_to_pg_text(s, oid)),
+        J::Array(_) | J::Object(_) if oid == OID_JSONB => Some(jsonb_text(v)),
         J::Array(items) => {
             if oid == OID_JSON || oid == OID_JSONB {
                 Some(v.to_string())
@@ -192,8 +197,56 @@ pub fn to_pg_text(v: &serde_json::Value, oid: u32) -> Option<String> {
     }
 }
 
+/// Text output của jsonb như PostgreSQL: `{"a": 1, "b": [1, 2]}`, khoá xếp theo độ dài rồi theo byte,
+/// khoá trùng giữ giá trị cuối.
+pub fn jsonb_text(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_jsonb(v, &mut out);
+    out
+}
+
+fn write_jsonb(v: &serde_json::Value, out: &mut String) {
+    use serde_json::Value as J;
+    match v {
+        J::Array(a) => {
+            out.push('[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_jsonb(x, out);
+            }
+            out.push(']');
+        }
+        J::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes())));
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&J::String((*k).clone()).to_string());
+                out.push_str(": ");
+                write_jsonb(&m[*k], out);
+            }
+            out.push('}');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 fn string_to_pg_text(s: &str, oid: u32) -> String {
     match oid {
+        OID_JSONB => {
+            let t = s.trim_start();
+            if t.starts_with('{') || t.starts_with('[') {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+                    return jsonb_text(&v);
+                }
+            }
+            s.to_string()
+        }
         OID_BOOL => match s.trim().to_lowercase().as_str() {
             "true" | "t" | "1" | "yes" | "on" => "t".to_string(),
             "false" | "f" | "0" | "no" | "off" => "f".to_string(),
@@ -259,13 +312,89 @@ pub fn normalize_timestamptz(s: &str) -> String {
     out
 }
 
-fn bytes_to_hex(b: &[u8]) -> String {
+pub fn bytes_to_hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(2 + b.len() * 2);
     s.push_str("\\x");
     for byte in b {
         s.push_str(&format!("{:02x}", byte));
     }
     s
+}
+
+pub const OID_RECORD: u32 = 2249;
+
+/// Mảng JSON do engine trả cho một biểu thức mảng (hàm `array_*`, `ARRAY[...]`) → text mảng PostgreSQL
+/// và OID mảng theo kiểu phần tử. `nested_strings`: phần tử là chuỗi `[..]` (mảng con ở chế độ raw text)
+/// được coi là mảng con.
+pub fn json_to_pg_array(items: &[serde_json::Value], nested_strings: bool) -> (String, u32) {
+    use serde_json::Value as J;
+    fn expand(v: &J, nested: bool) -> J {
+        match v {
+            J::String(s) if nested && s.starts_with('[') => match serde_json::from_str::<J>(s) {
+                Ok(J::Array(a)) => J::Array(a.iter().map(|x| expand(x, nested)).collect()),
+                _ => v.clone(),
+            },
+            J::Array(a) => J::Array(a.iter().map(|x| expand(x, nested)).collect()),
+            _ => v.clone(),
+        }
+    }
+    let items: Vec<J> = items.iter().map(|x| expand(x, nested_strings)).collect();
+    fn leaves<'a>(v: &'a J, out: &mut Vec<&'a J>) {
+        match v {
+            J::Array(a) => a.iter().for_each(|x| leaves(x, out)),
+            J::Null => {}
+            other => out.push(other),
+        }
+    }
+    let mut ls = Vec::new();
+    items.iter().for_each(|x| leaves(x, &mut ls));
+    let oid = if ls.is_empty() {
+        OID_TEXT_ARRAY
+    } else if ls.iter().all(|x| x.as_i64().is_some_and(|i| i32::try_from(i).is_ok())) {
+        OID_INT4_ARRAY
+    } else if ls.iter().all(|x| x.is_i64() || x.is_u64()) {
+        OID_INT8_ARRAY
+    } else if ls.iter().all(|x| x.is_number()) {
+        OID_NUMERIC_ARRAY
+    } else if ls.iter().all(|x| x.is_boolean()) {
+        OID_BOOL_ARRAY
+    } else {
+        OID_TEXT_ARRAY
+    };
+    (json_array_to_pg_array(&items), oid)
+}
+
+/// `[1,"a",null]` (giá trị engine của `ROW(1,'a',NULL)`) → `(1,a,)` như output của kiểu record.
+pub fn json_to_pg_record(items: &[serde_json::Value]) -> String {
+    use serde_json::Value as J;
+    let mut out = String::from("(");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let s = match item {
+            J::Null => continue,
+            J::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+            J::Number(n) => n.to_string(),
+            J::String(s) => s.clone(),
+            J::Array(a) => json_array_to_pg_array(a),
+            J::Object(_) => item.to_string(),
+        };
+        if s.is_empty() || s.chars().any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace()) {
+            out.push('"');
+            for c in s.chars() {
+                if c == '"' || c == '\\' {
+                    out.push(c);
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&s);
+        }
+    }
+    out.push(')');
+    out
 }
 
 /// `["a","b c",null,1]` → `{a,"b c",NULL,1}`
@@ -607,7 +736,8 @@ mod tests {
         assert_eq!(to_pg_text(&json!(["x", "y z", null]), OID_TEXT_ARRAY).as_deref(), Some("{x,\"y z\",NULL}"));
         assert_eq!(to_pg_text(&json!("[1,2]"), OID_INT4_ARRAY).as_deref(), Some("{1,2}"));
         assert_eq!(to_pg_text(&json!("[7831,7832]"), OID_TEXT).as_deref(), Some("[7831,7832]"));
-        assert_eq!(to_pg_text(&json!({"a": 1}), OID_JSONB).as_deref(), Some("{\"a\":1}"));
+        assert_eq!(to_pg_text(&json!({"a": 1}), OID_JSONB).as_deref(), Some("{\"a\": 1}"));
+        assert_eq!(to_pg_text(&json!({"bb": [1, 2], "a": "x"}), OID_JSONB).as_deref(), Some("{\"a\": \"x\", \"bb\": [1, 2]}"));
         assert_eq!(to_pg_text(&json!([1, 2]), OID_BYTEA).as_deref(), Some("\\x0102"));
         assert_eq!(to_pg_text(&json!("2026-10-12 08:00:00"), OID_TIMESTAMPTZ).as_deref(), Some("2026-10-12 08:00:00+00"));
         assert_eq!(to_pg_text(&json!("2026-10-12T08:00:00Z"), OID_TIMESTAMPTZ).as_deref(), Some("2026-10-12 08:00:00+00"));
@@ -656,7 +786,11 @@ pub fn sqlstate(message: &str) -> &'static str {
         "23514"
     } else if has("current transaction is aborted") {
         "25P02"
-    } else if (has("out of range") || has("numeric field overflow")) {
+    } else if has("date/time field value out of range") {
+        "22008"
+    } else if ["date", "time", "timestamp", "timestamp with time zone", "time with time zone", "interval"].iter().any(|t| has(&format!("invalid input syntax for type {}:", t))) {
+        "22007"
+    } else if has("out of range") || has("numeric field overflow") {
         "22003"
     } else if has("value too long") {
         "22001"

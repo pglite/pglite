@@ -73,6 +73,11 @@ fn main() {
                 db.query("SELECT count(*), avg(age) FROM plain WHERE active = true AND age > 30", &[]).unwrap();
             }
         }));
+        rec("scan_arith_20x", time(|| {
+            for _ in 0..20 {
+                db.query("SELECT id, age * 2 + id / 3 AS x FROM plain WHERE age + 1 > 30", &[]).unwrap();
+            }
+        }));
         rec("bulk_update_tx", time(|| {
             db.execute("BEGIN", &[]).unwrap();
             db.execute("UPDATE plain SET active = NOT active WHERE age < 45", &[]).unwrap();

@@ -55,6 +55,7 @@ fn type_column_name(t: &str) -> String {
         "timestamp with time zone" | "timestamptz" => "timestamptz",
         "time without time zone" | "time" => "time",
         "time with time zone" | "timetz" => "timetz",
+        "bit varying" | "varbit" => "varbit",
         other => return if is_array { other.to_string() } else { other.to_string() },
     };
     name.to_string()
@@ -81,19 +82,24 @@ pub(crate) fn default_column_name(expr: &str) -> String {
             return name.to_string();
         }
     }
-    if let Some(p) = find_last_top_level_op(s, "::") {
-        let inner = default_column_name(&s[..p]);
-        return if inner == "?column?" { type_column_name(&s[p + 2..]) } else { inner };
+    // phép toán hai ngôi ở cấp ngoài cùng (`created - '1 hour'::interval`): ép kiểu chỉ thuộc vế phải
+    let case_expr = up.starts_with("CASE") && up.ends_with("END");
+    if !case_expr
+        && (super::executor::find_top_level_math_op(s, &['+', '-', '*', '/', '%']).is_some_and(|(p, _)| !s[..p].trim().is_empty())
+            || ["||", "#>", "=", "<", ">", "@>", "<@"].iter().any(|op| super::executor::find_top_level_op(s, op).is_some_and(|p| p > 0)))
+    {
+        return "?column?".to_string();
     }
-    if up.starts_with("CAST(") && s.ends_with(')') {
-        let inside = &s[5..s.len() - 1];
-        if let Some(a) = find_top_level_keyword(inside, "AS") {
-            let inner = default_column_name(&inside[..a]);
-            return if inner == "?column?" { type_column_name(&inside[a + 2..]) } else { inner };
+    if find_last_top_level_op(s, "::").is_some() || up.starts_with("CAST(") && s.ends_with(')') {
+        if let Some((name, _)) = cast_name(s) {
+            return name;
         }
     }
     if up.starts_with("CASE") && up.ends_with("END") {
         return "case".to_string();
+    }
+    if up.starts_with("ROW(") && s.ends_with(')') {
+        return "row".to_string();
     }
     if up.starts_with("ARRAY[") || up.starts_with("ARRAY(") {
         return "array".to_string();
@@ -122,6 +128,35 @@ pub(crate) fn default_column_name(expr: &str) -> String {
         }
     }
     "?column?".to_string()
+}
+
+/// Tên cột của một ép kiểu theo FigureColname của PostgreSQL: (tên, độ mạnh). Cột / hàm bên trong
+/// (độ mạnh 2) thắng tên kiểu (`n::numeric::text` → `n`); ép kiểu lồng của hằng thì kiểu ngoài cùng
+/// thắng (`'1'::bit(1)::varbit` → `varbit`).
+fn cast_name(s: &str) -> Option<(String, u8)> {
+    let mut s = s.trim();
+    while s.starts_with('(') && s.ends_with(')') && super::executor::is_fully_enclosed_pub(s) {
+        s = s[1..s.len() - 1].trim();
+    }
+    let (arg, ty) = if let Some(p) = find_last_top_level_op(s, "::") {
+        (&s[..p], &s[p + 2..])
+    } else if s.len() > 5 && s[..5].eq_ignore_ascii_case("CAST(") && s.ends_with(')') {
+        let inside = &s[5..s.len() - 1];
+        let a = find_top_level_keyword(inside, "AS")?;
+        (&inside[..a], &inside[a + 2..])
+    } else {
+        let n = default_column_name(s);
+        let strength = if n == "?column?" {
+            0
+        } else if s.ends_with('\'') {
+            1 // literal có kiểu: INTERVAL '1 day'
+        } else {
+            2
+        };
+        return Some((n, strength));
+    };
+    let (inner, strength) = cast_name(arg)?;
+    Some(if strength > 1 { (inner, strength) } else { (type_column_name(ty), 1) })
 }
 
 /// Alias không có `AS` ở cuối phần tử: (biểu thức, alias).
@@ -166,7 +201,11 @@ fn alias_can_follow(expr: &str) -> bool {
     // từ cuối của biểu thức không được là từ khoá (vd. `x IS NOT` + `NULL` đã loại ở trên)
     let w_start = expr.rfind(|c: char| !is_ident_char(c)).map(|p| p + 1).unwrap_or(0);
     let w = &expr[w_start..];
-    if !w.is_empty() && is_keyword(w) && !matches!(w.to_uppercase().as_str(), "END" | "NULL" | "TRUE" | "FALSE" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME") {
+    // `'x'::timestamp a`, `x::double precision v`: từ cuối là tên kiểu sau `::`
+    let after_cast = find_last_top_level_op(expr, "::").is_some_and(|p| {
+        expr[p + 2..].chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '_' || c == '(' || c == ')' || c == ',' || c == '[' || c == ']')
+    });
+    if !w.is_empty() && is_keyword(w) && !after_cast && !matches!(w.to_uppercase().as_str(), "END" | "NULL" | "TRUE" | "FALSE" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME") {
         return false;
     }
     // cả biểu thức phải "đóng": số ngoặc cân bằng và không ở trong chuỗi
@@ -271,4 +310,93 @@ pub(crate) fn normalize_select_sql(sql: &str) -> Option<String> {
         return None;
     }
     Some(format!("{} {} {}", t[..list_start].trim_end(), out_items.join(", "), &t[end..]).trim_end().to_string())
+}
+
+/// Tên cột PostgreSQL cho từng phần tử của danh sách SELECT (đường wire): alias nếu có, ngược lại tên
+/// mặc định (`?column?`, `int4`, `count`...) — kể cả khi nhiều cột trùng tên, điều mà kết quả dạng object
+/// không giữ được. `None` khi không chắc (có `*`, không phải SELECT, nhiều câu lệnh...). Cờ đi kèm:
+/// tên chắc chắn đã là tên cột engine trả về (alias, tham chiếu cột) — dùng để kiểm tra khớp vị trí.
+pub(crate) fn wire_names(sql: &str) -> Option<Vec<(String, bool, String)>> {
+    let lexed = super::frontend::lex(sql).ok()?;
+    let mut t = lexed.trim().trim_end_matches(';').trim();
+    if t.len() < 7 || !t[..6].eq_ignore_ascii_case("SELECT") || !t.as_bytes()[6].is_ascii_whitespace() || t.contains(';') {
+        return None;
+    }
+    for kw in ["UNION", "INTERSECT", "EXCEPT"] {
+        if let Some(p) = find_top_level_keyword(t, kw) {
+            t = t[..p].trim_end();
+        }
+    }
+    let end = select_list_end(t);
+    let mut list = t.get(6..end)?.trim_start();
+    let up = list.to_uppercase();
+    if up.starts_with("DISTINCT ON") {
+        let open = list.find('(')?;
+        let close = super::constraints::matching_paren(list, open)?;
+        list = &list[close + 1..];
+    } else if up.starts_with("DISTINCT ") {
+        list = &list[9..];
+    } else if up.starts_with("ALL ") {
+        list = &list[4..];
+    }
+    let mut out = Vec::new();
+    for item in split_projection_items_pub(list) {
+        let it = item.trim();
+        if it.is_empty() || it == "*" || it.ends_with(".*") {
+            return None;
+        }
+        let (name, certain, expr) = if let Some(p) = find_top_level_keyword(it, "AS") {
+            let a = it[p + 2..].trim();
+            (if a.starts_with('"') { a.trim_matches('"').replace("\"\"", "\"") } else { a.to_lowercase() }, true, it[..p].trim())
+        } else if let (Some((expr, alias)), false) = (implicit_alias(it), is_column_ref(it)) {
+            (alias, true, expr)
+        } else {
+            (default_column_name(it), is_column_ref(it), it)
+        };
+        out.push((super::frontend::decode_all(&name).into_owned(), certain, expr.to_string()));
+    }
+    Some(out)
+}
+
+/// Loại giá trị đặc biệt của một biểu thức SELECT mà engine trả dạng JSON/chuỗi nhưng PostgreSQL in
+/// theo kiểu riêng (đường wire).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum WireShape {
+    /// mảng: `ARRAY[...]`, `string_to_array(...)`, `array_append(...)`...
+    Array { constructor: bool },
+    /// `ROW(...)`, `(a, b)`
+    Record,
+    /// bytea từ `decode(...)` (engine trả chuỗi byte)
+    ByteaText,
+    /// bytea từ `sha256(...)`... (engine trả hex)
+    ByteaHex,
+}
+
+pub(crate) fn wire_shape(expr: &str) -> Option<WireShape> {
+    let mut s = expr.trim();
+    while s.starts_with('(') && s.ends_with(')') && super::executor::is_fully_enclosed_pub(s) {
+        let inner = s[1..s.len() - 1].trim();
+        if super::executor::split_comma_separated_tokens(inner).len() > 1 {
+            return Some(WireShape::Record);
+        }
+        s = inner;
+    }
+    let up = s.to_uppercase();
+    if up.starts_with("ARRAY[") && s.ends_with(']') {
+        return Some(WireShape::Array { constructor: true });
+    }
+    let open = s.find('(')?;
+    if !s.ends_with(')') || super::constraints::matching_paren(s, open) != Some(s.len() - 1) {
+        return None;
+    }
+    match up[..open].trim() {
+        "ROW" => Some(WireShape::Record),
+        "ARRAY" => Some(WireShape::Array { constructor: true }),
+        "STRING_TO_ARRAY" | "REGEXP_SPLIT_TO_ARRAY" | "REGEXP_MATCH" | "ARRAY_APPEND" | "ARRAY_PREPEND" | "ARRAY_CAT" | "ARRAY_REMOVE"
+        | "ARRAY_REPLACE" | "ARRAY_AGG" | "ARRAY_FILL" | "ARRAY_POSITIONS" | "TRIM_ARRAY" | "ARRAY_REVERSE" | "ARRAY_SORT"
+        | "ARRAY_SHUFFLE" | "ARRAY_SAMPLE" => Some(WireShape::Array { constructor: false }),
+        "DECODE" => Some(WireShape::ByteaText),
+        "SHA224" | "SHA256" | "SHA384" | "SHA512" => Some(WireShape::ByteaHex),
+        _ => None,
+    }
 }

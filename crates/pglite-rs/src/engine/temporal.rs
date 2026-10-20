@@ -102,7 +102,8 @@ pub(crate) fn parse_interval(s: &str) -> Option<Interval> {
 pub(crate) fn format_interval(iv: Interval) -> String {
     let mut parts = Vec::new();
     let (y, mo) = (iv.months / 12, iv.months % 12);
-    let plural = |n: i64, one: &str, many: &str| format!("{} {}", n, if n.abs() == 1 { one } else { many });
+    // PostgreSQL chỉ dùng số ít khi đúng bằng 1: `1 day`, `-1 days`
+    let plural = |n: i64, one: &str, many: &str| format!("{} {}", n, if n == 1 { one } else { many });
     if y != 0 {
         parts.push(plural(y, "year", "years"));
     }
@@ -332,6 +333,13 @@ pub(crate) fn cast_date(s: &str) -> Option<String> {
         return None;
     }
     Some(format!("{:04}-{:02}-{:02}", dt.year, dt.month, dt.day))
+}
+
+/// Chuỗi đúng dạng ngày giờ nhưng trường nằm ngoài miền (`2024-13-01`, `2024-02-30`): PostgreSQL báo
+/// `date/time field value out of range` (22008) thay vì lỗi cú pháp.
+pub(crate) fn field_out_of_range(s: &str) -> bool {
+    let t = s.trim();
+    t.len() >= 8 && t.as_bytes()[0].is_ascii_digit() && special_datetime(t).is_none() && parse_datetime_components(t).is_some_and(|dt| !valid_parts(&dt))
 }
 
 /// Chuỗi có phải timestamp hợp lệ (ngày tháng có thật) không.

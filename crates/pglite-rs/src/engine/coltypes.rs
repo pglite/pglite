@@ -226,10 +226,34 @@ impl DeclType {
                 "money" => 790,
                 "bit" => 1560,
                 "varbit" => 1562,
+                "jsonpath" => 4072,
+                "point" => 600,
+                "box" => 603,
                 _ => return None,
             }
         };
         Some(o)
+    }
+
+    /// Tên kiểu như `format_type()` / `pg_typeof()` của PostgreSQL (không kèm typmod).
+    pub fn sql_name(&self) -> String {
+        let n = match self.base.as_str() {
+            "int2" | "smallserial" => "smallint",
+            "int4" | "serial" => "integer",
+            "int8" | "bigserial" => "bigint",
+            "float4" => "real",
+            "float8" => "double precision",
+            "varchar" => "character varying",
+            "bpchar" => "character",
+            "bool" => "boolean",
+            "timestamp" => "timestamp without time zone",
+            "timestamptz" => "timestamp with time zone",
+            "time" => "time without time zone",
+            "timetz" => "time with time zone",
+            "varbit" => "bit varying",
+            other => other,
+        };
+        if self.array { format!("{}[]", n) } else { n.to_string() }
     }
 
     fn type_label(&self) -> String {
@@ -594,7 +618,7 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
                 }
             }
             if let Some(i) = t.get_column_index(c) {
-                return Some(t.decl_type(i).cloned());
+                return Some(t.decl_type(i).cloned().or_else(|| implied_decl(&t.columns[i].data_type)));
             }
         }
         None
@@ -623,28 +647,279 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
         while e.starts_with('(') && e.ends_with(')') && is_fully_enclosed_in_parens(e) {
             e = e[1..e.len() - 1].trim();
         }
-        let decl = if let Some(d) = col_decl(e) {
-            d
-        } else if let Some(p) = crate::engine::executor::find_last_top_level_op(e, "::") {
-            DeclType::parse(&e[p + 2..])
-        } else if e.len() > 5 && e[..5].eq_ignore_ascii_case("CAST(") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[4..]) {
-            let inner = &e[5..e.len() - 1];
-            find_top_level_keyword(inner, "AS").and_then(|p| DeclType::parse(&inner[p + 2..]))
-        } else if let Some(q) = e.find('\'') {
-            // literal có kiểu: TIMESTAMP '...', DATE '...'
-            let head = e[..q].trim();
-            if !head.is_empty() && head.chars().all(|c| c.is_alphabetic() || c == ' ') && e.ends_with('\'') {
-                DeclType::parse(head).filter(|d| !matches!(d.base.as_str(), "interval"))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // INTERVAL '...' đứng riêng: engine đã trả đúng kiểu và định dạng
+        let decl = expr_decl(e, &col_decl).filter(|d| d.base != "interval" || !e[..e.len().min(8)].eq_ignore_ascii_case("INTERVAL"));
         out.push(decl);
     }
     if out.len() != field_count || out.iter().all(|d| d.is_none()) {
         return vec![];
     }
     out
+}
+
+/// Kiểu khai báo của một biểu thức trong SELECT (đường wire): cột, ép kiểu, literal có kiểu, và một số
+/// dạng suy ra từ chúng (`ts + interval`, `date_trunc(u, ts)`). `col` trả `Some(kiểu?)` khi `e` là cột.
+fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<DeclType> {
+    use crate::engine::executor::{find_top_level_keyword, is_fully_enclosed_in_parens};
+    let mut e = e.trim();
+    while e.starts_with('(') && e.ends_with(')') && is_fully_enclosed_in_parens(e) {
+        e = e[1..e.len() - 1].trim();
+    }
+    if let Some(d) = col(e) {
+        return d;
+    }
+    let is_json = |d: &Option<DeclType>| d.as_ref().is_some_and(|d| !d.array && (d.base == "jsonb" || d.base == "json"));
+    // jsonb: a || b, a - k, a #- p giữ kiểu jsonb; a -> k, a #> p trả jsonb; ->>, #>> trả text
+    for op in ["||", "#-"] {
+        if let Some(p) = crate::engine::executor::find_top_level_op(e, op) {
+            let (dl, dr) = (expr_decl(&e[..p], col), expr_decl(&e[p + op.len()..], col));
+            if is_json(&dl) || is_json(&dr) && op == "||" {
+                return DeclType::parse("jsonb");
+            }
+            return None;
+        }
+    }
+    for op in ["->", "#>"] {
+        if let Some(p) = find_top_level_plain(e, op) {
+            if e[p + 2..].starts_with('>') {
+                return DeclType::parse("text");
+            }
+            return if is_json(&expr_decl(&e[..p], col)) { DeclType::parse("jsonb") } else { None };
+        }
+    }
+    // ts ± interval, date ± interval → timestamp; date ± int → date
+    if let Some((p, _)) = crate::engine::executor::find_top_level_math_op(e, &['+', '-']) {
+        let (l, r) = (e[..p].trim(), e[p + 1..].trim());
+        if l.is_empty() {
+            return None;
+        }
+        let (dl, dr) = (expr_decl(l, col), expr_decl(r, col));
+        let base = |d: &Option<DeclType>| d.as_ref().filter(|d| !d.array).map(|d| d.base.clone()).unwrap_or_default();
+        let (bl, br) = (base(&dl), base(&dr));
+        let temporal = |b: &str| matches!(b, "timestamp" | "timestamptz");
+        return match (bl.as_str(), br.as_str()) {
+            (a, "interval") if temporal(a) => dl,
+            ("interval", b) if temporal(b) => dr,
+            ("date", "interval") | ("interval", "date") => DeclType::parse("timestamp"),
+            ("interval", "interval") => DeclType::parse("interval"),
+            ("jsonb", "text" | "") if e.as_bytes()[p] == b'-' => DeclType::parse("jsonb"),
+            (a, b) => numeric_result(a, b),
+        };
+    }
+    if let Some((p, _)) = crate::engine::executor::find_top_level_math_op(e, &['*', '/', '%']) {
+        let (l, r) = (e[..p].trim(), e[p + 1..].trim());
+        if l.is_empty() {
+            return None;
+        }
+        let base = |d: Option<DeclType>| d.filter(|d| !d.array).map(|d| d.base).unwrap_or_default();
+        return numeric_result(&base(expr_decl(l, col)), &base(expr_decl(r, col)));
+    }
+    if let Some(p) = crate::engine::executor::find_last_top_level_op(e, "::") {
+        return DeclType::parse(&e[p + 2..]);
+    }
+    if e.len() > 5 && e[..5].eq_ignore_ascii_case("CAST(") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[4..]) {
+        let inner = &e[5..e.len() - 1];
+        return find_top_level_keyword(inner, "AS").and_then(|p| DeclType::parse(&inner[p + 2..]));
+    }
+    if e.len() > 10 && e[..10].eq_ignore_ascii_case("DATE_TRUNC") && e.ends_with(')') {
+        let open = e.find('(')?;
+        if is_fully_enclosed_in_parens(&e[open..]) {
+            let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
+            let d = expr_decl(args.get(1)?, col)?;
+            return match d.base.as_str() {
+                "timestamp" | "timestamptz" | "interval" => Some(DeclType { mods: vec![], ..d }),
+                "date" => DeclType::parse("timestamptz"),
+                _ => None,
+            };
+        }
+    }
+    if let Some(q) = e.find('\'') {
+        // literal có kiểu: TIMESTAMP '...', DATE '...', INTERVAL '1 day'
+        let head = e[..q].trim();
+        if !head.is_empty() && head.chars().all(|c| c.is_alphabetic() || c == ' ') && e.ends_with('\'') {
+            return DeclType::parse(head);
+        }
+    }
+    None
+}
+
+/// Kiểu kết quả phép tính số học giữa hai kiểu khai báo (rỗng = chưa biết): numeric thắng số nguyên,
+/// float8 thắng tất cả; chỉ trả khi một vế đã biết là numeric/float (phần số nguyên do engine lo).
+fn numeric_result(a: &str, b: &str) -> Option<DeclType> {
+    let rank = |t: &str| match t {
+        "int2" | "int4" | "int8" | "serial" | "bigserial" | "smallserial" => Some(1),
+        "numeric" | "money" => Some(2),
+        "float4" | "float8" => Some(3),
+        _ => None,
+    };
+    let (ra, rb) = (rank(a), rank(b));
+    let top = match (ra, rb) {
+        (Some(x), Some(y)) => x.max(y),
+        (Some(x), None) | (None, Some(x)) if x >= 2 => x,
+        _ => return None,
+    };
+    match top {
+        2 => DeclType::parse("numeric"),
+        3 => DeclType::parse("float8"),
+        _ => None,
+    }
+}
+
+/// Kiểu khai báo suy từ `DataType` khi bảng không lưu riêng (kiểu không cần thêm thông tin: INT, TEXT,
+/// JSONB...). Timestamp không suy được (bản cũ lưu chung timestamp/timestamptz).
+fn implied_decl(dt: &crate::types::DataType) -> Option<DeclType> {
+    use crate::types::DataType as D;
+    let name = match dt {
+        D::Integer => "int4",
+        D::BigInt => "int8",
+        D::Text => "text",
+        D::Boolean => "bool",
+        D::Numeric => "numeric",
+        D::Date => "date",
+        D::Jsonb => "jsonb",
+        D::Uuid => "uuid",
+        D::Bytea => "bytea",
+        _ => return None,
+    };
+    DeclType::parse(name)
+}
+
+/// Vị trí cuối cùng của `op` ở cấp ngoài cùng (ngoài chuỗi và ngoặc), không có xử lý đặc biệt nào.
+fn find_top_level_plain(s: &str, op: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut in_str, mut last) = (0i32, false, None);
+    for i in 0..b.len() {
+        match b[i] {
+            b'\'' => in_str = !in_str,
+            b'(' | b'[' if !in_str => depth += 1,
+            b')' | b']' if !in_str => depth -= 1,
+            _ if !in_str && depth == 0 && b[i..].starts_with(op.as_bytes()) => last = Some(i),
+            _ => {}
+        }
+    }
+    last
+}
+
+/// Kiểu khai báo của cột thứ `idx` (lưu riêng, hoặc suy từ `DataType`; timestamp cũ coi là timestamptz
+/// như OID engine vẫn báo).
+pub(crate) fn column_decl(t: &crate::storage::table::Table, idx: usize) -> Option<DeclType> {
+    t.decl_type(idx).cloned().or_else(|| match &t.columns.get(idx)?.data_type {
+        crate::types::DataType::Timestamp => DeclType::parse("timestamptz"),
+        crate::types::DataType::Serial => DeclType::parse("int4"),
+        crate::types::DataType::Time => DeclType::parse("time"),
+        crate::types::DataType::Array(e) => DeclType::parse(&format!("{}[]", e.trim_matches('"'))),
+        dt => implied_decl(dt),
+    })
+}
+
+/// `pg_typeof(expr)` suy tĩnh từ biểu thức; `col` trả kiểu của một tham chiếu cột. `None` khi không
+/// suy được (nơi gọi dùng kiểu của giá trị lúc chạy).
+pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Option<String> {
+    use crate::engine::executor::is_fully_enclosed_in_parens;
+    let mut e = e.trim();
+    while e.starts_with('(') && e.ends_with(')') && is_fully_enclosed_in_parens(e) {
+        e = e[1..e.len() - 1].trim();
+    }
+    if e.is_empty() {
+        return None;
+    }
+    let up = e.to_ascii_uppercase();
+    if e.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(match e.parse::<i64>() {
+            Ok(v) if i32::try_from(v).is_ok() => "integer",
+            Ok(_) => "bigint",
+            Err(_) => "numeric",
+        }
+        .into());
+    }
+    if e.bytes().all(|b| b.is_ascii_digit() || b == b'.') || up.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'E' || b == b'-' || b == b'+') && up.contains('E') && up.as_bytes()[0].is_ascii_digit() {
+        return Some("numeric".into());
+    }
+    match up.as_str() {
+        "TRUE" | "FALSE" => return Some("boolean".into()),
+        "NULL" => return Some("unknown".into()),
+        "CURRENT_TIMESTAMP" | "NOW()" | "CLOCK_TIMESTAMP()" | "STATEMENT_TIMESTAMP()" | "TRANSACTION_TIMESTAMP()" => {
+            return Some("timestamp with time zone".into())
+        }
+        "LOCALTIMESTAMP" => return Some("timestamp without time zone".into()),
+        "CURRENT_DATE" => return Some("date".into()),
+        "CURRENT_TIME" => return Some("time with time zone".into()),
+        "LOCALTIME" => return Some("time without time zone".into()),
+        _ => {}
+    }
+    if e.starts_with('\'') && e.ends_with('\'') && e.len() >= 2 && !e[1..e.len() - 1].contains('\'') {
+        return Some("unknown".into());
+    }
+    let colk = |c: &str| col(c).and_then(|d| crate::engine::inttype::IntKind::from_type_name(&d.canonical()));
+    if let Some(k) = crate::engine::inttype::int_kind(e, &colk) {
+        return Some(match k {
+            crate::engine::inttype::IntKind::I2 => "smallint",
+            crate::engine::inttype::IntKind::I4 => "integer",
+            crate::engine::inttype::IntKind::I8 => "bigint",
+        }
+        .into());
+    }
+    if up.starts_with("ARRAY[") && e.ends_with(']') {
+        let items = crate::engine::executor::split_comma_separated_tokens(&e[6..e.len() - 1]);
+        let first = pg_typeof(items.first()?, col)?;
+        return Some(if first == "unknown" { "text[]".into() } else { format!("{}[]", first) });
+    }
+    let colref = |c: &str| col(c);
+    if let Some(d) = expr_decl(e, &|c: &str| {
+        let ok = !c.is_empty() && c.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '"');
+        if ok { colref(c).map(Some) } else { None }
+    }) {
+        return Some(d.sql_name());
+    }
+    if let Some(open) = e.find('(') {
+        if e.ends_with(')') && is_fully_enclosed_in_parens(&e[open..]) {
+            let name = up[..open].trim();
+            let r = match name {
+                "COUNT" => "bigint",
+                "LENGTH" | "CHAR_LENGTH" | "OCTET_LENGTH" | "STRPOS" | "POSITION" | "ASCII" | "ARRAY_LENGTH" | "CARDINALITY" => "integer",
+                "AVG" => "numeric",
+                "LOWER" | "UPPER" | "CONCAT" | "CONCAT_WS" | "SUBSTRING" | "SUBSTR" | "TRIM" | "REPLACE" | "MD5" | "INITCAP" | "LEFT"
+                | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "SPLIT_PART" | "TO_CHAR" | "FORMAT" | "ENCODE" | "CHR"
+                | "STRING_AGG" | "VERSION" | "ARRAY_TO_STRING" => "text",
+                "SHA256" | "SHA224" | "SHA384" | "SHA512" | "DECODE" => "bytea",
+                "AGE" => "interval",
+                "TO_TIMESTAMP" => "timestamp with time zone",
+                "TO_DATE" => "date",
+                "GEN_RANDOM_UUID" | "UUIDV4" | "UUIDV7" => "uuid",
+                "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "TO_JSONB" | "JSONB_AGG" | "JSONB_SET" | "JSONB_OBJECT_AGG" => "jsonb",
+                "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "TO_JSON" | "JSON_AGG" | "JSON_OBJECT_AGG" => "json",
+                "STRING_TO_ARRAY" => "text[]",
+                "PG_TYPEOF" => "regtype",
+                "SUM" => {
+                    let inner = &e[open + 1..e.len() - 1];
+                    return Some(match pg_typeof(inner, col).as_deref() {
+                        Some("integer" | "smallint") => "bigint",
+                        Some("real") => "real",
+                        Some("double precision") => "double precision",
+                        _ => "numeric",
+                    }
+                    .into());
+                }
+                "MIN" | "MAX" | "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" | "ABS" | "ROUND" | "TRUNC" | "FLOOR" | "CEIL" => {
+                    let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
+                    let t = pg_typeof(args.first()?, col)?;
+                    return Some(if matches!(name, "ROUND" | "TRUNC" | "FLOOR" | "CEIL") && t != "double precision" && t != "real" { "numeric".into() } else { t });
+                }
+                _ => return None,
+            };
+            return Some(r.into());
+        }
+    }
+    // so sánh / logic
+    for op in [" AND ", " OR ", " IS ", " LIKE ", " ILIKE ", " IN ", " BETWEEN "] {
+        if crate::engine::executor::find_top_level_keyword(e, op.trim()).is_some() {
+            return Some("boolean".into());
+        }
+    }
+    for op in ["<=", ">=", "<>", "!=", "=", "<", ">"] {
+        if crate::engine::executor::find_top_level_op(e, op).is_some_and(|p| p > 0) {
+            return Some("boolean".into());
+        }
+    }
+    None
 }

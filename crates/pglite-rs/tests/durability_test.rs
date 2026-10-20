@@ -107,7 +107,7 @@ fn savepoints_are_replayed() {
 
 #[test]
 fn ddl_inside_rolled_back_transaction_matches_live_state() {
-    // DDL không được hoàn tác lúc chạy, nên replay cũng phải giữ nó.
+    // Như PostgreSQL, ROLLBACK hoàn tác cả DDL; replay phải cho cùng trạng thái với lúc chạy.
     let (dir, path) = temp_db("ddl");
     let mut db = reopen_same(&path, &["SELECT * FROM t ORDER BY id"], |db| {
         exec_all(db, &[
@@ -121,7 +121,8 @@ fn ddl_inside_rolled_back_transaction_matches_live_state() {
         ]);
     });
     assert_eq!(col(&mut db, "SELECT v FROM t", "v"), vec!["a"]);
-    assert!(db.query("SELECT * FROM side", &[]).is_ok());
+    assert!(db.query("SELECT * FROM side", &[]).is_err());
+    assert!(db.query("SELECT extra FROM t", &[]).is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
 

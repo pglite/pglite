@@ -120,7 +120,8 @@ fn wire_select_star_types_and_text_format() {
     assert_eq!(row[0].as_deref(), Some("1"));
     assert_eq!(row[2].as_deref(), Some("t"));
     assert_eq!(row[3].as_deref(), Some("4.5"));
-    assert_eq!(row[4].as_deref(), Some("{\"a\":1}"));
+    // jsonb in theo định dạng PostgreSQL: `": "` và `", "`
+    assert_eq!(row[4].as_deref(), Some("{\"a\": 1}"));
     assert_eq!(row[5].as_deref(), Some("2026-10-12 08:00:00+00"));
     assert_eq!(row[6].as_deref(), Some("2026-01-02"));
     assert_eq!(row[8].as_deref(), Some("\\x0102"));
@@ -167,7 +168,8 @@ fn wire_join_fields_ordered_typed_and_present_with_zero_rows() {
     let empty = db.query_wire(&format!("{sql} WHERE s.id = 999"), &[]).unwrap();
     assert!(empty.rows.is_empty());
     assert_eq!(names(&empty), vec!["title", "school_name", "start_at", "id"]);
-    assert_eq!(oids(&empty), vec![25, 25, 1184, 23]);
+    // không có dòng nào vẫn suy cùng kiểu khai báo
+    assert_eq!(oids(&empty), vec![25, 1043, 1114, 23]);
 }
 
 #[test]
@@ -349,7 +351,7 @@ fn inserts_into_legacy_db_work_and_survive_reopen() {
     assert_eq!(schools.rows[2]["phone"], "0123");
 
     let lit = db.query_wire("SELECT active, rating, meta, tags, class_ids, logo FROM schools WHERE name = 'Lit'", &[]).unwrap();
-    assert_eq!(lit.rows[0], vec![Some("t".into()), Some("1.25".into()), Some("{\"k\":[1,2]}".into()), Some("{p,q}".into()), Some("[1,2]".into()), Some("\\x0a0b".into())]);
+    assert_eq!(lit.rows[0], vec![Some("t".into()), Some("1.25".into()), Some("{\"k\": [1, 2]}".into()), Some("{p,q}".into()), Some("[1,2]".into()), Some("\\x0a0b".into())]);
 
     let sched = db.query("SELECT id, title FROM schedules ORDER BY id", &[]).unwrap();
     assert_eq!(sched.rows.len(), 4);

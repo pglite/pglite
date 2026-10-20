@@ -6,6 +6,7 @@ pub(crate) mod frontend;
 pub mod coltypes;
 pub(crate) mod validate;
 pub mod expr;
+pub mod inttype;
 pub mod executor;
 pub mod plan;
 pub mod plpgsql;
