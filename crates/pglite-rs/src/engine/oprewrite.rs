@@ -29,6 +29,17 @@ fn may_need(sql: &str) -> bool {
             if (4..=10).contains(&w.len()) && WORDS.iter().any(|k| k.eq_ignore_ascii_case(w)) {
                 return true;
             }
+            let prev = b[..start].iter().rev().find(|c| !c.is_ascii_whitespace()).copied();
+            // VALUES / TABLE đứng đầu câu hoặc sau `(`; FROM ONLY; ORDER BY x USING >; FETCH FIRST
+            if (w.eq_ignore_ascii_case(b"VALUES") || w.eq_ignore_ascii_case(b"TABLE")) && matches!(prev, None | Some(b'(')) {
+                return true;
+            }
+            if w.eq_ignore_ascii_case(b"ONLY") || w.eq_ignore_ascii_case(b"FETCH") {
+                return true;
+            }
+            if w.eq_ignore_ascii_case(b"USING") && b[i..].iter().find(|c| !c.is_ascii_whitespace()).is_some_and(|c| *c == b'<' || *c == b'>') {
+                return true;
+            }
             continue;
         }
         i += 1;
@@ -499,6 +510,236 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         changed = true;
     }
 
+    // FROM ONLY t / JOIN ONLY t: không có kế thừa bảng nên ONLY không đổi gì
+    for kw in ["FROM", "JOIN", "UPDATE"] {
+        let mut from = 0;
+        loop {
+            let m = code_mask(&s);
+            let Some(p) = find_kw(&s, &m, kw, from) else { break };
+            let after = p + kw.len();
+            let rest = &s[after..];
+            let ws = rest.len() - rest.trim_start().len();
+            let q = after + ws;
+            if ws > 0 && s.len() >= q + 5 && s.as_bytes()[q..q + 4].eq_ignore_ascii_case(b"ONLY") && s.as_bytes()[q + 4].is_ascii_whitespace() {
+                s.replace_range(q..q + 5, "");
+                changed = true;
+            }
+            from = after;
+        }
+    }
+
+    // ORDER BY x USING > / < → DESC / ASC
+    loop {
+        let m = code_mask(&s);
+        let mut from = 0;
+        let mut hit = None;
+        while let Some(p) = find_kw(&s, &m, "USING", from) {
+            let rest = s[p + 5..].trim_start();
+            let op_len = if rest.starts_with(">=") || rest.starts_with("<=") { 2 } else if rest.starts_with('>') || rest.starts_with('<') { 1 } else { 0 };
+            if op_len > 0 {
+                let start_op = p + 5 + (s[p + 5..].len() - rest.len());
+                hit = Some((p, start_op + op_len, rest.starts_with('>')));
+                break;
+            }
+            from = p + 5;
+        }
+        let Some((p, end, desc)) = hit else { break };
+        s.replace_range(p..end, if desc { "DESC" } else { "ASC" });
+        changed = true;
+    }
+
+    // OFFSET m ROW[S] → OFFSET m; FETCH FIRST|NEXT [n] ROW[S] ONLY → LIMIT n; ... WITH TIES → LIMIT n WITH TIES
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "FETCH", 0) else { break };
+        let rest = &s[p + 5..];
+        let words: Vec<&str> = rest.split_whitespace().take(6).collect();
+        if words.len() < 3 || !(words[0].eq_ignore_ascii_case("FIRST") || words[0].eq_ignore_ascii_case("NEXT")) {
+            break;
+        }
+        let (n, idx) = if words[1].eq_ignore_ascii_case("ROW") || words[1].eq_ignore_ascii_case("ROWS") { ("1".to_string(), 2) } else { (words[1].trim_matches(|c| c == '(' || c == ')').to_string(), 3) };
+        let ties = match (words.get(idx), words.get(idx + 1)) {
+            (Some(a), _) if a.eq_ignore_ascii_case("ONLY") => false,
+            (Some(a), Some(b2)) if a.eq_ignore_ascii_case("WITH") && b2.eq_ignore_ascii_case("TIES") => true,
+            _ => break,
+        };
+        // độ dài phần FETCH ... ONLY / WITH TIES trong chuỗi gốc
+        let consumed = idx + if ties { 2 } else { 1 };
+        let mut end = p + 5;
+        for _ in 0..consumed {
+            let r = &s[end..];
+            let ws = r.len() - r.trim_start().len();
+            let wl = r.trim_start().find(char::is_whitespace).unwrap_or(r.trim_start().len());
+            end += ws + wl;
+        }
+        let rep = if ties { format!("LIMIT {} WITH TIES", n) } else { format!("LIMIT {}", n) };
+        s.replace_range(p..end, &rep);
+        changed = true;
+    }
+    loop {
+        let m = code_mask(&s);
+        let mut from = 0;
+        let mut hit = None;
+        while let Some(p) = find_kw(&s, &m, "OFFSET", from) {
+            let rest = &s[p + 6..];
+            let mut w = rest.split_whitespace();
+            if let (Some(_n), Some(r)) = (w.next(), w.next()) {
+                if r.eq_ignore_ascii_case("ROW") || r.eq_ignore_ascii_case("ROWS") {
+                    let lead = rest.len() - rest.trim_start().len();
+                    let after_n = p + 6 + lead + rest.trim_start().find(char::is_whitespace).unwrap_or(0);
+                    let r2 = &s[after_n..];
+                    let start = after_n + (r2.len() - r2.trim_start().len());
+                    hit = Some((after_n, start + r.len()));
+                    break;
+                }
+            }
+            from = p + 6;
+        }
+        let Some((a, e)) = hit else { break };
+        s.replace_range(a..e, "");
+        changed = true;
+    }
+
+    // TABLE t (đầu câu hoặc sau `(`) → SELECT * FROM t
+    loop {
+        let m = code_mask(&s);
+        let mut from = 0;
+        let mut hit = None;
+        while let Some(p) = find_kw(&s, &m, "TABLE", from) {
+            let prev = s[..p].trim_end();
+            if prev.is_empty() || prev.ends_with('(') {
+                hit = Some(p);
+                break;
+            }
+            from = p + 5;
+        }
+        let Some(p) = hit else { break };
+        s.replace_range(p..p + 5, "SELECT * FROM");
+        changed = true;
+    }
+
+    // VALUES (...), (...) đứng đầu câu / sau `(` → SELECT ... UNION ALL SELECT ...; có danh sách cột
+    // `(VALUES ...) AS v(a, b)` hoặc CTE `x(a, b) AS (VALUES ...)` thì dùng tên đó
+    loop {
+        let m = code_mask(&s);
+        let mut from = 0;
+        let mut hit = None;
+        while let Some(p) = find_kw(&s, &m, "VALUES", from) {
+            let prev = s[..p].trim_end();
+            if prev.is_empty() || prev.ends_with('(') {
+                hit = Some(p);
+                break;
+            }
+            from = p + 6;
+        }
+        let Some(p) = hit else { break };
+        // các dòng (...), (...)
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut i = p + 6;
+        loop {
+            let r = &s[i..];
+            let ws = r.len() - r.trim_start().len();
+            let j = i + ws;
+            if s.as_bytes().get(j) != Some(&b'(') {
+                break;
+            }
+            let Some(close) = super::constraints::matching_paren(&s, j) else { break };
+            rows.push(super::executor::split_comma_separated_tokens(&s[j + 1..close]).into_iter().map(|x| x.trim().to_string()).collect());
+            i = close + 1;
+            let r = &s[i..];
+            let ws = r.len() - r.trim_start().len();
+            if s.as_bytes().get(i + ws) == Some(&b',') {
+                i += ws + 1;
+                continue;
+            }
+            break;
+        }
+        if rows.is_empty() || rows.iter().any(|r| r.len() != rows[0].len()) {
+            break;
+        }
+        let ncols = rows[0].len();
+        let mut names: Vec<String> = (1..=ncols).map(|k| format!("column{}", k)).collect();
+        // danh sách cột: sau `) AS v(...)`
+        let enclosed_open = s[..p].trim_end().len().checked_sub(1).filter(|&o| s.as_bytes()[o] == b'(');
+        let mut alias_fix: Option<(usize, usize, String)> = None;
+        if let Some(o) = enclosed_open {
+            if let Some(c) = super::constraints::matching_paren(&s, o) {
+                let tail = &s[c + 1..];
+                let t2 = tail.trim_start();
+                let t3 = if t2.len() > 3 && t2.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") { t2[3..].trim_start() } else { t2 };
+                let alias_len = t3.find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '"')).unwrap_or(t3.len());
+                if alias_len > 0 && t3[alias_len..].starts_with('(') {
+                    let base = c + 1 + (tail.len() - t3.len());
+                    let open = base + alias_len;
+                    if let Some(close) = super::constraints::matching_paren(&s, open) {
+                        let cols: Vec<String> = super::executor::split_comma_separated_tokens(&s[open + 1..close]).into_iter().map(|x| x.trim().to_string()).collect();
+                        for (k, cname) in cols.iter().enumerate().take(ncols) {
+                            names[k] = cname.clone();
+                        }
+                        alias_fix = Some((open, close + 1, String::new()));
+                    }
+                }
+                // CTE: x(a, b) AS (VALUES ...)
+                let before = s[..o].trim_end();
+                if alias_fix.is_none() && before.len() >= 2 && before.as_bytes()[before.len() - 2..].eq_ignore_ascii_case(b"AS") {
+                    let b2 = before[..before.len() - 2].trim_end();
+                    if b2.ends_with(')') {
+                        let close = b2.len() - 1;
+                        let mut depth = 0;
+                        let bb = b2.as_bytes();
+                        let mut k = close as isize;
+                        while k >= 0 {
+                            match bb[k as usize] {
+                                b')' => depth += 1,
+                                b'(' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            k -= 1;
+                        }
+                        if k > 0 && (bb[k as usize - 1].is_ascii_alphanumeric() || bb[k as usize - 1] == b'_' || bb[k as usize - 1] == b'"') {
+                            let open = k as usize;
+                            let cols: Vec<String> = super::executor::split_comma_separated_tokens(&s[open + 1..close]).into_iter().map(|x| x.trim().to_string()).collect();
+                            for (k2, cname) in cols.iter().enumerate().take(ncols) {
+                                names[k2] = cname.clone();
+                            }
+                            alias_fix = Some((open, close + 1, String::new()));
+                        }
+                    }
+                }
+            }
+        }
+        let selects: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(ri, r)| {
+                if ri == 0 {
+                    format!("SELECT {}", r.iter().zip(&names).map(|(v, n)| format!("{} AS {}", v, n)).collect::<Vec<_>>().join(", "))
+                } else {
+                    format!("SELECT {}", r.join(", "))
+                }
+            })
+            .collect();
+        let rep = selects.join(" UNION ALL ");
+        // thay danh sách cột trước (nằm sau / trước đoạn VALUES)
+        match alias_fix {
+            Some((a, e, _)) if a > i => {
+                s.replace_range(a..e, "");
+                s.replace_range(p..i, &rep);
+            }
+            Some((a, e, _)) => {
+                s.replace_range(p..i, &rep);
+                s.replace_range(a..e, "");
+            }
+            None => s.replace_range(p..i, &rep),
+        }
+        changed = true;
+    }
+
     changed.then_some(s)
 }
 
@@ -553,6 +794,15 @@ mod tests {
         );
         assert_eq!(r("SELECT x::timestamp with time zone AT TIME ZONE 'UTC'"), "SELECT timezone('UTC', x::timestamp with time zone)");
         assert_eq!(r("SELECT 'a' IS NORMALIZED AS a, 'b' IS NOT NFKC NORMALIZED"), "SELECT is_normalized('a', 'NFC') AS a, NOT is_normalized('b', 'NFKC')");
+        assert_eq!(r("VALUES (1, 'a'), (2, 'b') ORDER BY 1 DESC"), "SELECT 1 AS column1, 'a' AS column2 UNION ALL SELECT 2, 'b' ORDER BY 1 DESC");
+        assert_eq!(r("SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v(id, s)"), "SELECT * FROM (SELECT 1 AS id, 'a' AS s UNION ALL SELECT 2, 'b') AS v");
+        assert_eq!(r("WITH x(a, b) AS (VALUES (1, 'p')) SELECT b FROM x"), "WITH x AS (SELECT 1 AS a, 'p' AS b) SELECT b FROM x");
+        assert_eq!(r("INSERT INTO t VALUES (1, 'a')"), "INSERT INTO t VALUES (1, 'a')");
+        assert_eq!(r("TABLE u"), "SELECT * FROM u");
+        assert_eq!(r("SELECT name FROM ONLY t ORDER BY n USING > NULLS LAST"), "SELECT name FROM t ORDER BY n DESC NULLS LAST");
+        assert_eq!(r("SELECT * FROM t ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY"), "SELECT * FROM t ORDER BY id OFFSET 1 LIMIT 2");
+        assert_eq!(r("SELECT n FROM t ORDER BY n FETCH FIRST 1 ROWS WITH TIES"), "SELECT n FROM t ORDER BY n LIMIT 1 WITH TIES");
+        assert_eq!(r("SELECT * FROM t JOIN u USING (id)"), "SELECT * FROM t JOIN u USING (id)");
         assert_eq!(similar_to_regex("(a|b)%", Some('\\')), "^(?:(a|b).*)$");
         assert_eq!(similar_to_regex("a.b_", Some('\\')), "^(?:a\\.b.)$");
     }

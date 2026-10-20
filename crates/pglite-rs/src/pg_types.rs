@@ -802,7 +802,7 @@ pub fn sqlstate(message: &str) -> &'static str {
         "22001"
     } else if has("invalid input value for enum") || has("invalid input syntax") {
         "22P02"
-    } else if has("is not supported") || has("not supported") && has("feature") {
+    } else if has("is not supported") || has("are not supported") || has("not supported") && has("feature") || has("is not allowed with") {
         "0A000"
     } else if has("read-only transaction") {
         "25006"
@@ -818,7 +818,7 @@ pub fn sqlstate(message: &str) -> &'static str {
         "25P01"
     } else if has("relation") && has("already exists") {
         "42P07"
-    } else if has("column") && has("already exists") {
+    } else if has("column") && (has("already exists") || has("specified more than once")) {
         "42701"
     } else if has("constraint") && has("already exists") {
         "42710"

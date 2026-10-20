@@ -935,3 +935,25 @@
 {"id":"W3_14","ok":true,"fields":["a","b","c"],"rows":[["{v3,v2,v1}","{}","{5,3,NULL}"]]}
 {"id":"W3_15","ok":true,"fields":["a","b","c"],"rows":[["{x}","{x,y}","{}"]]}
 {"id":"W3_16","ok":true,"fields":["a","b"],"rows":[["t","f"]]}
+{"id":"W4_01","ok":true,"fields":["column1","column2","column3"],"rows":[["2","y","3.5"]]}
+{"id":"W4_02","ok":true,"fields":["name","label"],"rows":[["alice","one"],["bob","two"]]}
+{"id":"W4_03","ok":true,"fields":["column2"],"rows":[["p"]]}
+{"id":"W4_04","ok":true,"fields":["id","name","n","price"],"rows":[["1","alice","5","1.50"],["2","bob","3","2.00"]]}
+{"id":"W4_05","ok":true,"fields":["a","b"],"rows":[["1","10"],["2","6"],["3",null]]}
+{"id":"W4_06","ok":true,"fields":["c"],"rows":[["0"]]}
+{"id":"W4_07","ok":true,"fields":["a"],"rows":[["1"]]}
+{"id":"W4_08","ok":false,"error":"column \"a\" specified more than once","sqlstate":"42701","failed_stmt":0}
+{"id":"W4_09","ok":true,"fields":["name"],"rows":[["alice"],["bob"]]}
+{"id":"W4_10","ok":true,"fields":["id"],"rows":[["2"]]}
+{"id":"W4_11","ok":true,"fields":["id","parity"],"rows":[["1","1"],["2","1"]]}
+{"id":"W4_12","ok":true,"fields":["flag","c"],"rows":[[null,"3"]]}
+{"id":"W4_13","ok":true,"fields":["n","flag","g","c"],"rows":[["3","f","0","1"],["5","t","0","1"],[null,null,"0","1"],["3",null,"1","1"],["5",null,"1","1"],[null,null,"1","1"],[null,null,"3","3"]]}
+{"id":"W4_14","ok":true,"fields":["h","q","m","c","z"],"rows":[["1","4","6","3","3"]]}
+{"id":"W4_15","ok":true,"fields":["n","x","s"],"rows":[[null,"10",null],["3","10","4"],["5","10","6"]]}
+{"id":"W4_16","ok":true,"fields":["x"],"rows":[["1"],["1"]]}
+{"id":"W4_17","ok":true,"fields":["x"],"rows":[["1"],["2"]]}
+{"id":"W4_18","ok":true,"fields":["id"],"rows":[["1"]]}
+{"id":"W4_19","ok":true,"fields":["id"],"rows":[["2"]]}
+{"id":"W4_20","ok":false,"error":"FOR KEY SHARE is not allowed with aggregate functions","sqlstate":"0A000","failed_stmt":0}
+{"id":"W4_21","ok":true,"fields":["id","n"],"rows":[["1","9"]]}
+{"id":"W4_22","ok":true,"fields":["count","count","count","sum","max"],"rows":[["3","2","2","8","2.00"]]}

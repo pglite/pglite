@@ -320,6 +320,17 @@ impl Executor {
             return self.handle_union(trimmed, params);
         }
 
+        // SELECT ... INTO bảng FROM ... → CREATE TABLE bảng AS SELECT ...
+        if upper.starts_with("SELECT") && contains_ci(trimmed, " INTO ") {
+            if let Some(ctas) = select_into_as_ctas(trimmed) {
+                return self.handle_create_table_as(&ctas, params);
+            }
+        }
+        if (upper.starts_with("CREATE TABLE") || upper.starts_with("CREATE UNLOGGED TABLE") || upper.starts_with("CREATE TEMP") || upper.starts_with("CREATE TEMPORARY"))
+            && is_create_table_as(trimmed)
+        {
+            return self.handle_create_table_as(trimmed, params);
+        }
         if upper.starts_with("CREATE TABLE") {
             return self.handle_create_table(trimmed);
         }
@@ -1351,6 +1362,78 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
             }
         }
         Ok(resolved)
+    }
+
+    /// `... ORDER BY k LIMIT n WITH TIES` (từ `FETCH FIRST n ROWS WITH TIES`): n dòng đầu cùng mọi dòng
+    /// tiếp theo có khoá sắp xếp bằng dòng thứ n. Khoá không phải cột kết quả được thêm làm cột ẩn.
+    fn select_with_ties(&mut self, sql: &str, params: &[Value]) -> Result<Option<QueryResult>, String> {
+        let Some(lim) = last_top_level_keyword(sql, "LIMIT") else { return Ok(None) };
+        let tail = sql[lim + 5..].trim();
+        let mut parts = tail.split_whitespace();
+        let (Some(n_txt), Some(w), Some(t)) = (parts.next(), parts.next(), parts.next()) else { return Ok(None) };
+        if !w.eq_ignore_ascii_case("WITH") || !t.eq_ignore_ascii_case("TIES") || parts.next().is_some() {
+            return Ok(None);
+        }
+        let n: usize = match eval_sql_expr(n_txt, &[], None, &[], None, params).as_i64() {
+            Some(v) if v >= 0 => v as usize,
+            _ => return Err("row count cannot be negative in FETCH FIRST ... WITH TIES".to_string()),
+        };
+        let base = sql[..lim].trim_end();
+        let Some(ob) = find_top_level_keyword(base, "ORDER BY") else {
+            return Err("WITH TIES cannot be specified without ORDER BY clause".to_string());
+        };
+        let order_txt = base[ob + 8..].trim();
+        let Some(from) = find_top_level_keyword(base, "FROM") else { return Ok(None) };
+        let list = base[6..from].trim();
+        // khoá: số thứ tự / alias / tên cột kết quả → dùng cột đó; còn lại → cột ẩn
+        let mut extra = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for (j, spec) in split_comma_separated_tokens(order_txt).into_iter().enumerate() {
+            let mut e = spec.trim();
+            for suffix in ["NULLS FIRST", "NULLS LAST", "DESC", "ASC"] {
+                let u = e.to_uppercase();
+                if u.ends_with(suffix) {
+                    e = e[..e.len() - suffix.len()].trim_end();
+                }
+            }
+            let e = e.trim();
+            if let Ok(k) = e.parse::<usize>() {
+                keys.push(format!("#{}", k));
+                continue;
+            }
+            let key = format!("__tie{}__", j);
+            extra.push(format!("{} AS \"{}\"", e, key));
+            keys.push(key);
+        }
+        let sel = if extra.is_empty() { list.to_string() } else { format!("{}, {}", list, extra.join(", ")) };
+        let q = format!("SELECT {} {}", sel, &base[from..]);
+        let (mut res, _) = self.handle_select(&q, params)?;
+        let key_of = |row: &serde_json::Value, fields: &[FieldInfo]| -> Vec<serde_json::Value> {
+            keys.iter()
+                .map(|k| match k.strip_prefix('#').and_then(|x| x.parse::<usize>().ok()) {
+                    Some(pos) => fields.get(pos - 1).and_then(|f| row.get(&f.name)).cloned().unwrap_or_default(),
+                    None => row.get(k).cloned().unwrap_or_default(),
+                })
+                .collect()
+        };
+        let mut keep = n.min(res.rows.len());
+        if keep > 0 {
+            let last = key_of(&res.rows[keep - 1], &res.fields);
+            while keep < res.rows.len() && key_of(&res.rows[keep], &res.fields) == last {
+                keep += 1;
+            }
+        }
+        res.rows.truncate(keep);
+        if !extra.is_empty() {
+            for r in res.rows.iter_mut() {
+                if let serde_json::Value::Object(m) = r {
+                    m.retain(|k, _| !(k.starts_with("__tie") && k.ends_with("__")));
+                }
+            }
+            res.fields.retain(|f| !(f.name.starts_with("__tie") && f.name.ends_with("__")));
+        }
+        res.row_count = res.rows.len();
+        Ok(Some(res))
     }
 
     /// `ARRAY(SELECT x ...)` không tương quan → `ARRAY[v1, v2, ...]` (cột đầu của mọi dòng, giữ thứ tự),
@@ -2560,6 +2643,139 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         })
     }
 
+    /// `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] t [(cột, ...)] AS <truy vấn> [WITH [NO] DATA]`: tạo bảng theo
+    /// kiểu các cột kết quả rồi chép dữ liệu bằng INSERT thường (WAL như mọi bảng khác), trong một giao dịch.
+    fn handle_create_table_as(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        let mut rest = sql["CREATE".len()..].trim_start();
+        let up = rest.to_uppercase();
+        if up.starts_with("TEMP ") || up.starts_with("TEMPORARY ") {
+            return Err("TEMP tables are not supported".to_string());
+        }
+        if up.starts_with("UNLOGGED ") {
+            rest = rest[9..].trim_start();
+        }
+        rest = rest["TABLE".len()..].trim_start();
+        let if_not_exists = rest.len() > 14 && rest.as_bytes()[..14].eq_ignore_ascii_case(b"IF NOT EXISTS ");
+        if if_not_exists {
+            rest = rest[14..].trim_start();
+        }
+        let as_pos = find_top_level_keyword(rest, "AS").ok_or("Invalid CREATE TABLE AS syntax")?;
+        let head = rest[..as_pos].trim();
+        let mut query = rest[as_pos + 2..].trim();
+        let mut with_data = true;
+        let uq = query.to_uppercase();
+        if uq.ends_with("WITH NO DATA") {
+            with_data = false;
+            query = query[..query.len() - 12].trim_end();
+        } else if uq.ends_with("WITH DATA") {
+            query = query[..query.len() - 9].trim_end();
+        }
+        let (name_raw, col_list) = match head.find('(') {
+            Some(p) if head.ends_with(')') => (head[..p].trim(), Some(split_comma_separated_tokens(&head[p + 1..head.len() - 1]).into_iter().map(|c| c.trim().trim_matches('"').to_string()).collect::<Vec<_>>())),
+            _ => (head, None),
+        };
+        let table_name = strip_schema_keep_case(name_raw);
+        if self.storage.get_table(&table_name).is_some() {
+            if if_not_exists {
+                return Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "CREATE TABLE AS".to_string() });
+            }
+            return Err(format!("relation \"{}\" already exists", table_name));
+        }
+        // dữ liệu dạng engine (mảng/JSON là giá trị JSON), không phải text của đường wire
+        let res = {
+            let _guard = RawTextGuard(set_raw_text_mode(false));
+            self.execute_statement(query, params)?
+        };
+        let decls = crate::engine::coltypes::wire_decls(query, &self.storage, res.fields.len());
+        let mut names: Vec<String> = res.fields.iter().map(|f| crate::engine::frontend::decode_all(&f.name).into_owned()).collect();
+        if let Some(cl) = &col_list {
+            if cl.len() > names.len() {
+                return Err("too many column names were specified".to_string());
+            }
+            for (i, c) in cl.iter().enumerate() {
+                names[i] = c.clone();
+            }
+        }
+        // tên trên wire như PostgreSQL (`?column?`, tên trùng do engine giữ văn bản biểu thức)
+        if col_list.is_none() {
+            if let Some(items) = crate::engine::select_list::wire_names(query) {
+                if items.len() == names.len() {
+                    names = items.into_iter().map(|(n, _, _)| n).collect();
+                }
+            }
+        }
+        for (i, n) in names.iter().enumerate() {
+            if names[..i].iter().any(|m| m.eq_ignore_ascii_case(n)) {
+                return Err(format!("column \"{}\" specified more than once", n));
+            }
+        }
+        let quote = |n: &str| -> String {
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') && !n.starts_with(|c: char| c.is_ascii_digit()) {
+                n.to_string()
+            } else if n.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                format!("\"{}\"", n)
+            } else {
+                crate::engine::frontend::encode_ident(n)
+            }
+        };
+        let col_defs: Vec<String> = (0..names.len())
+            .map(|i| {
+                let ty = decls
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .map(|d| d.canonical())
+                    .unwrap_or_else(|| sql_type_for_oid(crate::pg_types::oid_for_type_str(&res.fields[i].data_type), res.rows.iter().filter_map(|r| r.get(&res.fields[i].name)).find(|v| !v.is_null())));
+                format!("{} {}", quote(&names[i]), ty)
+            })
+            .collect();
+        let implicit = !self.storage.in_transaction;
+        if implicit {
+            self.storage.begin_transaction();
+        }
+        let result = (|| -> Result<usize, String> {
+            self.handle_create_table(&format!("CREATE TABLE {} ({})", quote(&table_name), col_defs.join(", ")))?;
+            if !with_data || res.rows.is_empty() {
+                return Ok(0);
+            }
+            let cols = names.iter().map(|n| quote(n)).collect::<Vec<_>>().join(", ");
+            for chunk in res.rows.chunks(200) {
+                let mut vals = Vec::with_capacity(chunk.len());
+                let mut ps: Vec<Value> = Vec::with_capacity(chunk.len() * names.len());
+                for row in chunk {
+                    let mut ph = Vec::with_capacity(names.len());
+                    for f in &res.fields {
+                        let v = row.get(&f.name).cloned().unwrap_or_default();
+                        ps.push(match &v {
+                            serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::text(v.to_string()),
+                            other => json_to_value(other),
+                        });
+                        ph.push(format!("${}", ps.len()));
+                    }
+                    vals.push(format!("({})", ph.join(", ")));
+                }
+                let _guard = RawTextGuard(set_raw_text_mode(false));
+                self.execute_statement(&format!("INSERT INTO {} ({}) VALUES {}", quote(&table_name), cols, vals.join(", ")), &ps)?;
+            }
+            Ok(res.rows.len())
+        })();
+        match result {
+            Ok(n) => {
+                if implicit {
+                    self.storage.commit()?;
+                }
+                Ok(QueryResult { rows: vec![], row_count: n, fields: vec![], command: "SELECT".to_string() })
+            }
+            Err(e) => {
+                if implicit {
+                    let _ = self.storage.rollback();
+                    self.plan_cache.clear();
+                }
+                Err(e)
+            }
+        }
+    }
+
     fn handle_create_table(&mut self, sql: &str) -> Result<QueryResult, String> {
         // Simple CREATE TABLE parser
         let after_create = sql[12..].trim();
@@ -3389,6 +3605,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_select(&mut self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
+        if contains_ci(sql, "WITH TIES") {
+            if let Some(r) = self.select_with_ties(sql, params)? {
+                return Ok((r, None));
+            }
+        }
+        if (contains_ci(sql, "GROUPING SETS") || contains_ci(sql, "ROLLUP") || contains_ci(sql, "CUBE")) && contains_ci(sql, "GROUP BY") {
+            if let Some(u) = grouping_sets_as_union(sql)? {
+                let r = self.execute_statement(&u, params)?;
+                return Ok((r, None));
+            }
+        }
         if contains_ci(sql, "ARRAY(") {
             if let Some(expanded) = self.expand_array_subqueries(sql, params)? {
                 return self.handle_select(&expanded, params);
@@ -3398,8 +3625,26 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         // không có ý nghĩa; bỏ đi thay vì để nó làm hỏng điều kiện (trước đây trả 0 dòng).
         if let Some(p) = contains_ci(sql, " FOR ").then(|| last_top_level_keyword(sql, "FOR")).flatten() {
             let tail = sql[p + 3..].trim_start().to_uppercase();
-            if ["UPDATE", "SHARE", "NO KEY UPDATE", "KEY SHARE"].iter().any(|k| tail.starts_with(k)) {
-                return self.handle_select(sql[..p].trim_end(), params);
+            if let Some(kind) = ["NO KEY UPDATE", "KEY SHARE", "UPDATE", "SHARE"].iter().find(|k| tail.starts_with(*k)) {
+                // như PostgreSQL: khoá dòng không dùng được với kết quả gộp
+                let head = sql[..p].trim_end();
+                let after_select = &head[6..];
+                let list_end = find_top_level_keyword(after_select, "FROM").unwrap_or(after_select.len());
+                let reason = if find_top_level_keyword(head, "GROUP BY").is_some() {
+                    Some("GROUP BY clause")
+                } else if find_top_level_keyword(head, "HAVING").is_some() {
+                    Some("HAVING clause")
+                } else if after_select.trim_start().to_uppercase().starts_with("DISTINCT") {
+                    Some("DISTINCT clause")
+                } else if split_projection_items(&after_select[..list_end]).iter().any(|i| is_aggregate_projection_item(i)) {
+                    Some("aggregate functions")
+                } else {
+                    None
+                };
+                if let Some(r) = reason {
+                    return Err(format!("FOR {} is not allowed with {}", kind, r));
+                }
+                return self.handle_select(head, params);
             }
         }
         // DISTINCT ON (biểu thức): giữ dòng đầu tiên (theo ORDER BY) của mỗi khoá
@@ -3670,7 +3915,18 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         };
 
         if !agg_specs.is_empty() {
-            return Ok((self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params)?, None));
+            // Đường nhanh chỉ đúng khi mọi mục là một lời gọi aggregate thuần (`count(*)`, `sum(n) AS s`).
+            // Biểu thức trên aggregate (`count(*) / 2`, `sum(n) / count(n)`) hay hằng / cột kèm theo
+            // (`NULL AS x, count(*)`) đi đường GROUP BY một nhóm, nơi biểu thức được tính đầy đủ.
+            let items = split_comma_separated_tokens(select_clause);
+            if items.len() == agg_specs.len() && items.iter().all(|i| is_pure_aggregate_item(i)) {
+                return Ok((self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params)?, None));
+            }
+            // đường GROUP BY chưa hỗ trợ mọi dạng (vd. json_agg(t) cả dòng): khi đó giữ đường cũ
+            match self.handle_group_by_query(table, select_clause, &clauses, params) {
+                Ok(r) => return Ok((r, None)),
+                Err(_) => return Ok((self.handle_aggregate_query(table, &agg_specs, clauses.where_clause, params)?, None)),
+            }
         }
 
         if clauses.join_clause.is_none() && select_clause.trim() == "*" {
@@ -4783,6 +5039,29 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         clauses: &SelectClauses,
         params: &[Value],
     ) -> Result<QueryResult, String> {
+        match self.handle_group_by_query_inner(table, select_clause, clauses, params, true) {
+            // tách biểu thức aggregate thất bại (dạng chưa hỗ trợ như json_agg(t)): chạy như trước
+            Err(_) if split_aggregate_expressions(select_clause).0.is_some() => {
+                crate::engine::errors::clear();
+                self.handle_group_by_query_inner(table, select_clause, clauses, params, false)
+            }
+            r => r,
+        }
+    }
+
+    fn handle_group_by_query_inner(
+        &self,
+        table: &crate::storage::table::Table,
+        select_clause: &str,
+        clauses: &SelectClauses,
+        params: &[Value],
+        split_aggs: bool,
+    ) -> Result<QueryResult, String> {
+        // Biểu thức trên aggregate (`count(*) / 2`, `sum(n) / count(n)`, `max(n) + 1`, `count(*)::int`):
+        // mỗi lời gọi aggregate thành một mục ẩn `__agg{j}__` tính trước, mục gốc thành `__cmp{k}__` rồi được
+        // tính lại từ giá trị của các mục ẩn (cùng dòng đầu của nhóm cho cột không gộp).
+        let (rewritten, composites) = if split_aggs { split_aggregate_expressions(select_clause) } else { (None, vec![]) };
+        let select_clause = rewritten.as_deref().unwrap_or(select_clause);
         // Không có GROUP BY (hàm gộp có FILTER): cả bảng là một nhóm.
         let gb_str = clauses.group_by_clause.unwrap_or("");
         let proj_items_for_ordinal = split_projection_items(select_clause);
@@ -5042,7 +5321,18 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 } else if proj.func.is_none() {
                     let first_ri = r_indices.first().copied().unwrap_or(0);
                     let row: &[Value] = if first_ri < table.rows.len() { &table.rows[first_ri] } else { &[] };
-                    let v = eval_sql_expr(&proj.name, row, Some(table), &[], None, params);
+                    let expr = match composites.iter().find(|(ph, _, _)| *ph == proj.name) {
+                        Some((_, text, calls)) => {
+                            let mut e = text.clone();
+                            for (call, hidden) in calls.iter().rev() {
+                                let lit = json_to_sql_literal(row_map.get(hidden).unwrap_or(&serde_json::Value::Null));
+                                e.replace_range(call.clone(), &lit);
+                            }
+                            e
+                        }
+                        None => proj.name.clone(),
+                    };
+                    let v = eval_sql_expr(&expr, row, Some(table), &[], None, params);
                     row_map.insert(proj.alias.clone(), value_to_json(&v));
                 } else if let Some(ref func) = proj.func {
                     let mut target_indices: Vec<usize> = if let Some(ref f_expr) = proj.filter_expr {
@@ -5087,12 +5377,15 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         }
                         AggFunc::Sum(c_idx) => {
                             let mut sum = 0.0;
+                            let mut any = false;
                             for &ri in &target_indices {
                                 if let Some(f) = table.rows[ri].get(*c_idx).and_then(|v| v.as_f64()) {
                                     sum += f;
+                                    any = true;
                                 }
                             }
-                            json!(sum)
+                            // như PostgreSQL: sum của nhóm không có giá trị nào là NULL
+                            if any { json!(sum) } else { serde_json::Value::Null }
                         }
                         AggFunc::Avg(c_idx) => {
                             let mut sum = 0.0;
@@ -5362,7 +5655,21 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     continue;
                 }
             }
+            if !composites.is_empty() {
+                row_map.retain(|k, _| !is_hidden_agg_key(k));
+            }
             group_rows.push(serde_json::Value::Object(row_map));
+        }
+        if !composites.is_empty() {
+            fields.retain(|f| !is_hidden_agg_key(&f.name));
+            // kiểu của mục ghép theo giá trị đầu tiên khác NULL
+            for f in fields.iter_mut().filter(|f| f.data_type == "text") {
+                if let Some(v) = group_rows.iter().filter_map(|r| r.get(&f.name)).find(|v| !v.is_null()) {
+                    if !v.is_string() {
+                        f.data_type = type_str_from_json_value(v);
+                    }
+                }
+            }
         }
 
         if !clauses.order_by_specs.is_empty() {
@@ -10233,11 +10540,27 @@ fn find_matching_paren(s: &str, start_open_paren: usize) -> Option<usize> {
 }
 
 fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table) -> Vec<AggSpec> {
-    let mut specs = Vec::new();
+    let mut specs: Vec<AggSpec> = Vec::new();
     let parts: Vec<&str> = split_comma_separated_tokens(select_clause);
 
     for part in parts {
         let part_trim = part.trim();
+        let before = specs.len();
+        parse_aggregation_item(part_trim, table, &mut specs);
+        // tên mặc định trùng (`count(*), count(n)`): như đường thường, khoá là văn bản của mục để các cột
+        // không đè nhau trong object kết quả (wire đặt lại tên PostgreSQL)
+        if specs.len() == before + 1 && rfind_top_level_as(&part_trim.to_uppercase()).is_none() {
+            let a = specs[before].alias.clone();
+            if specs[..before].iter().any(|sp| sp.alias == a) {
+                specs[before].alias = part_trim.to_string();
+            }
+        }
+    }
+    specs
+}
+
+fn parse_aggregation_item(part_trim: &str, table: &crate::storage::table::Table, specs: &mut Vec<AggSpec>) {
+    {
         let upper = part_trim.to_uppercase();
 
         let get_alias = |default_alias: &str| -> String {
@@ -10419,8 +10742,6 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
             }
         }
     }
-
-    specs
 }
 
 #[derive(Clone, Debug)]
@@ -11075,6 +11396,398 @@ fn normalize_named_sql_params(sql: &str) -> String {
     }
     result.push_str(&sql[copied_until..]);
     result
+}
+
+const AGG_NAMES: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG", "STRING_AGG", "JSON_AGG", "JSONB_AGG"];
+
+fn is_hidden_agg_key(k: &str) -> bool {
+    k.starts_with("__agg") && k.ends_with("__")
+}
+
+/// Vị trí (đầu..cuối) các lời gọi aggregate trong `e` (ngoài chuỗi), kèm `FILTER (...)` theo sau.
+fn find_aggregate_calls(e: &str) -> Vec<std::ops::Range<usize>> {
+    let b = e.as_bytes();
+    let mut out = Vec::new();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            in_str = !in_str;
+            i += 1;
+            continue;
+        }
+        if in_str || !(b[i].is_ascii_alphabetic()) || i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.') {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        let word = &e[i..j];
+        let mut k = j;
+        while k < b.len() && b[k] == b' ' {
+            k += 1;
+        }
+        if k < b.len() && b[k] == b'(' && AGG_NAMES.iter().any(|n| n.eq_ignore_ascii_case(word)) {
+            if let Some(close) = crate::engine::constraints::matching_paren(e, k) {
+                let mut end = close + 1;
+                let rest = e[end..].trim_start();
+                if rest.len() > 6 && rest.as_bytes()[..6].eq_ignore_ascii_case(b"FILTER") {
+                    let fstart = end + (e[end..].len() - rest.len()) + 6;
+                    let after = e[fstart..].trim_start();
+                    if after.starts_with('(') {
+                        let open = fstart + (e[fstart..].len() - after.len());
+                        if let Some(fc) = crate::engine::constraints::matching_paren(e, open) {
+                            end = fc + 1;
+                        }
+                    }
+                }
+                out.push(i..end);
+                i = end;
+                continue;
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+/// Tách các mục SELECT là biểu thức chứa aggregate (nhưng không phải một lời gọi aggregate thuần) thành
+/// mục ẩn. Trả (select mới, [(placeholder, biểu thức gốc, [(vị trí lời gọi, khoá ẩn)])]).
+#[allow(clippy::type_complexity)]
+fn split_aggregate_expressions(select_clause: &str) -> (Option<String>, Vec<(String, String, Vec<(std::ops::Range<usize>, String)>)>) {
+    let up = select_clause.to_uppercase();
+    if !AGG_NAMES.iter().any(|n| up.contains(&format!("{}(", n))) || up.contains(" OVER") {
+        return (None, vec![]);
+    }
+    let items = split_projection_items(select_clause);
+    let mut hidden: Vec<String> = Vec::new();
+    let mut out_items: Vec<String> = Vec::new();
+    let mut composites = Vec::new();
+    for item in items {
+        let it = item.trim();
+        let (expr, alias) = match rfind_top_level_as(&it.to_uppercase()) {
+            Some(p) => (it[..p].trim(), Some(it[p + 4..].trim())),
+            None => (it, None),
+        };
+        let calls = find_aggregate_calls(expr);
+        let pure = calls.len() == 1 && calls[0].start == 0 && calls[0].end == expr.len();
+        if calls.is_empty() || pure {
+            out_items.push(it.to_string());
+            continue;
+        }
+        let k = composites.len();
+        let mut call_keys = Vec::new();
+        for c in &calls {
+            let key = format!("__agg{}__", hidden.len());
+            hidden.push(format!("{} AS \"{}\"", &expr[c.clone()], key));
+            call_keys.push((c.clone(), key));
+        }
+        let ph = format!("__cmp{}__", k);
+        // không alias (engine để nguyên vì tên mặc định bị trùng): khoá là chính văn bản biểu thức
+        let name = match alias {
+            Some(a) => a.to_string(),
+            None => format!("\"{}\"", expr.replace('"', "\"\"")),
+        };
+        out_items.push(format!("{} AS {}", ph, name));
+        composites.push((ph, expr.to_string(), call_keys));
+    }
+    if composites.is_empty() {
+        return (None, vec![]);
+    }
+    hidden.extend(out_items);
+    (Some(hidden.join(", ")), composites)
+}
+
+fn json_to_sql_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        serde_json::Value::Number(n) => {
+            let t = n.to_string();
+            if t.starts_with('-') { format!("({})", t) } else { t }
+        }
+        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
+/// Chuẩn hoá biểu thức để so khớp cột nhóm (`t.n`, `N`, ` n ` → `n`).
+fn norm_group_expr(e: &str) -> String {
+    let mut t = e.trim();
+    while t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
+        t = t[1..t.len() - 1].trim();
+    }
+    let lower = t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    if lower.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '"') {
+        return lower.rsplit('.').next().unwrap_or(&lower).trim_matches('"').to_string();
+    }
+    lower
+}
+
+/// Một phần tử của GROUP BY → danh sách các tập nhóm (mỗi tập là danh sách biểu thức).
+fn grouping_element_sets(el: &str) -> Result<Vec<Vec<String>>, String> {
+    let e = el.trim();
+    let up = e.to_uppercase();
+    let unit = |x: &str| -> Vec<String> {
+        let x = x.trim();
+        if x.starts_with('(') && x.ends_with(')') && is_fully_enclosed_in_parens(x) {
+            split_comma_separated_tokens(&x[1..x.len() - 1]).into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
+        } else {
+            vec![x.to_string()]
+        }
+    };
+    let body = |kw_len: usize| -> Result<&str, String> {
+        let r = e[kw_len..].trim();
+        if r.starts_with('(') && r.ends_with(')') && is_fully_enclosed_in_parens(r) { Ok(&r[1..r.len() - 1]) } else { Err(format!("syntax error at or near \"{}\"", e)) }
+    };
+    if up.starts_with("GROUPING SETS") {
+        let mut out = Vec::new();
+        for item in split_comma_separated_tokens(body(13)?) {
+            let it = item.trim();
+            let iu = it.to_uppercase();
+            if iu.starts_with("ROLLUP") || iu.starts_with("CUBE") || iu.starts_with("GROUPING SETS") {
+                out.extend(grouping_element_sets(it)?);
+            } else {
+                out.push(unit(it));
+            }
+        }
+        return Ok(out);
+    }
+    if up.starts_with("ROLLUP") {
+        let units: Vec<Vec<String>> = split_comma_separated_tokens(body(6)?).into_iter().map(unit).collect();
+        return Ok((0..=units.len()).rev().map(|k| units[..k].concat()).collect());
+    }
+    if up.starts_with("CUBE") {
+        let units: Vec<Vec<String>> = split_comma_separated_tokens(body(4)?).into_iter().map(unit).collect();
+        let n = units.len();
+        if n > 12 {
+            return Err("CUBE is limited to 12 elements".to_string());
+        }
+        let mut out = Vec::new();
+        for mask in (0..(1u32 << n)).rev() {
+            out.push((0..n).filter(|i| mask & (1 << (n - 1 - i)) != 0).flat_map(|i| units[i].clone()).collect());
+        }
+        return Ok(out);
+    }
+    Ok(vec![unit(e)])
+}
+
+/// `GROUP BY GROUPING SETS (...) / ROLLUP (...) / CUBE (...)` → UNION ALL các truy vấn GROUP BY thường:
+/// cột nhóm không thuộc tập hiện tại thành NULL, `GROUPING(...)` thành hằng bitmask. `None` nếu không áp dụng.
+fn grouping_sets_as_union(sql: &str) -> Result<Option<String>, String> {
+    let s = sql.trim();
+    if !s.to_uppercase().starts_with("SELECT") || ["UNION", "INTERSECT", "EXCEPT"].iter().any(|k| find_top_level_keyword(s, k).is_some()) {
+        return Ok(None);
+    }
+    let Some(gb) = find_top_level_keyword(s, "GROUP BY") else { return Ok(None) };
+    let Some(from) = find_top_level_keyword(s, "FROM") else { return Ok(None) };
+    let after_gb = &s[gb + 8..];
+    let mut end = after_gb.len();
+    let mut cuts: Vec<(usize, &str)> = Vec::new();
+    for kw in ["HAVING", "ORDER BY", "LIMIT", "OFFSET", "WINDOW"] {
+        if let Some(p) = find_top_level_keyword(after_gb, kw) {
+            end = end.min(p);
+            cuts.push((p, kw));
+        }
+    }
+    cuts.sort();
+    let group_txt = after_gb[..end].trim();
+    let gu = group_txt.to_uppercase();
+    if !(gu.contains("GROUPING SETS") || gu.contains("ROLLUP") || gu.contains("CUBE")) {
+        return Ok(None);
+    }
+    let having = cuts.iter().position(|c| c.1 == "HAVING").map(|i| {
+        let st = cuts[i].0 + 6;
+        let en = cuts.get(i + 1).map(|c| c.0).unwrap_or(after_gb.len());
+        after_gb[st..en].trim().to_string()
+    });
+    let tail = cuts.iter().find(|c| c.1 != "HAVING").map(|c| after_gb[c.0..].trim().to_string()).unwrap_or_default();
+    // tích Đề-các các phần tử
+    let mut sets: Vec<Vec<String>> = vec![vec![]];
+    for el in split_comma_separated_tokens(group_txt) {
+        let el_sets = grouping_element_sets(el)?;
+        let mut next = Vec::new();
+        for a in &sets {
+            for b in &el_sets {
+                next.push([a.clone(), b.clone()].concat());
+            }
+        }
+        sets = next;
+    }
+    let list = s[6..from].trim();
+    let from_where = s[from..gb].trim_end();
+    let items: Vec<(String, String)> = split_projection_items(list)
+        .into_iter()
+        .map(|it| {
+            let it = it.trim().to_string();
+            match rfind_top_level_as(&it.to_uppercase()) {
+                Some(p) => (it[..p].trim().to_string(), it[p + 4..].trim().to_string()),
+                None => {
+                    let name = crate::engine::select_list::default_column_name(&it);
+                    (it.clone(), format!("\"{}\"", name.replace('"', "\"\"")))
+                }
+            }
+        })
+        .collect();
+    // alias dùng trong GROUP BY (`GROUP BY CUBE (flag, big)` với `(n > 4) AS big`) → biểu thức của mục
+    let resolve = |g: &str| -> String {
+        let ng = norm_group_expr(g);
+        items.iter().find(|(_, a)| a.trim_matches('"').to_lowercase() == ng).map(|(e, _)| e.clone()).unwrap_or_else(|| g.trim().to_string())
+    };
+    let all_groups: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        for st in &sets {
+            for g in st {
+                let r = norm_group_expr(&resolve(g));
+                if !v.contains(&r) {
+                    v.push(r);
+                }
+            }
+        }
+        v
+    };
+    let mut branches = Vec::new();
+    for st in &sets {
+        let present: Vec<String> = st.iter().map(|g| norm_group_expr(&resolve(g))).collect();
+        let mut out_items = Vec::new();
+        for (e, alias) in &items {
+            let ne = norm_group_expr(e);
+            if all_groups.contains(&ne) && !present.contains(&ne) {
+                out_items.push(format!("NULL AS {}", alias));
+                continue;
+            }
+            // GROUPING(a, b, ...) → bitmask (bit = 1 khi đối số không thuộc tập hiện tại)
+            let mut ex = e.clone();
+            while let Some(p) = find_ci_word(&ex, "GROUPING(") {
+                let open = p + 8;
+                let Some(close) = crate::engine::constraints::matching_paren(&ex, open) else { break };
+                let args: Vec<String> = split_comma_separated_tokens(&ex[open + 1..close]).into_iter().map(|a| norm_group_expr(&resolve(a))).collect();
+                let mut mask = 0u64;
+                for a in &args {
+                    mask = (mask << 1) | u64::from(!present.contains(a));
+                }
+                ex.replace_range(p..close + 1, &mask.to_string());
+            }
+            out_items.push(format!("{} AS {}", ex, alias));
+        }
+        let gb_clause = if st.is_empty() { String::new() } else { format!(" GROUP BY {}", st.iter().map(|g| resolve(g)).collect::<Vec<_>>().join(", ")) };
+        let hv = having.as_ref().map(|h| format!(" HAVING {}", h)).unwrap_or_default();
+        branches.push(format!("SELECT {} {}{}{}", out_items.join(", "), from_where, gb_clause, hv));
+    }
+    let mut u = branches.join(" UNION ALL ");
+    if !tail.is_empty() {
+        u.push(' ');
+        u.push_str(&tail);
+    }
+    Ok(Some(u))
+}
+
+/// Vị trí của `word` (kết thúc bằng `(`), không phân biệt hoa thường, có biên từ phía trước, ngoài chuỗi.
+fn find_ci_word(s: &str, word: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let w = word.as_bytes();
+    let mut in_str = false;
+    for i in 0..b.len() {
+        if b[i] == b'\'' {
+            in_str = !in_str;
+        }
+        if !in_str && i + w.len() <= b.len() && b[i..i + w.len()].eq_ignore_ascii_case(w) && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// `CREATE [UNLOGGED|TEMP] TABLE ... AS SELECT|WITH|VALUES|TABLE|(`: CREATE TABLE AS.
+fn is_create_table_as(sql: &str) -> bool {
+    let Some(p) = find_top_level_keyword(sql, "AS") else { return false };
+    // `AS` phải nằm ngoài phần định nghĩa cột (cột GENERATED ALWAYS AS (...) nằm trong ngoặc)
+    let before = &sql[..p];
+    if before.contains('(') && !before.trim_end().ends_with(')') {
+        return false;
+    }
+    let after = sql[p + 2..].trim_start().to_uppercase();
+    ["SELECT", "WITH", "VALUES", "TABLE", "("].iter().any(|k| after.starts_with(k))
+}
+
+/// `SELECT <list> INTO [TEMP|TEMPORARY|UNLOGGED] [TABLE] t FROM ...` → `CREATE [UNLOGGED] TABLE t AS SELECT <list> FROM ...`.
+fn select_into_as_ctas(sql: &str) -> Option<String> {
+    let into = find_top_level_keyword(sql, "INTO")?;
+    if let Some(from) = find_top_level_keyword(sql, "FROM") {
+        if from < into {
+            return None;
+        }
+    }
+    let after = sql[into + 4..].trim_start();
+    let mut words = after.splitn(2, char::is_whitespace);
+    let mut first = words.next()?.to_string();
+    let mut rest = words.next().unwrap_or("").trim_start().to_string();
+    let mut prefix = "";
+    loop {
+        match first.to_uppercase().as_str() {
+            "TEMP" | "TEMPORARY" => prefix = "TEMP ",
+            "UNLOGGED" => prefix = "UNLOGGED ",
+            "TABLE" => {}
+            _ => break,
+        }
+        let mut w = rest.splitn(2, char::is_whitespace);
+        first = w.next()?.to_string();
+        rest = w.next().unwrap_or("").trim_start().to_string();
+    }
+    let name = first;
+    Some(format!("CREATE {}TABLE {} AS {} {}", prefix, name, sql[..into].trim_end(), rest).trim_end().to_string())
+}
+
+/// Kiểu SQL cho cột CTAS khi không có kiểu khai báo: theo OID của cột kết quả, rồi theo giá trị.
+fn sql_type_for_oid(oid: u32, sample: Option<&serde_json::Value>) -> String {
+    use crate::pg_types::*;
+    let t = match oid {
+        OID_INT4 => "int4",
+        OID_INT8 => "int8",
+        OID_INT2 => "int2",
+        OID_BOOL => "boolean",
+        OID_NUMERIC => "numeric",
+        OID_FLOAT4 => "real",
+        OID_FLOAT8 => "double precision",
+        OID_TIMESTAMP => "timestamp",
+        OID_TIMESTAMPTZ => "timestamptz",
+        OID_DATE => "date",
+        OID_TIME => "time",
+        OID_JSON => "json",
+        OID_JSONB => "jsonb",
+        OID_UUID => "uuid",
+        OID_BYTEA => "bytea",
+        OID_VARCHAR => "varchar",
+        OID_TEXT_ARRAY => "text[]",
+        OID_INT4_ARRAY => "int4[]",
+        OID_INT8_ARRAY => "int8[]",
+        OID_NUMERIC_ARRAY => "numeric[]",
+        OID_BOOL_ARRAY => "boolean[]",
+        OID_FLOAT8_ARRAY => "double precision[]",
+        _ => match sample {
+            Some(serde_json::Value::Bool(_)) => "boolean",
+            Some(serde_json::Value::Number(n)) if n.is_i64() => "int4",
+            Some(serde_json::Value::Number(_)) => "numeric",
+            Some(serde_json::Value::Object(_)) => "jsonb",
+            Some(serde_json::Value::Array(_)) => "text[]",
+            _ => "text",
+        },
+    };
+    t.to_string()
+}
+
+/// `count(...)`, `sum(...)`, `avg(...)`, `min(...)`, `max(...)` chiếm trọn biểu thức (có thể kèm alias).
+fn is_pure_aggregate_item(item: &str) -> bool {
+    let t = item.trim();
+    let e = match rfind_top_level_as(&t.to_uppercase()) {
+        Some(p) => t[..p].trim(),
+        None => t,
+    };
+    let Some(open) = e.find('(') else { return false };
+    let name = e[..open].trim().to_ascii_uppercase();
+    AGG_NAMES.contains(&name.as_str()) && e.ends_with(')') && is_fully_enclosed_in_parens(&e[open..])
 }
 
 fn is_aggregate_projection_item(item: &str) -> bool {

@@ -450,6 +450,11 @@ pub(crate) fn format_wire(decl: &DeclType, text: String) -> String {
             Ok(f) => format_money(f),
             Err(_) => text,
         },
+        // số nguyên đã qua phép tính số thực (`8.0` từ sum/min): in như số nguyên
+        "int2" | "int4" | "int8" | "serial" | "bigserial" | "smallserial" if text.contains('.') => match text.trim().parse::<f64>() {
+            Ok(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => format!("{}", f as i64),
+            _ => text,
+        },
         "float4" => match text.trim().parse::<f32>() {
             Ok(f) if f.is_finite() => format!("{}", f),
             _ => text,
@@ -738,6 +743,34 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
         let args = crate::engine::executor::split_comma_separated_tokens(&e[9..e.len() - 1]);
         let naive = matches!(expr_decl(args.get(1)?, col).map(|d| d.base), Some(b) if b == "timestamp" || b == "date");
         return DeclType::parse(if naive { "timestamptz" } else { "timestamp" });
+    }
+    // aggregate: count → int8; sum(int) → int8, sum(numeric) → numeric; min/max giữ kiểu; avg → numeric
+    if let Some(open) = e.find('(') {
+        let fname = e[..open].trim().to_ascii_uppercase();
+        if fname == "GROUPING" && e.ends_with(')') && is_fully_enclosed_in_parens(&e[open..]) {
+            return DeclType::parse("int4");
+        }
+        if matches!(fname.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[open..]) {
+            let inner = e[open + 1..e.len() - 1].trim();
+            let inner = inner.strip_prefix("DISTINCT ").or_else(|| inner.strip_prefix("distinct ")).unwrap_or(inner);
+            let arg = || expr_decl(inner, col).filter(|d| !d.array);
+            return match fname.as_str() {
+                "COUNT" => DeclType::parse("int8"),
+                "AVG" => match arg().map(|d| d.base) {
+                    Some(b) if b == "float4" || b == "float8" => DeclType::parse("float8"),
+                    _ => DeclType::parse("numeric"),
+                },
+                "SUM" => match arg().map(|d| d.base) {
+                    Some(b) if matches!(b.as_str(), "int2" | "int4" | "serial" | "smallserial") => DeclType::parse("int8"),
+                    Some(b) if b == "int8" || b == "bigserial" => DeclType::parse("numeric"),
+                    // sum(numeric(p,s)) giữ scale s
+                    Some(b) if b == "numeric" => arg(),
+                    Some(b) if b == "float4" || b == "float8" || b == "money" || b == "interval" => DeclType::parse(&b),
+                    _ => None,
+                },
+                _ => arg(),
+            };
+        }
     }
     if e.len() > 10 && e.as_bytes()[..10].eq_ignore_ascii_case(b"DATE_TRUNC") && e.ends_with(')') {
         let open = e.find('(')?;
