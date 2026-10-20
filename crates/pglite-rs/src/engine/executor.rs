@@ -1353,6 +1353,68 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
         Ok(resolved)
     }
 
+    /// `ARRAY(SELECT x ...)` không tương quan → `ARRAY[v1, v2, ...]` (cột đầu của mọi dòng, giữ thứ tự),
+    /// rỗng → `'{}'`. Subquery chạy lỗi (vd. tham chiếu bảng ngoài) thì giữ nguyên. `None` nếu không đổi gì.
+    fn expand_array_subqueries(&mut self, sql: &str, params: &[Value]) -> Result<Option<String>, String> {
+        let mut out = sql.to_string();
+        let mut from = 0;
+        let mut changed = false;
+        loop {
+            let b = out.as_bytes();
+            let mut found = None;
+            let mut in_str = false;
+            for i in from..b.len() {
+                if b[i] == b'\'' {
+                    in_str = !in_str;
+                }
+                if !in_str
+                    && i + 6 <= b.len()
+                    && b[i..i + 6].eq_ignore_ascii_case(b"ARRAY(")
+                    && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                    && out[i + 6..].trim_start().len() > 7
+                    && out[i + 6..].trim_start().as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ")
+                {
+                    found = Some(i);
+                    break;
+                }
+            }
+            let Some(i) = found else { break };
+            let open = i + 5;
+            let Some(close) = crate::engine::constraints::matching_paren(&out, open) else { break };
+            let sub = out[open + 1..close].to_string();
+            if subquery_is_correlated(&sub) {
+                return Err("correlated ARRAY(subquery) is not supported".to_string());
+            }
+            let Ok((res, _)) = self.handle_select(sub.trim(), params) else {
+                from = close;
+                continue;
+            };
+            let first_key = res.fields.first().map(|f| f.name.clone());
+            let items: Vec<String> = res
+                .rows
+                .iter()
+                .map(|r| {
+                    let v = match (r.as_object(), &first_key) {
+                        (Some(o), Some(k)) => o.get(k).or_else(|| o.values().next()).cloned().unwrap_or_default(),
+                        (Some(o), None) => o.values().next().cloned().unwrap_or_default(),
+                        _ => serde_json::Value::Null,
+                    };
+                    match v {
+                        serde_json::Value::Null => "NULL".to_string(),
+                        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                        serde_json::Value::Array(_) | serde_json::Value::Object(_) => format!("'{}'", v.to_string().replace('\'', "''")),
+                        other => other.to_string(),
+                    }
+                })
+                .collect();
+            let arr = if items.is_empty() { "'{}'".to_string() } else { format!("ARRAY[{}]", items.join(", ")) };
+            out = format!("{}{}{}", &out[..i], arr, &out[close + 1..]);
+            from = i + arr.len();
+            changed = true;
+        }
+        Ok(changed.then_some(out))
+    }
+
     fn resolve_subqueries_in_select(&mut self, select_str: &str, params: &[Value]) -> Result<String, String> {
         let mut resolved = select_str.to_string();
         loop {
@@ -3327,6 +3389,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_select(&mut self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
+        if contains_ci(sql, "ARRAY(") {
+            if let Some(expanded) = self.expand_array_subqueries(sql, params)? {
+                return self.handle_select(&expanded, params);
+            }
+        }
         // FOR UPDATE / FOR SHARE / ... [OF t] [NOWAIT | SKIP LOCKED]: engine nhúng chạy tuần tự, khoá dòng
         // không có ý nghĩa; bỏ đi thay vì để nó làm hỏng điều kiện (trước đây trả 0 dòng).
         if let Some(p) = contains_ci(sql, " FOR ").then(|| last_top_level_keyword(sql, "FOR")).flatten() {
@@ -10671,6 +10738,55 @@ pub(crate) fn extract_value_groups(values_part: &str) -> Vec<&str> {
     groups
 }
 
+/// Subquery có tham chiếu `q.col` mà `q` không phải bảng / alias trong FROM của chính nó (tương quan).
+fn subquery_is_correlated(sub: &str) -> bool {
+    let Some(f) = find_top_level_keyword(sub, "FROM") else { return false };
+    let rest = &sub[f + 4..];
+    let mut end = rest.len();
+    for kw in ["WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "UNION", "WINDOW"] {
+        if let Some(p) = find_top_level_keyword(rest, kw) {
+            end = end.min(p);
+        }
+    }
+    let mut own: Vec<String> = Vec::new();
+    let mut prev_kw = true;
+    for tok in rest[..end].split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')') {
+        if tok.is_empty() {
+            continue;
+        }
+        let up = tok.to_uppercase();
+        if ["JOIN", "LEFT", "RIGHT", "FULL", "INNER", "OUTER", "CROSS", "ON", "AS", "USING", "LATERAL", "NATURAL"].contains(&up.as_str()) {
+            prev_kw = true;
+            continue;
+        }
+        if tok.contains('=') || tok.contains('.') && !prev_kw {
+            prev_kw = false;
+            continue;
+        }
+        own.push(tok.rsplit('.').next().unwrap_or(tok).trim_matches('"').to_lowercase());
+        prev_kw = false;
+    }
+    let b = sub.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            in_str = !in_str;
+        } else if !in_str && b[i] == b'.' && i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'"') {
+            let mut s0 = i;
+            while s0 > 0 && (b[s0 - 1].is_ascii_alphanumeric() || b[s0 - 1] == b'_') {
+                s0 -= 1;
+            }
+            let q = sub[s0..i].to_lowercase();
+            if !q.chars().next().is_some_and(|c| c.is_ascii_digit()) && !own.contains(&q) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(crate) fn clean_col_name(raw: &str) -> &str {
     let mut s = raw.trim();
     while s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
@@ -12582,17 +12698,33 @@ fn get_raw_bytes(val: &Value) -> Vec<u8> {
     }
 }
 
+thread_local! {
+    /// Regex đã biên dịch theo (mẫu, không phân biệt hoa thường): tránh biên dịch lại ở mỗi dòng.
+    static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<(String, bool), Option<regex::Regex>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `text ~ pat` (POSIX regex của PostgreSQL, quy về cú pháp crate `regex`). Mẫu sai → lỗi 2201B.
 pub(crate) fn regex_match(text: &str, pat: &str, case_insensitive: bool) -> bool {
-    let pattern = if case_insensitive {
-        format!("(?i){}", pat)
-    } else {
-        pat.to_string()
-    };
-    if let Ok(re) = regex::Regex::new(&pattern) {
-        re.is_match(text)
-    } else {
-        false
-    }
+    REGEX_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let key = (pat.to_string(), case_insensitive);
+        if !c.contains_key(&key) {
+            if c.len() > 256 {
+                c.clear();
+            }
+            // \m, \M, \y (biên từ của PostgreSQL) → \b
+            let p = pat.replace("\\m", "\\b").replace("\\M", "\\b").replace("\\y", "\\b");
+            let re = regex::RegexBuilder::new(&p).case_insensitive(case_insensitive).build();
+            c.insert(key.clone(), re.ok());
+        }
+        match &c[&key] {
+            Some(re) => re.is_match(text),
+            None => {
+                crate::engine::errors::raise(format!("invalid regular expression: {}", pat));
+                false
+            }
+        }
+    })
 }
 
 pub(crate) fn json_to_value(j: &serde_json::Value) -> Value {
@@ -13829,7 +13961,8 @@ pub(crate) fn find_top_level_math_op(s: &str, ops: &[char]) -> Option<(usize, ch
                     if ch == '*' {
                         let prev_non_space = s[..idx].trim_end();
                         let next_non_space = s[idx + 1..].trim_start();
-                        if prev_non_space.is_empty() || next_non_space.is_empty() {
+                        // `~*`, `!~*` là toán tử regex, không phải phép nhân
+                        if prev_non_space.is_empty() || next_non_space.is_empty() || idx > 0 && bytes[idx - 1] == b'~' {
                             i -= 1;
                             continue;
                         }
@@ -14705,6 +14838,47 @@ pub(crate) fn eval_sql_expr(
         }
     }
 
+    // timezone(zone, ts) = ts AT TIME ZONE zone (oprewrite viết lại AT TIME ZONE thành hàm này)
+    if upper.starts_with("TIMEZONE(") && s.ends_with(')') && is_fully_enclosed_in_parens(&s[8..]) {
+        let args = split_function_args(&s[9..s.len() - 1]);
+        if args.len() == 2 {
+            let zone = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let ts = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            if zone.is_null() || ts.is_null() {
+                return Value::Null;
+            }
+            let col = |c: &str| {
+                let name = c.rsplit('.').next().unwrap_or(c).trim_matches('"');
+                [primary_table, joined_table].into_iter().flatten().find_map(|t| t.get_column_index(name).and_then(|i| crate::engine::coltypes::column_decl(t, i)))
+            };
+            let input_tz = !matches!(crate::engine::coltypes::pg_typeof(&args[1], &col).as_deref(), Some("timestamp without time zone" | "date"));
+            return match crate::engine::temporal::timezone_convert(&zone.as_str(), &ts.as_str(), input_tz) {
+                Ok(v) => Value::text(v),
+                Err(e) => {
+                    crate::engine::errors::raise(e);
+                    Value::Null
+                }
+            };
+        }
+    }
+    // is_normalized(text [, form]) — `x IS [NOT] [form] NORMALIZED`
+    if upper.starts_with("IS_NORMALIZED(") && s.ends_with(')') && is_fully_enclosed_in_parens(&s[13..]) {
+        let args = split_function_args(&s[14..s.len() - 1]);
+        let v = eval_sql_expr(args.first().map(|a| a.as_str()).unwrap_or("NULL"), primary_row, primary_table, joined_row, joined_table, params);
+        if v.is_null() {
+            return Value::Null;
+        }
+        let form = args.get(1).map(|f| eval_sql_expr(f, primary_row, primary_table, joined_row, joined_table, params).as_str().to_uppercase()).unwrap_or_else(|| "NFC".to_string());
+        use unicode_normalization::{is_nfc, is_nfd, is_nfkc, is_nfkd};
+        let t = v.as_str();
+        return Value::Bool(match form.as_str() {
+            "NFD" => is_nfd(&t),
+            "NFKC" => is_nfkc(&t),
+            "NFKD" => is_nfkd(&t),
+            _ => is_nfc(&t),
+        });
+    }
+
     if upper.starts_with("PG_TYPEOF(") && s.ends_with(')') && is_fully_enclosed_in_parens(&s[9..]) {
         return Value::text(pg_typeof_value(&s[10..s.len() - 1], primary_row, primary_table, joined_row, joined_table, params));
     }
@@ -15021,6 +15195,29 @@ pub(crate) fn eval_sql_expr(
             let col_part = s[..open_bracket].trim();
             if !col_part.eq_ignore_ascii_case("ARRAY") {
                 let idx_part = s[open_bracket + 1..s.len() - 1].trim();
+                // slice: a[lo:hi], a[lo:], a[:hi] (chỉ số từ 1, hai đầu tính cả; ngoài miền → mảng rỗng)
+                if let Some(colon) = idx_part.find(':').filter(|_| !idx_part.contains("::") && !idx_part.contains('\'')) {
+                    let bound = |e: &str| -> Option<Option<i64>> {
+                        let e = e.trim();
+                        if e.is_empty() {
+                            return Some(None);
+                        }
+                        match eval_sql_expr(e, primary_row, primary_table, joined_row, joined_table, params) {
+                            Value::Null => None,
+                            v => v.as_i64().map(Some),
+                        }
+                    };
+                    let col_val = eval_sql_expr(col_part, primary_row, primary_table, joined_row, joined_table, params);
+                    let (Some(lo), Some(hi)) = (bound(&idx_part[..colon]), bound(&idx_part[colon + 1..])) else { return Value::Null };
+                    if col_val.is_null() {
+                        return Value::Null;
+                    }
+                    let items = val_to_array_items(&col_val);
+                    let lo = lo.unwrap_or(1).max(1);
+                    let hi = hi.unwrap_or(items.len() as i64).min(items.len() as i64);
+                    let picked: Vec<serde_json::Value> = if lo > hi { vec![] } else { items[(lo - 1) as usize..hi as usize].iter().map(value_to_json).collect() };
+                    return Value::text(serde_json::Value::Array(picked).to_string());
+                }
                 if let Ok(idx_1based) = idx_part.parse::<usize>() {
                     let col_val = eval_sql_expr(col_part, primary_row, primary_table, joined_row, joined_table, params);
                     let items = val_to_array_items(&col_val);

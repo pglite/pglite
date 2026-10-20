@@ -355,6 +355,14 @@ fn interval_field(chars: &[char], from: usize) -> Option<(usize, &'static str)> 
 
 /// Chuẩn hoá `sql` (xem đầu file). Lỗi cú pháp trả `Err` theo đúng thông báo PostgreSQL.
 pub(crate) fn lex(sql: &str) -> Result<String, String> {
+    let out = lex_tokens(sql)?;
+    Ok(match super::oprewrite::rewrite(&out) {
+        Some(r) => r,
+        None => out,
+    })
+}
+
+fn lex_tokens(sql: &str) -> Result<String, String> {
     if !needs_lex(sql) {
         return Ok(sql.to_string());
     }
@@ -678,7 +686,8 @@ mod tests {
         assert_eq!(lex("SELECT 1; DO $$ x $$").unwrap(), "SELECT 1; DO $$ x $$");
         assert_eq!(lex("SELECT 'it''s' 'x'").is_err(), true);
         assert_eq!(lex("SELECT int '5', DATE '2024-01-01', INTERVAL '1' DAY, INTERVAL '2 hours'").unwrap(), "SELECT '5'::int4, '2024-01-01'::date, '1 days'::interval, '2 hours'::interval");
-        assert_eq!(lex("SELECT now() AT TIME ZONE 'UTC'").unwrap(), "SELECT now() AT TIME ZONE 'UTC'");
+        // `TIME ZONE 'UTC'` không phải literal kiểu time; AT TIME ZONE được viết lại thành timezone()
+        assert_eq!(lex("SELECT now() AT TIME ZONE 'UTC'").unwrap(), "SELECT timezone('UTC', now())");
     }
 
     #[test]

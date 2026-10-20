@@ -37,6 +37,7 @@ md-5 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 regex = "1.10"
+unicode-normalization = "0.1"
 
 # Node.js native addon dependencies
 napi = { version = "2.16.14", default-features = false, features = ["napi4", "async", "serde-json"], optional = true }

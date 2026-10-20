@@ -786,6 +786,12 @@ pub fn sqlstate(message: &str) -> &'static str {
         "23514"
     } else if has("current transaction is aborted") {
         "25P02"
+    } else if has("which is not a composite type") {
+        "42809"
+    } else if has("time zone") && has("not recognized") {
+        "22023"
+    } else if has("invalid regular expression") {
+        "2201B"
     } else if has("date/time field value out of range") {
         "22008"
     } else if ["date", "time", "timestamp", "timestamp with time zone", "time with time zone", "interval"].iter().any(|t| has(&format!("invalid input syntax for type {}:", t))) {

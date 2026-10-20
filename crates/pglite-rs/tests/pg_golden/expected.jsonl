@@ -919,3 +919,19 @@
 {"id":"W2_14","ok":true,"fields":["box","jsonpath","d"],"rows":[["(3,4),(1,2)","$.\"a\"[0].\"b\"","-2 days"]]}
 {"id":"W2_15","ok":true,"fields":["name"],"rows":[["alice"]]}
 {"id":"W2_16","ok":true,"fields":["d"],"rows":[["5"],["5"],["1"]]}
+{"id":"W3_01","ok":true,"fields":["name"],"rows":[["alice"],["bob"]]}
+{"id":"W3_02","ok":true,"fields":["name","v"],"rows":[["alice","v1"],["bob","v3"]]}
+{"id":"W3_03","ok":true,"fields":["a","b","c"],"rows":[["t","t","f"]]}
+{"id":"W3_04","ok":false,"error":"invalid regular expression: parentheses () not balanced","sqlstate":"2201B","failed_stmt":0}
+{"id":"W3_05","ok":true,"fields":["name"],"rows":[["alice"]]}
+{"id":"W3_06","ok":true,"fields":["id","nb"],"rows":[["1","t"],["2","f"],["3",null]]}
+{"id":"W3_07","ok":true,"fields":["a","b","c","d","e"],"rows":[["t","f","t","t","f"]]}
+{"id":"W3_08","ok":true,"fields":["name"],"rows":[]}
+{"id":"W3_09","ok":true,"fields":["id","a","b"],"rows":[["1","5","5.0990195135927845"],["3",null,null]]}
+{"id":"W3_10","ok":true,"fields":["a","b","c"],"rows":[["2024-07-01 14:00:00","2024-01-01 13:00:00","2024-07-04 16:00:00+00"]]}
+{"id":"W3_11","ok":true,"fields":["a","b"],"rows":[["2023-12-31 17:00:00","2023-12-31 17:00:00"]]}
+{"id":"W3_12","ok":false,"error":"time zone \"Mars/Base\" not recognized","sqlstate":"22023","failed_stmt":0}
+{"id":"W3_13","ok":true,"fields":["a","b","c"],"rows":[["2024-03-10 01:59:00","2024-03-10 03:00:00","2024-01-01 11:00:00"]]}
+{"id":"W3_14","ok":true,"fields":["a","b","c"],"rows":[["{v3,v2,v1}","{}","{5,3,NULL}"]]}
+{"id":"W3_15","ok":true,"fields":["a","b","c"],"rows":[["{x}","{x,y}","{}"]]}
+{"id":"W3_16","ok":true,"fields":["a","b"],"rows":[["t","f"]]}

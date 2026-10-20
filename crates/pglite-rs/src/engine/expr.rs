@@ -70,7 +70,7 @@ pub enum CompiledExpr {
     },
     Regex {
         expr: Box<CompiledExpr>,
-        pattern: String,
+        pattern: Box<CompiledExpr>,
         case_insensitive: bool,
         negated: bool,
     },
@@ -555,10 +555,11 @@ impl CompiledExpr {
             }
             CompiledExpr::Regex { expr, pattern, case_insensitive, negated } => {
                 let text_val = expr.eval(primary_row, joined_row, params);
-                if text_val.is_null() {
+                let pat_val = pattern.eval(primary_row, joined_row, params);
+                if text_val.is_null() || pat_val.is_null() {
                     Value::Null
                 } else {
-                    let m = crate::engine::executor::regex_match(&text_val.as_str(), pattern, *case_insensitive);
+                    let m = crate::engine::executor::regex_match(&text_val.as_str(), &pat_val.as_str(), *case_insensitive);
                     Value::Bool(if *negated { !m } else { m })
                 }
             }
@@ -1304,6 +1305,15 @@ pub fn compile_expr(
         }
     }
 
+    // 11b. Regex: !~*, !~, ~*, ~
+    for (op, ci, neg) in [("!~*", true, true), ("!~", false, true), ("~*", true, false), ("~", false, false)] {
+        if let Some(pos) = crate::engine::executor::find_top_level_op(s, op) {
+            let l = compile_expr(&s[..pos], table, table_alias, joined_table, joined_alias);
+            let r = compile_expr(&s[pos + op.len()..], table, table_alias, joined_table, joined_alias);
+            return CompiledExpr::Regex { expr: Box::new(l), pattern: Box::new(r), case_insensitive: ci, negated: neg };
+        }
+    }
+
     // 12. Concat (||)
     if let Some(pipe_idx) = crate::engine::executor::find_top_level_op(s, "||") {
         let l = compile_expr(&s[..pipe_idx], table, table_alias, joined_table, joined_alias);
@@ -1416,10 +1426,10 @@ pub fn compile_expr(
             if !COMPILED_FUNCS.contains(&fn_name.as_str()) && joined_table.is_none() {
                 if let Some(t) = table {
                     // Hàm khác (length, to_char, extract, jsonb_build_object...): bộ đánh giá đầy đủ
-                    return CompiledExpr::RawCtx {
-                        expr: s.to_string(),
-                        table: std::sync::Arc::new(crate::storage::table::Table::new(t.name.clone(), t.columns.clone())),
-                    };
+                    // giữ kiểu khai báo (timestamp vs timestamptz, int2...) cho bộ đánh giá đầy đủ
+                    let mut copy = crate::storage::table::Table::new(t.name.clone(), t.columns.clone());
+                    copy.decl_types = t.decl_types.clone();
+                    return CompiledExpr::RawCtx { expr: s.to_string(), table: std::sync::Arc::new(copy) };
                 }
                 return CompiledExpr::Raw(s.to_string());
             }
@@ -1666,6 +1676,15 @@ pub(crate) fn compile_expr_for_joined(
         let l = compile_expr_for_joined(&s[..pos], joined_schema);
         let r = compile_expr_for_joined(&s[pos + 1..], joined_schema);
         return CompiledExpr::JsonHasKey(Box::new(l), Box::new(r));
+    }
+
+    // Regex: !~*, !~, ~*, ~
+    for (op, ci, neg) in [("!~*", true, true), ("!~", false, true), ("~*", true, false), ("~", false, false)] {
+        if let Some(pos) = crate::engine::executor::find_top_level_op(s, op) {
+            let l = compile_expr_for_joined(&s[..pos], joined_schema);
+            let r = compile_expr_for_joined(&s[pos + op.len()..], joined_schema);
+            return CompiledExpr::Regex { expr: Box::new(l), pattern: Box::new(r), case_insensitive: ci, negated: neg };
+        }
     }
 
     // Concat (||)

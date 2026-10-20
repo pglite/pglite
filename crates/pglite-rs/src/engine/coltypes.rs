@@ -528,7 +528,7 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
     use crate::engine::executor::{find_top_level_keyword, is_fully_enclosed_in_parens, split_comma_separated_tokens};
     let Ok(lexed) = crate::engine::frontend::lex(sql) else { return vec![] };
     let mut s = lexed.trim().trim_end_matches(';').trim();
-    if s.len() < 7 || !s[..7].eq_ignore_ascii_case("SELECT ") || s.contains(';') {
+    if s.len() < 7 || !s.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") || s.contains(';') {
         return vec![];
     }
     for kw in ["UNION", "INTERSECT", "EXCEPT"] {
@@ -540,7 +540,7 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
     let after = match after.get(..9) {
         Some(p) if p.eq_ignore_ascii_case("DISTINCT ") => {
             let r = after[9..].trim_start();
-            if r.len() >= 3 && r[..3].eq_ignore_ascii_case("ON ") || r.len() >= 3 && r[..3].eq_ignore_ascii_case("ON(") {
+            if r.len() >= 3 && r.as_bytes()[..3].eq_ignore_ascii_case(b"ON ") || r.len() >= 3 && r.as_bytes()[..3].eq_ignore_ascii_case(b"ON(") {
                 return vec![];
             }
             r
@@ -648,7 +648,7 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
             e = e[1..e.len() - 1].trim();
         }
         // INTERVAL '...' đứng riêng: engine đã trả đúng kiểu và định dạng
-        let decl = expr_decl(e, &col_decl).filter(|d| d.base != "interval" || !e[..e.len().min(8)].eq_ignore_ascii_case("INTERVAL"));
+        let decl = expr_decl(e, &col_decl).filter(|d| d.base != "interval" || !e.as_bytes()[..e.len().min(8)].eq_ignore_ascii_case(b"INTERVAL"));
         out.push(decl);
     }
     if out.len() != field_count || out.iter().all(|d| d.is_none()) {
@@ -667,6 +667,18 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
     }
     if let Some(d) = col(e) {
         return d;
+    }
+    // so sánh / logic ở cấp ngoài cùng: kết quả boolean (`::` phía sau chỉ thuộc một vế)
+    let upper_e = e.to_ascii_uppercase();
+    if upper_e.starts_with("SELECT") || upper_e.starts_with("WITH") || upper_e.starts_with("VALUES") {
+        return None; // subquery vô hướng: kiểu là của cột nó trả
+    }
+    if ["AND", "OR", "NOT", "IS", "LIKE", "ILIKE", "IN", "BETWEEN", "EXISTS"].iter().any(|k| find_top_level_keyword(&upper_e, k).is_some_and(|p| p > 0 || *k == "NOT" || *k == "EXISTS"))
+        || ["=", "<", ">", "<>", "!=", "~", "~*", "!~", "!~*", "@>", "<@", "?"].iter().any(|op| crate::engine::executor::find_top_level_op(e, op).is_some_and(|p| p > 0))
+    {
+        if !(upper_e.starts_with("CASE") && upper_e.ends_with("END")) {
+            return DeclType::parse("bool");
+        }
     }
     let is_json = |d: &Option<DeclType>| d.as_ref().is_some_and(|d| !d.array && (d.base == "jsonb" || d.base == "json"));
     // jsonb: a || b, a - k, a #- p giữ kiểu jsonb; a -> k, a #> p trả jsonb; ->>, #>> trả text
@@ -717,11 +729,17 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
     if let Some(p) = crate::engine::executor::find_last_top_level_op(e, "::") {
         return DeclType::parse(&e[p + 2..]);
     }
-    if e.len() > 5 && e[..5].eq_ignore_ascii_case("CAST(") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[4..]) {
+    if e.len() > 5 && e.as_bytes()[..5].eq_ignore_ascii_case(b"CAST(") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[4..]) {
         let inner = &e[5..e.len() - 1];
         return find_top_level_keyword(inner, "AS").and_then(|p| DeclType::parse(&inner[p + 2..]));
     }
-    if e.len() > 10 && e[..10].eq_ignore_ascii_case("DATE_TRUNC") && e.ends_with(')') {
+    // timezone(z, x): timestamptz → timestamp và ngược lại
+    if e.len() > 9 && e.as_bytes()[..9].eq_ignore_ascii_case(b"TIMEZONE(") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[8..]) {
+        let args = crate::engine::executor::split_comma_separated_tokens(&e[9..e.len() - 1]);
+        let naive = matches!(expr_decl(args.get(1)?, col).map(|d| d.base), Some(b) if b == "timestamp" || b == "date");
+        return DeclType::parse(if naive { "timestamptz" } else { "timestamp" });
+    }
+    if e.len() > 10 && e.as_bytes()[..10].eq_ignore_ascii_case(b"DATE_TRUNC") && e.ends_with(')') {
         let open = e.find('(')?;
         if is_fully_enclosed_in_parens(&e[open..]) {
             let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
@@ -890,6 +908,7 @@ pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Opti
                 "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "TO_JSON" | "JSON_AGG" | "JSON_OBJECT_AGG" => "json",
                 "STRING_TO_ARRAY" => "text[]",
                 "PG_TYPEOF" => "regtype",
+                "IS_NORMALIZED" => "boolean",
                 "SUM" => {
                     let inner = &e[open + 1..e.len() - 1];
                     return Some(match pg_typeof(inner, col).as_deref() {

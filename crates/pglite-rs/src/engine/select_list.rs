@@ -71,6 +71,15 @@ pub(crate) fn default_column_name(expr: &str) -> String {
         }
         s = inner;
     }
+    // subscript / slice: tên của biểu thức gốc (`tags[1:2]` → `tags`)
+    if s.ends_with(']') && !s.to_uppercase().starts_with("ARRAY[") {
+        if let Some(open) = s.rfind('[') {
+            let base = s[..open].trim();
+            if !base.is_empty() && super::constraints::matching_bracket_ok(&s[open..]) {
+                return default_column_name(base);
+            }
+        }
+    }
     if is_column_ref(s) {
         let last = s.rsplit('.').next().unwrap_or(s).trim();
         return if last.starts_with('"') { last.trim_matches('"').to_string() } else { last.to_lowercase() };
@@ -86,7 +95,8 @@ pub(crate) fn default_column_name(expr: &str) -> String {
     let case_expr = up.starts_with("CASE") && up.ends_with("END");
     if !case_expr
         && (super::executor::find_top_level_math_op(s, &['+', '-', '*', '/', '%']).is_some_and(|(p, _)| !s[..p].trim().is_empty())
-            || ["||", "#>", "=", "<", ">", "@>", "<@"].iter().any(|op| super::executor::find_top_level_op(s, op).is_some_and(|p| p > 0)))
+            || ["||", "#>", "=", "<", ">", "@>", "<@", "~"].iter().any(|op| super::executor::find_top_level_op(s, op).is_some_and(|p| p > 0))
+            || ["LIKE", "ILIKE", "IN", "BETWEEN", "IS", "AND", "OR", "SIMILAR"].iter().any(|k| find_top_level_keyword(s, k).is_some_and(|p| p > 0)))
     {
         return "?column?".to_string();
     }
@@ -140,7 +150,7 @@ fn cast_name(s: &str) -> Option<(String, u8)> {
     }
     let (arg, ty) = if let Some(p) = find_last_top_level_op(s, "::") {
         (&s[..p], &s[p + 2..])
-    } else if s.len() > 5 && s[..5].eq_ignore_ascii_case("CAST(") && s.ends_with(')') {
+    } else if s.len() > 5 && s.as_bytes()[..5].eq_ignore_ascii_case(b"CAST(") && s.ends_with(')') {
         let inside = &s[5..s.len() - 1];
         let a = find_top_level_keyword(inside, "AS")?;
         (&inside[..a], &inside[a + 2..])
@@ -241,7 +251,7 @@ fn select_list_end(sql: &str) -> usize {
 /// Viết lại `SELECT ...` với alias tường minh. Trả về `None` nếu không cần đổi gì.
 pub(crate) fn normalize_select_sql(sql: &str) -> Option<String> {
     let t = sql.trim();
-    if t.len() < 7 || !t[..6].eq_ignore_ascii_case("SELECT") {
+    if t.len() < 7 || !t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") {
         return None;
     }
     // SELECT * FROM ...: không có gì để đặt tên (đường nóng của tra cứu theo khoá)
@@ -319,7 +329,7 @@ pub(crate) fn normalize_select_sql(sql: &str) -> Option<String> {
 pub(crate) fn wire_names(sql: &str) -> Option<Vec<(String, bool, String)>> {
     let lexed = super::frontend::lex(sql).ok()?;
     let mut t = lexed.trim().trim_end_matches(';').trim();
-    if t.len() < 7 || !t[..6].eq_ignore_ascii_case("SELECT") || !t.as_bytes()[6].is_ascii_whitespace() || t.contains(';') {
+    if t.len() < 7 || !t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") || !t.as_bytes()[6].is_ascii_whitespace() || t.contains(';') {
         return None;
     }
     for kw in ["UNION", "INTERSECT", "EXCEPT"] {
@@ -384,6 +394,15 @@ pub(crate) fn wire_shape(expr: &str) -> Option<WireShape> {
     let up = s.to_uppercase();
     if up.starts_with("ARRAY[") && s.ends_with(']') {
         return Some(WireShape::Array { constructor: true });
+    }
+    // slice a[1:2]
+    if s.ends_with(']') {
+        if let Some(open) = s.rfind('[') {
+            let inner = &s[open + 1..s.len() - 1];
+            if inner.contains(':') && !inner.contains("::") {
+                return Some(WireShape::Array { constructor: false });
+            }
+        }
     }
     let open = s.find('(')?;
     if !s.ends_with(')') || super::constraints::matching_paren(s, open) != Some(s.len() - 1) {

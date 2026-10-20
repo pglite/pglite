@@ -462,3 +462,193 @@ mod wire_tests {
         assert_eq!(wire_time("10:11", false).unwrap(), "10:11:00");
     }
 }
+
+/// Quy tắc giờ của một múi giờ (bảng nhúng các vùng thường dùng; không có tzdata đầy đủ).
+#[derive(Clone, Copy)]
+enum ZoneRule {
+    Fixed(i64),
+    /// EU: giờ mùa hè từ CN cuối tháng 3 01:00 UTC tới CN cuối tháng 10 01:00 UTC
+    Eu(i64),
+    /// Mỹ/Canada: CN thứ 2 tháng 3 02:00 giờ chuẩn tới CN đầu tháng 11 02:00 giờ mùa hè
+    Us(i64),
+    /// Đông nam Úc: CN đầu tháng 10 02:00 giờ chuẩn tới CN đầu tháng 4 03:00 giờ mùa hè
+    AuSouth(i64),
+    /// New Zealand: CN cuối tháng 9 02:00 giờ chuẩn tới CN đầu tháng 4 03:00 giờ mùa hè
+    Nz(i64),
+}
+
+const H: i64 = 3600;
+
+fn zone_rule(zone: &str) -> Option<ZoneRule> {
+    use ZoneRule::*;
+    let z = zone.trim();
+    let lower = z.to_ascii_lowercase();
+    let fixed: &[(&str, i64)] = &[
+        ("utc", 0), ("gmt", 0), ("z", 0), ("ut", 0), ("zulu", 0), ("etc/utc", 0), ("etc/gmt", 0), ("etc/universal", 0), ("universal", 0),
+        ("asia/ho_chi_minh", 7 * H), ("asia/saigon", 7 * H), ("asia/bangkok", 7 * H), ("asia/jakarta", 7 * H), ("asia/phnom_penh", 7 * H),
+        ("asia/vientiane", 7 * H), ("ict", 7 * H), ("asia/singapore", 8 * H), ("asia/shanghai", 8 * H), ("asia/hong_kong", 8 * H),
+        ("asia/taipei", 8 * H), ("asia/manila", 8 * H), ("asia/kuala_lumpur", 8 * H), ("australia/perth", 8 * H), ("prc", 8 * H),
+        ("hkt", 8 * H), ("sgt", 8 * H), ("asia/tokyo", 9 * H), ("asia/seoul", 9 * H), ("jst", 9 * H), ("kst", 9 * H),
+        ("asia/kolkata", 5 * H + 1800), ("asia/calcutta", 5 * H + 1800), ("ist", 5 * H + 1800), ("asia/kathmandu", 5 * H + 2700),
+        ("asia/dhaka", 6 * H), ("asia/yangon", 6 * H + 1800), ("asia/karachi", 5 * H), ("asia/dubai", 4 * H), ("asia/riyadh", 3 * H),
+        ("europe/moscow", 3 * H), ("europe/istanbul", 3 * H), ("msk", 3 * H), ("australia/brisbane", 10 * H), ("australia/darwin", 9 * H + 1800),
+        ("america/phoenix", -7 * H), ("pacific/honolulu", -10 * H), ("hst", -10 * H), ("america/sao_paulo", -3 * H),
+        ("america/mexico_city", -6 * H), ("america/bogota", -5 * H), ("america/lima", -5 * H), ("africa/cairo", 2 * H),
+        ("africa/johannesburg", 2 * H), ("africa/lagos", H), ("africa/nairobi", 3 * H),
+        ("est", -5 * H), ("edt", -4 * H), ("cst", -6 * H), ("cdt", -5 * H), ("mst", -7 * H), ("mdt", -6 * H), ("pst", -8 * H), ("pdt", -7 * H),
+        ("cet", H), ("cest", 2 * H), ("eet", 2 * H), ("eest", 3 * H), ("wet", 0), ("west", H), ("bst", H), ("aest", 10 * H), ("aedt", 11 * H),
+    ];
+    if let Some((_, o)) = fixed.iter().find(|(n, _)| *n == lower) {
+        return Some(Fixed(*o));
+    }
+    let eu: &[(&str, i64)] = &[
+        ("europe/london", 0), ("europe/dublin", 0), ("europe/lisbon", 0), ("gb", 0), ("europe/paris", H), ("europe/berlin", H),
+        ("europe/madrid", H), ("europe/rome", H), ("europe/amsterdam", H), ("europe/brussels", H), ("europe/vienna", H),
+        ("europe/stockholm", H), ("europe/oslo", H), ("europe/copenhagen", H), ("europe/warsaw", H), ("europe/prague", H),
+        ("europe/zurich", H), ("europe/budapest", H), ("europe/belgrade", H), ("europe/athens", 2 * H), ("europe/helsinki", 2 * H),
+        ("europe/kiev", 2 * H), ("europe/kyiv", 2 * H), ("europe/bucharest", 2 * H), ("europe/sofia", 2 * H),
+    ];
+    if let Some((_, o)) = eu.iter().find(|(n, _)| *n == lower) {
+        return Some(Eu(*o));
+    }
+    let us: &[(&str, i64)] = &[
+        ("america/new_york", -5 * H), ("us/eastern", -5 * H), ("america/toronto", -5 * H), ("america/detroit", -5 * H),
+        ("america/chicago", -6 * H), ("us/central", -6 * H), ("america/denver", -7 * H), ("us/mountain", -7 * H),
+        ("america/los_angeles", -8 * H), ("us/pacific", -8 * H), ("america/vancouver", -8 * H), ("america/anchorage", -9 * H),
+        ("america/halifax", -4 * H),
+    ];
+    if let Some((_, o)) = us.iter().find(|(n, _)| *n == lower) {
+        return Some(Us(*o));
+    }
+    match lower.as_str() {
+        "australia/sydney" | "australia/melbourne" | "australia/canberra" | "australia/hobart" => return Some(AuSouth(10 * H)),
+        "australia/adelaide" => return Some(AuSouth(9 * H + 1800)),
+        "pacific/auckland" | "nz" => return Some(Nz(12 * H)),
+        _ => {}
+    }
+    // Etc/GMT+N: dấu ngược (POSIX), Etc/GMT+7 = UTC-7
+    if let Some(n) = lower.strip_prefix("etc/gmt") {
+        return posix_offset(n).map(Fixed);
+    }
+    // POSIX: `UTC+7`, `+07`, `-05:30`, `7` → độ lệch về phía TÂY (như PostgreSQL)
+    let body = lower.strip_prefix("utc").or_else(|| lower.strip_prefix("gmt")).unwrap_or(&lower);
+    posix_offset(body).map(Fixed)
+}
+
+/// `+7`, `-05:30`, `7` theo quy ước POSIX (dương = phía tây Greenwich) → giây phía đông.
+fn posix_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() || !s.trim_start_matches(['+', '-']).starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let (sign, body) = match s.as_bytes()[0] {
+        b'-' => (1, &s[1..]),
+        b'+' => (-1, &s[1..]),
+        _ => (-1, s),
+    };
+    let (h, m) = match body.split_once(':') {
+        Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
+        None => (body.parse::<i64>().ok()?, 0),
+    };
+    if h > 15 || m > 59 {
+        return None;
+    }
+    Some(sign * (h * H + m * 60))
+}
+
+/// Ngày (tính từ epoch) của Chủ nhật thứ `n` (n > 0) hoặc cuối cùng (n = 0) trong tháng.
+fn sunday(y: i32, m: u32, n: u32) -> i64 {
+    if n == 0 {
+        let last = days_from_civil(y, m, days_in_month(y, m));
+        last - (last + 4).rem_euclid(7)
+    } else {
+        let first = days_from_civil(y, m, 1);
+        let to_sun = (7 - (first + 4).rem_euclid(7)) % 7;
+        first + to_sun + 7 * (n as i64 - 1)
+    }
+}
+
+/// Độ lệch (giây phía đông UTC) của múi giờ tại thời điểm UTC `utc` (giây epoch).
+fn offset_at(rule: ZoneRule, utc: i64) -> i64 {
+    use ZoneRule::*;
+    let (y, _, _) = civil_from_days(utc.div_euclid(86_400));
+    match rule {
+        Fixed(o) => o,
+        Eu(std) => {
+            let start = sunday(y, 3, 0) * 86_400 + H;
+            let end = sunday(y, 10, 0) * 86_400 + H;
+            if utc >= start && utc < end { std + H } else { std }
+        }
+        Us(std) => {
+            let start = sunday(y, 3, 2) * 86_400 + 2 * H - std;
+            let end = sunday(y, 11, 1) * 86_400 + 2 * H - (std + H);
+            if utc >= start && utc < end { std + H } else { std }
+        }
+        AuSouth(std) => {
+            let end = sunday(y, 4, 1) * 86_400 + 3 * H - (std + H);
+            let start = sunday(y, 10, 1) * 86_400 + 2 * H - std;
+            if utc < end || utc >= start { std + H } else { std }
+        }
+        Nz(std) => {
+            let end = sunday(y, 4, 1) * 86_400 + 3 * H - (std + H);
+            let start = sunday(y, 9, 0) * 86_400 + 2 * H - std;
+            if utc < end || utc >= start { std + H } else { std }
+        }
+    }
+}
+
+/// `timezone(zone, ts)` / `ts AT TIME ZONE zone`. `input_tz`: giá trị vào là timestamptz (thời điểm tuyệt
+/// đối) → trả giờ địa phương (timestamp); ngược lại là timestamp (giờ địa phương của `zone`) → trả
+/// timestamptz (UTC, phiên đặt TimeZone = UTC).
+pub(crate) fn timezone_convert(zone: &str, ts: &str, input_tz: bool) -> Result<String, String> {
+    let rule = zone_rule(zone).ok_or_else(|| format!("time zone \"{}\" not recognized", zone))?;
+    let t = ts.trim();
+    let b = t.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return Err(format!("invalid input syntax for type timestamp with time zone: \"{}\"", ts));
+    }
+    let y: i32 = t[..4].parse().map_err(|_| format!("invalid input syntax for type timestamp: \"{}\"", ts))?;
+    let mo: u32 = t[5..7].parse().map_err(|_| format!("invalid input syntax for type timestamp: \"{}\"", ts))?;
+    let d: u32 = t[8..10].parse().map_err(|_| format!("invalid input syntax for type timestamp: \"{}\"", ts))?;
+    let rest = t[10..].trim_start_matches(['T', 't', ' ']);
+    let (secs, frac, offset) = if rest.is_empty() { (0, String::new(), None) } else { parse_clock(rest).ok_or_else(|| format!("invalid input syntax for type timestamp: \"{}\"", ts))? };
+    let wall = days_from_civil(y, mo, d) * 86_400 + secs;
+    let fmt = |total: i64, suffix: &str| {
+        let (yy, mm, dd) = civil_from_days(total.div_euclid(86_400));
+        format!("{:04}-{:02}-{:02} {}{}", yy, mm, dd, fmt_clock(total.rem_euclid(86_400), &frac), suffix)
+    };
+    if input_tz {
+        // thời điểm tuyệt đối → giờ địa phương
+        let utc = wall - offset.unwrap_or(0);
+        Ok(fmt(utc + offset_at(rule, utc), ""))
+    } else {
+        // giờ địa phương của zone → UTC (timestamp không có múi giờ: bỏ hậu tố `Z` engine ghi kèm)
+        let guess = offset_at(rule, wall - offset_at(rule, wall));
+        let utc = wall - guess;
+        let off = offset_at(rule, utc);
+        Ok(fmt(wall - off, "+00"))
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+
+    #[test]
+    fn conversions() {
+        assert_eq!(timezone_convert("Asia/Ho_Chi_Minh", "2024-01-02 10:00:00+00", true).unwrap(), "2024-01-02 17:00:00");
+        assert_eq!(timezone_convert("UTC", "2024-01-02 10:00:00", false).unwrap(), "2024-01-02 10:00:00+00");
+        assert_eq!(timezone_convert("UTC", "2024-01-02 10:00:00+07", true).unwrap(), "2024-01-02 03:00:00");
+        assert_eq!(timezone_convert("Asia/Ho_Chi_Minh", "2024-01-01 10:00:00", false).unwrap(), "2024-01-01 03:00:00+00");
+        // DST châu Âu / Mỹ
+        assert_eq!(timezone_convert("Europe/Paris", "2024-07-01 12:00:00+00", true).unwrap(), "2024-07-01 14:00:00");
+        assert_eq!(timezone_convert("Europe/Paris", "2024-01-01 12:00:00+00", true).unwrap(), "2024-01-01 13:00:00");
+        assert_eq!(timezone_convert("America/New_York", "2024-03-10 06:59:00+00", true).unwrap(), "2024-03-10 01:59:00");
+        assert_eq!(timezone_convert("America/New_York", "2024-03-10 07:00:00+00", true).unwrap(), "2024-03-10 03:00:00");
+        assert_eq!(timezone_convert("America/New_York", "2024-07-04 12:00:00", false).unwrap(), "2024-07-04 16:00:00+00");
+        assert_eq!(timezone_convert("Australia/Sydney", "2024-01-01 00:00:00+00", true).unwrap(), "2024-01-01 11:00:00");
+        // POSIX: '+07' là phía tây
+        assert_eq!(timezone_convert("+07", "2024-01-01 00:00:00+00", true).unwrap(), "2023-12-31 17:00:00");
+        assert!(timezone_convert("Mars/Base", "2024-01-01", true).is_err());
+    }
+}

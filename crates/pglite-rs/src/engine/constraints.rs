@@ -918,3 +918,26 @@ fn still_referenced(fk: &ResolvedFk, key: &[Value], ex: &Executor) -> String {
         fk.parent, fk.name, fk.child, detail, fk.child
     )
 }
+
+/// `[...]` có cặp ngoặc vuông bao trọn (không có `]` đóng sớm ngoài chuỗi).
+pub(crate) fn matching_bracket_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'[') || b.last() != Some(&b']') {
+        return false;
+    }
+    let (mut depth, mut in_str) = (0i32, false);
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'\'' => in_str = !in_str,
+            b'[' if !in_str => depth += 1,
+            b']' if !in_str => {
+                depth -= 1;
+                if depth == 0 && i + 1 != b.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}

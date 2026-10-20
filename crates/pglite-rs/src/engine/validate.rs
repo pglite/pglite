@@ -189,6 +189,18 @@ pub(crate) fn check_select_columns(sql: &str, storage: &StorageEngine) -> Result
         }
         let e = expr.trim();
         let e = e.strip_prefix("DISTINCT ").or_else(|| e.strip_prefix("distinct ")).unwrap_or(e).trim();
+        // `(col).field`: chưa có kiểu composite nên cột nào cũng không phải composite (42809 như PostgreSQL)
+        if let Some(rest) = e.strip_prefix('(') {
+            if let Some((inner, field)) = rest.split_once(").") {
+                let (inner, field) = (unquote(inner.trim()), field.trim());
+                if !field.is_empty() && field.chars().all(|c| is_ident_char(c)) {
+                    if let Some(i) = table.get_column_index(&inner) {
+                        let ty = crate::engine::coltypes::column_decl(table, i).map(|d| d.sql_name()).unwrap_or_else(|| "text".to_string());
+                        return Err(format!("column notation .{} applied to type {}, which is not a composite type", unquote(field), ty));
+                    }
+                }
+            }
+        }
         let idents = top_level_idents(e);
         // chỉ mục là đúng một định danh (`nope`, `t.nope`); `expr alias` có alias ngầm thì bỏ qua
         if idents.len() == 1 && idents[0].len() == e.len() {
