@@ -112,6 +112,13 @@ pub enum SchemaOp {
     AlterColumn { table: String, column: String, def: ColumnDef },
     RenameColumn { table: String, from: String, to: String },
     RenameTable { from: String, to: String },
+    /// Kiểu khai báo chi tiết của cột (`numeric(6,2)`, `varchar(3)`, `timestamptz`...), dạng chuẩn của
+    /// `coltypes::DeclType::canonical`. Ghi đè từng cột được liệt kê; chuỗi rỗng = xoá. Bản cũ bỏ qua op này.
+    ColumnTypes { table: String, types: Vec<(String, String)> },
+    /// Đánh dấu: các DDL sau đó trong cùng giao dịch được ghi bởi bản có DDL theo giao dịch, nên khi
+    /// replay gặp TxRollback / RollbackToSavepoint thì hoàn tác cả DDL (bản cũ không làm vậy lúc chạy,
+    /// nên WAL của bản cũ được replay như cũ).
+    TxDdlUndo,
 }
 
 pub fn encode_schema_op(op: &SchemaOp) -> Vec<u8> {

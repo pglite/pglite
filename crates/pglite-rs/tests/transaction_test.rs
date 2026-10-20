@@ -39,3 +39,37 @@ fn nested_begin_keeps_outer_work_rollbackable_and_replays() {
     drop(db);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn ddl_inside_transaction_is_rolled_back_in_memory_and_on_disk() {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("pglite_txddl_{}_{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.db").to_str().unwrap().to_string();
+    let snapshot = |db: &mut PGlite| -> (Vec<String>, usize, bool) {
+        let cols = db.query_wire("SELECT * FROM a", &[]).unwrap().fields.iter().map(|f| f.name.clone()).collect();
+        let rows = db.query("SELECT * FROM a", &[]).unwrap().rows.len();
+        (cols, rows, db.query("SELECT * FROM b", &[]).is_ok())
+    };
+    {
+        let mut db = PGlite::open(&path).unwrap();
+        for sql in ["CREATE TABLE a (x INT PRIMARY KEY, y TEXT)", "INSERT INTO a VALUES (1, 'one'), (2, 'two')"] {
+            db.exec(sql, &[]).unwrap();
+        }
+        // Như PostgreSQL: CREATE / ALTER / RENAME / DROP trong giao dịch đều bị ROLLBACK hoàn tác
+        for sql in ["BEGIN", "CREATE TABLE b (z INT)", "ALTER TABLE a ADD COLUMN w INT", "ALTER TABLE a RENAME COLUMN y TO yy", "INSERT INTO a VALUES (3, 'three', 3)", "DROP TABLE a", "ROLLBACK"] {
+            db.exec(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        assert_eq!(snapshot(&mut db), (vec!["x".to_string(), "y".to_string()], 2, false));
+        // ROLLBACK TO SAVEPOINT cũng vậy; phần trước savepoint được giữ
+        for sql in ["BEGIN", "ALTER TABLE a ADD COLUMN keep INT", "SAVEPOINT s", "ALTER TABLE a DROP COLUMN y", "CREATE TABLE b (z INT)", "ROLLBACK TO SAVEPOINT s", "COMMIT"] {
+            db.exec(sql, &[]).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        assert_eq!(snapshot(&mut db), (vec!["x".to_string(), "y".to_string(), "keep".to_string()], 2, false));
+        db.exec("INSERT INTO a VALUES (4, 'four', 4)", &[]).unwrap();
+    }
+    let mut db = PGlite::open(&path).unwrap();
+    assert_eq!(snapshot(&mut db), (vec!["x".to_string(), "y".to_string(), "keep".to_string()], 3, false));
+    drop(db);
+    let _ = std::fs::remove_dir_all(dir);
+}

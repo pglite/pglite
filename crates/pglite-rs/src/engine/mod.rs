@@ -3,6 +3,7 @@ pub mod constraints;
 pub mod dml_join;
 pub mod errors;
 pub(crate) mod frontend;
+pub mod coltypes;
 pub(crate) mod validate;
 pub mod expr;
 pub mod executor;

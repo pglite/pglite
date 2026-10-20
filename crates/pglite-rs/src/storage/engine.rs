@@ -10,6 +10,9 @@ pub enum UndoAction {
     DeleteLastInsertedRow { table: String },
     RestoreRow { table: String, row_idx: usize, col_idx: usize, old_val: Value },
     UndeleteRow { table: String, row_idx: usize },
+    /// Trạng thái của bảng trước một lệnh DDL trong giao dịch (`None` = bảng chưa tồn tại): ROLLBACK
+    /// đặt lại nguyên bảng, như DDL có giao dịch của PostgreSQL.
+    RestoreTable { name: String, table: Option<Box<Table>> },
 }
 
 pub struct StorageEngine {
@@ -25,6 +28,8 @@ pub struct StorageEngine {
     /// Một câu lệnh trong giao dịch đã lỗi: như PostgreSQL, mọi lệnh sau đó báo 25P02 cho tới
     /// ROLLBACK / ROLLBACK TO SAVEPOINT (COMMIT lúc này tương đương ROLLBACK).
     pub tx_aborted: bool,
+    /// Giao dịch hiện tại có DDL được hoàn tác khi ROLLBACK (đã ghi / đã gặp `SchemaOp::TxDdlUndo`).
+    pub tx_ddl_undo: bool,
 }
 
 /// Mốc đầu một câu lệnh (xem `StorageEngine::begin_statement`).
@@ -47,6 +52,7 @@ impl StorageEngine {
             wal,
             stmt_depth: 0,
             tx_aborted: false,
+            tx_ddl_undo: false,
         };
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
@@ -60,11 +66,17 @@ impl StorageEngine {
             match record {
                 WalRecord::CreateTable { name, columns } => {
                     let clean = name.to_lowercase();
+                    if engine.in_transaction && engine.tx_ddl_undo {
+                        engine.push_table_snapshot(&clean);
+                    }
                     table_hist_cols.insert(clean.clone(), columns.iter().map(|c| c.name.clone()).collect());
                     engine.tables.insert(clean, Table::new(name, columns));
                 }
                 WalRecord::DropTable { name } => {
                     let clean = name.to_lowercase();
+                    if engine.in_transaction && engine.tx_ddl_undo {
+                        engine.push_table_snapshot(&clean);
+                    }
                     table_hist_cols.remove(&clean);
                     engine.tables.remove(&clean);
                 }
@@ -117,12 +129,14 @@ impl StorageEngine {
                 }
                 WalRecord::Begin => {
                     engine.in_transaction = true;
+                    engine.tx_ddl_undo = false;
                     engine.tx_undo_log.clear();
                     engine.savepoints.clear();
                     open_tx_is_new = false;
                 }
                 WalRecord::TxBegin => {
                     engine.in_transaction = true;
+                    engine.tx_ddl_undo = false;
                     engine.tx_undo_log.clear();
                     engine.savepoints.clear();
                     open_tx_is_new = true;
@@ -132,9 +146,7 @@ impl StorageEngine {
                 // để DB cũ mở ra đúng như trước.
                 WalRecord::Rollback => engine.end_replayed_transaction(),
                 WalRecord::TxRollback => {
-                    while let Some(undo) = engine.tx_undo_log.pop() {
-                        engine.apply_undo(undo);
-                    }
+                    engine.replay_undo_to(0, &mut table_hist_cols);
                     engine.end_replayed_transaction();
                 }
                 WalRecord::Savepoint { name } => {
@@ -144,11 +156,7 @@ impl StorageEngine {
                 WalRecord::RollbackToSavepoint { name } => {
                     let clean = name.trim_matches('"').to_lowercase();
                     if let Some(&target_len) = engine.savepoints.get(&clean) {
-                        while engine.tx_undo_log.len() > target_len {
-                            if let Some(undo) = engine.tx_undo_log.pop() {
-                                engine.apply_undo(undo);
-                            }
-                        }
+                        engine.replay_undo_to(target_len, &mut table_hist_cols);
                     }
                 }
                 WalRecord::ReleaseSavepoint { name } => {
@@ -170,6 +178,9 @@ impl StorageEngine {
                 }
                 WalRecord::AlterTableAddColumn { table, column, default_val } => {
                     let clean = table.to_lowercase();
+                    if engine.in_transaction && engine.tx_ddl_undo {
+                        engine.push_table_snapshot(&clean);
+                    }
                     table_hist_cols.entry(clean.clone()).or_default().push(column.name.clone());
                     if let Some(t) = engine.get_table_mut(&clean) {
                         if !t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&column.name)) {
@@ -181,7 +192,17 @@ impl StorageEngine {
                     }
                 }
                 WalRecord::Schema { version, payload } => match decode_schema_op(version, &payload) {
+                    Some(SchemaOp::TxDdlUndo) => {
+                        if engine.in_transaction {
+                            engine.tx_ddl_undo = true;
+                        }
+                    }
                     Some(op) => {
+                        if engine.in_transaction && engine.tx_ddl_undo {
+                            for t in engine.schema_op_tables(&op) {
+                                engine.push_table_snapshot(&t);
+                            }
+                        }
                         match &op {
                             SchemaOp::RenameColumn { table, from, to } => {
                                 if let Some(h_cols) = table_hist_cols.get_mut(&table.to_lowercase()) {
@@ -206,6 +227,9 @@ impl StorageEngine {
                 },
                 WalRecord::AlterTableDropColumn { table, column } => {
                     let clean = table.to_lowercase();
+                    if engine.in_transaction && engine.tx_ddl_undo {
+                        engine.push_table_snapshot(&clean);
+                    }
                     if let Some(h_cols) = table_hist_cols.get_mut(&clean) {
                         if let Some(pos) = h_cols.iter().position(|h| h.eq_ignore_ascii_case(&column)) {
                             h_cols.remove(pos);
@@ -246,8 +270,32 @@ impl StorageEngine {
         engine
     }
 
+    /// Hoàn tác undo log tới độ dài `len` lúc replay. Bảng được đặt lại nguyên trạng (DDL có giao dịch)
+    /// thì danh sách cột lịch sử dùng để ánh xạ `col_idx` của các bản ghi sau cũng được đặt lại.
+    fn replay_undo_to(&mut self, len: usize, hist: &mut HashMap<String, Vec<String>>) {
+        while self.tx_undo_log.len() > len {
+            let Some(undo) = self.tx_undo_log.pop() else { break };
+            let restored = match &undo {
+                UndoAction::RestoreTable { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            self.apply_undo(undo);
+            if let Some(name) = restored {
+                match self.tables.get(&name) {
+                    Some(t) => {
+                        hist.insert(name, t.columns.iter().map(|c| c.name.clone()).collect());
+                    }
+                    None => {
+                        hist.remove(&name);
+                    }
+                }
+            }
+        }
+    }
+
     fn end_replayed_transaction(&mut self) {
         self.in_transaction = false;
+        self.tx_ddl_undo = false;
         self.tx_undo_log.clear();
         self.savepoints.clear();
     }
@@ -331,6 +379,7 @@ impl StorageEngine {
         if self.tables.contains_key(&clean_name) {
             return Err(format!("relation \"{}\" already exists", name));
         }
+        self.snapshot_table_for_undo(&clean_name);
         self.wal.append(WalRecord::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
@@ -342,6 +391,11 @@ impl StorageEngine {
 
     /// Ghi một thay đổi catalog vào WAL rồi áp dụng nó (đúng như lúc replay).
     pub fn log_schema_op(&mut self, op: SchemaOp) {
+        if self.in_transaction {
+            for t in self.schema_op_tables(&op) {
+                self.snapshot_table_for_undo(&t);
+            }
+        }
         self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&op) });
         self.apply_schema_op(&op);
     }
@@ -420,6 +474,22 @@ impl StorageEngine {
                                 for rc in ref_cols.iter_mut().filter(|rc| rc.eq_ignore_ascii_case(from)) {
                                     *rc = to.clone();
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            SchemaOp::TxDdlUndo => {}
+            SchemaOp::ColumnTypes { table, types } => {
+                if let Some(t) = self.get_table_mut(table) {
+                    for (col, ty) in types {
+                        let key = col.to_lowercase();
+                        match crate::engine::coltypes::DeclType::parse(ty) {
+                            Some(d) if !ty.is_empty() => {
+                                t.decl_types.insert(key, d);
+                            }
+                            _ => {
+                                t.decl_types.remove(&key);
                             }
                         }
                     }
@@ -505,6 +575,7 @@ impl StorageEngine {
 
     pub fn drop_table(&mut self, name: &str) -> bool {
         let clean_name = name.to_lowercase();
+        self.snapshot_table_for_undo(&clean_name);
         self.wal.append(WalRecord::DropTable {
             name: name.to_string(),
         });
@@ -539,6 +610,7 @@ impl StorageEngine {
         }
         self.in_transaction = true;
         self.tx_aborted = false;
+        self.tx_ddl_undo = false;
         self.tx_undo_log.clear();
         self.savepoints.clear();
         // `Begin` cho binary cũ (chúng bỏ qua `TxBegin`), rồi `TxBegin` để bản này biết giao dịch
@@ -604,7 +676,61 @@ impl StorageEngine {
                     t.undelete_row(row_idx);
                 }
             }
+            UndoAction::RestoreTable { name, table } => match table {
+                Some(t) => {
+                    self.tables.insert(name, *t);
+                }
+                None => {
+                    self.tables.remove(&name);
+                }
+            },
         }
+    }
+
+    /// Trong giao dịch: lưu bảng `name` (kể cả "chưa tồn tại") vào undo log trước khi DDL sửa nó.
+    pub fn snapshot_table_for_undo(&mut self, name: &str) {
+        if !self.in_transaction {
+            return;
+        }
+        if !self.tx_ddl_undo {
+            self.tx_ddl_undo = true;
+            self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&SchemaOp::TxDdlUndo) });
+        }
+        self.push_table_snapshot(name);
+    }
+
+    /// Các bảng mà một op catalog sửa (để lưu trạng thái trước nó vào undo log). Đổi tên cột / bảng
+    /// sửa cả khoá ngoại của bảng khác trỏ tới nó.
+    fn schema_op_tables(&self, op: &SchemaOp) -> Vec<String> {
+        let mut out = match op {
+            SchemaOp::TableCatalog { table, .. }
+            | SchemaOp::AddConstraint { table, .. }
+            | SchemaOp::DropConstraint { table, .. }
+            | SchemaOp::CreateIndex { table, .. }
+            | SchemaOp::DropIndex { table, .. }
+            | SchemaOp::AlterColumn { table, .. }
+            | SchemaOp::RenameColumn { table, .. }
+            | SchemaOp::ColumnTypes { table, .. } => vec![table.clone()],
+            SchemaOp::RenameTable { from, to } => vec![from.clone(), to.clone()],
+            SchemaOp::TxDdlUndo => vec![],
+        };
+        if let SchemaOp::RenameColumn { table, .. } | SchemaOp::RenameTable { from: table, .. } = op {
+            out.extend(
+                self.tables
+                    .iter()
+                    .filter(|(k, t)| !k.eq_ignore_ascii_case(table) && t.constraints.iter().any(|c| matches!(&c.kind, ConstraintKind::ForeignKey { ref_table, .. } if ref_table.eq_ignore_ascii_case(table))))
+                    .map(|(k, _)| k.clone()),
+            );
+        }
+        out
+    }
+
+    /// Lưu bảng vào undo log (dùng chung cho lúc chạy và lúc replay, không ghi WAL).
+    fn push_table_snapshot(&mut self, name: &str) {
+        let key = name.to_lowercase();
+        let key = if self.tables.contains_key(&key) { key } else { crate::engine::frontend::decode_ident(&key).map(|d| d.to_lowercase()).filter(|d| self.tables.contains_key(d)).unwrap_or(key) };
+        let snap = self.tables.get(&key).map(|t| Box::new(t.clone()));
+        self.tx_undo_log.push(UndoAction::RestoreTable { name: key, table: snap });
     }
 
     pub fn commit(&mut self) -> Result<(), String> {
@@ -612,6 +738,7 @@ impl StorageEngine {
         if self.in_transaction {
             self.wal.append(WalRecord::Commit);
             self.in_transaction = false;
+            self.tx_ddl_undo = false;
             self.tx_undo_log.clear();
             self.tx_undo_log.shrink_to_fit();
             self.savepoints.clear();
@@ -630,6 +757,7 @@ impl StorageEngine {
             // TxRollback (không phải Rollback cũ) để lần mở lại sau hoàn tác đúng giao dịch này
             self.wal.append(WalRecord::TxRollback);
             self.in_transaction = false;
+            self.tx_ddl_undo = false;
             self.tx_undo_log.shrink_to_fit();
             self.savepoints.clear();
             return self.wal.commit_point();

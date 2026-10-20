@@ -656,7 +656,7 @@ pub fn sqlstate(message: &str) -> &'static str {
         "23514"
     } else if has("current transaction is aborted") {
         "25P02"
-    } else if has("out of range") {
+    } else if (has("out of range") || has("numeric field overflow")) {
         "22003"
     } else if has("value too long") {
         "22001"

@@ -35,6 +35,11 @@ pub struct Table {
     pub legacy_data: bool,
     /// Index UNIQUE lúc chạy, dựng từ `constraints` + `indexes` (xem `rebuild_unique_indexes`).
     pub uniq: Vec<UniqueIdx>,
+    /// Kiểu khai báo chi tiết theo tên cột (viết thường), từ `SchemaOp::ColumnTypes`. Rỗng với bảng cũ.
+    pub decl_types: HashMap<String, crate::engine::coltypes::DeclType>,
+    /// Giá trị kế tiếp của các cột SERIAL không phải cột tự tăng chính (`auto_increment`), theo vị trí cột.
+    /// Tính lười từ max của cột; xoá khi danh sách cột đổi.
+    pub serial_next: HashMap<usize, i64>,
 }
 
 impl Table {
@@ -94,6 +99,8 @@ impl Table {
             catalog_tracked: false,
             legacy_data: false,
             uniq: Vec::new(),
+            decl_types: HashMap::new(),
+            serial_next: HashMap::new(),
         }
     }
 
@@ -258,6 +265,25 @@ impl Table {
         }
         if row.len() > self.columns.len() {
             row.truncate(self.columns.len());
+        }
+
+        // Cột SERIAL khác (bảng có nhiều cột SERIAL/BIGSERIAL): mỗi cột một bộ đếm riêng, như sequence.
+        for c in 0..self.columns.len() {
+            if Some(c) == self.pk_col_idx || self.columns[c].data_type != crate::types::DataType::Serial {
+                continue;
+            }
+            let next = match self.serial_next.get(&c) {
+                Some(n) => *n,
+                None => self.rows.iter().zip(&self.is_deleted).filter_map(|(r, d)| if *d { None } else { r.get(c).and_then(|v| v.as_i64()) }).max().unwrap_or(0) + 1,
+            };
+            let v = match row.get(c) {
+                None | Some(Value::Null) => {
+                    row[c] = Value::Int(next);
+                    next
+                }
+                Some(v) => v.as_i64().unwrap_or(0).max(next - 1),
+            };
+            self.serial_next.insert(c, v.max(next - 1) + 1);
         }
 
         // Handle SERIAL / Primary Key auto-increment for integer/serial ID types or UUID
@@ -643,6 +669,22 @@ impl Table {
         self.active_count
     }
 
+    /// Kiểu khai báo của cột thứ `idx` (nếu bảng có lưu).
+    pub fn decl_type(&self, idx: usize) -> Option<&crate::engine::coltypes::DeclType> {
+        if self.decl_types.is_empty() {
+            return None;
+        }
+        self.columns.get(idx).and_then(|c| self.decl_types.get(&c.name.to_lowercase()))
+    }
+
+    /// Kiểu khai báo theo vị trí cột (rỗng nếu bảng không lưu).
+    pub fn decl_types_vec(&self) -> Vec<Option<crate::engine::coltypes::DeclType>> {
+        if self.decl_types.is_empty() {
+            return Vec::new();
+        }
+        (0..self.columns.len()).map(|i| self.decl_type(i).cloned()).collect()
+    }
+
     pub fn get_column_index(&self, name: &str) -> Option<usize> {
         let clean = name.trim_matches('"').to_lowercase();
         self.columns
@@ -659,6 +701,8 @@ impl Table {
                 self.pk_enforced = false;
             }
             let dropped = self.columns[pos].name.clone();
+            self.decl_types.remove(&dropped.to_lowercase());
+            self.serial_next.clear();
             let uses = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(&dropped));
             // Như PostgreSQL: ràng buộc / index dùng cột bị xoá cũng bị xoá theo.
             self.constraints.retain(|c| !uses(c.columns()));
@@ -692,6 +736,9 @@ impl Table {
         };
         let old = self.columns[idx].name.clone();
         self.columns[idx].name = to.to_string();
+        if let Some(d) = self.decl_types.remove(&old.to_lowercase()) {
+            self.decl_types.insert(to.to_lowercase(), d);
+        }
         let fix = |cols: &mut Vec<String>| {
             for c in cols.iter_mut().filter(|c| c.eq_ignore_ascii_case(&old)) {
                 *c = to.to_string();

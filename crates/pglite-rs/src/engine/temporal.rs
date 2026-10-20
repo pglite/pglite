@@ -349,3 +349,108 @@ pub(crate) fn is_valid_timestamp(s: &str) -> bool {
         None => false,
     }
 }
+
+/// Phần giờ `HH:MM[:SS[.ffffff]]` kèm offset `Z` / `±HH[:MM]` (giây). Trả (giây trong ngày, phần lẻ, offset).
+fn parse_clock(s: &str) -> Option<(i64, String, Option<i64>)> {
+    let s = s.trim();
+    let (clock, offset) = match s.find(|c: char| c == '+' || c == '-' || c == 'Z' || c == 'z') {
+        Some(p) => {
+            let off = &s[p..];
+            let secs = if off.eq_ignore_ascii_case("z") {
+                0
+            } else {
+                let sign = if off.starts_with('-') { -1 } else { 1 };
+                let body = off[1..].trim();
+                let (h, m) = match body.split_once(':') {
+                    Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
+                    None if body.len() == 4 => (body[..2].parse::<i64>().ok()?, body[2..].parse::<i64>().ok()?),
+                    None => (body.parse::<i64>().ok()?, 0),
+                };
+                sign * (h * 3600 + m * 60)
+            };
+            (s[..p].trim(), Some(secs))
+        }
+        None => (s, None),
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let h: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let (sec, frac) = match parts.get(2) {
+        Some(sp) => match sp.split_once('.') {
+            Some((a, f)) => (a.parse::<i64>().ok()?, f.chars().take(6).collect::<String>()),
+            None => (sp.parse::<i64>().ok()?, String::new()),
+        },
+        None => (0, String::new()),
+    };
+    if !frac.chars().all(|c| c.is_ascii_digit()) || h > 24 || m > 59 || sec > 60 {
+        return None;
+    }
+    Some((h * 3600 + m * 60 + sec, frac.trim_end_matches('0').to_string(), offset))
+}
+
+fn fmt_clock(secs: i64, frac: &str) -> String {
+    let f = if frac.is_empty() { String::new() } else { format!(".{}", frac) };
+    format!("{:02}:{:02}:{:02}{}", secs / 3600, (secs % 3600) / 60, secs % 60, f)
+}
+
+fn fmt_offset(off: i64) -> String {
+    let sign = if off < 0 { '-' } else { '+' };
+    let a = off.abs();
+    if a % 3600 == 0 {
+        format!("{}{:02}", sign, a / 3600)
+    } else {
+        format!("{}{:02}:{:02}", sign, a / 3600, (a % 3600) / 60)
+    }
+}
+
+/// Text PostgreSQL của một giá trị timestamp (`tz = false`) / timestamptz (quy về UTC, phiên đặt
+/// TimeZone = UTC) từ chuỗi engine lưu (`2024-01-02T10:00:00.5Z`, `2024-01-02 10:00+07`, `2024-01-02`).
+pub(crate) fn wire_timestamp(s: &str, tz: bool) -> Option<String> {
+    let t = s.trim();
+    if matches!(t.to_lowercase().as_str(), "infinity" | "-infinity") {
+        return Some(t.to_lowercase());
+    }
+    let b = t.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y: i32 = t[..4].parse().ok()?;
+    let mo: u32 = t[5..7].parse().ok()?;
+    let d: u32 = t[8..10].parse().ok()?;
+    let rest = t[10..].trim_start_matches(['T', 't', ' ']);
+    let (secs, frac, offset) = if rest.is_empty() { (0, String::new(), None) } else { parse_clock(rest)? };
+    if !tz {
+        return Some(format!("{:04}-{:02}-{:02} {}", y, mo, d, fmt_clock(secs, &frac)));
+    }
+    let total = days_from_civil(y, mo, d) * 86_400 + secs - offset.unwrap_or(0);
+    let (yy, mm, dd) = civil_from_days(total.div_euclid(86_400));
+    Some(format!("{:04}-{:02}-{:02} {}+00", yy, mm, dd, fmt_clock(total.rem_euclid(86_400), &frac)))
+}
+
+/// Text PostgreSQL của time / timetz.
+pub(crate) fn wire_time(s: &str, tz: bool) -> Option<String> {
+    let (secs, frac, offset) = parse_clock(s)?;
+    let mut out = fmt_clock(secs, &frac);
+    if tz {
+        out.push_str(&fmt_offset(offset.unwrap_or(0)));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn wire_formats() {
+        assert_eq!(wire_timestamp("2024-01-02 10:00+07", true).unwrap(), "2024-01-02 03:00:00+00");
+        assert_eq!(wire_timestamp("2024-01-02T10:00:00.500Z", false).unwrap(), "2024-01-02 10:00:00.5");
+        assert_eq!(wire_timestamp("2024-01-02", true).unwrap(), "2024-01-02 00:00:00+00");
+        assert_eq!(wire_timestamp("2024-01-01 02:00:00+05:30", true).unwrap(), "2023-12-31 20:30:00+00");
+        assert_eq!(wire_time("10:00+07", true).unwrap(), "10:00:00+07");
+        assert_eq!(wire_time("10:11", false).unwrap(), "10:11:00");
+    }
+}

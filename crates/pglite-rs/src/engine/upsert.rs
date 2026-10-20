@@ -286,6 +286,7 @@ impl Executor {
             };
             (indices, table.columns.clone(), table.name.to_lowercase())
         };
+        let decls = self.storage.get_table(&table_name).map(|t| t.decl_types_vec()).unwrap_or_default();
 
         // 1. Dựng mọi dòng định chèn (chưa sửa gì)
         let defaults_row = |params: &[Value]| -> Vec<Value> {
@@ -330,6 +331,20 @@ impl Executor {
             }
         }
 
+        // Kiểu khai báo (numeric(p,s), varchar(n)...): làm tròn / báo lỗi trước khi ghi, kể cả giá trị DEFAULT.
+        if !decls.is_empty() {
+            for row in &mut built {
+                for (c, d) in decls.iter().enumerate() {
+                    if d.is_some() && c < row.len() {
+                        let v = std::mem::replace(&mut row[c], Value::Null);
+                        row[c] = crate::engine::coltypes::coerce_for_write(d.as_ref(), v);
+                    }
+                }
+            }
+            if let Some(e) = crate::engine::errors::take() {
+                return Err(e);
+            }
+        }
         let upsert = on_conflict.is_some();
         let referenced = on_conflict.as_ref().map_or(false, |oc| matches!(oc.action, ConflictAction::Update { .. })) && self.is_referenced(&clean_table_name);
         let undo = self.storage.undo_enabled();
@@ -442,7 +457,7 @@ impl Executor {
                                     .iter()
                                     .map(|(c, e)| {
                                         let v = super::executor::evaluate_assignment_val_pub(e, cur, table, &ext_params);
-                                        (*c, coerce_update_val(&table.columns[*c], v))
+                                        (*c, crate::engine::coltypes::coerce_for_write(table.decl_type(*c), coerce_update_val(&table.columns[*c], v)))
                                     })
                                     .collect();
                                 (updates, pass)

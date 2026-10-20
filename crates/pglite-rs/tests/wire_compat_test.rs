@@ -114,7 +114,8 @@ fn wire_select_star_types_and_text_format() {
         names(&res),
         vec!["id", "name", "active", "rating", "meta", "created_at", "opened", "code", "logo", "tags", "class_ids", "big"]
     );
-    assert_eq!(oids(&res), vec![23, 25, 16, 1700, 3802, 1184, 1082, 2950, 17, 1009, 25, 20]);
+    // VARCHAR → character varying (1043) như PostgreSQL
+    assert_eq!(oids(&res), vec![23, 1043, 16, 1700, 3802, 1184, 1082, 2950, 17, 1009, 25, 20]);
     let row = &res.rows[0];
     assert_eq!(row[0].as_deref(), Some("1"));
     assert_eq!(row[2].as_deref(), Some("t"));
@@ -139,7 +140,7 @@ fn wire_projection_keeps_select_order_and_types() {
     let mut db = setup();
     let res = db.query_wire("SELECT name, id, active AS ok, big FROM schools ORDER BY id", &[]).unwrap();
     assert_eq!(names(&res), vec!["name", "id", "ok", "big"]);
-    assert_eq!(oids(&res), vec![25, 23, 16, 20]);
+    assert_eq!(oids(&res), vec![1043, 23, 16, 20]);
     assert_eq!(res.rows[0], vec![Some("Alpha".into()), Some("1".into()), Some("t".into()), Some("9000000000".into())]);
     assert_eq!(res.row_count, 2);
 }
@@ -158,9 +159,10 @@ fn wire_join_fields_ordered_typed_and_present_with_zero_rows() {
     let sql = "SELECT s.title, sc.name AS school_name, s.start_at, sc.id FROM schedules s JOIN schools sc ON sc.id = s.school_id";
     let res = db.query_wire(sql, &[]).unwrap();
     assert_eq!(names(&res), vec!["title", "school_name", "start_at", "id"]);
-    assert_eq!(oids(&res), vec![25, 25, 1184, 23]);
+    // TIMESTAMP (không múi giờ) → 1114, VARCHAR → 1043 như PostgreSQL
+    assert_eq!(oids(&res), vec![25, 1043, 1114, 23]);
     assert_eq!(res.rows.len(), 1);
-    assert_eq!(res.rows[0][2].as_deref(), Some("2026-10-12 08:00:00+00"));
+    assert_eq!(res.rows[0][2].as_deref(), Some("2026-10-12 08:00:00"));
 
     let empty = db.query_wire(&format!("{sql} WHERE s.id = 999"), &[]).unwrap();
     assert!(empty.rows.is_empty());
@@ -203,7 +205,7 @@ fn describe_without_writing() {
     let mut db = setup();
     let d = db.describe("SELECT name, id FROM schools WHERE id = $1").unwrap();
     assert_eq!(d.param_count, 1);
-    assert_eq!(d.fields.iter().map(|f| (f.name.as_str(), f.type_oid)).collect::<Vec<_>>(), vec![("name", 25), ("id", 23)]);
+    assert_eq!(d.fields.iter().map(|f| (f.name.as_str(), f.type_oid)).collect::<Vec<_>>(), vec![("name", 1043), ("id", 23)]);
 
     let before = db.query("SELECT COUNT(*) AS n FROM schools", &[]).unwrap().rows[0]["n"].clone();
     let d = db.describe("INSERT INTO schools (name) VALUES ($1) RETURNING id, name").unwrap();

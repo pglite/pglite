@@ -266,6 +266,8 @@ impl Executor {
 
         if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
             self.storage.rollback()?;
+            // DDL trong giao dịch đã được hoàn tác: kế hoạch đã cache có thể trỏ tới cột/bảng cũ
+            self.plan_cache.clear();
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -576,8 +578,10 @@ impl Executor {
                     // Mọi index (kể cả khoá text/UUID và index phụ) phải rỗng theo bảng.
                     table.rebuild_indexes();
                     let catalog = table.catalog_tracked.then(|| (table.constraints.clone(), table.indexes.clone(), table.legacy_data));
-                    (table.declared_columns(), table.comment.clone(), catalog)
+                    let decls: Vec<(String, String)> = table.columns.iter().filter_map(|c| table.decl_types.get(&c.name.to_lowercase()).map(|d| (c.name.clone(), d.canonical()))).collect();
+                    (table.declared_columns(), table.comment.clone(), (catalog, decls))
                 };
+                let (catalog, decls) = catalog;
                 self.storage.wal.append(WalRecord::DropTable {
                     name: table_name.to_string(),
                 });
@@ -601,6 +605,12 @@ impl Executor {
                             indexes,
                             legacy,
                         }),
+                    });
+                }
+                if !decls.is_empty() {
+                    self.storage.wal.append(WalRecord::Schema {
+                        version: crate::storage::catalog::SCHEMA_OP_VERSION,
+                        payload: crate::storage::catalog::encode_schema_op(&crate::storage::catalog::SchemaOp::ColumnTypes { table: table_name.to_string(), types: decls }),
                     });
                 }
             }
@@ -2045,7 +2055,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
                 for item in &proj_items {
                     let upper = item.to_uppercase();
-                    let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                    let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                         (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
                     } else {
                         (item.trim(), clean_col_name(item.trim()).replace('"', ""))
@@ -2072,7 +2082,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 let mut row_map = serde_json::Map::new();
                 for item in &proj_items {
                     let upper = item.to_uppercase();
-                    let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                    let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                         (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
                     } else {
                         (item.trim(), clean_col_name(item.trim()).replace('"', ""))
@@ -2117,7 +2127,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 if !has_wildcards {
                     let precompiled: Vec<(String, Option<usize>, Option<CompiledExpr>, String)> = proj_items.iter().map(|item| {
                         let upper = item.to_uppercase();
-                        let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                        let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                             (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
                         } else {
                             (item.trim(), clean_col_name(item.trim()).replace('"', ""))
@@ -2218,7 +2228,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
 
                             let upper = item.to_uppercase();
-                            let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                            let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                                 (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
                             } else {
                                 (item.trim(), clean_col_name(item.trim()).replace('"', ""))
@@ -2328,7 +2338,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 }
             }
             let upper = item.to_uppercase();
-            let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+            let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                 (item[..as_idx].trim(), item[as_idx + 4..].trim().replace('"', ""))
             } else {
                 (item.trim(), clean_col_name(item.trim()).replace('"', ""))
@@ -2513,6 +2523,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let mut columns = Vec::new();
         let mut table_level_pks = Vec::new();
         let mut defs: Vec<crate::storage::catalog::ConstraintDef> = Vec::new();
+        let mut decl_types: Vec<(String, String)> = Vec::new();
 
         for col_def_str in split_comma_separated_tokens(body_part) {
             let col_def_str = col_def_str.trim();
@@ -2536,6 +2547,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             let (col, rest_def) = parse_column_definition(col_def_str);
             crate::engine::constraints::parse_column_constraints(&table_name, &col.name, rest_def, &mut defs);
+            if let Some(d) = crate::engine::coltypes::DeclType::parse(rest_def).filter(|d| d.is_informative()) {
+                decl_types.push((col.name.clone(), d.canonical()));
+            }
             columns.push(col);
         }
 
@@ -2567,7 +2581,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     }
                 }
             }
-            self.storage.create_table_with_catalog(table_name, columns, defs)?;
+            self.storage.create_table_with_catalog(table_name.clone(), columns, defs)?;
+            if !decl_types.is_empty() {
+                self.storage.log_schema_op(crate::storage::catalog::SchemaOp::ColumnTypes { table: table_name, types: decl_types });
+            }
         }
 
         Ok(QueryResult {
@@ -3369,7 +3386,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             let mut fields = Vec::new();
             for item in items {
                 let upper = item.to_uppercase();
-                let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+                let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                     (item[..as_idx].trim(), item[as_idx + 4..].trim().trim_matches('"').trim_matches(';').trim().to_string())
                 } else {
                     let col = clean_col_name(item.trim().trim_matches(';'));
@@ -4780,7 +4797,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         for p_str in proj_strs {
             let p_trim = p_str.trim();
             let upper = p_trim.to_uppercase();
-            let (raw_expr, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+            let (raw_expr, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
                 (p_trim[..as_idx].trim(), p_trim[as_idx + 4..].trim().trim_matches('"').to_string())
             } else {
                 (p_trim, clean_col_name(p_trim).to_string())
@@ -6154,7 +6171,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     } else {
                         evaluate_assignment_val(v_str, &table.rows[i], table, params)
                     };
-                    let coerced = coerce_update_val(&table.columns[c_idx], raw_val);
+                    let coerced = crate::engine::coltypes::coerce_for_write(table.decl_type(c_idx), coerce_update_val(&table.columns[c_idx], raw_val));
                     (c_idx, coerced)
                 }).collect()
             };
@@ -7810,7 +7827,7 @@ fn eval_joined_scalar_expr(
                     }
                     return if is_float { serde_json::json!(sum_f) } else { serde_json::json!(sum_i) };
                 } else {
-                    let expr_to_eval = if let Some(as_idx) = sel_upper.rfind(" AS ") {
+                    let expr_to_eval = if let Some(as_idx) = rfind_top_level_as(&sel_upper) {
                         sel_trimmed[..as_idx].trim()
                     } else {
                         sel_trimmed
@@ -7851,7 +7868,7 @@ fn eval_joined_scalar_expr(
     // 3. CAST(expr AS type) or expr::type
     if upper.starts_with("CAST(") && t.ends_with(')') {
         let inner = &t[5..t.len() - 1].trim();
-        if let Some(as_pos) = inner.to_uppercase().rfind(" AS ") {
+        if let Some(as_pos) = rfind_top_level_as(&inner.to_uppercase()) {
             let target_expr = inner[..as_pos].trim();
             let target_type = inner[as_pos + 4..].trim().to_uppercase();
             let val = eval_joined_scalar_expr(target_expr, row, params, storage);
@@ -9698,7 +9715,7 @@ fn parse_projection(
         }
 
         let upper = item.to_uppercase();
-        let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+        let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
             (item[..as_idx].trim(), item[as_idx + 4..].trim().trim_matches('"').to_string())
         } else {
             let col = clean_col_name(item.trim());
@@ -10152,14 +10169,14 @@ fn parse_aggregations(select_clause: &str, table: &crate::storage::table::Table)
         let upper = part_trim.to_uppercase();
 
         let get_alias = |default_alias: &str| -> String {
-            if let Some(as_idx) = upper.rfind(" AS ") {
+            if let Some(as_idx) = rfind_top_level_as(&upper) {
                 part_trim[as_idx + 4..].trim().trim_matches('"').to_string()
             } else {
                 default_alias.to_string()
             }
         };
 
-        let raw_expr = if let Some(as_pos) = upper.rfind(" AS ") {
+        let raw_expr = if let Some(as_pos) = rfind_top_level_as(&upper) {
             part_trim[..as_pos].trim().to_string()
         } else {
             part_trim.to_string()
@@ -10941,7 +10958,7 @@ fn normalize_named_sql_params(sql: &str) -> String {
 
 fn is_aggregate_projection_item(item: &str) -> bool {
     let mut t = item.trim();
-    if let Some(as_idx) = t.to_uppercase().rfind(" AS ") {
+    if let Some(as_idx) = rfind_top_level_as(&t.to_uppercase()) {
         t = t[..as_idx].trim();
     }
     while t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
@@ -12821,7 +12838,7 @@ fn projection_exprs_by_alias(select_clause: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for item in split_projection_items(select_clause) {
         let upper = item.to_uppercase();
-        let (expr_part, alias) = if let Some(as_idx) = upper.rfind(" AS ") {
+        let (expr_part, alias) = if let Some(as_idx) = rfind_top_level_as(&upper) {
             (item[..as_idx].trim(), item[as_idx + 4..].trim().trim_matches('"').to_string())
         } else {
             (item.trim(), clean_col_name(item.trim()).to_string())
@@ -15141,7 +15158,7 @@ pub(crate) fn eval_sql_expr(
     // 2. CAST(expr AS type) or expr::type
     if upper.starts_with("CAST(") && s.ends_with(')') {
         let inner = &s[5..s.len() - 1].trim();
-        if let Some(as_pos) = inner.to_uppercase().rfind(" AS ") {
+        if let Some(as_pos) = rfind_top_level_as(&inner.to_uppercase()) {
             let target_expr = inner[..as_pos].trim();
             let target_type = inner[as_pos + 4..].trim().to_uppercase();
             let val = eval_sql_expr(target_expr, primary_row, primary_table, joined_row, joined_table, params);
@@ -16234,7 +16251,12 @@ impl Executor {
             let _guard = RawTextGuard(set_raw_text_mode(true));
             self.execute(sql, params)?
         };
-        Ok(query_result_to_wire(&res))
+        let mut wire = query_result_to_wire(&res);
+        if !wire.rows.is_empty() || !wire.fields.is_empty() {
+            let decls = crate::engine::coltypes::wire_decls(sql, &self.storage, res.fields.len());
+            apply_wire_decls(&mut wire, &res, &decls);
+        }
+        Ok(wire)
     }
 
     /// Trả về các cột kết quả và số tham số `$n` mà không ghi dữ liệu.
@@ -16386,4 +16408,67 @@ fn decode_quoted_idents(res: Result<QueryResult, String>) -> Result<QueryResult,
         }
     }
     Ok(r)
+}
+
+/// Định dạng lại các cột wire có kiểu khai báo (OID, scale numeric, timestamp, char(n)...).
+fn apply_wire_decls(wire: &mut crate::pg_types::WireResult, res: &QueryResult, decls: &[Option<crate::engine::coltypes::DeclType>]) {
+    if decls.is_empty() {
+        return;
+    }
+    for (i, d) in decls.iter().enumerate() {
+        let Some(d) = d else { continue };
+        let Some(field) = wire.fields.get_mut(i) else { continue };
+        let Some(oid) = d.oid() else { continue };
+        if field.type_oid != oid {
+            field.type_oid = oid;
+            // Text lại theo OID mới từ giá trị gốc
+            let name = field.name.clone();
+            for (r, row) in res.rows.iter().enumerate() {
+                if let (serde_json::Value::Object(map), Some(cell)) = (row, wire.rows.get_mut(r).and_then(|w| w.get_mut(i))) {
+                    *cell = map.get(&name).and_then(|v| crate::pg_types::to_pg_text(v, oid));
+                }
+            }
+        }
+        for row in wire.rows.iter_mut() {
+            if let Some(cell) = row.get_mut(i) {
+                if let Some(t) = cell.take() {
+                    *cell = Some(crate::engine::coltypes::format_wire(d, t));
+                }
+            }
+        }
+    }
+}
+
+/// Vị trí (dấu cách đứng trước) của ` AS ` cuối cùng ở cấp ngoài cùng — ngoài ngoặc và chuỗi — như
+/// `rfind(" AS ")` nhưng không bắt nhầm `CAST(x AS int)` hay `'a AS b'`.
+pub(crate) fn rfind_top_level_as(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut last = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_sq {
+            if c == b'\'' {
+                in_sq = false;
+            }
+        } else if in_dq {
+            if c == b'"' {
+                in_dq = false;
+            }
+        } else {
+            match c {
+                b'\'' => in_sq = true,
+                b'"' => in_dq = true,
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b' ' if depth == 0 && i + 4 <= b.len() && b[i + 1..i + 3].eq_ignore_ascii_case(b"AS") && b[i + 3] == b' ' => last = Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    last
 }

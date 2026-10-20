@@ -69,6 +69,7 @@ impl Executor {
         let (table, alias) = table_and_alias(head);
         let key = table.to_lowercase();
         let cols = self.storage.get_table(&key).ok_or_else(|| format!("Table {} not found", table))?.columns.clone();
+        let decls = self.storage.get_table(&key).map(|t| t.decl_types_vec()).unwrap_or_default();
         let mut assigns: Vec<(usize, Option<String>)> = Vec::new();
         let mut extra = Vec::new();
         for (j, a) in split_comma_separated_tokens(set_part).into_iter().enumerate() {
@@ -99,7 +100,7 @@ impl Executor {
                         Some(k) => json_cell(obj.get(k).unwrap_or(&serde_json::Value::Null)),
                         None => cols[*c].default_value.as_deref().map(eval_default_value).unwrap_or(Value::Null),
                     };
-                    (*c, coerce_update_val(&cols[*c], v))
+                    (*c, crate::engine::coltypes::coerce_for_write(decls.get(*c).and_then(|d| d.as_ref()), coerce_update_val(&cols[*c], v)))
                 })
                 .collect();
             if referenced {

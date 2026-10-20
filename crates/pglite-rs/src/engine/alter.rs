@@ -178,6 +178,7 @@ impl Executor {
 
     fn alter_add_column(&mut self, table_name: &str, def: &str, if_not_exists: bool) -> Result<(), String> {
         let (col_def, rest_def) = parse_column_definition(def);
+        let add_col_decl = crate::engine::coltypes::DeclType::parse(rest_def).filter(|d| d.is_informative());
         let col_name = col_def.name.clone();
         let mut col_constraints = Vec::new();
         {
@@ -217,6 +218,7 @@ impl Executor {
         // dòng): replay chỉ biết `default_val`, nên ghi thêm UPDATE cho chúng.
         let mut fixups: Vec<(RowIdentity, Value)> = Vec::new();
         let new_col_idx;
+        self.storage.snapshot_table_for_undo(table_name);
         {
             let table = self.storage.get_table_mut(table_name).unwrap();
             table.columns.push(col_def.clone());
@@ -226,7 +228,7 @@ impl Executor {
                     Some(ref expr_str) => eval_default_value(expr_str),
                     None => default_val.clone(),
                 };
-                let cell = coerce_update_val(&col_def, cell);
+                let cell = crate::engine::coltypes::coerce_for_write(add_col_decl.as_ref(), coerce_update_val(&col_def, cell));
                 row.push(cell);
             }
             for i in 0..table.rows.len() {
@@ -242,7 +244,11 @@ impl Executor {
                 }
             }
         }
+        let col_name_for_type = col_def.name.clone();
         self.storage.wal.append(WalRecord::AlterTableAddColumn { table: table_name.to_string(), column: col_def, default_val });
+        if let Some(d) = add_col_decl {
+            self.storage.log_schema_op(SchemaOp::ColumnTypes { table: table_name.to_string(), types: vec![(col_name_for_type, d.canonical())] });
+        }
         for (identity, new_val) in fixups {
             for rec in identity.update_records(table_name.to_string(), vec![(new_col_idx, new_val)]) {
                 self.storage.wal.append(rec);
@@ -345,6 +351,7 @@ impl Executor {
                 self.storage.log_schema_op(SchemaOp::DropConstraint { table: t, name });
             }
         }
+        self.storage.snapshot_table_for_undo(table);
         let col_name = {
             let t = self.storage.get_table_mut(table).unwrap();
             let name = t.columns[t.get_column_index(col).unwrap()].name.clone();
@@ -412,6 +419,13 @@ impl Executor {
     fn alter_column_type(&mut self, table: &str, idx: usize, cur: &ColumnDef, type_str: &str, using: Option<&str>) -> Result<(), String> {
         let new_type = DataType::from_sql_str(type_str);
         let new_def = ColumnDef { data_type: new_type.clone(), ..cur.clone() };
+        let new_decl = crate::engine::coltypes::DeclType::parse(type_str);
+        let decl_op = {
+            let t = self.storage.get_table(table).unwrap();
+            let old_decl = t.decl_type(idx).map(|d| d.canonical());
+            let new_canon = new_decl.as_ref().filter(|d| d.is_informative()).map(|d| d.canonical());
+            (old_decl != new_canon).then(|| SchemaOp::ColumnTypes { table: table.to_string(), types: vec![(cur.name.clone(), new_canon.unwrap_or_default())] })
+        };
         // Tính giá trị mới cho mọi dòng trước khi sửa gì: chuyển kiểu lỗi thì không đổi gì cả.
         let mut changes: Vec<(usize, Value)> = Vec::new();
         {
@@ -435,17 +449,24 @@ impl Executor {
                 if casted.is_null() {
                     return Err(format!("invalid input syntax for type {}: \"{}\"", type_str.to_lowercase(), raw.as_str()));
                 }
-                let v = coerce_update_val(&new_def, casted);
+                let v = crate::engine::coltypes::coerce_for_write(new_decl.as_ref(), coerce_update_val(&new_def, casted));
                 if &v != old {
                     changes.push((r, v));
                 }
             }
         }
         if new_type == cur.data_type && changes.is_empty() {
-            return Ok(()); // vd. VARCHAR(100) -> VARCHAR(150): cùng kiểu lưu trữ
+            // vd. VARCHAR(100) -> VARCHAR(150): cùng kiểu lưu trữ, chỉ đổi kiểu khai báo
+            if let Some(op) = decl_op {
+                self.storage.log_schema_op(op);
+            }
+            return Ok(());
         }
         // Validate ràng buộc trên giá trị mới (UNIQUE có thể trùng sau khi chuyển kiểu, vd 1.2 -> 1)
         self.storage.log_schema_op(SchemaOp::AlterColumn { table: table.to_string(), column: cur.name.clone(), def: new_def });
+        if let Some(op) = decl_op {
+            self.storage.log_schema_op(op);
+        }
         for (r, v) in changes {
             let identity = {
                 let t = self.storage.get_table_mut(table).unwrap();

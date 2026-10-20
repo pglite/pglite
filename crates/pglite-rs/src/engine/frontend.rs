@@ -251,6 +251,18 @@ fn needs_lex(sql: &str) -> bool {
                 if i > 0 && matches!(b[i - 1], b'e' | b'E' | b'b' | b'B' | b'x' | b'X') {
                     return true;
                 }
+                // literal có kiểu: int '5', DATE '...'
+                let mut k = i;
+                while k > 0 && b[k - 1] == b' ' {
+                    k -= 1;
+                }
+                let mut w = k;
+                while w > 0 && b[w - 1].is_ascii_alphabetic() {
+                    w -= 1;
+                }
+                if k < i && w < k && (w == 0 || !is_ident_char(b[w - 1] as char)) && typed_literal_type(&sql[w..k]).is_some() {
+                    return true;
+                }
             }
             b'0' if matches!(b.get(i + 1), Some(b'x' | b'X' | b'o' | b'O' | b'b' | b'B')) => return true,
             b'_' if i > 0 && b[i - 1].is_ascii_digit() && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => return true,
@@ -284,6 +296,61 @@ fn adjacent_literals_possible(b: &[u8]) -> bool {
         i += 1;
     }
     in_q // chuỗi chưa đóng: để lexer báo lỗi
+}
+
+/// Tên kiểu dùng được trong literal có kiểu (`int '5'`) → tên kiểu chuẩn cho `::`.
+fn typed_literal_type(word: &str) -> Option<&'static str> {
+    Some(match word.to_uppercase().as_str() {
+        "INT" | "INTEGER" | "INT4" => "int4",
+        "BIGINT" | "INT8" => "int8",
+        "SMALLINT" | "INT2" => "int2",
+        "NUMERIC" | "DECIMAL" => "numeric",
+        "REAL" | "FLOAT4" => "float4",
+        "FLOAT8" => "float8",
+        "TEXT" => "text",
+        "VARCHAR" => "varchar",
+        "BOOLEAN" | "BOOL" => "bool",
+        "JSON" => "json",
+        "JSONB" => "jsonb",
+        "UUID" => "uuid",
+        "BYTEA" => "bytea",
+        "DATE" => "date",
+        "TIME" => "time",
+        "TIMETZ" => "timetz",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamptz",
+        "INTERVAL" => "interval",
+        "MONEY" => "money",
+        "INET" => "inet",
+        "CIDR" => "cidr",
+        _ => return None,
+    })
+}
+
+/// Trường sau `INTERVAL '..'`: `DAY`, `HOUR TO MINUTE`... Trả (vị trí sau trường, đơn vị đầu).
+fn interval_field(chars: &[char], from: usize) -> Option<(usize, &'static str)> {
+    const UNITS: &[(&str, &str)] = &[("YEAR", "years"), ("MONTH", "months"), ("DAY", "days"), ("HOUR", "hours"), ("MINUTE", "minutes"), ("SECOND", "seconds")];
+    let word_at = |p: usize| -> Option<(usize, String)> {
+        let (k, _) = skip_ws(chars, p);
+        let mut e = k;
+        while e < chars.len() && chars[e].is_alphabetic() {
+            e += 1;
+        }
+        (e > k).then(|| (e, chars[k..e].iter().collect::<String>().to_uppercase()))
+    };
+    let (e1, w1) = word_at(from)?;
+    let unit = UNITS.iter().find(|(u, _)| *u == w1)?.1;
+    let mut end = e1;
+    if let Some((e2, w2)) = word_at(e1) {
+        if w2 == "TO" {
+            if let Some((e3, w3)) = word_at(e2) {
+                if UNITS.iter().any(|(u, _)| *u == w3) {
+                    end = e3;
+                }
+            }
+        }
+    }
+    Some((end, unit))
 }
 
 /// Chuẩn hoá `sql` (xem đầu file). Lỗi cú pháp trả `Err` theo đúng thông báo PostgreSQL.
@@ -501,6 +568,29 @@ pub(crate) fn lex(sql: &str) -> Result<String, String> {
                 i = next;
                 continue;
             }
+            // literal có kiểu: int '5', DATE '2024-01-01', INTERVAL '1' DAY → '...'::kiểu
+            if let Some(ty) = typed_literal_type(&word) {
+                let (k, newline) = skip_ws(&chars, j);
+                let prev_word = out.trim_end().rsplit(|c: char| !is_ident_char(c)).next().unwrap_or("").to_uppercase();
+                if k < n && chars[k] == '\'' && !newline && !matches!(prev_word.as_str(), "AT" | "WITH" | "WITHOUT") {
+                    if let Some((mut content, next)) = read_std_string(&chars, k) {
+                        let mut after = next;
+                        if ty == "interval" {
+                            if let Some((unit_len, unit)) = interval_field(&chars, next) {
+                                if content.trim().parse::<f64>().is_ok() {
+                                    content = format!("{} {}", content.trim(), unit);
+                                }
+                                after = unit_len;
+                            }
+                        }
+                        push_std_literal(&mut out, &content);
+                        out.push_str("::");
+                        out.push_str(ty);
+                        i = after;
+                        continue;
+                    }
+                }
+            }
             out.push_str(&word);
             i = j;
             continue;
@@ -587,6 +677,8 @@ mod tests {
         assert_eq!(lex("DO $$ BEGIN RAISE NOTICE 'x--y'; END $$").unwrap(), "DO $$ BEGIN RAISE NOTICE 'x--y'; END $$");
         assert_eq!(lex("SELECT 1; DO $$ x $$").unwrap(), "SELECT 1; DO $$ x $$");
         assert_eq!(lex("SELECT 'it''s' 'x'").is_err(), true);
+        assert_eq!(lex("SELECT int '5', DATE '2024-01-01', INTERVAL '1' DAY, INTERVAL '2 hours'").unwrap(), "SELECT '5'::int4, '2024-01-01'::date, '1 days'::interval, '2 hours'::interval");
+        assert_eq!(lex("SELECT now() AT TIME ZONE 'UTC'").unwrap(), "SELECT now() AT TIME ZONE 'UTC'");
     }
 
     #[test]
