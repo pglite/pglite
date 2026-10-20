@@ -479,7 +479,7 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
             b'"' if !in_sq => in_dq = !in_dq,
             b'(' | b'[' if !in_sq && !in_dq => depth += 1,
             b')' | b']' if !in_sq && !in_dq => depth -= 1,
-            _ if !in_sq && !in_dq && depth == 0 && s[i..].starts_with(op) => {
+            _ if !in_sq && !in_dq && depth == 0 && b[i..].starts_with(op.as_bytes()) => {
                 // `=` không phải một phần của `:=`, `<=`, `>=`, `<>`, `!=`, `==`
                 if op == "=" && (i > 0 && matches!(b[i - 1], b':' | b'<' | b'>' | b'!' | b'=') || b.get(i + 1) == Some(&b'=')) {
                     i += 1;

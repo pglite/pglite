@@ -55,7 +55,9 @@ Câu gốc trong WAIKI:
 
 ---
 
-## Lỗi 2 (nghiêm trọng): subquery vô hướng trong `INSERT ... VALUES` trả về `false` — VẪN CÒN ở bản `49af97425`
+## Lỗi 2 (nghiêm trọng): subquery vô hướng trong `INSERT ... VALUES` trả về `false` — ĐÃ SỬA (2026-10-21)
+
+> Sửa: subquery (không tương quan) trong `VALUES` được tính bằng chính engine trước khi chèn (`engine/upsert.rs`), áp cho cả `ON CONFLICT`. Cùng đợt cũng sửa `UPDATE ... SET col = (SELECT ... tương quan)` từng ghi `true`/NULL. Golden `BG_03`–`BG_05`, `ZA_11`–`ZA_13`.
 
 Subquery `(SELECT id FROM ... WHERE ...)` đặt trong `VALUES` của `INSERT` được tính thành boolean `false` thay vì giá trị `id`. Cùng subquery đó đặt trong `SELECT` thì ra đúng.
 
@@ -118,7 +120,9 @@ Cùng mẫu câu này còn nằm trong các repository chạy lúc runtime (khô
 
 ---
 
-## Lỗi 4 (nghiêm trọng): `GREATEST`/`LEAST` sai trong query có JOIN — bản `49af97425`
+## Lỗi 4 (nghiêm trọng): `GREATEST`/`LEAST` sai trong query có JOIN — ĐÃ SỬA (2026-10-21)
+
+> Sửa: `greatest`/`least` dùng chung một cài đặt cho mọi bộ đánh giá (`engine/strfn.rs`); trên dòng JOIN, biểu thức có phép toán / hàm số học / ngày giờ / ép kiểu (`ROUND(... / GREATEST(...))`, `CEIL(EXTRACT(EPOCH FROM (a - b)))::int`) được tính bằng bộ đánh giá đầy đủ sau khi thay cột bằng giá trị. Golden `BG_06`–`BG_09` (gồm `UPDATE ... FROM`).
 
 Câu chỉ có một bảng thì đúng. Có JOIN (bảng thật, bảng dẫn xuất hay `CROSS JOIN`) thì kết quả sai, có khi báo lỗi:
 
@@ -141,7 +145,9 @@ Câu gốc trong WAIKI:
 - `wellness/wellness-loyalty/backend/infrastructure/kysely-rewards.repository.ts:58` (`days_left` của phiếu đổi thưởng, JOIN `rewards`) → báo lỗi lúc runtime
 - `wellness/wellness-bookings/backend/infrastructure/demo-seed.ts:658` (`UPDATE ... FROM`), `wellness/wellness-protocols/lifecycle.ts:460` (`UPDATE ... FROM`)
 
-## Lỗi 5: self-join không alias bảng bên trái trả 0 dòng — bản `49af97425`
+## Lỗi 5: self-join không alias bảng bên trái trả 0 dòng — ĐÃ SỬA (2026-10-21)
+
+> Sửa: khi cả hai vế của `ON` đều khớp bảng bên phải (tên gốc `sp` và alias `sp2`), vế mang alias là cột của bảng phải; vế trái là biểu thức (`sp.id + 1`) được tính bằng bộ biên dịch JOIN. Golden `BG_10`–`BG_12`.
 
 ```sql
 SELECT sp.id FROM sp JOIN sp sp2 ON sp2.id = sp.id;   -- Postgres: mọi dòng của sp, db-rs: 0 dòng
@@ -150,7 +156,7 @@ SELECT a.id FROM sp a JOIN sp b ON b.id = a.id;       -- đúng
 
 WAIKI chưa thấy dùng mẫu này.
 
-## Lỗi 3 (nhỏ): `pg_typeof()` không được tính
+## Lỗi 3 (nhỏ): `pg_typeof()` không được tính — ĐÃ SỬA (kiểm tra lại 2026-10-21, golden `BG_13`)
 
 ```sql
 SELECT cat_id, pg_typeof(cat_id) FROM item2;

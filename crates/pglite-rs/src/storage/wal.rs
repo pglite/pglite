@@ -418,6 +418,9 @@ pub struct WalManager {
     /// fsync tại mỗi điểm commit (COMMIT, ROLLBACK, lệnh autocommit). Mặc định bật;
     /// tắt bằng `PGLITE_SYNC=off` hoặc `PGlite::set_sync(false)`.
     pub sync: bool,
+    /// Group commit: điểm commit chỉ ghi xuống file, fsync dồn lại cho tới `sync_now()`.
+    /// Người gọi chỉ được báo thành công cho client sau khi `sync_now()` trả về Ok.
+    pub defer_sync: bool,
     /// Lỗi ghi đầu tiên. Sau đó mọi lệnh ghi đều báo lỗi để bộ nhớ không lệch thêm khỏi đĩa.
     poisoned: Option<String>,
     /// Độ dài file sau lần ghi thành công gần nhất (để cắt bỏ khung dở khi ghi lỗi).
@@ -460,6 +463,7 @@ impl WalManager {
             writer,
             pending_bytes: Vec::with_capacity(BATCH_FLUSH_SIZE),
             sync: !sync_disabled_by_env(),
+            defer_sync: false,
             poisoned: None,
             durable_len,
             unsynced: false,
@@ -738,6 +742,18 @@ impl WalManager {
     /// Điểm commit: ghi buffer và fsync (nếu bật `sync`).
     pub fn commit_point(&mut self) -> Result<(), String> {
         self.flush_pending()?;
+        if !self.defer_sync {
+            self.sync_now()?;
+        }
+        self.committed_len = self.durable_len;
+        Ok(())
+    }
+
+    /// fsync phần đã ghi xuống file mà chưa fsync (nếu bật `sync`).
+    pub fn sync_now(&mut self) -> Result<(), String> {
+        if let Some(e) = &self.poisoned {
+            return Err(e.clone());
+        }
         if self.unsynced {
             if self.sync {
                 if let Some(writer) = &self.writer {
@@ -748,7 +764,6 @@ impl WalManager {
             }
             self.unsynced = false;
         }
-        self.committed_len = self.durable_len;
         Ok(())
     }
 
@@ -813,5 +828,6 @@ impl WalManager {
 impl Drop for WalManager {
     fn drop(&mut self) {
         let _ = self.commit_point();
+        let _ = self.sync_now();
     }
 }

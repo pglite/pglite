@@ -290,3 +290,26 @@ fn legacy_transaction_fixture_reads_exactly_like_old_engine() {
     assert_eq!(col(&mut db, "SELECT v FROM t ORDER BY id", "v"), want);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Group commit: với deferred sync, lệnh vẫn nằm trong file ngay sau điểm commit (chỉ chưa
+/// fsync); `sync_wal` fsync một lần cho cả lô và mở lại thấy đủ dữ liệu.
+#[test]
+fn deferred_sync_batches_fsync_and_keeps_data() {
+    let (dir, path) = temp_db("deferred");
+    {
+        let mut db = PGlite::open(&path).unwrap();
+        db.set_deferred_sync(true);
+        exec_all(&mut db, &["CREATE TABLE t (id SERIAL PRIMARY KEY, v INT)"]);
+        for i in 0..100 {
+            db.exec("INSERT INTO t (v) VALUES ($1)", &[Value::Int(i)]).unwrap();
+        }
+        assert!(db.has_unsynced(), "chưa sync_wal thì phải còn phần chưa fsync");
+        db.sync_wal().unwrap();
+        assert!(!db.has_unsynced());
+        // Chưa sync mà đóng: Drop vẫn phải fsync.
+        db.exec("INSERT INTO t (v) VALUES (100)", &[]).unwrap();
+    }
+    let mut db = PGlite::open(&path).unwrap();
+    assert_eq!(col(&mut db, "SELECT count(*) AS n FROM t", "n"), vec![serde_json::json!(101)]);
+    let _ = std::fs::remove_dir_all(dir);
+}

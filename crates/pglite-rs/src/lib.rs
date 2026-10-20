@@ -224,6 +224,22 @@ impl PGlite {
         self.executor.storage.wal.sync = enabled;
     }
 
+    /// Group commit: khi bật, lệnh autocommit/COMMIT chỉ ghi WAL xuống file, fsync được dồn lại
+    /// cho tới [`PGlite::sync_wal`]. Chỉ báo thành công cho client sau khi `sync_wal` trả về Ok.
+    pub fn set_deferred_sync(&mut self, enabled: bool) {
+        self.executor.storage.wal.defer_sync = enabled;
+    }
+
+    /// fsync mọi thay đổi đã chốt mà chưa fsync. Lỗi nghĩa là WAL đã hỏng: DB cần mở lại.
+    pub fn sync_wal(&mut self) -> Result<(), String> {
+        self.executor.storage.wal.sync_now()
+    }
+
+    /// Còn dữ liệu chưa ghi xuống file hoặc chưa fsync.
+    pub fn has_unsynced(&self) -> bool {
+        self.executor.storage.wal.has_pending()
+    }
+
     /// Get the database filepath.
     pub fn filepath(&self) -> &str {
         &self.filepath

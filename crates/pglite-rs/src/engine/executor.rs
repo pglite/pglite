@@ -1700,7 +1700,7 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
                 b'"' if !in_sq => in_dq = !in_dq,
                 b'(' if !in_sq && !in_dq => {
                     let after = list[i + 1..].trim_start();
-                    if after.len() > 7 && after[..7].eq_ignore_ascii_case("SELECT ") || after.len() > 7 && after[..7].eq_ignore_ascii_case("SELECT\n") {
+                    if after.len() > 7 && after.get(..7).map_or(false, |p| p.eq_ignore_ascii_case("SELECT ") || p.eq_ignore_ascii_case("SELECT\n")) {
                         let close = crate::engine::constraints::matching_paren(list, i)?;
                         let inner = list[i + 1..close].trim();
                         if subquery_is_correlated(inner) {
@@ -3014,13 +3014,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     fn handle_create_temp_table(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let mut rest = sql["CREATE".len()..].trim_start();
         for kw in ["LOCAL ", "GLOBAL "] {
-            if rest.len() >= kw.len() && rest[..kw.len()].eq_ignore_ascii_case(kw) {
+            if rest.get(..kw.len()).map_or(false, |p| p.eq_ignore_ascii_case(kw)) {
                 rest = rest[kw.len()..].trim_start();
             }
         }
-        let kw_len = if rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("TEMPORARY ") { 10 } else { 5 };
-        rest = rest[kw_len..].trim_start();
-        if !(rest.len() > 6 && rest[..6].eq_ignore_ascii_case("TABLE ")) {
+        let kw_len = if rest.get(..10).map_or(false, |p| p.eq_ignore_ascii_case("TEMPORARY ")) { 10 } else { 5 };
+        rest = rest.get(kw_len..).unwrap_or("").trim_start();
+        if !rest.get(..6).map_or(false, |p| p.eq_ignore_ascii_case("TABLE ")) {
             return Err("only CREATE TEMP TABLE is supported".to_string());
         }
         let body = rest[6..].trim_start();

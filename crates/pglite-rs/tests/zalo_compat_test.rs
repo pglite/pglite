@@ -111,3 +111,19 @@ fn correlated_subqueries_and_regex_in_app_queries() {
         .rows;
     assert_eq!(r, vec![json!({"id": 1})]);
 }
+
+#[test]
+fn new_paths_handle_vietnamese_identifiers() {
+    // các đường mới (subquery tương quan, DO có biến, UPDATE tương quan, bảng tạm) cắt chuỗi theo byte:
+    // tên tiếng Việt nhiều byte không được làm panic
+    let mut db = PGlite::in_memory().unwrap();
+    db.exec("CREATE TABLE tỉnh (id SERIAL PRIMARY KEY, tên TEXT)", &[]).unwrap();
+    db.exec("CREATE TABLE lớp (id SERIAL PRIMARY KEY, tỉnh_id INT, tên TEXT)", &[]).unwrap();
+    db.exec("INSERT INTO tỉnh (tên) VALUES ('Huế')", &[]).unwrap();
+    db.exec("INSERT INTO lớp (tỉnh_id, tên) VALUES (1, 'Lớp Một')", &[]).unwrap();
+    assert_eq!(rows(&mut db, "SELECT t.tên, (SELECT string_agg(l.tên, ',') FROM lớp l WHERE l.tỉnh_id = t.id) AS ds FROM tỉnh t"), vec![json!({"tên": "Huế", "ds": "Lớp Một"})]);
+    db.exec("DO $$ DECLARE số int := 0; BEGIN SELECT count(*) INTO số FROM tỉnh; INSERT INTO tỉnh (tên) VALUES ('Đà Nẵng ' || số); END $$", &[]).unwrap();
+    db.exec("UPDATE tỉnh t SET tên = (SELECT max(l.tên) FROM lớp l WHERE l.tỉnh_id = t.id) WHERE t.id = 1", &[]).unwrap();
+    db.exec("CREATE TEMP TABLE tạm AS SELECT * FROM tỉnh", &[]).unwrap();
+    assert_eq!(rows(&mut db, "SELECT tên FROM tạm ORDER BY id"), vec![json!({"tên": "Lớp Một"}), json!({"tên": "Đà Nẵng 1"})]);
+}
