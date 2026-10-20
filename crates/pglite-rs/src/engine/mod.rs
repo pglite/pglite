@@ -8,6 +8,8 @@ pub(crate) mod validate;
 pub mod expr;
 pub mod inttype;
 pub(crate) mod oprewrite;
+pub(crate) mod strfn;
+pub(crate) mod sequences;
 pub(crate) mod datetime;
 pub mod executor;
 pub mod plan;

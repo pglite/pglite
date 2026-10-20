@@ -298,7 +298,16 @@ impl Executor {
             built.push(defaults_row(params));
         } else if up_src.starts_with("VALUES") {
             let mut param_cursor = 0;
-            for group in extract_value_groups(&source[6..]) {
+            // `VALUES ((SELECT id FROM t WHERE ...), ...)`: subquery (không tương quan) tính bằng engine trước
+            // (trước đây bị đánh giá như một biểu thức và ghi `false` vào cột)
+            let resolved_values;
+            let values_src: &str = if super::executor::contains_ci(source, "SELECT") {
+                resolved_values = self.resolve_subqueries_in_select_pub(source, params)?;
+                &resolved_values
+            } else {
+                source
+            };
+            for group in extract_value_groups(&values_src[6..]) {
                 let mut row = defaults_row(params);
                 let tokens = split_comma_separated_tokens(group);
                 if tokens.len() > col_indices.len() {
@@ -328,6 +337,22 @@ impl Executor {
                     }
                 }
                 built.push(row);
+            }
+        }
+
+        // Cột không phải khoá chính có `DEFAULT nextval(...)` mà để trống: lấy giá trị kế tiếp của bộ đếm
+        // (khoá chính thì `Table::insert` cấp từ `auto_increment` như SERIAL).
+        {
+            let table = self.storage.tables.get_mut(&clean_table_name).unwrap();
+            let seq_cols: Vec<usize> = (0..col_defs.len())
+                .filter(|&c| Some(c) != table.pk_col_idx && col_defs[c].default_value.as_deref().map_or(false, crate::engine::sequences::is_nextval_default))
+                .collect();
+            for &c in &seq_cols {
+                for row in &mut built {
+                    if row[c].is_null() {
+                        row[c] = Value::Int(Executor::take_next_value(table, c));
+                    }
+                }
             }
         }
 

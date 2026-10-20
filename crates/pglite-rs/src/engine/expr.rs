@@ -867,6 +867,12 @@ impl CompiledExpr {
                 }
             }
             CompiledExpr::Raw(s) => {
+                // tên cột không có trong schema JOIN (cột của subquery LATERAL `d.dt`): lấy giá trị của dòng
+                // thay vì tính như một điều kiện (trước đây ra true/false)
+                let t = s.trim();
+                if !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '"') && !t.chars().next().unwrap().is_ascii_digit() {
+                    return row.get_val(t);
+                }
                 Value::Bool(crate::engine::executor::eval_condition_on_row(row, s, params))
             }
             _ => self.eval(&row.values, None, params),
@@ -1637,6 +1643,19 @@ pub(crate) fn compile_expr_for_joined(
         let r = compile_expr_for_joined(&s[pos + 5..], joined_schema);
         return CompiledExpr::Like { expr: Box::new(l), pattern: Box::new(r), case_insensitive: true, negated: false };
     }
+    // LIKE / NOT LIKE (không ESCAPE): trước đây rơi vào `Raw`, vế trái là hàm như `coalesce(x, '')` thì sai
+    if crate::engine::executor::find_top_level_keyword(s, "ESCAPE").is_none() {
+        if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "NOT LIKE") {
+            let l = compile_expr_for_joined(&s[..pos], joined_schema);
+            let r = compile_expr_for_joined(&s[pos + 8..], joined_schema);
+            return CompiledExpr::Like { expr: Box::new(l), pattern: Box::new(r), case_insensitive: false, negated: true };
+        }
+        if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "LIKE") {
+            let l = compile_expr_for_joined(&s[..pos], joined_schema);
+            let r = compile_expr_for_joined(&s[pos + 4..], joined_schema);
+            return CompiledExpr::Like { expr: Box::new(l), pattern: Box::new(r), case_insensitive: false, negated: false };
+        }
+    }
 
     // IS NULL / IS NOT NULL
     if let Some(pos) = crate::engine::executor::find_top_level_keyword(s, "IS NOT NULL") {
@@ -1717,8 +1736,9 @@ pub(crate) fn compile_expr_for_joined(
         };
     }
 
-    // Cast (::)
-    if let Some(colon_pos) = crate::engine::executor::find_last_top_level_op(s, "::") {
+    // Cast (::): chỉ khi là phép ngoài cùng (`t >= $1::timestamptz` là phép so sánh, ép kiểu thuộc vế phải;
+    // trước đây cả `t >= $1` bị ép thành timestamp)
+    if let Some(colon_pos) = crate::engine::executor::find_last_top_level_op(s, "::").filter(|&p| crate::engine::executor::cast_is_outermost(s, p)) {
         let target_expr = compile_expr_for_joined(&s[..colon_pos], joined_schema);
         let target_type = s[colon_pos + 2..].trim().to_uppercase();
         return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
@@ -1774,6 +1794,20 @@ pub(crate) fn compile_expr_for_joined(
             let a = compile_expr_for_joined(&args[0], joined_schema);
             let b = compile_expr_for_joined(&args[1], joined_schema);
             return CompiledExpr::NullIf(Box::new(a), Box::new(b));
+        }
+    }
+
+    // hàm chuỗi bổ sung (regex, format): đối số biên dịch theo dòng JOIN (trước đây rơi vào `Raw` và bị tính như một điều kiện)
+    if crate::engine::strfn::is_strfn_name(&upper) && s.ends_with(')') {
+        if let Some(open_p) = s.find('(') {
+            let fn_name = s[..open_p].trim().to_uppercase();
+            if crate::engine::strfn::is_known(&fn_name) && crate::engine::executor::is_fully_enclosed_in_parens(&s[open_p..]) {
+                let args = crate::engine::executor::split_function_args(&s[open_p + 1..s.len() - 1])
+                    .into_iter()
+                    .map(|a| compile_expr_for_joined(&a, joined_schema))
+                    .collect();
+                return CompiledExpr::FuncCall { name: fn_name, args };
+            }
         }
     }
 
@@ -1915,6 +1949,7 @@ fn eval_func_call(name: &str, args: &[Value]) -> Value {
                 Value::Null
             }
         }
+        n if crate::engine::strfn::is_known(n) => crate::engine::strfn::call(n, args).unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }

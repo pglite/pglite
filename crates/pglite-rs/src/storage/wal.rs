@@ -432,9 +432,28 @@ pub struct WalManager {
     committed_len: u64,
     #[cfg(not(target_arch = "wasm32"))]
     pub last_flush: Instant,
+    /// Bảng tạm (`CREATE TEMP TABLE`, viết thường): chỉ sống trong phiên, mọi bản ghi của chúng bị bỏ
+    /// qua nên không bao giờ xuống đĩa (file DB không đổi, kể cả khi sau này có bảng thật trùng tên).
+    pub temp_tables: std::collections::HashSet<String>,
 }
 
 impl WalManager {
+    /// Bản ghi thuộc một bảng tạm: không ghi. `DropTable` của bảng tạm còn gỡ tên khỏi danh sách.
+    fn skip_temp(&mut self, table: Option<&str>, is_drop: bool) -> bool {
+        let Some(t) = table else { return false };
+        if self.temp_tables.is_empty() {
+            return false;
+        }
+        let key = t.to_lowercase();
+        if !self.temp_tables.contains(&key) {
+            return false;
+        }
+        if is_drop {
+            self.temp_tables.remove(&key);
+        }
+        true
+    }
+
     fn empty(filepath: Option<PathBuf>, writer: Option<BufWriter<File>>, durable_len: u64) -> Self {
         Self {
             filepath,
@@ -449,6 +468,7 @@ impl WalManager {
             committed_len: durable_len,
             #[cfg(not(target_arch = "wasm32"))]
             last_flush: Instant::now(),
+            temp_tables: std::collections::HashSet::new(),
         }
     }
 
@@ -609,6 +629,25 @@ impl WalManager {
     }
 
     pub fn append(&mut self, record: WalRecord) {
+        let (table, is_drop) = match &record {
+            WalRecord::CreateTable { name, .. } => (Some(name.as_str()), false),
+            WalRecord::DropTable { name } => (Some(name.as_str()), true),
+            WalRecord::Insert { table, .. }
+            | WalRecord::Update { table, .. }
+            | WalRecord::Delete { table, .. }
+            | WalRecord::CommentOnTable { table, .. }
+            | WalRecord::CommentOnColumn { table, .. }
+            | WalRecord::AlterTableAddColumn { table, .. }
+            | WalRecord::AlterTableDropColumn { table, .. }
+            | WalRecord::UpdateByKey { table, .. }
+            | WalRecord::DeleteByKey { table, .. }
+            | WalRecord::UpdateByRow { table, .. }
+            | WalRecord::DeleteByRow { table, .. } => (Some(table.as_str()), false),
+            _ => (None, false),
+        };
+        if self.skip_temp(table, is_drop) {
+            return;
+        }
         self.appended += 1;
         if record.is_ddl() {
             self.ddl_appended += 1;
@@ -622,6 +661,25 @@ impl WalManager {
     }
 
     pub fn append_ref<'a>(&mut self, record: WalRecordRef<'a>) {
+        let (table, is_drop) = match &record {
+            WalRecordRef::CreateTable { name, .. } => (Some(*name), false),
+            WalRecordRef::DropTable { name } => (Some(*name), true),
+            WalRecordRef::Insert { table, .. }
+            | WalRecordRef::Update { table, .. }
+            | WalRecordRef::Delete { table, .. }
+            | WalRecordRef::CommentOnTable { table, .. }
+            | WalRecordRef::CommentOnColumn { table, .. }
+            | WalRecordRef::AlterTableAddColumn { table, .. }
+            | WalRecordRef::AlterTableDropColumn { table, .. }
+            | WalRecordRef::UpdateByKey { table, .. }
+            | WalRecordRef::DeleteByKey { table, .. }
+            | WalRecordRef::UpdateByRow { table, .. }
+            | WalRecordRef::DeleteByRow { table, .. } => (Some(*table), false),
+            _ => (None, false),
+        };
+        if self.skip_temp(table, is_drop) {
+            return;
+        }
         self.appended += 1;
         if self.writer.is_some() {
             if let Ok(bytes) = bincode::serialize(&record) {

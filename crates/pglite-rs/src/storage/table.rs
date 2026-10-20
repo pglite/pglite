@@ -243,6 +243,9 @@ impl Table {
                 let up = trimmed.to_uppercase();
                 if up.starts_with("GEN_RANDOM_UUID") || up.starts_with("UUID_GENERATE_V4") {
                     Value::text(uuid::Uuid::new_v4().to_string())
+                } else if up.starts_with("NEXTVAL(") {
+                    // cột tự tăng: khoá chính lấy `auto_increment` bên dưới
+                    Value::Null
                 } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
                     Value::text(&trimmed[1..trimmed.len() - 1])
                 } else if let Ok(n) = trimmed.parse::<i64>() {

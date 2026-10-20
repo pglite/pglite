@@ -26,7 +26,26 @@ pub(crate) fn parse_interval(s: &str) -> Option<Interval> {
         t.truncate(t.len() - 4);
     }
     let t = t.trim_start_matches('@').trim();
-    let words: Vec<&str> = t.split_whitespace().collect();
+    // dấu đứng riêng gắn vào số sau nó: '1 month - 1 day' = 1 tháng -1 ngày (như PostgreSQL)
+    let mut merged: Vec<String> = Vec::new();
+    let mut sign: Option<&str> = None;
+    for w in t.split_whitespace() {
+        if w == "-" || w == "+" {
+            if sign.is_some() {
+                return None;
+            }
+            sign = Some(w);
+            continue;
+        }
+        merged.push(match sign.take() {
+            Some(sg) => format!("{}{}", sg, w),
+            None => w.to_string(),
+        });
+    }
+    if sign.is_some() {
+        return None;
+    }
+    let words: Vec<&str> = merged.iter().map(|w| w.as_str()).collect();
     let mut iv = Interval::default();
     let mut i = 0;
     let mut any = false;

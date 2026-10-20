@@ -30,6 +30,8 @@ pub struct StorageEngine {
     pub tx_aborted: bool,
     /// Giao dịch hiện tại có DDL được hoàn tác khi ROLLBACK (đã ghi / đã gặp `SchemaOp::TxDdlUndo`).
     pub tx_ddl_undo: bool,
+    /// Bảng tạm `ON COMMIT DROP` của giao dịch đang mở (viết thường).
+    pub on_commit_drop: Vec<String>,
 }
 
 /// Mốc đầu một câu lệnh (xem `StorageEngine::begin_statement`).
@@ -53,6 +55,7 @@ impl StorageEngine {
             stmt_depth: 0,
             tx_aborted: false,
             tx_ddl_undo: false,
+            on_commit_drop: Vec::new(),
         };
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
@@ -396,8 +399,21 @@ impl StorageEngine {
                 self.snapshot_table_for_undo(&t);
             }
         }
-        self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&op) });
+        // thay đổi catalog chỉ của bảng tạm: không ghi
+        let tables = self.schema_op_tables(&op);
+        let only_temp = !tables.is_empty() && tables.iter().all(|t| self.wal.temp_tables.contains(&t.to_lowercase()));
+        if !only_temp {
+            self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&op) });
+        }
         self.apply_schema_op(&op);
+    }
+
+    /// Bảng tạm `ON COMMIT DROP`: xoá khỏi bộ nhớ khi giao dịch kết thúc (không ghi WAL).
+    pub fn drop_on_commit_temp_tables(&mut self) {
+        for name in std::mem::take(&mut self.on_commit_drop) {
+            self.tables.remove(&name);
+            self.wal.temp_tables.remove(&name);
+        }
     }
 
     /// Áp dụng một thay đổi catalog, dùng chung cho lúc chạy và lúc replay. Không kiểm tra dữ liệu:
@@ -735,6 +751,7 @@ impl StorageEngine {
 
     pub fn commit(&mut self) -> Result<(), String> {
         self.tx_aborted = false;
+        self.drop_on_commit_temp_tables();
         if self.in_transaction {
             self.wal.append(WalRecord::Commit);
             self.in_transaction = false;
@@ -754,6 +771,7 @@ impl StorageEngine {
             while let Some(undo) = self.tx_undo_log.pop() {
                 self.apply_undo(undo);
             }
+            self.drop_on_commit_temp_tables();
             // TxRollback (không phải Rollback cũ) để lần mở lại sau hoàn tác đúng giao dịch này
             self.wal.append(WalRecord::TxRollback);
             self.in_transaction = false;
