@@ -12,7 +12,7 @@
 /// Lọc nhanh, một lượt qua câu (chạy cho mọi câu lệnh): có `@` tiền tố, `|/`, hoặc một trong các từ
 /// khoá ISNULL, NOTNULL, SYMMETRIC, SIMILAR, ZONE, NORMALIZED.
 fn may_need(sql: &str) -> bool {
-    const WORDS: [&[u8]; 6] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED"];
+    const WORDS: [&[u8]; 7] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS"];
     let b = sql.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -510,6 +510,29 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         changed = true;
     }
 
+    // (a, b) OVERLAPS (c, d) → overlaps(a, b, c, d)
+    let mut from = 0;
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "OVERLAPS", from) else { break };
+        let before = s[..p].trim_end();
+        if !before.ends_with(')') {
+            from = p + 8; // `overlaps(...)` đã viết lại / tên hàm
+            continue;
+        }
+        let lclose = before.len() - 1;
+        let Some(lopen) = primary_start(&s, &m, lclose + 1).filter(|&o| s.as_bytes()[o] == b'(') else { break };
+        let after = &s[p + 8..];
+        let ropen = p + 8 + (after.len() - after.trim_start().len());
+        if s.as_bytes().get(ropen) != Some(&b'(') {
+            break;
+        }
+        let Some(rclose) = super::constraints::matching_paren(&s, ropen) else { break };
+        let rep = format!("overlaps({}, {})", &s[lopen + 1..lclose], &s[ropen + 1..rclose]);
+        s.replace_range(lopen..rclose + 1, &rep);
+        changed = true;
+    }
+
     // FROM ONLY t / JOIN ONLY t: không có kế thừa bảng nên ONLY không đổi gì
     for kw in ["FROM", "JOIN", "UPDATE"] {
         let mut from = 0;
@@ -799,6 +822,7 @@ mod tests {
         assert_eq!(r("WITH x(a, b) AS (VALUES (1, 'p')) SELECT b FROM x"), "WITH x AS (SELECT 1 AS a, 'p' AS b) SELECT b FROM x");
         assert_eq!(r("INSERT INTO t VALUES (1, 'a')"), "INSERT INTO t VALUES (1, 'a')");
         assert_eq!(r("TABLE u"), "SELECT * FROM u");
+        assert_eq!(r("SELECT ('2024-01-01'::date, '2024-02-01'::date) OVERLAPS ('2024-01-15'::date, interval '1 day')"), "SELECT overlaps('2024-01-01'::date, '2024-02-01'::date, '2024-01-15'::date, interval '1 day')");
         assert_eq!(r("SELECT name FROM ONLY t ORDER BY n USING > NULLS LAST"), "SELECT name FROM t ORDER BY n DESC NULLS LAST");
         assert_eq!(r("SELECT * FROM t ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY"), "SELECT * FROM t ORDER BY id OFFSET 1 LIMIT 2");
         assert_eq!(r("SELECT n FROM t ORDER BY n FETCH FIRST 1 ROWS WITH TIES"), "SELECT n FROM t ORDER BY n LIMIT 1 WITH TIES");

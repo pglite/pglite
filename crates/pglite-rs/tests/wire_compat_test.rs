@@ -43,6 +43,14 @@ fn legacy_wal_fixture_opens_with_identical_data() {
         for (key, sql) in SNAPSHOT_QUERIES {
             let rows = serde_json::Value::Array(db.query(sql, &[]).unwrap().rows);
             assert_eq!(rows, expected[*key], "dữ liệu bảng {key} khác với snapshot của code cũ");
+            // lần chạy thứ hai đi qua plan cache: phải ra y hệt (mảng `{x,y}` của DB cũ từng ra dạng chuỗi)
+            let again = serde_json::Value::Array(db.query(sql, &[]).unwrap().rows);
+            assert_eq!(again, expected[*key], "bảng {key}: lần chạy lại (plan cache) khác lần đầu");
+            // múi giờ phiên không đổi dữ liệu đã lưu
+            db.exec("SET TIME ZONE 'Asia/Ho_Chi_Minh'", &[]).unwrap();
+            let tz = serde_json::Value::Array(db.query(sql, &[]).unwrap().rows);
+            db.exec("SET TIME ZONE 'UTC'", &[]).unwrap();
+            assert_eq!(tz, expected[*key], "bảng {key}: dữ liệu đổi khi đặt múi giờ +7");
         }
         // Ghi thêm bằng code mới trên cùng file
         db.exec("INSERT INTO schools (name, active) VALUES ('Delta', true)", &[]).unwrap();

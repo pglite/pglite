@@ -597,6 +597,26 @@ fn offset_at(rule: ZoneRule, utc: i64) -> i64 {
     }
 }
 
+/// Độ lệch (giây phía đông UTC) của `zone` tại thời điểm UTC `utc_secs`; `None` nếu không nhận ra.
+pub(crate) fn zone_offset_at(zone: &str, utc_secs: i64) -> Option<i64> {
+    zone_rule(zone).map(|r| offset_at(r, utc_secs))
+}
+
+/// Độ lệch của `zone` cho một giờ địa phương `local_secs` (giờ treo tường tính như epoch).
+pub(crate) fn zone_offset_for_local(zone: &str, local_secs: i64) -> Option<i64> {
+    let r = zone_rule(zone)?;
+    let guess = offset_at(r, local_secs - offset_at(r, local_secs));
+    Some(offset_at(r, local_secs - guess))
+}
+
+pub(crate) fn civil_from_days_pub(days: i64) -> (i32, u32, u32) {
+    civil_from_days(days)
+}
+
+pub(crate) fn days_in_month_pub(y: i32, m: u32) -> u32 {
+    days_in_month(y, m)
+}
+
 /// `timezone(zone, ts)` / `ts AT TIME ZONE zone`. `input_tz`: giá trị vào là timestamptz (thời điểm tuyệt
 /// đối) → trả giờ địa phương (timestamp); ngược lại là timestamp (giờ địa phương của `zone`) → trả
 /// timestamptz (UTC, phiên đặt TimeZone = UTC).

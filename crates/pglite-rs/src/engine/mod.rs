@@ -8,6 +8,7 @@ pub(crate) mod validate;
 pub mod expr;
 pub mod inttype;
 pub(crate) mod oprewrite;
+pub(crate) mod datetime;
 pub mod executor;
 pub mod plan;
 pub mod plpgsql;

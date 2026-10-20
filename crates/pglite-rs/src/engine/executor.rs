@@ -61,6 +61,11 @@ impl Executor {
         let top = self.storage.stmt_depth == 0;
         if top {
             crate::engine::errors::clear();
+            // múi giờ của phiên này cho các hàm ngày giờ (mặc định UTC / PGLITE_TIMEZONE)
+            match self.settings.get("timezone") {
+                Some(z) => crate::engine::datetime::set_session_tz(z),
+                None => crate::engine::datetime::set_session_tz(default_tz()),
+            }
             if self.storage.in_transaction && self.storage.tx_aborted {
                 if let Some(res) = self.aborted_transaction_gate(sql) {
                     return res;
@@ -1434,6 +1439,153 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
         }
         res.row_count = res.rows.len();
         Ok(Some(res))
+    }
+
+    /// `FROM generate_series(a, b [, step]) [WITH ORDINALITY] [AS] alias[(cột, ...)] ...` và tương tự với
+    /// `unnest(arr, ...)`: tính các dòng thành một bảng tạm có tên riêng (không bao giờ trùng bảng thật), viết
+    /// lại thành `FROM __srf_N AS alias` rồi chạy như truy vấn thường. `None` nếu FROM không có dạng này.
+    fn try_srf_from(&mut self, select_clause: &str, is_distinct: bool, after_from: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
+        let up = after_from.to_uppercase();
+        let fname = if up.starts_with("GENERATE_SERIES(") {
+            "generate_series"
+        } else if up.starts_with("UNNEST(") {
+            "unnest"
+        } else {
+            return None;
+        };
+        let open = after_from.find('(')?;
+        let close = crate::engine::constraints::matching_paren(after_from, open)?;
+        let args = split_function_args(&after_from[open + 1..close]);
+        let mut rest = after_from[close + 1..].trim_start();
+        let mut ordinality = false;
+        if rest.len() >= 15 && rest.as_bytes()[..15].eq_ignore_ascii_case(b"WITH ORDINALITY") {
+            ordinality = true;
+            rest = rest[15..].trim_start();
+        }
+        // alias [(cột, ...)]
+        let mut alias = fname.to_string();
+        let mut col_names: Vec<String> = Vec::new();
+        let stop_words = ["WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "HAVING", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "UNION", "WINDOW", "FETCH", "FOR"];
+        let r2 = if rest.len() >= 3 && rest.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") { rest[3..].trim_start() } else { rest };
+        let word_len = r2.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).unwrap_or(r2.len());
+        let word = &r2[..word_len];
+        if !word.is_empty() && !stop_words.iter().any(|w| w.eq_ignore_ascii_case(word)) {
+            alias = word.trim_matches('"').to_string();
+            rest = r2[word_len..].trim_start();
+            if rest.starts_with('(') {
+                let c = crate::engine::constraints::matching_paren(rest, 0)?;
+                col_names = split_comma_separated_tokens(&rest[1..c]).into_iter().map(|x| x.trim().trim_matches('"').to_string()).collect();
+                rest = rest[c + 1..].trim_start();
+            } else {
+                col_names.push(alias.clone());
+            }
+        }
+        if rest.starts_with(',') || has_top_level_join(rest) {
+            return None; // SRF cùng bảng khác (LATERAL...): chưa hỗ trợ ở đây
+        }
+        // tính các cột
+        let eval = |e: &str| eval_sql_expr(e, &[], None, &[], None, params);
+        let mut columns: Vec<(Vec<Value>, crate::types::DataType, Option<&'static str>)> = Vec::new();
+        if fname == "generate_series" {
+            if args.len() < 2 || args.len() > 3 {
+                return Some(Err("function generate_series requires 2 or 3 arguments".to_string()));
+            }
+            let a = eval(&args[0]);
+            let b = eval(&args[1]);
+            let st = args.get(2).map(|x| eval(x));
+            if a.is_null() || b.is_null() || st.as_ref().is_some_and(|v| v.is_null()) {
+                columns.push((vec![], crate::types::DataType::Integer, None));
+            } else if matches!((&a, &b), (Value::Int(_), Value::Int(_))) && st.as_ref().map_or(true, |v| matches!(v, Value::Int(_))) {
+                let (x, y) = (a.as_i64().unwrap_or(0), b.as_i64().unwrap_or(0));
+                let step = st.and_then(|v| v.as_i64()).unwrap_or(1);
+                if step == 0 {
+                    return Some(Err("step size cannot equal zero".to_string()));
+                }
+                let n = if (step > 0 && y >= x) || (step < 0 && y <= x) { ((y - x) / step + 1) as usize } else { 0 };
+                if n > 10_000_000 {
+                    return Some(Err("generate_series would return more than 10000000 rows".to_string()));
+                }
+                let big = x.abs() > i32::MAX as i64 || y.abs() > i32::MAX as i64;
+                columns.push(((0..n).map(|k| Value::Int(x + k as i64 * step)).collect(), if big { crate::types::DataType::BigInt } else { crate::types::DataType::Integer }, None));
+            } else if let (Some(x), Some(y)) = (a.as_f64().filter(|_| !matches!(a, Value::Text(_))), b.as_f64().filter(|_| !matches!(b, Value::Text(_)))) {
+                let step = st.and_then(|v| v.as_f64()).unwrap_or(1.0);
+                if step == 0.0 {
+                    return Some(Err("step size cannot equal zero".to_string()));
+                }
+                let mut vals = Vec::new();
+                let mut cur = x;
+                while (step > 0.0 && cur <= y + 1e-12) || (step < 0.0 && cur >= y - 1e-12) {
+                    vals.push(Value::Float((cur * 1e12).round() / 1e12));
+                    cur += step;
+                    if vals.len() > 10_000_000 {
+                        return Some(Err("generate_series would return more than 10000000 rows".to_string()));
+                    }
+                }
+                columns.push((vals, crate::types::DataType::Numeric, None));
+            } else {
+                let Some(step) = st else { return Some(Err("function generate_series(timestamp, timestamp) does not exist".to_string())) };
+                let col = |_: &str| None;
+                let tz_hint = match crate::engine::coltypes::pg_typeof(&args[0], &col).as_deref() {
+                    // date được nâng lên timestamptz như PostgreSQL
+                    Some("timestamp with time zone" | "date") => Some(true),
+                    Some("timestamp without time zone") => Some(false),
+                    _ => None,
+                };
+                match crate::engine::datetime::series(&a.as_str(), &b.as_str(), &step.as_str(), tz_hint) {
+                    Ok((vals, tz)) => columns.push((vals.into_iter().map(Value::text).collect(), crate::types::DataType::Text, Some(if tz { "timestamptz" } else { "timestamp without time zone" }))),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        } else {
+            for a in &args {
+                let v = eval(a);
+                columns.push((if v.is_null() { vec![] } else { val_to_array_items(&v) }, crate::types::DataType::Text, None));
+            }
+        }
+        let nrows = columns.iter().map(|c| c.0.len()).max().unwrap_or(0);
+        // tên cột: danh sách alias, ngược lại tên hàm (một cột) / alias
+        let ncols = columns.len();
+        let mut names: Vec<String> = (0..ncols).map(|i| col_names.get(i).cloned().unwrap_or_else(|| if ncols == 1 { if col_names.is_empty() { fname.to_string() } else { alias.clone() } } else { fname.to_string() })).collect();
+        if ordinality {
+            names.push(col_names.get(ncols).cloned().unwrap_or_else(|| "ordinality".to_string()));
+        }
+        static SRF_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!("__srf_{}", SRF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let mut defs: Vec<crate::types::ColumnDef> = Vec::new();
+        for (i, n) in names.iter().enumerate() {
+            let dt = if i < ncols {
+                // mảng số nguyên → cột số
+                let c = &columns[i];
+                if fname == "unnest" && !c.0.is_empty() && c.0.iter().all(|v| matches!(v, Value::Int(_) | Value::Null)) { crate::types::DataType::Integer } else { c.1.clone() }
+            } else {
+                crate::types::DataType::BigInt
+            };
+            defs.push(crate::types::ColumnDef { name: n.clone(), data_type: dt, is_primary_key: false, is_nullable: true, default_value: None, comment: None });
+        }
+        let mut table = crate::storage::table::Table::new(tmp.clone(), defs);
+        for r in 0..nrows {
+            let mut row: Vec<Value> = columns.iter().map(|c| c.0.get(r).cloned().unwrap_or(Value::Null)).collect();
+            if ordinality {
+                row.push(Value::Int(r as i64 + 1));
+            }
+            table.insert(row);
+        }
+        self.storage.tables.insert(tmp.clone(), table);
+        let sel = if is_distinct { format!("DISTINCT {}", select_clause) } else { select_clause.to_string() };
+        let q = format!("SELECT {} FROM {} AS {} {}", sel, tmp, alias, rest);
+        let res = self.handle_select(q.trim_end(), params);
+        self.storage.tables.remove(&tmp);
+        let res = res.map(|(mut r, p)| {
+            for (i, c) in columns.iter().enumerate() {
+                if let Some(t) = c.2 {
+                    if let Some(f) = r.fields.iter_mut().find(|f| f.name == names[i]) {
+                        f.data_type = t.to_string();
+                    }
+                }
+            }
+            (r, p)
+        });
+        Some(res)
     }
 
     /// `ARRAY(SELECT x ...)` không tương quan → `ARRAY[v1, v2, ...]` (cột đầu của mọi dòng, giữ thứ tự),
@@ -3605,6 +3757,29 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_select(&mut self, sql: &str, params: &[Value]) -> Result<(QueryResult, Option<ExecutionPlan>), String> {
+        // SELECT generate_series(...) [AS x] / SELECT unnest(...) không có FROM → FROM hàm đó
+        if (contains_ci(sql, "GENERATE_SERIES(") || contains_ci(sql, "UNNEST(")) && find_top_level_keyword(sql, "FROM").is_none() {
+            let list = sql[6..].trim();
+            let mut end = list.len();
+            for kw in ["ORDER BY", "LIMIT", "OFFSET", "WHERE"] {
+                if let Some(p) = find_top_level_keyword(list, kw) {
+                    end = end.min(p);
+                }
+            }
+            let item = list[..end].trim();
+            let tail = list[end..].trim();
+            let (call, alias) = match rfind_top_level_as(&item.to_uppercase()) {
+                Some(p) => (item[..p].trim(), Some(item[p + 4..].trim().trim_matches('"').to_string())),
+                None => (item, None),
+            };
+            let cu = call.to_uppercase();
+            if (cu.starts_with("GENERATE_SERIES(") || cu.starts_with("UNNEST(")) && call.ends_with(')') && is_fully_enclosed_in_parens(&call[call.find('(').unwrap_or(0)..]) {
+                let fname = if cu.starts_with("UNNEST(") { "unnest" } else { "generate_series" };
+                let name = alias.unwrap_or_else(|| fname.to_string());
+                let q = format!("SELECT \"{}\" FROM {} AS \"{}\" {}", name, call, name, tail);
+                return self.handle_select(q.trim_end(), params);
+            }
+        }
         if contains_ci(sql, "WITH TIES") {
             if let Some(r) = self.select_with_ties(sql, params)? {
                 return Ok((r, None));
@@ -3768,6 +3943,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         };
         let after_from = sql[from_idx + 4..].trim();
 
+        // generate_series(...) / unnest(...) đứng một mình trong FROM: bảng tạm tên duy nhất
+        if let Some(r) = self.try_srf_from(select_clause, is_distinct, after_from, params) {
+            return r;
+        }
         if after_from.to_uppercase().starts_with("UNNEST(") {
             let open_p = after_from.find('(').unwrap();
             let mut depth = 1;
@@ -8044,6 +8223,17 @@ fn eval_joined_scalar_expr(
     }
     let upper = t.to_uppercase();
 
+    // hàm ngày giờ (engine/datetime.rs), đối số tính bằng chính bộ đánh giá của JOIN
+    if t.ends_with(')') && is_datetime_fn_name(&upper) {
+        let eval = |e: &str| json_to_value(&eval_joined_scalar_expr(e, row, params, storage));
+        let none = |_: &str| None;
+        let type_of = |e: &str| crate::engine::coltypes::pg_typeof(e, &none);
+        let ctx = crate::engine::datetime::Ctx { eval: &eval, type_of: &type_of };
+        if let Some(v) = crate::engine::datetime::try_eval(t, &upper, &ctx) {
+            return value_to_json(&v);
+        }
+    }
+
     // 1. Correlated / Scalar Subquery: (SELECT ... FROM child WHERE child.fk = parent.id AND ...)
     if (upper.starts_with("(SELECT") || upper.starts_with("SELECT")) && upper.contains("FROM") {
         let sub_sql = if t.starts_with('(') && t.ends_with(')') && is_fully_enclosed_in_parens(t) {
@@ -10229,7 +10419,8 @@ fn parse_projection(
 
         let is_complex_expr = {
             let u = expr_part.to_uppercase();
-            u.contains('(') || u.contains('+') || u.contains('*') || u.contains('/') || u.contains("||") || u.contains("CASE")
+            // `col::date` không phải cột thường: phép ép kiểu đổi giá trị
+            u.contains('(') || u.contains('+') || u.contains('*') || u.contains('/') || u.contains("||") || u.contains("CASE") || u.contains("::")
         };
 
         if !is_complex_expr {
@@ -12230,30 +12421,51 @@ pub(crate) fn get_current_timestamp() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", year, m, d, hours, mins, s, millis)
 }
 
+/// `current_date` theo múi giờ phiên.
 pub(crate) fn get_current_date() -> String {
-    let ts = get_current_timestamp();
-    ts[..10].to_string()
+    crate::engine::datetime::current_date()
 }
 
+/// `current_time` / `localtime`: giờ địa phương của phiên (UTC như các bản trước).
 pub(crate) fn get_current_time() -> String {
-    let ts = get_current_timestamp();
-    ts[11..19].to_string()
+    crate::engine::datetime::local_time().unwrap_or_else(|| {
+        let ts = get_current_timestamp();
+        ts[11..19].to_string()
+    })
+}
+
+/// `localtimestamp`: timestamp không múi giờ theo giờ địa phương của phiên (UTC như các bản trước).
+pub(crate) fn get_local_timestamp() -> String {
+    crate::engine::datetime::local_timestamp().unwrap_or_else(get_current_timestamp)
+}
+
+static DEFAULT_TZ: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Múi giờ mặc định của phiên (đọc `PGLITE_TIMEZONE` một lần).
+pub(crate) fn default_tz() -> &'static str {
+    DEFAULT_TZ.get_or_init(crate::engine::datetime::default_timezone)
 }
 
 fn eval_date_time_keyword(token: &str) -> Option<Value> {
     let trimmed = token.trim();
     let upper = trimmed.to_uppercase();
-    if upper == "CURRENT_TIMESTAMP" || upper == "NOW()" || upper == "LOCALTIMESTAMP"
-        || upper.starts_with("CURRENT_TIMESTAMP") || upper.starts_with("NOW()") || upper.starts_with("LOCALTIMESTAMP")
-    {
+    // chỉ đúng từ khoá (có thể kèm độ chính xác `CURRENT_TIMESTAMP(3)`): `now() - interval '1 hour'` không phải
+    let is = |kw: &str| {
+        upper == kw || upper.strip_prefix(kw).is_some_and(|r| {
+            let r = r.trim();
+            r.starts_with('(') && r.ends_with(')') && r[1..r.len() - 1].trim().bytes().all(|b| b.is_ascii_digit())
+        })
+    };
+    if is("LOCALTIMESTAMP") {
+        return Some(Value::text(get_local_timestamp()));
+    }
+    if is("CURRENT_TIMESTAMP") || upper == "NOW()" {
         return Some(Value::text(get_current_timestamp()));
     }
-    if upper == "CURRENT_DATE" || upper.starts_with("CURRENT_DATE") {
+    if is("CURRENT_DATE") {
         return Some(Value::text(get_current_date()));
     }
-    if upper == "CURRENT_TIME" || upper == "LOCALTIME"
-        || upper.starts_with("CURRENT_TIME") || upper.starts_with("LOCALTIME")
-    {
+    if is("CURRENT_TIME") || is("LOCALTIME") {
         return Some(Value::text(get_current_time()));
     }
     None
@@ -12356,7 +12568,7 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
             return Value::text(d);
         }
     }
-    if let Some(colon_pos) = find_last_top_level_op(t, "::") {
+    if let Some(colon_pos) = find_last_top_level_op(t, "::").filter(|&p| cast_is_outermost(t, p)) {
         let target_type = t[colon_pos + 2..].trim();
         let val = parse_value(&t[..colon_pos], params);
         return cast_val(val, target_type);
@@ -12436,6 +12648,22 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
     if let Ok(f) = t.parse::<f64>() {
         return Value::Float(f);
     }
+    // biểu thức hằng (`now() - interval '1 hour'`, `current_date + 1`, `upper('a') || 'b'`): tính thay vì
+    // trả nguyên văn. Biểu thức cần cột sẽ ra NULL ở đây → giữ cách cũ.
+    thread_local! {
+        /// đang tính biểu thức hằng từ parse_value: eval_sql_expr có thể quay lại parse_value cho chính nó
+        static IN_CONST_EVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !IN_CONST_EVAL.with(|f| f.get())
+        && (t.contains('(') || find_top_level_math_op(t, &['+', '-', '*', '/', '%']).is_some_and(|(p, _)| p > 0) || find_top_level_op(t, "||").is_some())
+    {
+        IN_CONST_EVAL.with(|f| f.set(true));
+        let v = eval_sql_expr(t, &[], None, &[], None, params);
+        IN_CONST_EVAL.with(|f| f.set(false));
+        if !v.is_null() && v.as_str() != t {
+            return v;
+        }
+    }
     Value::text(t)
 }
 
@@ -12494,6 +12722,10 @@ fn parse_single_condition_template(
     let mut s = part.trim();
     while is_fully_enclosed_in_parens(s) {
         s = s[1..s.len() - 1].trim();
+    }
+    // ép kiểu ở vế cột (`created::date = current_date`) đổi giá trị: để bộ đánh giá đầy đủ xử lý
+    if lhs_has_cast(s) {
+        return Err("cast on column side".to_string());
     }
     if s.contains("->") || s.contains("@>") || s.contains("<@") || s.contains('?') || s.contains("#>") {
         return Err("Custom JSON condition".to_string());
@@ -12728,6 +12960,10 @@ fn parse_single_condition(
     let mut s = part.trim();
     while is_fully_enclosed_in_parens(s) {
         s = s[1..s.len() - 1].trim();
+    }
+    // ép kiểu ở vế cột (`created::date = current_date`) đổi giá trị: để bộ đánh giá đầy đủ xử lý
+    if lhs_has_cast(s) {
+        return Err("cast on column side".to_string());
     }
     if s.contains("->") || s.contains("@>") || s.contains("<@") || s.contains('?') || s.contains("#>") {
         return Err("Custom JSON condition".to_string());
@@ -14280,6 +14516,7 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
             }
             val
         }
+        "DATE" if crate::engine::datetime::tz_to_date(&val.as_str()).is_some() => Value::text(crate::engine::datetime::tz_to_date(&val.as_str()).unwrap_or_default()),
         "DATE" => match crate::engine::temporal::cast_date(&val.as_str()) {
             Some(d) => Value::text(d),
             None if crate::engine::temporal::field_out_of_range(&val.as_str()) => {
@@ -14293,8 +14530,18 @@ pub(crate) fn cast_val(val: Value, target_type: &str) -> Value {
         },
         "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITHOUT TIME ZONE" | "TIMESTAMP WITH TIME ZONE" => {
             let s = val.as_str();
+            let with_tz = base == "TIMESTAMPTZ" || base == "TIMESTAMP WITH TIME ZONE";
+            // giá trị đặc biệt: 'epoch', 'today', 'now'... thành thời điểm cụ thể (giữ 'infinity')
+            if let Some(sp) = crate::engine::datetime::resolve_special(&s, with_tz) {
+                return Value::text(sp);
+            }
             if crate::engine::temporal::is_valid_timestamp(&s) {
-                val
+                // theo múi giờ phiên (UTC: giữ nguyên chuỗi như các bản trước)
+                let conv = if with_tz { crate::engine::datetime::naive_to_tz(&s) } else { crate::engine::datetime::tz_to_naive(&s) };
+                match conv {
+                    Some(c) => Value::text(c),
+                    None => val,
+                }
             } else if crate::engine::temporal::field_out_of_range(&s) {
                 raise(format!("date/time field value out of range: \"{}\"", s));
                 Value::Null
@@ -15021,6 +15268,45 @@ fn evaluate_custom_condition(
     params: &[Value],
 ) -> bool {
     eval_sql_expr(cond, primary_row, primary_table, joined_row, joined_table, params).as_bool() == Some(true)
+}
+
+/// Vế trái (trước toán tử so sánh đầu tiên) của điều kiện có `::`.
+fn lhs_has_cast(s: &str) -> bool {
+    let Some(c) = s.find("::") else { return false };
+    let up = s.to_ascii_uppercase();
+    let first_op = ["=", "<", ">", "!", "~", " LIKE ", " ILIKE ", " IN ", " IN(", " BETWEEN ", " IS ", " SIMILAR "]
+        .iter()
+        .filter_map(|op| up.find(op))
+        .min()
+        .unwrap_or(s.len());
+    c < first_op
+}
+
+/// `x::t` tại `colon_pos` là phép ngoài cùng của `s`: phần trước không có toán tử hai ngôi ở cấp ngoài cùng
+/// (`now() - '1 hour'::interval` là phép trừ, `::` chỉ thuộc vế phải).
+pub(crate) fn cast_is_outermost(s: &str, colon_pos: usize) -> bool {
+    let left = &s[..colon_pos];
+    if find_top_level_math_op(left, &['+', '-', '*', '/', '%']).is_some_and(|(p, _)| !left[..p].trim().is_empty()) {
+        return false;
+    }
+    if ["||", "=", "<", ">", "~"].iter().any(|op| find_top_level_op(left, op).is_some_and(|p| p > 0)) {
+        return false;
+    }
+    !["AND", "OR", "IS", "LIKE", "ILIKE", "IN", "BETWEEN"].iter().any(|k| find_top_level_keyword(left, k).is_some_and(|p| p > 0))
+}
+
+/// Tên hàm ngày giờ do engine/datetime.rs xử lý (lọc nhanh trước khi gọi).
+pub(crate) fn is_datetime_fn_name(upper: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "EXTRACT(", "DATE_PART(", "DATE_TRUNC(", "TO_CHAR(", "AGE(", "TO_TIMESTAMP(", "TO_DATE(", "MAKE_DATE(", "MAKE_TIME(", "MAKE_TIMESTAMP(",
+        "MAKE_TIMESTAMPTZ(", "MAKE_INTERVAL(", "JUSTIFY_DAYS(", "JUSTIFY_HOURS(", "JUSTIFY_INTERVAL(", "ISFINITE(", "DATE_ADD(", "DATE_SUBTRACT(",
+        "DATE_BIN(", "OVERLAPS(", "CLOCK_TIMESTAMP(", "STATEMENT_TIMESTAMP(", "TRANSACTION_TIMESTAMP(", "TIMEOFDAY(",
+    ];
+    let b = upper.as_bytes();
+    if b.is_empty() || !matches!(b[0], b'E' | b'D' | b'T' | b'A' | b'M' | b'J' | b'I' | b'O' | b'C' | b'S') {
+        return false;
+    }
+    NAMES.iter().any(|n| upper.starts_with(n))
 }
 
 /// Kết quả `pg_typeof(inner)`: suy tĩnh (cột, ép kiểu, literal, hàm quen thuộc), không được thì theo giá
@@ -16188,7 +16474,7 @@ pub(crate) fn eval_sql_expr(
             return cast_val(val, &target_type);
         }
     }
-    if let Some(colon_pos) = find_last_top_level_op(s, "::") {
+    if let Some(colon_pos) = find_last_top_level_op(s, "::").filter(|&p| cast_is_outermost(s, p)) {
         let target_expr = s[..colon_pos].trim();
         let target_type = s[colon_pos + 2..].trim().to_uppercase();
         let val = eval_sql_expr(target_expr, primary_row, primary_table, joined_row, joined_table, params);
@@ -17117,7 +17403,19 @@ pub(crate) fn eval_sql_expr(
         }
     }
 
-    // 6. Date & Time: EXTRACT, DATE_PART, DATE_TRUNC, TO_CHAR, AGE, CURRENT_DATE, CURRENT_TIMESTAMP, NOW(), etc.
+    // 6. Date & Time: bộ hàm đầy đủ ở engine/datetime.rs (theo múi giờ phiên); mã cũ bên dưới là dự phòng
+    if s.ends_with(')') && is_datetime_fn_name(&upper) {
+        let eval = |e: &str| eval_sql_expr(e, primary_row, primary_table, joined_row, joined_table, params);
+        let col = |c: &str| {
+            let name = c.rsplit('.').next().unwrap_or(c).trim_matches('"');
+            [primary_table, joined_table].into_iter().flatten().find_map(|t| t.get_column_index(name).and_then(|i| crate::engine::coltypes::column_decl(t, i)))
+        };
+        let type_of = |e: &str| crate::engine::coltypes::pg_typeof(e, &col);
+        let ctx = crate::engine::datetime::Ctx { eval: &eval, type_of: &type_of };
+        if let Some(v) = crate::engine::datetime::try_eval(s, &upper, &ctx) {
+            return v;
+        }
+    }
     if upper.starts_with("EXTRACT(") && s.ends_with(')') {
         let inner = s[8..s.len() - 1].trim();
         let inner_upper = inner.to_uppercase();
@@ -17204,7 +17502,10 @@ pub(crate) fn eval_sql_expr(
     if upper == "CURRENT_DATE" {
         return Value::text(get_current_date());
     }
-    if upper == "CURRENT_TIMESTAMP" || upper == "NOW()" || upper == "LOCALTIMESTAMP" {
+    if upper == "LOCALTIMESTAMP" {
+        return Value::text(get_local_timestamp());
+    }
+    if upper == "CURRENT_TIMESTAMP" || upper == "NOW()" {
         return Value::text(get_current_timestamp());
     }
     if upper == "CURRENT_TIME" || upper == "LOCALTIME" {

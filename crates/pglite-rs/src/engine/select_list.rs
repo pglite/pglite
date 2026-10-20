@@ -9,11 +9,11 @@ use super::executor::{find_last_top_level_op, find_top_level_keyword, split_proj
 
 const KEYWORDS: &[&str] = &[
     "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "THEN", "ELSE", "WHEN", "CASE", "END", "SELECT", "DISTINCT", "AS", "ON",
-    "BY", "SIMILAR", "TO", "ESCAPE", "OVER", "FILTER", "WHERE", "FROM", "INTERVAL", "SYMMETRIC", "ANY", "ALL", "SOME", "COLLATE", "AT",
-    "ZONE", "TIME", "WITH", "WITHOUT", "NULL", "TRUE", "FALSE", "UNKNOWN", "ASC", "DESC", "NULLS", "FIRST", "LAST", "DATE", "TIMESTAMP",
+    "BY", "SIMILAR", "TO", "ESCAPE", "OVER", "FILTER", "WHERE", "FROM", "INTERVAL", "SYMMETRIC", "ANY", "ALL", "SOME", "COLLATE",
+    "TIME", "WITH", "WITHOUT", "NULL", "TRUE", "FALSE", "UNKNOWN", "ASC", "DESC", "NULLS", "FIRST", "LAST", "DATE", "TIMESTAMP",
     "ROW", "ARRAY", "EXISTS", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "DEFAULT", "ISNULL",
     "NOTNULL", "NORMALIZED", "OPERATOR", "UNION", "INTERSECT", "EXCEPT", "LIMIT", "OFFSET", "FETCH", "FOR", "GROUP", "HAVING", "ORDER",
-    "WINDOW", "INTO", "VARYING", "PRECISION", "ZONE",
+    "WINDOW", "INTO", "VARYING", "PRECISION",
 ];
 
 fn is_keyword(w: &str) -> bool {

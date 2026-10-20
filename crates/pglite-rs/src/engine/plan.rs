@@ -347,23 +347,9 @@ pub fn project_row_planned(
     serde_json::Value::Object(map)
 }
 
+/// Giống hệt cách đường thực thi thường đổi giá trị ra JSON (mảng dạng `{a,b}` của DB cũ, JSON, chế độ
+/// raw text của wire), để lần chạy qua plan cache cho cùng kết quả với lần đầu.
 #[inline(always)]
 pub fn value_to_json(val: &Value) -> serde_json::Value {
-    match val {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => serde_json::Value::Number((*i).into()),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => {
-            let trimmed = s.trim();
-            if (trimmed.starts_with('{') && trimmed.ends_with('}')) || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    return val;
-                }
-            }
-            serde_json::Value::String(s.to_string())
-        }
-    }
+    crate::engine::executor::value_to_json_pub(val)
 }

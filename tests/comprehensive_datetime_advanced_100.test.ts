@@ -461,7 +461,10 @@ describe("100 Comprehensive In-Depth PostgreSQL Date, Time & Timestamp Test Case
 
     test("57. TO_CHAR(date, 'Day') formats full day of week name", async () => {
       const res = await db.query(`SELECT TO_CHAR('2024-01-01T00:00:00.000Z', 'Day') AS day_name;`);
-      expect(res[0].day_name).toBe("Monday");
+      // Như PostgreSQL: 'Day' đệm tên thứ đến 9 ký tự; 'FMDay' thì không đệm
+      expect(res[0].day_name).toBe("Monday   ");
+      const fm = await db.query(`SELECT TO_CHAR('2024-01-01T00:00:00.000Z', 'FMDay') AS day_name;`);
+      expect(fm[0].day_name).toBe("Monday");
     });
 
     test("58. TO_CHAR(date, 'Dy') formats short day of week name", async () => {

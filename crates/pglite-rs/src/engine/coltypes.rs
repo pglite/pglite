@@ -352,6 +352,16 @@ pub(crate) fn coerce_for_write(decl: Option<&DeclType>, v: Value) -> Value {
         return v;
     }
     match d.base.as_str() {
+        // múi giờ phiên khác UTC: timestamptz → giờ địa phương khi ghi vào timestamp / date, và ngược lại
+        "timestamp" | "timestamptz" | "date" if !crate::engine::datetime::session_is_utc() => {
+            let Value::Text(t) = &v else { return v };
+            let conv = match d.base.as_str() {
+                "timestamp" => crate::engine::datetime::tz_to_naive(t),
+                "timestamptz" => crate::engine::datetime::naive_to_tz(t),
+                _ => crate::engine::datetime::tz_to_date(t),
+            };
+            conv.map(Value::text).unwrap_or(v)
+        }
         "numeric" => {
             let Some(s) = value_num_str(&v) else { return v };
             let precision = d.mods.first().copied();
@@ -444,7 +454,8 @@ pub(crate) fn format_wire(decl: &DeclType, text: String) -> String {
             }
         }
         "timestamp" => crate::engine::temporal::wire_timestamp(&text, false).unwrap_or(text),
-        "timestamptz" => crate::engine::temporal::wire_timestamp(&text, true).unwrap_or(text),
+        // timestamptz theo múi giờ phiên (`+00` khi UTC)
+        "timestamptz" => crate::engine::datetime::wire_tz(&text).or_else(|| crate::engine::temporal::wire_timestamp(&text, true)).unwrap_or(text),
         "time" | "timetz" => crate::engine::temporal::wire_time(&text, decl.base == "timetz").unwrap_or(text),
         "money" => match text.trim().parse::<f64>() {
             Ok(f) => format_money(f),
@@ -738,6 +749,37 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
         let inner = &e[5..e.len() - 1];
         return find_top_level_keyword(inner, "AS").and_then(|p| DeclType::parse(&inner[p + 2..]));
     }
+    // từ khoá / hàm ngày giờ có kiểu kết quả cố định
+    match e.to_ascii_uppercase().as_str() {
+        "LOCALTIMESTAMP" => return DeclType::parse("timestamp"),
+        "CURRENT_TIMESTAMP" | "NOW()" | "CLOCK_TIMESTAMP()" | "STATEMENT_TIMESTAMP()" | "TRANSACTION_TIMESTAMP()" => return DeclType::parse("timestamptz"),
+        "CURRENT_DATE" => return DeclType::parse("date"),
+        "LOCALTIME" => return DeclType::parse("time"),
+        "CURRENT_TIME" => return DeclType::parse("timetz"),
+        _ => {}
+    }
+    if let Some(open) = e.find('(') {
+        if e.ends_with(')') && is_fully_enclosed_in_parens(&e[open..]) {
+            let fname = e[..open].trim().to_ascii_uppercase();
+            let fixed = match fname.as_str() {
+                "TO_TIMESTAMP" | "MAKE_TIMESTAMPTZ" | "DATE_ADD" | "DATE_SUBTRACT" => Some("timestamptz"),
+                "TO_DATE" | "MAKE_DATE" => Some("date"),
+                "MAKE_TIMESTAMP" => Some("timestamp"),
+                "MAKE_TIME" => Some("time"),
+                "MAKE_INTERVAL" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" | "AGE" => Some("interval"),
+                "EXTRACT" | "DATE_PART" => Some("numeric"),
+                "ISFINITE" | "OVERLAPS" => Some("bool"),
+                _ => None,
+            };
+            if let Some(t) = fixed {
+                return DeclType::parse(t);
+            }
+            if fname == "DATE_BIN" {
+                let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
+                return expr_decl(args.get(1)?, col).map(|d| DeclType { mods: vec![], ..d });
+            }
+        }
+    }
     // timezone(z, x): timestamptz → timestamp và ngược lại
     if e.len() > 9 && e.as_bytes()[..9].eq_ignore_ascii_case(b"TIMEZONE(") && e.ends_with(')') && is_fully_enclosed_in_parens(&e[8..]) {
         let args = crate::engine::executor::split_comma_separated_tokens(&e[9..e.len() - 1]);
@@ -941,7 +983,14 @@ pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Opti
                 "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "TO_JSON" | "JSON_AGG" | "JSON_OBJECT_AGG" => "json",
                 "STRING_TO_ARRAY" => "text[]",
                 "PG_TYPEOF" => "regtype",
-                "IS_NORMALIZED" => "boolean",
+                "IS_NORMALIZED" | "ISFINITE" | "OVERLAPS" => "boolean",
+                "MAKE_DATE" => "date",
+                "MAKE_TIME" => "time without time zone",
+                "MAKE_TIMESTAMP" => "timestamp without time zone",
+                "MAKE_TIMESTAMPTZ" | "DATE_ADD" | "DATE_SUBTRACT" | "CLOCK_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" | "NOW" => "timestamp with time zone",
+                "MAKE_INTERVAL" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" => "interval",
+                "EXTRACT" | "DATE_PART" => "numeric",
+                "TIMEOFDAY" => "text",
                 "SUM" => {
                     let inner = &e[open + 1..e.len() - 1];
                     return Some(match pg_typeof(inner, col).as_deref() {

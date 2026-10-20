@@ -289,6 +289,9 @@ fn string_to_pg_text(s: &str, oid: u32) -> String {
 
 /// `2026-10-12 08:00:00` → `2026-10-12 08:00:00+00`; `...Z` → `...+00`; giữ nguyên offset có sẵn.
 pub fn normalize_timestamptz(s: &str) -> String {
+    if let Some(w) = crate::engine::datetime::wire_tz(s) {
+        return w;
+    }
     let t = s.trim();
     if t.len() < 10 || !t.as_bytes()[0].is_ascii_digit() {
         return t.to_string();
@@ -741,7 +744,8 @@ mod tests {
         assert_eq!(to_pg_text(&json!([1, 2]), OID_BYTEA).as_deref(), Some("\\x0102"));
         assert_eq!(to_pg_text(&json!("2026-10-12 08:00:00"), OID_TIMESTAMPTZ).as_deref(), Some("2026-10-12 08:00:00+00"));
         assert_eq!(to_pg_text(&json!("2026-10-12T08:00:00Z"), OID_TIMESTAMPTZ).as_deref(), Some("2026-10-12 08:00:00+00"));
-        assert_eq!(to_pg_text(&json!("2026-10-12T08:00:00.123+07:00"), OID_TIMESTAMPTZ).as_deref(), Some("2026-10-12 08:00:00.123+07:00"));
+        // như PostgreSQL: timestamptz in theo múi giờ phiên (UTC), không giữ độ lệch của chuỗi gốc
+        assert_eq!(to_pg_text(&json!("2026-10-12T08:00:00.123+07:00"), OID_TIMESTAMPTZ).as_deref(), Some("2026-10-12 01:00:00.123+00"));
         assert_eq!(to_pg_text(&json!("2026-10-12T08:00:00"), OID_DATE).as_deref(), Some("2026-10-12"));
     }
 
@@ -788,11 +792,11 @@ pub fn sqlstate(message: &str) -> &'static str {
         "25P02"
     } else if has("which is not a composite type") {
         "42809"
-    } else if has("time zone") && has("not recognized") {
+    } else if has("time zone") && has("not recognized") || has("invalid value for parameter") || has("not recognized for type") || has("not supported for type") {
         "22023"
     } else if has("invalid regular expression") {
         "2201B"
-    } else if has("date/time field value out of range") {
+    } else if has("date/time field value out of range") || has("date field value out of range") || has("time field value out of range") {
         "22008"
     } else if ["date", "time", "timestamp", "timestamp with time zone", "time with time zone", "interval"].iter().any(|t| has(&format!("invalid input syntax for type {}:", t))) {
         "22007"

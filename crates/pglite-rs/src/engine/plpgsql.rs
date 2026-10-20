@@ -541,7 +541,35 @@ impl Executor {
                 }
                 (name, v.to_string())
             };
-            let value = value.split(',').map(|p| p.trim().trim_matches('\'').to_string()).collect::<Vec<_>>().join(", ");
+            let mut value = value.split(',').map(|p| p.trim().trim_matches('\'').to_string()).collect::<Vec<_>>().join(", ");
+            if name == "timezone" {
+                let raw = value.trim().to_string();
+                if raw.eq_ignore_ascii_case("LOCAL") || raw.eq_ignore_ascii_case("DEFAULT") {
+                    self.settings.remove("timezone");
+                    return ok("SET");
+                }
+                // số (`SET TIME ZONE 7`) hoặc độ lệch ISO (`'+07'`, `'-05:30'`): giờ phía đông UTC như PostgreSQL
+                // (khác `AT TIME ZONE '+07'`, nơi chuỗi được hiểu theo POSIX)
+                let iso = raw.strip_prefix('+').or_else(|| raw.strip_prefix('-')).is_some_and(|b| {
+                    let (h, m) = b.split_once(':').unwrap_or((b, "0"));
+                    !h.is_empty() && h.len() <= 2 && h.bytes().all(|c| c.is_ascii_digit()) && m.bytes().all(|c| c.is_ascii_digit())
+                });
+                if iso {
+                    let neg = raw.starts_with('-');
+                    let (h, m) = raw[1..].split_once(':').unwrap_or((&raw[1..], "0"));
+                    let secs = (h.parse::<i64>().unwrap_or(0) * 3600 + m.parse::<i64>().unwrap_or(0) * 60) * if neg { -1 } else { 1 };
+                    value = format!("UTC{}{:02}:{:02}", if secs >= 0 { '-' } else { '+' }, secs.abs() / 3600, (secs.abs() % 3600) / 60);
+                } else if !rest.contains('\'') {
+                    if let Ok(h) = raw.parse::<f64>() {
+                        let secs = (h * 3600.0).round() as i64;
+                        let (hh, mm) = (secs.abs() / 3600, (secs.abs() % 3600) / 60);
+                        value = format!("UTC{}{:02}:{:02}", if secs >= 0 { '-' } else { '+' }, hh, mm);
+                    }
+                }
+                if !crate::engine::datetime::valid_zone(&value) {
+                    return Some(Err(format!("invalid value for parameter \"TimeZone\": \"{}\"", raw)));
+                }
+            }
             if value.eq_ignore_ascii_case("DEFAULT") {
                 self.settings.remove(&name);
             } else {
@@ -564,7 +592,9 @@ impl Executor {
             if name == "all" {
                 return Some(Err("SHOW ALL is not supported".to_string()));
             }
-            let value = self.settings.get(&name).cloned().or_else(|| default_setting(&name).map(|v| v.to_string()));
+            let value = self.settings.get(&name).cloned().or_else(|| {
+                if name == "timezone" { Some(crate::engine::executor::default_tz().to_string()) } else { default_setting(&name).map(|v| v.to_string()) }
+            });
             return Some(match value {
                 Some(v) => Ok(QueryResult {
                     rows: vec![serde_json::json!({ name.clone(): v })],

@@ -671,15 +671,26 @@ impl Table {
 
     /// Kiểu khai báo của cột thứ `idx` (nếu bảng có lưu).
     pub fn decl_type(&self, idx: usize) -> Option<&crate::engine::coltypes::DeclType> {
-        if self.decl_types.is_empty() {
-            return None;
+        let col = self.columns.get(idx)?;
+        if !self.decl_types.is_empty() {
+            if let Some(d) = self.decl_types.get(&col.name.to_lowercase()) {
+                return Some(d);
+            }
         }
-        self.columns.get(idx).and_then(|c| self.decl_types.get(&c.name.to_lowercase()))
+        // DATE không cần lưu kiểu khai báo; TIMESTAMP của bảng do bản cũ tạo (không có ColumnTypes) được engine
+        // hiểu là timestamptz. Trả kiểu suy ra để ép kiểu theo múi giờ phiên và định dạng wire dùng chung một đường.
+        static DATE: std::sync::OnceLock<crate::engine::coltypes::DeclType> = std::sync::OnceLock::new();
+        static TSTZ: std::sync::OnceLock<crate::engine::coltypes::DeclType> = std::sync::OnceLock::new();
+        match col.data_type {
+            crate::types::DataType::Date => Some(DATE.get_or_init(|| crate::engine::coltypes::DeclType::parse("date").unwrap())),
+            crate::types::DataType::Timestamp => Some(TSTZ.get_or_init(|| crate::engine::coltypes::DeclType::parse("timestamptz").unwrap())),
+            _ => None,
+        }
     }
 
     /// Kiểu khai báo theo vị trí cột (rỗng nếu bảng không lưu).
     pub fn decl_types_vec(&self) -> Vec<Option<crate::engine::coltypes::DeclType>> {
-        if self.decl_types.is_empty() {
+        if self.decl_types.is_empty() && !self.columns.iter().any(|c| matches!(c.data_type, crate::types::DataType::Date | crate::types::DataType::Timestamp)) {
             return Vec::new();
         }
         (0..self.columns.len()).map(|i| self.decl_type(i).cloned()).collect()
