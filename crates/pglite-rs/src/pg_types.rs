@@ -682,6 +682,8 @@ pub fn sqlstate(message: &str) -> &'static str {
         "42701"
     } else if has("constraint") && has("already exists") {
         "42710"
+    } else if has("function") && has("does not exist") {
+        "42883"
     } else if (has("column") && has("does not exist")) || has("not found in") {
         "42703"
     } else if has("constraint") && has("does not exist") {
