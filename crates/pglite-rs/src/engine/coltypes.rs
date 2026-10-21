@@ -1101,7 +1101,6 @@ pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Opti
                     let t = pg_typeof(args.first()?, col)?;
                     return Some(if name == "DIV" && t != "numeric" { "numeric".into() } else { t });
                 }
-                "TO_CHAR" => "text",
                 _ => crate::engine::fnlib::result_type(name)?,
             };
             return Some(r.into());

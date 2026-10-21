@@ -31,7 +31,7 @@ pub(crate) fn is_known(name: &str) -> bool {
             | "PG_ADVISORY_UNLOCK_ALL" | "PG_TRY_ADVISORY_LOCK" | "PG_TRY_ADVISORY_XACT_LOCK" | "PG_TRY_ADVISORY_LOCK_SHARED"
             | "PG_TRY_ADVISORY_XACT_LOCK_SHARED" | "PG_TOTAL_RELATION_SIZE" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE"
             | "PG_DATABASE_SIZE" | "PG_POSTMASTER_START_TIME" | "PG_CONF_LOAD_TIME" | "INET_SERVER_ADDR" | "INET_CLIENT_ADDR"
-            | "INET_SERVER_PORT" | "INET_CLIENT_PORT" | "PG_NOTIFY"
+            | "INET_SERVER_PORT" | "INET_CLIENT_PORT" | "PG_NOTIFY" | "PG_ARRAY_SET"
     )
 }
 
@@ -542,7 +542,7 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
     if let Some(r) = json_fn(name, args) {
         return r;
     }
-    if args.iter().any(|a| a.is_null()) && name != "ARRAY_POSITION" && name != "ARRAY_POSITIONS" && name != "ARRAY_FILL" {
+    if args.iter().any(|a| a.is_null()) && !matches!(name, "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_FILL" | "PG_ARRAY_SET") {
         return Some(Value::Null);
     }
     let a0 = args.first();
@@ -824,6 +824,21 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
                 return fail(format!("number of elements to trim must be between 0 and {}", a.len()));
             }
             a.truncate(a.len() - n as usize);
+            Some(array_value(a))
+        }
+        "PG_ARRAY_SET" => {
+            // `UPDATE ... SET a[i] = v`: chỉ số từ 1, quá độ dài thì đệm NULL như PostgreSQL
+            let mut a = if a0?.is_null() { vec![] } else { as_array(a0?)? };
+            let i = int(args.get(1)?)?;
+            if i < 1 {
+                return fail("array subscript out of range");
+            }
+            let v = json_of(args.get(2)?);
+            let i = i as usize;
+            while a.len() < i {
+                a.push(serde_json::Value::Null);
+            }
+            a[i - 1] = v;
             Some(array_value(a))
         }
         "ARRAY_REVERSE" => {

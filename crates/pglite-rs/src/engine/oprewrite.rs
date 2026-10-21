@@ -14,13 +14,17 @@
 //! - SQL/JSON `x IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [WITH|WITHOUT UNIQUE [KEYS]]` → `(pg_is_json(...) = TRUE|FALSE)`;
 //! - hàm gộp `WITHIN GROUP (ORDER BY k [DESC])`: `percentile_cont(f) ...` → `percentile_cont(f, k, 'asc')`,
 //!   `mode() ...` → `mode(k, 'asc')`, `rank(x) ...` → `pg_hyp_rank(x, k, 'asc')` (tên cột vẫn là `rank`);
+//! - `LATERAL f(...) [WITH ORDINALITY] [AS] a[(cột...)]` → `LATERAL (SELECT * FROM f(...) ... AS a(...)) a` (đường
+//!   LATERAL subquery sẵn có tính lại theo từng dòng ngoài);
+//! - `UPDATE ... SET a[i] = v` → `SET a = pg_array_set(a, i, v)`, `SET j['k'] = v` → `SET j = jsonb_set(j, '{k}', v)`;
+//! - JOIN trong ngoặc ngay sau FROM, không alias: `FROM (a JOIN b ON ...) ...` → `FROM a JOIN b ON ...`;
 //! - subscript jsonb bằng chuỗi `x['a'][0]` → `(x -> 'a' -> 0)`.
 //! Chuỗi `'...'`, định danh `"..."` và thân `$$...$$` không bị đụng tới.
 
 /// Lọc nhanh, một lượt qua câu (chạy cho mọi câu lệnh): có `@` tiền tố, `|/`, hoặc một trong các từ
 /// khoá ISNULL, NOTNULL, SYMMETRIC, SIMILAR, ZONE, NORMALIZED.
 fn may_need(sql: &str) -> bool {
-    const WORDS: [&[u8]; 11] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS", b"TRIM", b"OVERLAY", b"JSON", b"WITHIN"];
+    const WORDS: [&[u8]; 12] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS", b"TRIM", b"OVERLAY", b"JSON", b"WITHIN", b"LATERAL"];
     let b = sql.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -47,6 +51,14 @@ fn may_need(sql: &str) -> bool {
             }
             if w.eq_ignore_ascii_case(b"ONLY") || w.eq_ignore_ascii_case(b"FETCH") {
                 return true;
+            }
+            // FROM (a JOIN b ...)
+            if w.eq_ignore_ascii_case(b"FROM") && b[i..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(') {
+                let rest = &sql[i..];
+                let inner = rest.trim_start()[1..].trim_start();
+                if !inner.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("SELECT")) && !inner.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("WITH")) && !inner.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("VALUES")) {
+                    return true;
+                }
             }
             if w.eq_ignore_ascii_case(b"USING") && b[i..].iter().find(|c| !c.is_ascii_whitespace()).is_some_and(|c| *c == b'<' || *c == b'>') {
                 return true;
@@ -264,6 +276,94 @@ fn primary_start(s: &str, m: &[bool], end: usize) -> Option<usize> {
     }
 }
 
+/// `UPDATE t SET a[2] = v, j['k'] = w ...`: gán vào phần tử mảng / khoá jsonb (PostgreSQL) → hàm trên cả cột.
+fn update_subscript_set(sql: &str) -> Option<String> {
+    let t = sql.trim_start();
+    if t.len() < 7 || !t[..7].eq_ignore_ascii_case("UPDATE ") || !sql.contains('[') {
+        return None;
+    }
+    let m = code_mask(sql);
+    let set = find_kw(sql, &m, "SET", 0)?;
+    let end = ["WHERE", "FROM", "RETURNING"].iter().filter_map(|k| find_kw(sql, &m, k, set + 3)).min().unwrap_or(sql.len());
+    let list = &sql[set + 3..end];
+    let items = super::executor::split_comma_separated_tokens(list);
+    let mut changed = false;
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let it = it.trim();
+        let eq = it.find('=');
+        let lhs = eq.map(|e| it[..e].trim());
+        match lhs.filter(|l| l.ends_with(']') && l.contains('[') && !l.starts_with('(')) {
+            Some(l) => {
+                let open = l.find('[')?;
+                let col = l[..open].trim();
+                if col.is_empty() || !col.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '"') {
+                    out.push(it.to_string());
+                    continue;
+                }
+                let subs: Vec<String> = l[open..].split(']').filter(|x| !x.trim().is_empty()).map(|x| x.trim().trim_start_matches('[').trim().to_string()).collect();
+                let rhs = it[eq? + 1..].trim();
+                let new = if subs.iter().all(|s| s.starts_with('\'')) || subs.first().is_some_and(|s| s.starts_with('\'')) {
+                    // jsonb: đường dẫn '{a,b}'
+                    let keys: Vec<String> = subs.iter().map(|s| s.trim_matches('\'').replace("''", "'")).collect();
+                    format!("{} = jsonb_set({}, '{{{}}}', ({})::jsonb)", col, col, keys.join(","), rhs)
+                } else if subs.len() == 1 {
+                    format!("{} = pg_array_set({}, {}, {})", col, col, subs[0], rhs)
+                } else {
+                    out.push(it.to_string());
+                    continue;
+                };
+                out.push(new);
+                changed = true;
+            }
+            None => out.push(it.to_string()),
+        }
+    }
+    changed.then(|| format!("{} {} {}", &sql[..set + 3], out.join(", "), &sql[end..]).trim_end().to_string())
+}
+
+/// `FROM (a JOIN b ON ...)` (kể cả nhiều lớp ngoặc) không alias → `FROM a JOIN b ON ...`. Dùng cả ở đường wire
+/// để suy tên / kiểu cột của `SELECT *` qua JOIN như câu không ngoặc. `None` nếu không đổi gì.
+pub(crate) fn unparen_from_join(sql: &str) -> Option<String> {
+    if !super::executor::contains_ci_pub(sql, "JOIN") {
+        return None;
+    }
+    let mut s = sql.to_string();
+    let mut changed = false;
+    let mut from = 0;
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "FROM", from) else { break };
+        from = p + 4;
+        let rest = &s[p + 4..];
+        let open = p + 4 + (rest.len() - rest.trim_start().len());
+        if s.as_bytes().get(open) != Some(&b'(') {
+            continue;
+        }
+        let Some(close) = super::constraints::matching_paren(&s, open) else { break };
+        let mut inner = s[open + 1..close].trim();
+        while inner.starts_with('(') && super::executor::is_fully_enclosed_in_parens(inner) {
+            inner = inner[1..inner.len() - 1].trim();
+        }
+        let iu = inner.to_ascii_uppercase();
+        if iu.starts_with("SELECT") || iu.starts_with("WITH") || iu.starts_with("VALUES") || super::executor::find_top_level_keyword(inner, "JOIN").is_none() {
+            continue;
+        }
+        // sau dấu đóng ngoặc: hết câu / mệnh đề / JOIN tiếp / dấu phẩy — không phải alias
+        let after = s[close + 1..].trim_start();
+        let next_word: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>().to_ascii_uppercase();
+        let clause = ["", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW", "UNION", "INTERSECT", "EXCEPT", "FOR", "FETCH", "JOIN", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "NATURAL", "RETURNING"];
+        if !clause.contains(&next_word.as_str()) || (next_word.is_empty() && !(after.is_empty() || after.starts_with(',') || after.starts_with(')') || after.starts_with(';'))) {
+            continue;
+        }
+        let inner = inner.to_string();
+        s.replace_range(open..close + 1, &inner);
+        from = p;
+        changed = true;
+    }
+    changed.then_some(s)
+}
+
 /// Mẫu SIMILAR TO → regex (neo hai đầu).
 fn similar_to_regex(pat: &str, esc: Option<char>) -> String {
     let mut out = String::from("^(?:");
@@ -335,11 +435,13 @@ fn string_literal_at(s: &str, i: usize) -> Option<(String, usize)> {
 }
 
 pub(crate) fn rewrite(sql: &str) -> Option<String> {
+    let subscript_set = update_subscript_set(sql);
+    let sql = subscript_set.as_deref().unwrap_or(sql);
     if !may_need(sql) {
-        return None;
+        return subscript_set;
     }
     let mut s = sql.to_string();
-    let mut changed = false;
+    let mut changed = subscript_set.is_some();
 
     // ISNULL / NOTNULL
     for (kw, rep) in [("ISNULL", "IS NULL"), ("NOTNULL", "IS NOT NULL")] {
@@ -394,6 +496,67 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         let bv = s[b_start..end].trim().to_string();
         let rep = format!("LEAST({a}, {bv}) AND GREATEST({a}, {bv}) ");
         s.replace_range(p..end, &rep);
+        changed = true;
+    }
+
+    // LATERAL f(...) alias → LATERAL (SELECT * FROM f(...) AS alias) alias
+    let mut from = 0;
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "LATERAL", from) else { break };
+        from = p + 7;
+        let rest = &s[p + 7..];
+        let fs = p + 7 + (rest.len() - rest.trim_start().len());
+        let b = s.as_bytes();
+        let mut k = fs;
+        while k < b.len() && (is_word(b[k]) || b[k] == b'.') {
+            k += 1;
+        }
+        if k == fs || b.get(k) != Some(&b'(') {
+            continue; // LATERAL (subquery): đường cũ
+        }
+        let fname = s[fs..k].to_ascii_uppercase();
+        if fname == "SELECT" {
+            continue;
+        }
+        let Some(close) = super::constraints::matching_paren(&s, k) else { break };
+        let mut e = close + 1;
+        let tail = s[e..].to_string();
+        let mut t = tail.trim_start();
+        let mut ord = "";
+        if t.len() >= 15 && t[..15].eq_ignore_ascii_case("WITH ORDINALITY") {
+            ord = " WITH ORDINALITY";
+            t = t[15..].trim_start();
+        }
+        if t.len() >= 3 && t[..3].eq_ignore_ascii_case("AS ") {
+            t = t[3..].trim_start();
+        }
+        let w: String = t.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '"').collect();
+        let stop = ["ON", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "UNION", "WINDOW", "FETCH", "FOR", "USING", "NATURAL"];
+        let (alias, cols) = if !w.is_empty() && !stop.contains(&w.to_ascii_uppercase().as_str()) {
+            t = &t[w.len()..];
+            let tt = t.trim_start();
+            if tt.starts_with('(') {
+                let Some(c) = super::constraints::matching_paren(tt, 0) else { break };
+                let cols = tt[..c + 1].to_string();
+                t = &tt[c + 1..];
+                (w.clone(), cols)
+            } else {
+                (w.clone(), String::new())
+            }
+        } else {
+            (s[fs..k].rsplit('.').next().unwrap_or("f").to_ascii_lowercase(), String::new())
+        };
+        e += tail.len() - t.len();
+        let rep = format!("LATERAL (SELECT * FROM {}{} AS {}{}) {}", &s[fs..close + 1], ord, alias, cols, alias);
+        s.replace_range(p..e, &format!("{} ", rep));
+        from = p + rep.len();
+        changed = true;
+    }
+
+    // FROM (a JOIN b ON ...) [WHERE ...]: bỏ ngoặc (chỉ khi là mục đầu của FROM và không có alias)
+    if let Some(r) = unparen_from_join(&s) {
+        s = r;
         changed = true;
     }
 

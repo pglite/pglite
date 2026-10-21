@@ -6,17 +6,41 @@
 //! mới tới DISTINCT, ORDER BY, OFFSET/LIMIT của câu ngoài.
 //!
 //! Frame: không ORDER BY = cả partition; có ORDER BY = RANGE UNBOUNDED PRECEDING .. CURRENT ROW (gồm
-//! các dòng ngang hàng); `ROWS BETWEEN ...` được hỗ trợ đầy đủ.
+//! các dòng ngang hàng); `ROWS`, `GROUPS` và `RANGE` (offset số trên một khoá ORDER BY) `BETWEEN ...`,
+//! cùng `EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`. Biên tính bằng tìm nhị phân trên khoá đã sắp.
 use super::executor::{find_top_level_keyword, json_order_cmp_pub, split_comma_separated_tokens, split_projection_items_pub, Executor};
 use crate::types::{FieldInfo, QueryResult, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Bound {
     UnboundedPreceding,
-    Preceding(usize),
+    Preceding(f64),
     CurrentRow,
-    Following(usize),
+    Following(f64),
     UnboundedFollowing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Exclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    mode: FrameMode,
+    start: Bound,
+    end: Bound,
+    exclude: Exclude,
 }
 
 #[derive(Debug)]
@@ -27,7 +51,7 @@ struct WinItem {
     filter: Option<String>,
     partition: Vec<String>,
     order: Vec<(String, bool, bool)>,
-    rows_frame: Option<(Bound, Bound)>,
+    frame: Option<Frame>,
 }
 
 fn starts_kw(s: &str, kw: &str) -> bool {
@@ -47,7 +71,7 @@ fn parse_bound(s: &str) -> Option<Bound> {
         "CURRENT ROW" => Bound::CurrentRow,
         _ => {
             let mut it = u.split_whitespace();
-            let n: usize = it.next()?.parse().ok()?;
+            let n: f64 = it.next()?.trim_matches('\'').parse().ok().filter(|n: &f64| *n >= 0.0)?;
             match it.next()? {
                 "PRECEDING" => Bound::Preceding(n),
                 "FOLLOWING" => Bound::Following(n),
@@ -58,7 +82,7 @@ fn parse_bound(s: &str) -> Option<Bound> {
 }
 
 /// Đọc phần trong ngoặc của OVER (...): PARTITION BY, ORDER BY, frame.
-fn parse_spec(spec: &str) -> (Vec<String>, Vec<(String, bool, bool)>, Option<(Bound, Bound)>) {
+fn parse_spec(spec: &str) -> (Vec<String>, Vec<(String, bool, bool)>, Option<Frame>) {
     let mut partition = Vec::new();
     let mut order = Vec::new();
     let mut frame = None;
@@ -94,23 +118,37 @@ fn parse_spec(spec: &str) -> (Vec<String>, Vec<(String, bool, bool)>, Option<(Bo
         }
     }
     if let Some(f) = frame_str {
-        let up = f.trim().to_uppercase();
-        if up.starts_with("ROWS") {
-            let body = f.trim()[4..].trim();
-            let body = match find_top_level_keyword(body, "EXCLUDE") {
-                Some(p) => &body[..p],
-                None => body,
-            };
-            if starts_kw(body, "BETWEEN") {
-                let inner = &body[7..];
-                if let Some(a) = find_top_level_keyword(inner, "AND") {
-                    if let (Some(s), Some(e)) = (parse_bound(&inner[..a]), parse_bound(&inner[a + 3..])) {
-                        frame = Some((s, e));
-                    }
-                }
-            } else if let Some(s) = parse_bound(body) {
-                frame = Some((s, Bound::CurrentRow));
+        let f = f.trim();
+        let up = f.to_uppercase();
+        let (mode, kw_len) = if up.starts_with("ROWS") {
+            (FrameMode::Rows, 4)
+        } else if up.starts_with("GROUPS") {
+            (FrameMode::Groups, 6)
+        } else {
+            (FrameMode::Range, 5)
+        };
+        let body = f[kw_len..].trim();
+        let (body, exclude) = match find_top_level_keyword(body, "EXCLUDE") {
+            Some(p) => {
+                let ex = body[p + 7..].trim().to_uppercase();
+                let ex = match ex.as_str() {
+                    "CURRENT ROW" => Exclude::CurrentRow,
+                    "GROUP" => Exclude::Group,
+                    "TIES" => Exclude::Ties,
+                    _ => Exclude::NoOthers,
+                };
+                (body[..p].trim(), ex)
             }
+            None => (body, Exclude::NoOthers),
+        };
+        let bounds = if starts_kw(body, "BETWEEN") {
+            let inner = &body[7..];
+            find_top_level_keyword(inner, "AND").and_then(|a| Some((parse_bound(&inner[..a])?, parse_bound(&inner[a + 3..])?)))
+        } else {
+            parse_bound(body).map(|s| (s, Bound::CurrentRow))
+        };
+        if let Some((start, end)) = bounds {
+            frame = Some(Frame { mode, start, end, exclude });
         }
     }
     (partition, order, frame)
@@ -218,7 +256,7 @@ impl Executor {
             let func = call[..open].trim().to_lowercase();
             let args_str = call[open + 1..call.len().saturating_sub(1)].trim();
             let args: Vec<String> = if args_str.is_empty() || args_str == "*" { Vec::new() } else { split_comma_separated_tokens(args_str).into_iter().map(|a| a.trim().to_string()).collect() };
-            let (partition, order, rows_frame) = parse_spec(&spec);
+            let (partition, order, frame) = parse_spec(&spec);
             let w = wins.len();
             for (k, a) in args.iter().enumerate() {
                 inner_items.push(format!("{} AS \"__w{}a{}\"", a, w, k));
@@ -233,7 +271,7 @@ impl Executor {
                 inner_items.push(format!("{} AS \"__w{}o{}\"", e, w, k));
             }
             let name = alias.unwrap_or_else(|| func.clone());
-            wins.push(WinItem { alias: name.clone(), func, args, filter, partition, order, rows_frame });
+            wins.push(WinItem { alias: name.clone(), func, args, filter, partition, order, frame });
             out_cols.push((name, Some(w)));
         }
         // Cột ẩn cho ORDER BY của câu ngoài
@@ -310,28 +348,117 @@ impl Executor {
                     }
                     i = j + 1;
                 }
-                let frame = |pos: usize| -> (usize, usize) {
-                    match win.rows_frame {
-                        Some((s, e)) => {
-                            let st = match s {
-                                Bound::UnboundedPreceding => 0,
-                                Bound::Preceding(k) => pos.saturating_sub(k),
-                                Bound::CurrentRow => pos,
-                                Bound::Following(k) => (pos + k).min(len),
-                                Bound::UnboundedFollowing => len,
-                            };
-                            let en = match e {
-                                Bound::UnboundedPreceding => 0,
-                                Bound::Preceding(k) => if pos >= k { pos - k + 1 } else { 0 },
-                                Bound::CurrentRow => pos + 1,
-                                Bound::Following(k) => (pos + k + 1).min(len),
-                                Bound::UnboundedFollowing => len,
-                            };
-                            (st, en.max(st))
-                        }
-                        None if win.order.is_empty() => (0, len),
-                        None => (0, peer_end[pos] + 1),
+                // chỉ số nhóm ngang hàng của từng vị trí (cho GROUPS)
+                let mut group_of = vec![0usize; len];
+                let mut group_bounds: Vec<(usize, usize)> = Vec::new();
+                for pos in 0..len {
+                    if pos == 0 || peer_start[pos] == pos {
+                        group_bounds.push((peer_start[pos], peer_end[pos] + 1));
                     }
+                    group_of[pos] = group_bounds.len() - 1;
+                }
+                // RANGE có offset: khoá số của ORDER BY (một khoá), NULL nằm ở nhóm riêng
+                let range_key: Vec<Option<f64>> = keys.iter().map(|k| k.first().and_then(num)).collect();
+                let desc = win.order.first().is_some_and(|o| o.1);
+                // vị trí đầu tiên (trong [0, len]) mà `pred` đúng; `pred` đơn điệu trên các dòng có khoá
+                let first_where = |pred: &dyn Fn(f64) -> bool| -> usize {
+                    let (mut lo, mut hi) = (0usize, len);
+                    // các dòng NULL ở đầu hoặc cuối: bỏ qua bằng cách coi chúng thoả / không thoả theo vị trí
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let ok = match range_key[mid] {
+                            Some(v) => pred(v),
+                            None => mid > 0 && range_key[..mid].iter().any(|x| x.is_some()),
+                        };
+                        if ok { hi = mid } else { lo = mid + 1 }
+                    }
+                    lo
+                };
+                let frame = |pos: usize| -> Vec<usize> {
+                    let Some(fr) = win.frame else {
+                        return if win.order.is_empty() { (0..len).collect() } else { (0..peer_end[pos] + 1).collect() };
+                    };
+                    let (st, en) = match fr.mode {
+                        FrameMode::Rows => {
+                            let st = match fr.start {
+                                Bound::UnboundedPreceding => 0,
+                                Bound::Preceding(k) => pos.saturating_sub(k as usize),
+                                Bound::CurrentRow => pos,
+                                Bound::Following(k) => (pos + k as usize).min(len),
+                                Bound::UnboundedFollowing => len,
+                            };
+                            let en = match fr.end {
+                                Bound::UnboundedPreceding => 0,
+                                Bound::Preceding(k) => if pos >= k as usize { pos - k as usize + 1 } else { 0 },
+                                Bound::CurrentRow => pos + 1,
+                                Bound::Following(k) => (pos + k as usize + 1).min(len),
+                                Bound::UnboundedFollowing => len,
+                            };
+                            (st, en)
+                        }
+                        FrameMode::Groups => {
+                            let g = group_of[pos];
+                            let ng = group_bounds.len();
+                            let st = match fr.start {
+                                Bound::UnboundedPreceding => 0,
+                                Bound::Preceding(k) => group_bounds[g.saturating_sub(k as usize)].0,
+                                Bound::CurrentRow => group_bounds[g].0,
+                                Bound::Following(k) => group_bounds.get(g + k as usize).map_or(len, |b| b.0),
+                                Bound::UnboundedFollowing => len,
+                            };
+                            let en = match fr.end {
+                                Bound::UnboundedPreceding => 0,
+                                Bound::Preceding(k) => if g >= k as usize { group_bounds[g - k as usize].1 } else { 0 },
+                                Bound::CurrentRow => group_bounds[g].1,
+                                Bound::Following(k) => group_bounds[(g + k as usize).min(ng - 1)].1,
+                                Bound::UnboundedFollowing => len,
+                            };
+                            (st, en)
+                        }
+                        FrameMode::Range => {
+                            let cur = range_key[pos];
+                            let peers = (peer_start[pos], peer_end[pos] + 1);
+                            // giá trị khoá ở biên: theo hướng sắp xếp
+                            let bound_val = |b: Bound| -> Option<f64> {
+                                let v = cur?;
+                                match b {
+                                    Bound::Preceding(k) => Some(if desc { v + k } else { v - k }),
+                                    Bound::Following(k) => Some(if desc { v - k } else { v + k }),
+                                    _ => None,
+                                }
+                            };
+                            let st = match fr.start {
+                                Bound::UnboundedPreceding => 0,
+                                Bound::CurrentRow => peers.0,
+                                Bound::UnboundedFollowing => len,
+                                b => match bound_val(b) {
+                                    // dòng đầu tiên có khoá "không trước" giá trị biên
+                                    Some(bv) => first_where(&|x| if desc { x <= bv } else { x >= bv }),
+                                    None => peers.0,
+                                },
+                            };
+                            let en = match fr.end {
+                                Bound::UnboundedPreceding => 0,
+                                Bound::CurrentRow => peers.1,
+                                Bound::UnboundedFollowing => len,
+                                b => match bound_val(b) {
+                                    // dòng đầu tiên có khoá "sau" giá trị biên
+                                    Some(bv) => first_where(&|x| if desc { x < bv } else { x > bv }),
+                                    None => peers.1,
+                                },
+                            };
+                            (st, en)
+                        }
+                    };
+                    let (gs, ge) = (peer_start[pos], peer_end[pos]);
+                    (st..en.max(st))
+                        .filter(|&i| match fr.exclude {
+                            Exclude::NoOthers => true,
+                            Exclude::CurrentRow => i != pos,
+                            Exclude::Group => i < gs || i > ge,
+                            Exclude::Ties => i == pos || i < gs || i > ge,
+                        })
+                        .collect()
                 };
                 let arg = |r: usize, k: usize| get(r, &format!("__w{}a{}", w, k));
                 let passes = |r: usize| win.filter.is_none() || num(&get(r, &format!("__w{}f", w))) == Some(1.0);
@@ -378,21 +505,20 @@ impl Executor {
                             }
                         }
                         "first_value" | "last_value" | "nth_value" => {
-                            let (st, en) = frame(pos);
-                            if st >= en {
+                            let fr = frame(pos);
+                            if fr.is_empty() {
                                 serde_json::Value::Null
                             } else if win.func == "first_value" {
-                                arg(idxs[st], 0)
+                                arg(idxs[fr[0]], 0)
                             } else if win.func == "last_value" {
-                                arg(idxs[en - 1], 0)
+                                arg(idxs[fr[fr.len() - 1]], 0)
                             } else {
                                 let nth = int_arg(1, 1).max(1) as usize;
-                                if st + nth - 1 < en { arg(idxs[st + nth - 1], 0) } else { serde_json::Value::Null }
+                                fr.get(nth - 1).map_or(serde_json::Value::Null, |&p| arg(idxs[p], 0))
                             }
                         }
                         "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "string_agg" | "array_agg" | "json_agg" | "jsonb_agg" => {
-                            let (st, en) = frame(pos);
-                            let rows_in: Vec<usize> = idxs[st..en].iter().copied().filter(|&x| passes(x)).collect();
+                            let rows_in: Vec<usize> = frame(pos).into_iter().map(|p| idxs[p]).filter(|&x| passes(x)).collect();
                             match win.func.as_str() {
                                 "count" => {
                                     if win.args.is_empty() {

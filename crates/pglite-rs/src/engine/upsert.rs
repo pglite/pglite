@@ -266,9 +266,12 @@ impl Executor {
         let head = after_into[..src_pos].trim();
         let mut source = after_into[src_pos..].trim();
         let mut overriding_system = false;
+        let mut overriding_user = false;
         if source.len() > 10 && source.get(..10).map_or(false, |p| p.eq_ignore_ascii_case("OVERRIDING")) {
-            // OVERRIDING SYSTEM VALUE: cho ghi giá trị tường minh vào cột GENERATED ALWAYS AS IDENTITY
+            // OVERRIDING SYSTEM VALUE: cho ghi giá trị tường minh vào cột GENERATED ALWAYS AS IDENTITY;
+            // OVERRIDING USER VALUE: bỏ qua giá trị của cột identity, dùng giá trị sinh ra
             overriding_system = source[10..].trim_start().get(..6).map_or(false, |p| p.eq_ignore_ascii_case("SYSTEM"));
+            overriding_user = source[10..].trim_start().get(..4).map_or(false, |p| p.eq_ignore_ascii_case("USER"));
             let v = find_top_level_keyword(source, "VALUE").map(|p| p + 5).unwrap_or(source.len());
             source = source[v..].trim();
         }
@@ -297,6 +300,26 @@ impl Executor {
             };
             (indices, table.columns.clone(), table.name.to_lowercase())
         };
+        let user_override_src: String;
+        if overriding_user && source.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("VALUES")) {
+            let table = self.storage.get_table(&table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+            let ident_pos: Vec<usize> = col_indices.iter().enumerate().filter(|(_, &c)| table.identity.contains_key(&col_defs[c].name.to_lowercase())).map(|(p, _)| p).collect();
+            if !ident_pos.is_empty() {
+                // VALUES (...), (...) [ON CONFLICT ... | RETURNING ...]: thay giá trị ở cột identity bằng DEFAULT
+                let groups = extract_value_groups(&source[6..]);
+                let mut rest = source[6..].trim_start();
+                let mut rebuilt = Vec::new();
+                for g in &groups {
+                    let toks: Vec<String> = split_comma_separated_tokens(g).into_iter().enumerate().map(|(i, t)| if ident_pos.contains(&i) { "DEFAULT".to_string() } else { t.trim().to_string() }).collect();
+                    rebuilt.push(format!("({})", toks.join(", ")));
+                    if let Some(close) = rest.find('(').and_then(|o| matching_paren(rest, o)) {
+                        rest = rest[close + 1..].trim_start().trim_start_matches(',').trim_start();
+                    }
+                }
+                user_override_src = format!("VALUES {} {}", rebuilt.join(", "), rest);
+                source = user_override_src.trim();
+            }
+        }
         // GENERATED ALWAYS AS IDENTITY: chỉ nhận DEFAULT, trừ khi OVERRIDING SYSTEM VALUE (như PostgreSQL)
         if !overriding_system {
             let table = self.storage.get_table(&table_name).ok_or_else(|| format!("Table {} not found", table_name))?;

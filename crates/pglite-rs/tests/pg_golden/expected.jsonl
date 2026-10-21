@@ -1147,3 +1147,23 @@
 {"id":"W9_33","ok":true,"fields":["array_position","width_bucket"],"rows":[["4","3"]]}
 {"id":"W9_34","ok":true,"fields":["v","k"],"rows":[["x","1"],["y","1"]]}
 {"id":"W9_35","ok":true,"fields":["md5","encode","encode"],"rows":[["0cc175b9c0f1b6a831c399e269772661","YQ==","61"]]}
+{"id":"W10_01","ok":true,"fields":["x","s"],"rows":[["5","10"],["5","10"],["3","13"],["2","5"],["1","6"]]}
+{"id":"W10_02","ok":true,"fields":["x","s"],"rows":[["1","5"],["2","5"],["2","5"],["3","3"]]}
+{"id":"W10_03","ok":true,"fields":["x","c"],"rows":[["1","1"],["1","1"],["2","4"],["3","1"],["3","1"]]}
+{"id":"W10_04","ok":true,"fields":["x","first_value","last_value"],"rows":[["1","2","2"],["2","1","3"],["3","2","4"],["4","3","3"]]}
+{"id":"W10_05","ok":true,"fields":["id","v"],"rows":[["1","v1"],["1","v2"],["2","v3"]]}
+{"id":"W10_06","ok":true,"fields":["id","g"],"rows":[["2","1"],["2","2"],["2","3"]]}
+{"id":"W10_07","ok":true,"fields":["id","key","value"],"rows":[["1","a","1"],["2","a","2"]]}
+{"id":"W10_08","ok":true,"fields":["id","v","o"],"rows":[["1","x","1"],["1","y","2"],["2","y","1"],["3",null,null]]}
+{"id":"W10_09","ok":true,"fields":["id","n"],"rows":[["2","13"]]}
+{"id":"W10_10","ok":true,"fields":["id","t_id","v"],"rows":[["30","2","v3!"]]}
+{"id":"W10_11","ok":true,"fields":["n","ord"],"rows":[["1","(0,1)"],["2","(1,2)"],["3","(2,3)"]]}
+{"id":"W10_12","ok":true,"fields":["a","b","c","p"],"rows":[["1","2","f","{(1)}"],["2","3","f","{(1),(2)}"],["3","1","f","{(1),(2),(3)}"],["1","2","t","{(1),(2),(3),(1)}"]]}
+{"id":"W10_13","ok":true,"fields":["tags"],"rows":[["{y,NULL,z}"]]}
+{"id":"W10_14","ok":true,"fields":["meta"],"rows":[["{\"a\": 1, \"b\": 5}"]]}
+{"id":"W10_15","ok":true,"fields":["id","v"],"rows":[["1","a"],["2","b"]]}
+{"id":"W10_16","ok":true,"fields":["id","v"],"rows":[["1","x"]]}
+{"id":"W10_17","ok":true,"fields":["id","v"],"rows":[["1","v1a"],["3","v3"],["8","c"]]}
+{"id":"W10_18","ok":true,"fields":["id","v"],"rows":[["1","v1"],["2","v2"],["3","v3"]]}
+{"id":"W10_19","ok":true,"fields":["merge_action","id","v"],"rows":[["UPDATE","1","q"]]}
+{"id":"W10_20","ok":false,"error":"column \"nope\" does not exist","sqlstate":"42703","failed_stmt":0}

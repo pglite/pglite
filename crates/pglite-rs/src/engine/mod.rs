@@ -14,6 +14,7 @@ pub(crate) mod fnlib;
 pub(crate) mod jsonpath;
 pub(crate) mod srf;
 pub(crate) mod known_fns;
+pub(crate) mod merge;
 pub(crate) mod sequences;
 pub(crate) mod datetime;
 pub mod executor;

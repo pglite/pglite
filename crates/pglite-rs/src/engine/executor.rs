@@ -735,6 +735,9 @@ impl Executor {
             return Ok(res);
         }
 
+        if upper.starts_with("MERGE ") {
+            return self.handle_merge(trimmed, params);
+        }
         if upper.starts_with("UPDATE") {
             return self.handle_update(trimmed, params);
         }
@@ -1195,8 +1198,14 @@ impl Executor {
             };
 
             let cte_query = cur_slice[open_paren_idx + 1..close_paren_idx].trim();
-
-            if is_recursive {
+            // `SEARCH {DEPTH|BREADTH} FIRST BY ... SET c` / `CYCLE ... SET c [TO v DEFAULT d] USING p` sau thân CTE
+            let (search_cycle, clauses_len) = parse_search_cycle(&cur_slice[close_paren_idx + 1..]);
+            let close_paren_idx = close_paren_idx + clauses_len;
+            if is_recursive && !search_cycle.is_empty() {
+                let res = self.recursive_cte_with_paths(&cte_name, explicit_cols.as_deref(), cte_query, &search_cycle, params, shadow)?;
+                { let prev = self.storage.tables.insert(cte_name.to_lowercase(), res); shadow.push((cte_name.to_lowercase(), prev)); }
+                created_tables.push(cte_name.clone());
+            } else if is_recursive {
                 let (union_pos, is_all, kw_len) = if let Some(pos) = find_top_level_keyword(cte_query, "UNION ALL") {
                     (Some(pos), true, 9)
                 } else if let Some(pos) = find_top_level_keyword(cte_query, "UNION") {
@@ -1392,7 +1401,11 @@ impl Executor {
                 i = without_with.len() - after_comma.len();
             } else {
                 let main_query = rest_after_paren;
-                let main_res = self.execute(main_query, params);
+                // cột không tồn tại trong câu chính (bảng CTE đã có trong storage): 42703 như câu thường
+                let main_res = match crate::engine::validate::check_select_columns(main_query, &self.storage) {
+                    Err(e) => Err(e),
+                    Ok(_) => self.execute(main_query, params),
+                };
                 for tbl_name in created_tables {
                     self.storage.tables.remove(&tbl_name.to_lowercase());
                 }
@@ -1401,6 +1414,144 @@ impl Executor {
         }
 
         Err("Failed to parse CTE query".to_string())
+    }
+
+    /// CTE đệ quy có `SEARCH` / `CYCLE`: phần đệ quy chạy riêng cho từng dòng của bảng làm việc để biết dòng
+    /// cha của mỗi dòng mới, nhờ đó tính được cột thứ tự (`SEARCH`) và cột đường đi / đánh dấu vòng (`CYCLE`)
+    /// như PostgreSQL. Dòng đánh dấu vòng được trả ra nhưng không đệ quy tiếp.
+    fn recursive_cte_with_paths(
+        &mut self,
+        cte_name: &str,
+        explicit_cols: Option<&[String]>,
+        cte_query: &str,
+        clauses: &[SearchCycle],
+        params: &[Value],
+        shadow: &mut Vec<(String, Option<crate::storage::table::Table>)>,
+    ) -> Result<crate::storage::table::Table, String> {
+        let (u_pos, is_all, kw_len) = if let Some(p) = find_top_level_keyword(cte_query, "UNION ALL") {
+            (p, true, 9)
+        } else if let Some(p) = find_top_level_keyword(cte_query, "UNION") {
+            (p, false, 5)
+        } else {
+            return Err("recursive query must have the form non-recursive-term UNION [ALL] recursive-term".into());
+        };
+        let (non_rec, rec) = (cte_query[..u_pos].trim(), cte_query[u_pos + kw_len..].trim());
+        let base = self.execute(non_rec, params)?;
+        let cols: Vec<crate::types::ColumnDef> = base
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| crate::types::ColumnDef {
+                name: explicit_cols.and_then(|e| e.get(i).cloned()).unwrap_or_else(|| f.name.clone()),
+                data_type: crate::types::DataType::from_sql_str(&f.data_type),
+                is_primary_key: false,
+                is_nullable: true,
+                default_value: None,
+                comment: None,
+            })
+            .collect();
+        let to_row = |r: &serde_json::Value, fields: &[FieldInfo]| -> Vec<Value> {
+            (0..cols.len()).map(|i| fields.get(i).and_then(|f| r.get(&f.name)).map(json_to_value).unwrap_or(Value::Null)).collect()
+        };
+        // `(v1,v2)` như record_out của PostgreSQL (NULL = rỗng; giá trị có ký tự đặc biệt được bọc nháy)
+        let record = |row: &[Value], names: &[String]| -> String {
+            let parts: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    let v = cols.iter().position(|c| c.name.eq_ignore_ascii_case(n)).map(|i| row[i].clone()).unwrap_or(Value::Null);
+                    match v {
+                        Value::Null => String::new(),
+                        v => {
+                            let t = v.as_str();
+                            if t.is_empty() || t.contains([',', '(', ')', '"', '\\', ' ']) { format!("\"{}\"", t.replace('"', "\"\"")) } else { t }
+                        }
+                    }
+                })
+                .collect();
+            format!("({})", parts.join(","))
+        };
+        struct Node {
+            row: Vec<Value>,
+            depth: i64,
+            paths: Vec<Vec<String>>, // một đường đi cho mỗi mệnh đề
+            cyc: bool,
+        }
+        let mk = |row: Vec<Value>, parent: Option<&Node>| -> Node {
+            let mut paths = Vec::new();
+            let mut cyc = false;
+            for (k, c) in clauses.iter().enumerate() {
+                let rec_txt = record(&row, &c.cols);
+                let mut p = parent.map(|n| n.paths[k].clone()).unwrap_or_default();
+                if c.kind == SearchCycleKind::Cycle && p.contains(&rec_txt) {
+                    cyc = true;
+                }
+                p.push(rec_txt);
+                paths.push(p);
+            }
+            Node { row, depth: parent.map_or(0, |n| n.depth + 1), paths, cyc }
+        };
+        let mut all: Vec<Node> = base.rows.iter().map(|r| mk(to_row(r, &base.fields), None)).collect();
+        let mut frontier: Vec<usize> = (0..all.len()).collect();
+        let mut iterations = 0;
+        while !frontier.is_empty() && iterations < 1000 {
+            iterations += 1;
+            let mut next = Vec::new();
+            for &pi in &frontier {
+                if all[pi].cyc {
+                    continue;
+                }
+                let mut wt = crate::storage::table::Table::new(cte_name.to_string(), cols.clone());
+                wt.insert(all[pi].row.clone());
+                {
+                    let prev = self.storage.tables.insert(cte_name.to_lowercase(), wt);
+                    shadow.push((cte_name.to_lowercase(), prev));
+                }
+                let res = self.execute(rec, params)?;
+                for r in &res.rows {
+                    let row = to_row(r, &res.fields);
+                    let node = mk(row, Some(&all[pi]));
+                    if !is_all && all.iter().any(|n| n.row == node.row && n.paths == node.paths) {
+                        continue;
+                    }
+                    all.push(node);
+                    next.push(all.len() - 1);
+                }
+            }
+            frontier = next;
+        }
+        // cột thêm: theo thứ tự mệnh đề
+        let mut out_cols = cols.clone();
+        for c in clauses {
+            match c.kind {
+                SearchCycleKind::Depth => out_cols.push(crate::types::ColumnDef { name: c.set_col.clone(), data_type: crate::types::DataType::Array("TEXT".into()), is_primary_key: false, is_nullable: true, default_value: None, comment: None }),
+                SearchCycleKind::Breadth => out_cols.push(crate::types::ColumnDef { name: c.set_col.clone(), data_type: crate::types::DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None }),
+                SearchCycleKind::Cycle => {
+                    out_cols.push(crate::types::ColumnDef { name: c.set_col.clone(), data_type: crate::types::DataType::Boolean, is_primary_key: false, is_nullable: true, default_value: None, comment: None });
+                    out_cols.push(crate::types::ColumnDef { name: c.using_col.clone(), data_type: crate::types::DataType::Array("TEXT".into()), is_primary_key: false, is_nullable: true, default_value: None, comment: None });
+                }
+            }
+        }
+        let mut table = crate::storage::table::Table::new(cte_name.to_string(), out_cols);
+        table.pk_col_idx = None;
+        for n in &all {
+            let mut row = n.row.clone();
+            for (k, c) in clauses.iter().enumerate() {
+                let arr = || Value::text(serde_json::Value::Array(n.paths[k].iter().map(|p| serde_json::Value::String(p.clone())).collect()).to_string());
+                match c.kind {
+                    SearchCycleKind::Depth => row.push(arr()),
+                    SearchCycleKind::Breadth => {
+                        let inner = n.paths[k].last().cloned().unwrap_or_default();
+                        row.push(Value::text(format!("({},{}", n.depth, &inner[1..])));
+                    }
+                    SearchCycleKind::Cycle => {
+                        row.push(if n.cyc { c.mark_true.clone() } else { c.mark_false.clone() });
+                        row.push(arr());
+                    }
+                }
+            }
+            table.insert(row);
+        }
+        Ok(table)
     }
 
     fn handle_derived_table_query(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
@@ -2156,6 +2307,7 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
         let mut rest = after_from;
         let mut new_from = Vec::new();
         let mut temps = Vec::new();
+        let mut used_names: HashMap<String, usize> = HashMap::new();
         loop {
             let up = rest.to_uppercase();
             let Some(fname) = JSON_SRFS.iter().find(|f| up.starts_with(*f) && up[f.len()..].starts_with('(')) else { break };
@@ -2239,6 +2391,15 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
                 }
             }
             let tmp = format!("__srf_{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1_000_000);
+            // cột trùng tên với hàm trước trong cùng FROM (`jsonb_each(...), jsonb_each_text(...)`): tên phụ, đường
+            // wire trả lại tên gốc (như cột trùng tên của JOIN)
+            for (n, _) in defs.iter_mut() {
+                let k = used_names.entry(n.clone()).or_insert(0usize);
+                *k += 1;
+                if *k > 1 && select_clause.trim() == "*" {
+                    *n = format!("{}{}{}", n, DUP_MARK, k);
+                }
+            }
             let cdefs = defs.iter().map(|(n, dt)| crate::types::ColumnDef { name: n.clone(), data_type: dt.clone(), is_primary_key: false, is_nullable: true, default_value: None, comment: None }).collect();
             let mut table = crate::storage::table::Table::new(tmp.clone(), cdefs);
             table.pk_col_idx = None;
@@ -2902,6 +3063,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
         }
 
+        // cột đầu ra của từng LATERAL (cho `SELECT *`): tên bảng giả của join → [(cột, kiểu)]
+        let mut lateral_cols: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (j_idx, j) in joins.iter().enumerate() {
             if current_rows.is_empty() && !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
                 break;
@@ -2915,6 +3078,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 for base_comb in &current_rows {
                     let resolved_sql = Self::substitute_correlated_references(sub_sql, base_comb);
                     let sub_res = self.execute(&resolved_sql, params)?;
+                    lateral_cols.entry(j.table_name.clone()).or_insert_with(|| sub_res.fields.iter().map(|f| (f.name.clone(), f.data_type.clone())).collect());
                     let mut match_count = 0;
 
                     for row_json in &sub_res.rows {
@@ -3454,6 +3618,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                             let val = r.get_val(&col.name);
                                             row_map.insert(col.name.clone(), value_to_json(&val));
                                         }
+                                    } else if let Some(cols) = lateral_cols.get(&j.table_name) {
+                                        let a = j.alias.as_deref().unwrap_or(&j.table_name).to_lowercase();
+                                        for (c, _) in cols {
+                                            let val = r.get_val(&format!("{}.{}", a, c.to_lowercase()));
+                                            row_map.insert(c.clone(), value_to_json(&val));
+                                        }
                                     }
                                 }
                                 continue;
@@ -3505,6 +3675,18 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
         let row_count = final_json_rows.len();
         let mut fields = self.joined_projection_fields(clean_select, &base_tbl_name, base_alias.as_deref(), &joins);
+        // `SELECT *` qua LATERAL: thêm cột của hàm / subquery LATERAL theo thứ tự join
+        if !lateral_cols.is_empty() && split_projection_items(clean_select).iter().any(|i| i.trim() == "*") {
+            for j in &joins {
+                if let Some(cols) = lateral_cols.get(&j.table_name) {
+                    for (c, t) in cols {
+                        if !fields.iter().any(|f| &f.name == c) {
+                            fields.push(FieldInfo { name: c.clone(), data_type: t.clone() });
+                        }
+                    }
+                }
+            }
+        }
         // Key phát sinh ngoài danh sách SELECT (vd. cột của hàm cửa sổ) vẫn được giữ.
         if let Some(serde_json::Value::Object(map)) = final_json_rows.first() {
             for (k, v) in map {
@@ -13099,6 +13281,7 @@ fn is_constant_arg(a: &str) -> bool {
     }
     (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 && !t[1..t.len() - 1].replace("''", "").contains('\''))
         || (t.starts_with('$') && t[1..].chars().all(|c| c.is_ascii_digit()) && t.len() > 1)
+        || t.eq_ignore_ascii_case("NULL")
 }
 
 /// Thay tên quan hệ (không phân biệt hoa thường, đủ ranh giới từ, ngoài chuỗi) bằng `to`; mẫu dài đặt trước.
@@ -13775,6 +13958,10 @@ fn normalize_named_sql_params(sql: &str) -> String {
 
 /// `s` có lời gọi `tên(` với tên thuộc `names` (không phân biệt hoa thường, đủ ranh giới từ phía trước).
 /// Một lượt quét, không cấp phát — chạy cho mọi câu SELECT.
+pub(crate) fn contains_ci_pub(s: &str, pat: &str) -> bool {
+    contains_ci(s, pat)
+}
+
 pub(crate) fn mentions_call(s: &str, names: &[&str]) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
@@ -13793,6 +13980,85 @@ pub(crate) fn mentions_call(s: &str, names: &[&str]) -> bool {
         i = p + 1;
     }
     false
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SearchCycleKind {
+    Depth,
+    Breadth,
+    Cycle,
+}
+
+#[derive(Clone, Debug)]
+struct SearchCycle {
+    kind: SearchCycleKind,
+    cols: Vec<String>,
+    set_col: String,
+    using_col: String,
+    mark_true: Value,
+    mark_false: Value,
+}
+
+/// Đọc các mệnh đề `SEARCH` / `CYCLE` ở đầu `s` (ngay sau thân CTE đệ quy). Trả các mệnh đề và độ dài đã đọc.
+fn parse_search_cycle(s: &str) -> (Vec<SearchCycle>, usize) {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        let rest = &s[pos..];
+        let t = rest.trim_start();
+        let lead = rest.len() - t.len();
+        let up = t.to_ascii_uppercase();
+        let kind = if up.starts_with("SEARCH DEPTH FIRST BY ") {
+            SearchCycleKind::Depth
+        } else if up.starts_with("SEARCH BREADTH FIRST BY ") {
+            SearchCycleKind::Breadth
+        } else if up.starts_with("CYCLE ") {
+            SearchCycleKind::Cycle
+        } else {
+            break;
+        };
+        let body_start = match kind {
+            SearchCycleKind::Depth => 22,
+            SearchCycleKind::Breadth => 24,
+            SearchCycleKind::Cycle => 6,
+        };
+        let body = &t[body_start..];
+        let Some(set_at) = find_top_level_keyword(body, "SET") else { break };
+        let cols: Vec<String> = body[..set_at].split(',').map(|c| c.trim().trim_matches('"').to_string()).collect();
+        let after_set = body[set_at + 3..].trim_start();
+        let set_col: String = after_set.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '"').collect();
+        let mut used = body_start + set_at + 3 + (body[set_at + 3..].len() - after_set.len()) + set_col.len();
+        let mut using_col = String::new();
+        let (mut mark_true, mut mark_false) = (Value::Bool(true), Value::Bool(false));
+        if kind == SearchCycleKind::Cycle {
+            let tail = &t[used..];
+            let tu = tail.trim_start().to_ascii_uppercase();
+            if tu.starts_with("TO ") {
+                // TO v DEFAULT d
+                let tt = tail.trim_start();
+                let Some(d) = find_top_level_keyword(tt, "DEFAULT") else { break };
+                let Some(u) = find_top_level_keyword(tt, "USING") else { break };
+                mark_true = parse_value(tt[3..d].trim(), &[]);
+                mark_false = parse_value(tt[d + 7..u].trim(), &[]);
+                used += (tail.len() - tt.len()) + u;
+            }
+            let tail = &t[used..];
+            let tt = tail.trim_start();
+            if !tt.to_ascii_uppercase().starts_with("USING ") {
+                break;
+            }
+            let uc = tt[6..].trim_start();
+            using_col = uc.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '"').collect();
+            used += (tail.len() - tt.len()) + 6 + (tt[6..].len() - uc.len()) + using_col.len();
+        }
+        out.push(SearchCycle { kind, cols, set_col: set_col.trim_matches('"').to_string(), using_col: using_col.trim_matches('"').to_string(), mark_true, mark_false });
+        pos += lead + used;
+    }
+    (out, if out_is_empty(&s[..pos]) { 0 } else { pos })
+}
+
+fn out_is_empty(s: &str) -> bool {
+    s.trim().is_empty()
 }
 
 const AGG_NAMES: &[&str] = &[
@@ -20146,6 +20412,9 @@ impl Executor {
         };
         // cột đầu ra trùng tên (`a.name, b.name`, `*` qua JOIN): đặt alias tạm duy nhất để không cột nào bị
         // gộp, rồi trả lại tên gốc. Chỉ đường wire; JSON (object theo tên cột) giữ hành vi cũ.
+        // `FROM (a JOIN b ...)`: suy tên / kiểu cột trên câu đã bỏ ngoặc (như engine thực thi)
+        let unparen = crate::engine::oprewrite::unparen_from_join(sql);
+        let sql = unparen.as_deref().unwrap_or(sql);
         let dedup = self.dedupe_wire_sql(sql);
         let sql = dedup.as_deref().unwrap_or(sql);
         let res = {
