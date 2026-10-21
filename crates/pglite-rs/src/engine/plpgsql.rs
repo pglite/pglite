@@ -1471,7 +1471,7 @@ impl Executor {
 }
 
 /// Giá trị mặc định cho SHOW (giống PostgreSQL mới cài).
-fn default_setting(name: &str) -> Option<&'static str> {
+pub(crate) fn default_setting(name: &str) -> Option<&'static str> {
     Some(match name {
         "search_path" => "\"$user\", public",
         "timezone" => "UTC",
@@ -1499,7 +1499,7 @@ impl Executor {
             if name == "timezone" {
                 Some(crate::engine::executor::default_tz().to_string())
             } else {
-                default_setting(name).or_else(|| crate::engine::session::pg_default_setting(name)).map(|v| v.to_string())
+                default_setting(name).map(|v| v.to_string()).or_else(|| crate::engine::session::pg_default_setting(name))
             }
         })
     }

@@ -61,12 +61,12 @@ fn str_lit(s: &str) -> Option<String> {
 
 /// Tên canonical của tham số như PG in ở cột SHOW (`timezone` → `TimeZone`).
 pub(crate) fn canonical_setting_name(name: &str) -> Option<&'static str> {
-    super::pg_settings_data::SETTINGS.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name)).map(|(n, _, _)| *n)
+    super::catalog_views::setting_row(name).and_then(|r| r[0].as_deref())
 }
 
 /// Giá trị mặc định của PG cho tham số không được engine đặt riêng.
-pub(crate) fn pg_default_setting(name: &str) -> Option<&'static str> {
-    super::pg_settings_data::SETTINGS.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(name)).map(|(_, v, _)| *v)
+pub(crate) fn pg_default_setting(name: &str) -> Option<String> {
+    super::catalog_views::setting_row(name).map(|r| super::catalog_views::show_value(r))
 }
 
 /// Lệnh ghi bị chặn trong giao dịch READ ONLY: tên lệnh như thông báo của PG, `None` = lệnh đọc.
@@ -276,11 +276,14 @@ impl Executor {
     }
 
     fn show_all(&self) -> QueryResult {
-        let rows: Vec<serde_json::Value> = super::pg_settings_data::SETTINGS
+        let rows: Vec<serde_json::Value> = super::catalog_views::settings_rows()
             .iter()
-            .map(|(n, v, d)| {
-                let cur = self.settings.get(&n.to_lowercase()).cloned().unwrap_or_else(|| v.to_string());
-                serde_json::json!({ "name": n, "setting": cur, "description": d })
+            .map(|r| {
+                let name = r[0].clone().unwrap_or_default();
+                let lname = name.to_lowercase();
+                let engine_default = if lname == "timezone" { Some(super::executor::default_tz().to_string()) } else { super::plpgsql::default_setting(&lname).map(|v| v.to_string()) };
+                let cur = self.settings.get(&lname).cloned().or(engine_default).unwrap_or_else(|| super::catalog_views::show_value(r));
+                serde_json::json!({ "name": name, "setting": cur, "description": r[4] })
             })
             .collect();
         let fields = ["name", "setting", "description"].iter().map(|n| FieldInfo { name: n.to_string(), data_type: "text".to_string() }).collect();

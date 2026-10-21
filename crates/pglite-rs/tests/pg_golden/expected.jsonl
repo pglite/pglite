@@ -1239,3 +1239,35 @@
 {"id":"W13_26","ok":true,"fields":["QUERY PLAN"],"rows":[["Index Scan using t_pkey on t"],["  Index Cond: (id = 1)"]]}
 {"id":"W13_27","ok":true,"fields":["QUERY PLAN"],"rows":[["[\n  {\n    \"Plan\": {\n      \"Node Type\": \"Seq Scan\",\n      \"Parallel Aware\": false,\n      \"Async Capable\": false,\n      \"Relation Name\": \"t\",\n      \"Alias\": \"t\",\n      \"Startup Cost\": 0.00,\n      \"Total Cost\": 15.20,\n      \"Plan Rows\": 520,\n      \"Plan Width\": 129,\n      \"Disabled\": false\n    }\n  }\n]"]]}
 {"id":"W13_28","ok":true,"fields":["QUERY PLAN"],"rows":[["Aggregate  (cost=16.50..16.51 rows=1 width=8) (actual time=0.035..0.037 rows=1.00 loops=1)"],["  Buffers: shared hit=1"],["  ->  Seq Scan on t  (cost=0.00..15.20 rows=520 width=0) (actual time=0.025..0.028 rows=3.00 loops=1)"],["        Buffers: shared hit=1"],["Planning:"],["  Buffers: shared hit=2 read=1"],["Planning Time: 0.035 ms"],["Execution Time: 0.108 ms"]]}
+{"id":"W14_01","ok":true,"fields":["attname","t","attnotnull","attnum"],"rows":[["id","integer","t","1"],["t_id","integer","f","2"],["v","text","f","3"]]}
+{"id":"W14_02","ok":true,"fields":["relname","relkind"],"rows":[["t","r"],["t_id_seq","S"],["t_pkey","i"],["u","r"],["u_id_seq","S"],["u_pkey","i"]]}
+{"id":"W14_03","ok":true,"fields":["conname","contype","def"],"rows":[["u_id_not_null","n","NOT NULL id"],["u_pkey","p","PRIMARY KEY (id)"],["u_t_id_fkey","f","FOREIGN KEY (t_id) REFERENCES t(id)"]]}
+{"id":"W14_04","ok":true,"fields":["index_name","indisunique","indisprimary","attname"],"rows":[["t_name_idx","f","f","name"],["t_pkey","t","t","id"]]}
+{"id":"W14_05","ok":true,"fields":["indexname","indexdef"],"rows":[["t_lower_name","CREATE UNIQUE INDEX t_lower_name ON public.t USING btree (name) WHERE (n > 0)"],["t_pkey","CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)"]]}
+{"id":"W14_06","ok":true,"fields":["a","b","c","d","e","f"],"rows":[["integer","character varying(10)","numeric(10,2)","timestamp with time zone","integer[]","timestamp(3) without time zone"]]}
+{"id":"W14_07","ok":true,"fields":["r","same"],"rows":[["u","t"]]}
+{"id":"W14_08","ok":true,"fields":["proname","pronargs","rt","prokind"],"rows":[["add1","1","integer","f"]]}
+{"id":"W14_09","ok":true,"fields":["name","setting","vartype"],"rows":[["TimeZone","UTC","string"],["work_mem","4096","integer"]]}
+{"id":"W14_10","ok":true,"fields":["constraint_name","unique_constraint_name","update_rule","delete_rule"],"rows":[["u_t_id_fkey","t_pkey","NO ACTION","NO ACTION"]]}
+{"id":"W14_11","ok":true,"fields":["attname","def"],"rows":[["id","nextval('u_id_seq'::regclass)"]]}
+{"id":"W14_12","ok":true,"fields":["tgname","tgenabled","tgtype"],"rows":[["trg","O","7"]]}
+{"id":"W14_13","ok":true,"fields":["nspname"],"rows":[["app"],["information_schema"],["public"]]}
+{"id":"W14_14","ok":true,"fields":["datname"],"rows":[["postgres"]]}
+{"id":"W14_15","ok":true,"fields":["conname","def"],"rows":[["ck_pos","CHECK ((n > 0))"]]}
+{"id":"W14_16","ok":true,"fields":["ok"],"rows":[["t"]]}
+{"id":"W14_17","ok":true,"fields":["relname","relnatts","relhasindex","relkind"],"rows":[["t","8","t","r"],["u","3","t","r"]]}
+{"id":"W14_18","ok":true,"fields":["attname","attidentity","attgenerated"],"rows":[["id","a",""],["x","",""],["y","","s"]]}
+{"id":"W14_19","ok":true,"fields":["d"],"rows":[["CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)"]]}
+{"id":"W14_20","ok":true,"fields":["relname"],"rows":[["t"]]}
+{"id":"W14_21","ok":true,"fields":["typname","typtype","typcategory"],"rows":[["_int4","b","A"],["int4","b","N"],["jsonb","b","U"],["text","b","S"]]}
+{"id":"W14_22","ok":true,"fields":["attname","typname"],"rows":[["id","int4"],["name","text"],["n","int4"],["price","numeric"],["meta","jsonb"],["tags","_text"],["created","timestamp"],["flag","bool"]]}
+{"id":"W14_23","ok":true,"fields":["a","b"],"rows":[["t","t"]]}
+{"id":"W14_24","ok":true,"fields":["conname","conkey","confkey","confupdtype","confdeltype"],"rows":[["u_t_id_fkey","{2}","{1}","a","a"]]}
+{"id":"W14_25","ok":true,"fields":["extname","extversion"],"rows":[["plpgsql","1.0"]]}
+{"id":"W14_26","ok":true,"fields":["rolname","rolsuper"],"rows":[["postgres","t"]]}
+{"id":"W14_27","ok":true,"fields":["c"],"rows":[["1"]]}
+{"id":"W14_28","ok":true,"fields":["?column?"],"rows":[["1"]]}
+{"id":"W14_29","ok":true,"fields":["proname","args","res"],"rows":[["f2","a integer, b text DEFAULT 'x'::text","text"]]}
+{"id":"W14_30","ok":true,"fields":["description"],"rows":[]}
+{"id":"W14_31","ok":true,"fields":["description"],"rows":[["people"]]}
+{"id":"W14_32","ok":true,"fields":["constraint_name","constraint_type"],"rows":[["u_pkey","PRIMARY KEY"],["u_t_id_fkey","FOREIGN KEY"]]}

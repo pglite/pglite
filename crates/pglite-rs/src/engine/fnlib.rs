@@ -15,7 +15,7 @@ use std::cell::Cell;
 
 /// Hàm do module này sở hữu hoàn toàn (đường biên dịch được phép chuyển thành `FuncCall`).
 pub(crate) fn is_known(name: &str) -> bool {
-    matches!(
+    super::catalog_views::is_catalog_fn(name) || matches!(
         name,
         "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND" | "ACOSD" | "ATAND"
             | "ATAN2D" | "SINH" | "COSH" | "TANH" | "ASINH" | "ACOSH" | "ATANH" | "DIV" | "GCD" | "LCM" | "FACTORIAL" | "WIDTH_BUCKET"
@@ -43,6 +43,9 @@ pub(crate) fn is_partial(name: &str) -> bool {
 
 /// Kiểu kết quả (tên kiểu PG) cho đường wire.
 pub(crate) fn result_type(name: &str) -> Option<&'static str> {
+    if let Some(t) = super::catalog_views::catalog_fn_type(name) {
+        return Some(t);
+    }
     Some(match name {
         "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND" | "ACOSD" | "ATAND"
         | "ATAN2D" | "SINH" | "COSH" | "TANH" | "ASINH" | "ACOSH" | "ATANH" | "RANDOM" => "double precision",
@@ -462,6 +465,9 @@ fn size_pretty(bytes: f64) -> String {
 
 /// Gọi hàm `name` (viết hoa) với đối số đã tính.
 pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
+    if super::catalog_views::is_catalog_fn(name) {
+        return super::catalog_views::call_catalog_fn(name, args);
+    }
     // hàm không phụ thuộc NULL ở đối số
     match name {
         "PG_BACKEND_PID" => return Some(Value::Int(std::process::id() as i64)),

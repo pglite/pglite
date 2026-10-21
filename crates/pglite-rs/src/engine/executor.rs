@@ -752,6 +752,22 @@ impl Executor {
                 });
             }
 
+            // system catalog đầy đủ cột (engine/catalog_views.rs). Hai dạng introspection mà ứng dụng đang dùng
+            // (danh sách bảng + cột bằng json_agg trên pg_class, ràng buộc gom `column_names`/`referenced_columns`
+            // trên pg_constraint) giữ đường cũ; lỗi ở đường mới thì quay về đường cũ nếu có.
+            if crate::engine::catalog_views::wants_catalog(trimmed) {
+                let legacy_class = (upper.contains("FROM PG_CLASS") || upper.contains("FROM PG_CATALOG.PG_CLASS")) && upper.contains("JSON_AGG");
+                let legacy_con = (upper.contains("FROM PG_CONSTRAINT") || upper.contains("FROM PG_CATALOG.PG_CONSTRAINT")) && upper.contains("COLUMN_NAMES") && upper.contains("REFERENCED_COLUMNS");
+                if !legacy_class && !legacy_con {
+                    let has_legacy = ["PG_CLASS", "PG_CONSTRAINT", "PG_NAMESPACE", "PG_INDEX", "TABLE_CONSTRAINTS", "KEY_COLUMN_USAGE", "CONSTRAINT_COLUMN_USAGE"].iter().any(|k| upper.contains(k));
+                    match self.catalog_select(trimmed, params) {
+                        Some(Ok(r)) => return Ok(r),
+                        Some(Err(e)) if !has_legacy => return Err(e),
+                        _ => {}
+                    }
+                }
+            }
+
             if upper.contains("FROM PG_CLASS") || upper.contains("FROM PG_CATALOG.PG_CLASS") {
                 if upper.contains("JSON_AGG") || upper.contains("COLUMNS") || upper.contains("PG_ATTRIBUTE") {
                     return self.handle_table_introspection_query(trimmed, params);
@@ -4889,6 +4905,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             ColumnDef { name: "is_deferrable".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
             ColumnDef { name: "initially_deferred".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
             ColumnDef { name: "enforced".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
+            ColumnDef { name: "nulls_distinct".to_string(), data_type: DataType::Text, is_primary_key: false, is_nullable: true, default_value: None, comment: None },
         ];
         let mut tc_table = Table::new("information_schema.table_constraints".to_string(), tc_cols);
 
@@ -4974,24 +4991,30 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             if added_c_names.insert((tbl_name.clone(), c_name.clone())) {
                 tc_table.insert(vec![
-                    Value::text("litepostgres"),
+                    Value::text("postgres"),
                     Value::text("public"),
                     Value::text(c_name),
-                    Value::text("litepostgres"),
+                    Value::text("postgres"),
                     Value::text("public"),
                     Value::text(tbl_name),
                     Value::text(&cc.constraint_type),
                     Value::text("NO"),
                     Value::text("NO"),
                     Value::text("YES"),
+                    if cc.constraint_type == "UNIQUE" {
+                        let nnd = self.storage.get_table(tbl_name).is_some_and(|t| t.meta.contains_key(&format!("nulls_not_distinct:{}", c_name.to_lowercase())));
+                        Value::text(if nnd { "NO" } else { "YES" })
+                    } else {
+                        Value::Null
+                    },
                 ]);
             }
 
             kcu_table.insert(vec![
-                Value::text("litepostgres"),
+                Value::text("postgres"),
                 Value::text("public"),
                 Value::text(c_name),
-                Value::text("litepostgres"),
+                Value::text("postgres"),
                 Value::text("public"),
                 Value::text(tbl_name),
                 Value::text(&cc.column_name),
@@ -5002,22 +5025,22 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             if cc.constraint_type == "FOREIGN KEY" {
                 if let (Some(ftable), Some(fcol)) = (&cc.foreign_table_name, &cc.foreign_column_name) {
                     ccu_table.insert(vec![
-                        Value::text("litepostgres"),
+                        Value::text("postgres"),
                         Value::text("public"),
                         Value::text(ftable),
                         Value::text(fcol),
-                        Value::text("litepostgres"),
+                        Value::text("postgres"),
                         Value::text("public"),
                         Value::text(c_name),
                     ]);
                 }
             } else {
                 ccu_table.insert(vec![
-                    Value::text("litepostgres"),
+                    Value::text("postgres"),
                     Value::text("public"),
                     Value::text(tbl_name),
                     Value::text(&cc.column_name),
-                    Value::text("litepostgres"),
+                    Value::text("postgres"),
                     Value::text("public"),
                     Value::text(c_name),
                 ]);
@@ -5094,16 +5117,17 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 if !pk_indices.is_empty() {
                     added_c_names.insert((table.name.clone(), c_name.clone()));
                     tc_table.insert(vec![
-                        Value::text("litepostgres"),
+                        Value::text("postgres"),
                         Value::text("public"),
                         Value::text(&c_name),
-                        Value::text("litepostgres"),
+                        Value::text("postgres"),
                         Value::text("public"),
                         Value::text(&table.name),
                         Value::text("PRIMARY KEY"),
                         Value::text("NO"),
                         Value::text("NO"),
                         Value::text("YES"),
+                        Value::Null,
                     ]);
 
                     let indkey_json = serde_json::Value::Array(
@@ -5123,10 +5147,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
                     for (ord, (_, col_name)) in pk_indices.iter().enumerate() {
                         kcu_table.insert(vec![
-                            Value::text("litepostgres"),
+                            Value::text("postgres"),
                             Value::text("public"),
                             Value::text(&c_name),
-                            Value::text("litepostgres"),
+                            Value::text("postgres"),
                             Value::text("public"),
                             Value::text(&table.name),
                             Value::text(col_name),
@@ -5135,11 +5159,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         ]);
 
                         ccu_table.insert(vec![
-                            Value::text("litepostgres"),
+                            Value::text("postgres"),
                             Value::text("public"),
                             Value::text(&table.name),
                             Value::text(col_name),
-                            Value::text("litepostgres"),
+                            Value::text("postgres"),
                             Value::text("public"),
                             Value::text(&c_name),
                         ]);
@@ -5350,7 +5374,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         for r in &all.rows {
             let g = |k: &str| r.get(k).map(json_to_value).unwrap_or(Value::Null);
             t.insert(vec![
-                Value::text("litepostgres"),
+                Value::text("postgres"),
                 Value::text("public"),
                 g("table_name"),
                 g("column_name"),
@@ -5392,6 +5416,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     /// Tên bảng người dùng (bỏ bảng catalog ảo / bảng tạm nội bộ), đã sắp xếp.
+    pub(crate) fn user_table_names_pub(&self) -> Vec<String> {
+        self.user_table_names()
+    }
+
     fn user_table_names(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.storage.tables.keys()
             .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && !k.starts_with("__") && !["table_constraints", "key_column_usage", "constraint_column_usage", "pg_index", "pg_class", "pg_namespace"].contains(&k.as_str()))
@@ -5429,7 +5457,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 t.insert(vec![Value::text(schema), Value::text(&tbl.name), Value::text("postgres"), Value::Null, Value::Bool(!tbl.indexes.is_empty() || tbl.pk_col_idx.is_some()), Value::Bool(false), Value::Bool(false), Value::Bool(false)]);
             } else {
                 t.insert(vec![
-                    Value::text("litepostgres"),
+                    Value::text("postgres"),
                     Value::text(schema),
                     Value::text(&tbl.name),
                     Value::text(if temp { "LOCAL TEMPORARY" } else { "BASE TABLE" }),
@@ -5444,7 +5472,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         if !pg_tables {
             for (vname, v) in self.storage.objects.views.iter().filter(|(_, v)| !v.materialized) {
                 let _ = v;
-                t.insert(vec![Value::text("litepostgres"), Value::text("public"), Value::text(vname), Value::text("VIEW"), Value::text("NO"), Value::text("public"), Value::Bool(false), Value::Null]);
+                t.insert(vec![Value::text("postgres"), Value::text("public"), Value::text(vname), Value::text("VIEW"), Value::text("NO"), Value::text("public"), Value::Bool(false), Value::Null]);
             }
         }
         let q = replace_relation_name(sql, &["information_schema.tables", "pg_catalog.pg_tables", "pg_tables"], &name);
