@@ -361,6 +361,12 @@ impl CompiledExpr {
             CompiledExpr::Sub(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
+                if let Some(v) = crate::engine::executor::jsonb_minus(&vl, &vr) {
+                    return v;
+                }
                 if let Some(v) = crate::engine::temporal::temporal_arith('-', &vl, &vr) {
                     return v;
                 }
@@ -1327,6 +1333,16 @@ pub fn compile_expr(
         return CompiledExpr::Concat(Box::new(l), Box::new(r));
     }
 
+    // `jsonb #- path`: bộ đánh giá đầy đủ (trước đây bị tách thành phép trừ `x #` - `path`)
+    if crate::engine::executor::find_top_level_op(s, "#-").is_some() {
+        if let (Some(t), None) = (table, joined_table) {
+            let mut copy = crate::storage::table::Table::new(t.name.clone(), t.columns.clone());
+            copy.decl_types = t.decl_types.clone();
+            return CompiledExpr::RawCtx { expr: s.to_string(), table: std::sync::Arc::new(copy) };
+        }
+        return CompiledExpr::Raw(s.to_string());
+    }
+
     // 13. Arithmetic (+, -, *, /, %)
     if let Some(kind) = arith_int_kind(s, &|c| {
         crate::engine::inttype::column_int_kind(table, c).or_else(|| crate::engine::inttype::column_int_kind(joined_table, c))
@@ -1354,8 +1370,20 @@ pub fn compile_expr(
 
     // 14. Cast (::)
     if let Some(colon_pos) = crate::engine::executor::find_last_top_level_op(s, "::") {
-        let target_expr = compile_expr(&s[..colon_pos], table, table_alias, joined_table, joined_alias);
         let target_type = s[colon_pos + 2..].trim().to_uppercase();
+        // `cột::text` với cột numeric(p,s) / jsonb: định dạng theo kiểu khai báo (bộ đánh giá đầy đủ có bảng)
+        if matches!(target_type.as_str(), "TEXT" | "VARCHAR" | "CHARACTER VARYING") && joined_table.is_none() {
+            if let Some(t) = table {
+                let name = s[..colon_pos].trim().rsplit('.').next().unwrap_or("").trim_matches('"');
+                let special = t.get_column_index(name).and_then(|i| crate::engine::coltypes::column_decl(t, i)).map_or(false, |d| !d.array && (d.base == "jsonb" || d.scale().is_some()));
+                if special {
+                    let mut copy = crate::storage::table::Table::new(t.name.clone(), t.columns.clone());
+                    copy.decl_types = t.decl_types.clone();
+                    return CompiledExpr::RawCtx { expr: s.to_string(), table: std::sync::Arc::new(copy) };
+                }
+            }
+        }
+        let target_expr = compile_expr(&s[..colon_pos], table, table_alias, joined_table, joined_alias);
         return CompiledExpr::Cast { expr: Box::new(target_expr), target_type };
     }
     if let Some((inner, target_type)) = split_cast_call(s) {
@@ -1711,6 +1739,11 @@ pub(crate) fn compile_expr_for_joined(
         let l = compile_expr_for_joined(&s[..pipe_idx], joined_schema);
         let r = compile_expr_for_joined(&s[pipe_idx + 2..], joined_schema);
         return CompiledExpr::Concat(Box::new(l), Box::new(r));
+    }
+
+    // `jsonb #- path` trên dòng JOIN: để `eval_joined_scalar_expr` tính bằng bộ đánh giá đầy đủ
+    if crate::engine::executor::find_top_level_op(s, "#-").is_some() {
+        return CompiledExpr::Raw(s.to_string());
     }
 
     // Arithmetic (+, -, *, /, %)

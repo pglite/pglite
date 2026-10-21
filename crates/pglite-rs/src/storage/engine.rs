@@ -496,6 +496,18 @@ impl StorageEngine {
                 }
             }
             SchemaOp::TxDdlUndo => {}
+            SchemaOp::ColumnIdentity { table, column, spec } => {
+                if let Some(t) = self.get_table_mut(table) {
+                    match spec {
+                        Some(sp) => {
+                            t.identity.insert(column.to_lowercase(), *sp);
+                        }
+                        None => {
+                            t.identity.remove(&column.to_lowercase());
+                        }
+                    }
+                }
+            }
             SchemaOp::ColumnTypes { table, types } => {
                 if let Some(t) = self.get_table_mut(table) {
                     for (col, ty) in types {
@@ -729,6 +741,7 @@ impl StorageEngine {
             | SchemaOp::ColumnTypes { table, .. } => vec![table.clone()],
             SchemaOp::RenameTable { from, to } => vec![from.clone(), to.clone()],
             SchemaOp::TxDdlUndo => vec![],
+            SchemaOp::ColumnIdentity { table, .. } => vec![table.clone()],
         };
         if let SchemaOp::RenameColumn { table, .. } | SchemaOp::RenameTable { from: table, .. } = op {
             out.extend(

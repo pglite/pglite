@@ -119,6 +119,19 @@ pub enum SchemaOp {
     /// replay gặp TxRollback / RollbackToSavepoint thì hoàn tác cả DDL (bản cũ không làm vậy lúc chạy,
     /// nên WAL của bản cũ được replay như cũ).
     TxDdlUndo,
+    // ---- Chỉ THÊM VÀO CUỐI (bincode ghi chỉ số biến thể). Bản cũ gặp biến thể lạ: bỏ qua op, không lỗi.
+    /// Cột `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY`: `None` = bỏ identity. Cột vẫn có
+    /// `DEFAULT nextval('<bảng>_<cột>_seq'::regclass)` nên bản cũ bỏ qua op này vẫn đọc dữ liệu như thường.
+    ColumnIdentity { table: String, column: String, spec: Option<IdentitySpec> },
+}
+
+/// Thuộc tính identity của một cột.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct IdentitySpec {
+    /// `GENERATED ALWAYS`: chỉ nhận giá trị tường minh khi có `OVERRIDING SYSTEM VALUE`
+    pub always: bool,
+    pub start: i64,
+    pub increment: i64,
 }
 
 pub fn encode_schema_op(op: &SchemaOp) -> Vec<u8> {

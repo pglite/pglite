@@ -256,8 +256,10 @@ impl Executor {
             .ok_or("Missing VALUES clause in INSERT")?;
         let head = after_into[..src_pos].trim();
         let mut source = after_into[src_pos..].trim();
+        let mut overriding_system = false;
         if source.len() > 10 && source.get(..10).map_or(false, |p| p.eq_ignore_ascii_case("OVERRIDING")) {
-            // OVERRIDING SYSTEM|USER VALUE: bỏ qua
+            // OVERRIDING SYSTEM VALUE: cho ghi giá trị tường minh vào cột GENERATED ALWAYS AS IDENTITY
+            overriding_system = source[10..].trim_start().get(..6).map_or(false, |p| p.eq_ignore_ascii_case("SYSTEM"));
             let v = find_top_level_keyword(source, "VALUE").map(|p| p + 5).unwrap_or(source.len());
             source = source[v..].trim();
         }
@@ -286,6 +288,26 @@ impl Executor {
             };
             (indices, table.columns.clone(), table.name.to_lowercase())
         };
+        // GENERATED ALWAYS AS IDENTITY: chỉ nhận DEFAULT, trừ khi OVERRIDING SYSTEM VALUE (như PostgreSQL)
+        if !overriding_system {
+            let table = self.storage.get_table(&table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
+            let always: Vec<usize> = col_indices.iter().copied().filter(|&c| table.identity.get(&col_defs[c].name.to_lowercase()).map_or(false, |sp| sp.always)).collect();
+            if !always.is_empty() {
+                let up_src = source.to_uppercase();
+                let explicit = if up_src.starts_with("VALUES") {
+                    extract_value_groups(&source[6..]).iter().any(|g| {
+                        let toks = split_comma_separated_tokens(g);
+                        always.iter().any(|&c| col_indices.iter().position(|&x| x == c).and_then(|p| toks.get(p)).map_or(false, |t| !t.trim().eq_ignore_ascii_case("DEFAULT")))
+                    })
+                } else {
+                    !up_src.starts_with("DEFAULT VALUES")
+                };
+                if explicit {
+                    let name = &col_defs[always[0]].name;
+                    return Err(format!("cannot insert a non-DEFAULT value into column \"{}\"", name));
+                }
+            }
+        }
         let decls = self.storage.get_table(&table_name).map(|t| t.decl_types_vec()).unwrap_or_default();
 
         // 1. Dựng mọi dòng định chèn (chưa sửa gì)
@@ -344,8 +366,10 @@ impl Executor {
         // (khoá chính thì `Table::insert` cấp từ `auto_increment` như SERIAL).
         {
             let table = self.storage.tables.get_mut(&clean_table_name).unwrap();
+            // khoá chính dùng `auto_increment` trừ khi là identity có START / INCREMENT riêng
+            let custom_identity = |c: usize| table.identity.get(&col_defs[c].name.to_lowercase()).map_or(false, |sp| sp.start != 1 || sp.increment != 1);
             let seq_cols: Vec<usize> = (0..col_defs.len())
-                .filter(|&c| Some(c) != table.pk_col_idx && col_defs[c].default_value.as_deref().map_or(false, crate::engine::sequences::is_nextval_default))
+                .filter(|&c| (Some(c) != table.pk_col_idx || custom_identity(c)) && col_defs[c].default_value.as_deref().map_or(false, crate::engine::sequences::is_nextval_default))
                 .collect();
             for &c in &seq_cols {
                 for row in &mut built {

@@ -114,3 +114,25 @@ fn vietnamese_text_survives_multi_statement_and_named_params() {
     assert_eq!(r.iter().map(|x| x["s"].as_str().unwrap()).collect::<Vec<_>>(), vec!["Nguyễn Văn An", "Trường; học (1)", "Huế"]);
     assert_eq!(r[2]["note"], "Đà Nẵng ✓");
 }
+
+/// `$n` đứng trực tiếp trong danh sách SELECT có FROM: từ lần chạy thứ hai (qua plan cache) từng ra NULL
+/// (DB_RS_BUGS_FOUND lỗi 6), làm `INSERT ... SELECT $1, id FROM ...` vi phạm NOT NULL.
+#[test]
+fn param_in_select_list_is_rebound_on_cached_plan() {
+    let mut db = pglite_rs::PGlite::in_memory().unwrap();
+    db.exec("CREATE TABLE cat (id SERIAL PRIMARY KEY, code TEXT)", &[]).unwrap();
+    db.exec("INSERT INTO cat (code) VALUES ('a'), ('b')", &[]).unwrap();
+    db.exec("CREATE TABLE pi4 (id SERIAL PRIMARY KEY, program_id INT NOT NULL, item_id INT NOT NULL)", &[]).unwrap();
+    for (p, code, id) in [(8, "a", 1), (9, "a", 1), (10, "b", 2)] {
+        let r = db.query("SELECT $1 AS p, id FROM cat WHERE code = $2", &[pglite_rs::Value::Int(p), pglite_rs::Value::text(code)]).unwrap().rows;
+        assert_eq!(r, vec![serde_json::json!({"p": p, "id": id})], "lần chạy với p = {p}");
+    }
+    for p in 1..=3 {
+        let r = db.query("INSERT INTO pi4 (program_id, item_id) SELECT $1, id FROM cat WHERE code = $2 RETURNING program_id", &[pglite_rs::Value::Int(p), pglite_rs::Value::text("a")]).unwrap().rows;
+        assert_eq!(r, vec![serde_json::json!({"program_id": p})]);
+    }
+    for p in [5, 6] {
+        let r = db.query("SELECT $1 AS p, id FROM cat ORDER BY id", &[pglite_rs::Value::Int(p)]).unwrap().rows;
+        assert_eq!(r, vec![serde_json::json!({"p": p, "id": 1}), serde_json::json!({"p": p, "id": 2})]);
+    }
+}

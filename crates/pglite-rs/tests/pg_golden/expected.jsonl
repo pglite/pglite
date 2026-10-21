@@ -1032,3 +1032,27 @@
 {"id":"BG_12","ok":true,"fields":["id"],"rows":[["2"]]}
 {"id":"BG_13","ok":true,"fields":["cat_id","t"],"rows":[["2","integer"]]}
 {"id":"BG_14","ok":true,"fields":["id","d","s"],"rows":[["1","[\"L2\", \"L1\"]","L2,L1"],["2","[null]",null],["3","[\"L3\"]","L3"]]}
+{"id":"BG_15","ok":true,"fields":["c","a","l"],"rows":[["4","2","1"]]}
+{"id":"BG_16","ok":true,"fields":["id","days_left","g"],"rows":[["1","4","2"],["2",null,"3"]]}
+{"id":"BG_17","ok":true,"fields":["n","m","s","mx"],"rows":[["3","3","6","3"]]}
+{"id":"BG_18","ok":true,"fields":["id","pid"],"rows":[["10","7"]]}
+{"id":"BG_19","ok":true,"fields":["id","pid"],"rows":[["10","7"]]}
+{"id":"BG_20","ok":true,"fields":["id"],"rows":[["4"],["5"],["6"],["7"],["8"],["9"],["10"]]}
+{"id":"BG_21","ok":true,"fields":["id"],"rows":[["1"],["2"],["3"]]}
+{"id":"BG_22","ok":true,"fields":["customer_id","addr"],"rows":[["1","a"],["2","b"],["3","c"],["4","x"],["5","y"]]}
+{"id":"BG_23","ok":true,"fields":["tz","m"],"rows":[["UTC",null]]}
+{"id":"BG_24","ok":true,"fields":["a","b","c"],"rows":[["450000.00","{\"en\": \"b\", \"vi\": \"a\"}","1.500"]]}
+{"id":"BG_25","ok":true,"fields":["p","m","c"],"rows":[["450000.00","{\"en\": \"b\", \"vi\": \"a\"}","450000.00"]]}
+{"id":"W6_01","ok":true,"fields":["j"],"rows":[["[{\"id\":1,\"name\":\"a\",\"meta\":{\"x\": 1},\"tags\":[\"p\",\"q\"]}, \n {\"id\":2,\"name\":\"b\",\"meta\":null,\"tags\":null}]"]]}
+{"id":"W6_02","ok":true,"fields":["j"],"rows":[["[{\"id\":2,\"name\":\"b\",\"meta\":null,\"tags\":null}, \n {\"id\":1,\"name\":\"a\",\"meta\":{\"x\": 1},\"tags\":[\"p\",\"q\"]}]"]]}
+{"id":"W6_03","ok":true,"fields":["j"],"rows":[["[{\"id\":1,\"name\":\"a\",\"meta\":{\"x\": 1},\"tags\":[\"p\",\"q\"]}, \n {\"id\":2,\"name\":\"b\",\"meta\":null,\"tags\":null}]"]]}
+{"id":"W6_04","ok":true,"fields":["a","b"],"rows":[["{\"id\":1,\"name\":\"a\",\"meta\":{\"x\": 1},\"tags\":[\"p\",\"q\"]}","{\"id\":1,\"name\":\"a\",\"meta\":{\"x\": 1},\"tags\":[\"p\",\"q\"]}"]]}
+{"id":"W6_05","ok":true,"fields":["c"],"rows":[["{\"id\": 1, \"meta\": {\"x\": 1}, \"name\": \"a\", \"tags\": [\"p\", \"q\"]}"]]}
+{"id":"W6_06","ok":true,"fields":["a","b","c"],"rows":[["\"abc\"","5","{\"a\": 2, \"b\": 1}"]]}
+{"id":"W6_07","ok":true,"fields":["d","p","c"],"rows":[["{}","{}","{\"x\": 1, \"z\": 2}"],[null,null,null]]}
+{"id":"W6_08","ok":true,"fields":["p","ks","ai","ast"],"rows":[["{\"a\": 2, \"b\": {\"d\": 4}}","{}","[1, 3]","[\"b\"]"]]}
+{"id":"W6_09","ok":true,"fields":["a","b","c"],"rows":[["1","10","1"],["2","15","2"],["50","20","ok"]]}
+{"id":"W6_10","ok":false,"fields":[],"rows":[],"error":"column \"a\" can only be updated to DEFAULT","sqlstate":"428C9","failed_stmt":2}
+{"id":"W6_11","ok":true,"fields":["id","v","s"],"rows":[["1","a","public.idt3_id_seq"],["2","b","public.idt3_id_seq"]]}
+{"id":"W6_12","ok":true,"fields":["d","s","u","su","cs"],"rows":[["postgres","public","postgres","postgres","{pg_catalog,public}"]]}
+{"id":"W6_13","ok":true,"fields":["by_user"],"rows":[["postgres"]]}

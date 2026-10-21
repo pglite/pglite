@@ -25,7 +25,8 @@ pub(crate) fn is_nextval_default(def: &str) -> bool {
 
 /// Câu lệnh có gọi hàm sequence (lọc nhanh).
 pub(crate) fn mentions_sequence_fn(sql: &str) -> bool {
-    FUNCS.iter().any(|f| contains_ci(sql, &format!("{}(", f)))
+    const CALLS: [&str; 4] = ["NEXTVAL(", "CURRVAL(", "SETVAL(", "PG_GET_SERIAL_SEQUENCE("];
+    CALLS.iter().any(|f| contains_ci(sql, f))
 }
 
 /// Tên sequence từ đối số: bỏ `::regclass`, schema `public.` và ngoặc kép, viết thường.
@@ -104,6 +105,25 @@ impl Executor {
         let live_max = |t: &crate::storage::table::Table| {
             t.rows.iter().zip(&t.is_deleted).filter_map(|(r, d)| if *d { None } else { r.get(col).and_then(|v| v.as_i64()) }).max().unwrap_or(0)
         };
+        // cột identity có START / INCREMENT riêng: giá trị kế tiếp = max (min nếu bước âm) hiện có + bước,
+        // hoặc START khi chưa có dòng (bộ đếm dựng lại được từ dữ liệu khi mở DB)
+        if let Some(sp) = table.columns.get(col).and_then(|c| table.identity.get(&c.name.to_lowercase())).copied() {
+            if sp.start != 1 || sp.increment != 1 {
+                let next = match table.serial_next.get(&col) {
+                    Some(n) => *n,
+                    None => {
+                        let vals = table.rows.iter().zip(&table.is_deleted).filter_map(|(r, d)| if *d { None } else { r.get(col).and_then(|v| v.as_i64()) });
+                        let edge = if sp.increment > 0 { vals.max() } else { vals.min() };
+                        match edge {
+                            Some(e) => e + sp.increment,
+                            None => sp.start,
+                        }
+                    }
+                };
+                table.serial_next.insert(col, next + sp.increment);
+                return next;
+            }
+        }
         if Some(col) == table.pk_col_idx {
             let v = table.auto_increment.max(1);
             table.auto_increment = v + 1;

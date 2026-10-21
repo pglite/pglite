@@ -20,23 +20,25 @@ chỉ được co lại). Dòng nào mọi probe đã khớp được đánh d�
 | Mục 3 (toán tử) | `9ba3592` | 503 / 937 | 20 (6 test regex cũ đã qua, không có fail mới) | regex mọi đường, SIMILAR TO, ISNULL, BETWEEN SYMMETRIC, `\|/ \|\|/ @`, AT TIME ZONE, slice, ARRAY(subquery), IS NORMALIZED; +16 case `W3_*` |
 | Mục 4 (SELECT) | `b4d5b02` | 547 / 959 | 20 (không đổi) | VALUES, TABLE, SELECT INTO / CTAS, FROM ONLY, FETCH ... WITH TIES, GROUPING SETS/ROLLUP/CUBE, biểu thức trên aggregate (sửa `count(*)` ở mục 0); +22 case `W4_*` |
 | Mục 18.3 (ngày giờ) | `c6cadf5` | 613 / 993 | 20 (không đổi) | múi giờ phiên +7, toàn bộ hàm ngày giờ, generate_series/unnest trong FROM, sửa WHERE với `now() - interval` / `::date`, plan cache trả mảng cũ dạng chuỗi; +35 case `W5_*` |
+| Zalo-1054 + lỗi WAIKI (lần 1–2) | `ac748b0` | 666 / 1034 | 20 (không đổi) | regex (`regexp_*`), `format()`, `ANY(mảng)` trong JOIN / subquery, subquery tương quan trong SELECT / UPDATE SET / INSERT VALUES, `DEFAULT nextval(...)` + `setval`/`nextval`/`pg_get_serial_sequence` (sequence gắn với cột), `udt_name` mảng, PL/pgSQL có biến / vòng lặp / `EXECUTE format()`, `CREATE TEMP TABLE` (không xuống WAL), `GRANT`/`REVOKE` no-op, `pg_namespace`, GREATEST/LEAST và phép toán trong JOIN, self-join; +27 `ZA_*`, +14 `BG_*` |
+| Lỗi db-rs (lần 3–5) + P0 | chưa commit | 706 / 1058 | 20 (không đổi) | `$n` trong SELECT qua plan cache, `CASE`/`CAST` quanh GREATEST trong JOIN, ép kiểu hàm gộp trong JOIN, `LIMIT` + nhiều bảng, `EXISTS` tương quan trong JOIN, `current_setting`/`set_config`, `::text` của numeric(p,s)/jsonb, JSON mặc định không đoán sai jsonb / `::text` / chuỗi `{...}` không phải mảng; P0: `GENERATED AS IDENTITY` (`SchemaOp::ColumnIdentity` thêm cuối enum, bản cũ bỏ qua), `version()`/`current_database()`/`current_user`..., `jsonb - key`/`#- path`, cả dòng `json_agg(t)`/`to_json(t)`; +11 `BG_*`, +13 `W6_*` |
 
 Số golden ở bảng là kết quả của `cargo test --test pg_golden_test`. Script `checklist_status.py` in một con số thấp hơn
 (407/921 sau đợt 2b, 444/937 sau mục 3, 551/993 sau 18.3) vì không tính các case chỉ so được hình dạng (thời gian thực, ngẫu nhiên).
 
-Tổng hợp theo mục (sau mục 18.3, cập nhật 2026-10-20): **206 dòng xong / 129 dòng còn lại** (tính cả dòng con).
+Tổng hợp theo mục (cập nhật 2026-10-21, sau đợt lỗi db-rs + P0): **217 dòng xong / 118 dòng còn lại** (tính cả dòng con).
 
 | Mục | Xong | Còn | | Mục | Xong | Còn |
 |---|---|---|---|---|---|---|
-| 0. Xuyên suốt | 14 | 4 | | 10. UPDATE | 3 | 4 |
+| 0. Xuyên suốt | 20 | 5 | | 10. UPDATE | 3 | 4 |
 | 1. Lexical | 13 | 0 ✅ | | 11. DELETE/TRUNCATE/MERGE/COPY | 2 | 3 |
-| 2. Kiểu dữ liệu | 24 | 6 | | 12. DDL | 20 | 32 |
+| 2. Kiểu dữ liệu | 24 | 6 | | 12. DDL | 23 | 29 |
 | 3. Toán tử & biểu thức | 24 | 1 | | 13. Transaction | 5 | 3 |
-| 4. SELECT | 22 | 0 ✅ | | 14. Cấu hình phiên | 2 | 3 |
+| 4. SELECT | 22 | 0 ✅ | | 14. Cấu hình phiên | 4 | 1 |
 | 5. JOIN | 4 | 4 | | 15. Lệnh tiện ích | 3 | 6 |
-| 6. WITH (CTE) | 3 | 2 | | 16. Bảo mật / CSDL | 1 | 3 |
-| 7. Aggregate | 5 | 10 | | 17. System catalog | 1 | 7 |
-| 8. Window | 5 | 2 | | 18. Hàm dựng sẵn | 33 | 37 |
+| 6. WITH (CTE) | 3 | 2 | | 16. Bảo mật / CSDL | 2 | 2 |
+| 7. Aggregate | 7 | 8 | | 17. System catalog | 1 | 7 |
+| 8. Window | 5 | 2 | | 18. Hàm dựng sẵn | 41 | 34 |
 | 9. INSERT | 5 | 1 | | 19. Xử lý lỗi | 6 | 0 ✅ |
 
 6 dòng còn lại của mục 2 đều cần đối tượng mới nên chuyển đợt: ENUM, composite, DOMAIN (đợt 6); range, multirange,
@@ -89,7 +91,7 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 
 ## 0. Vấn đề xuyên suốt (nên sửa trước)
 
-- [ ] 🟡 **P0** Hàm/biểu thức chưa hỗ trợ bị **trả nguyên văn dạng chuỗi** thay vì báo lỗi `42883`/`42703`. Ví dụ `SELECT nope FROM t` → `"nope"`; `regexp_replace(...)`, `format(...)`, `to_date(...)` trả lại chính câu chữ. (`ERR03`, `STR11`, `X02`) — cột không tồn tại đã báo `42703`; hàm không tồn tại (`42883`) làm sau đợt 5
+- [ ] 🟡 **P0** Hàm/biểu thức chưa hỗ trợ bị **trả nguyên văn dạng chuỗi** thay vì báo lỗi `42883`/`42703`. Ví dụ `SELECT nope FROM t` → `"nope"`; `regexp_replace(...)`, `format(...)`, `to_date(...)` trả lại chính câu chữ. (`ERR03`, `STR11`, `X02`) — cột không tồn tại đã báo `42703`; hàm không tồn tại (`42883`) làm sau đợt 5 — các ví dụ đã có hàm thật (regex, `format`, `to_date`); hàm chưa hỗ trợ khác (vd. `regexp_instr`) vẫn trả nguyên văn
 - [x] ✅ **P0** Cột không tồn tại trong `WHERE` bị bỏ qua, trả 0 dòng mà không báo lỗi. (`ERR09`) — khớp PG
 - [ ] 🟡 **P0** `SELECT a.name, b.name` hoặc `SELECT *` qua JOIN **mất cột trùng tên**. PG giữ cả hai cột. (`X10`, `J10`, `S41`, `J15`, `J17`, `J19`)
 - [x] ✅ **P0** `'abc'::int` trả `NULL` thay vì lỗi `22P02`. (`ERR10`) — khớp PG
@@ -263,8 +265,8 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ `count`, `count(DISTINCT)`, `sum`, `avg`, `min`, `max`, kết hợp nhiều hàm và biểu thức trên chúng; kiểu wire như PG (`sum(int)` → bigint `8`, `max(numeric(10,2))` → `2.00`) (`A01`, `A01b`, `W4_14`, `W4_22`)
 - [x] ✅ `string_agg`, `array_agg`, có `ORDER BY` (`A02`, `A02c`, `A03`)
 - [x] ✅ `json_agg(col)`, `jsonb_agg(col)` (`A04b`)
-- [ ] ⬜ P0 `json_agg(t)` với cả dòng (chạy được, chưa so giá trị) (`A04`)
-- [ ] ❌ P1 `json_agg(t ORDER BY ...)` báo `Column t not found` (`X11`)
+- [x] ✅ P0 `json_agg(t)` với cả dòng, kể cả theo alias `json_agg(x) FROM t x` (`A04`, `W6_01`–`W6_03`) — khớp PG (trong JOIN: chưa)
+- [x] ✅ P1 `json_agg(t ORDER BY ...)` (`X11`, `W6_02`) — khớp PG (`X11` chỉ khác giá trị `now()` của cột `created`)
 - [ ] ❌ P1 `json_object_agg`, `jsonb_object_agg` (`A05`)
 - [x] ✅ `bool_and`, `bool_or`, `every` (`A06`)
 - [x] ✅ `agg(...) FILTER (WHERE ...)` (`A08`)
@@ -322,10 +324,10 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [ ] ⬜ P2 `ON DELETE SET DEFAULT/RESTRICT`, `ON UPDATE ...`
 - [x] ✅ Default bằng hàm (`gen_random_uuid()`, `now()`, `'{}'::jsonb`), `COLLATE` (`DT20`, `DT15`)
 - [ ] 🟡 P1 `DEFERRABLE INITIALLY DEFERRED` vẫn kiểm tra ngay (`DT06`)
-- [ ] ❌ **P0** `GENERATED ALWAYS/BY DEFAULT AS IDENTITY (...)` (`DT07`)
-- [ ] 🟡 P1 `GENERATED ALWAYS AS IDENTITY` không chặn ghi đè (`DT07b`)
+- [x] ✅ **P0** `GENERATED ALWAYS/BY DEFAULT AS IDENTITY (...)` (`DT07`) — khớp PG
+- [x] ✅ P1 `GENERATED ALWAYS AS IDENTITY` không chặn ghi đè (`DT07b`) — khớp PG
 - [ ] 🟡 P1 `GENERATED ALWAYS AS (expr) STORED` ra `NULL` (`DT08`)
-- [ ] ❌ P1 `CREATE TEMP TABLE` (`DT09`)
+- [x] ✅ P1 `CREATE TEMP TABLE` (`DT09`) — khớp PG
 - [ ] ❌ P3 `CREATE UNLOGGED TABLE` (`DT10`)
 - [x] ✅ P1 `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] t [(cột)] AS <truy vấn> [WITH [NO] DATA]`: kiểu cột theo kiểu khai báo của nguồn, dữ liệu chép bằng INSERT thường trong một giao dịch, trùng tên cột → `42701` (`DT11`, `W4_05`–`W4_08`) — khớp PG
 - [ ] 🟡 P2 `(LIKE t INCLUDING ALL)` tạo bảng không có cột (`DT12`)
@@ -357,7 +359,7 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [ ] ❌ P3 `REINDEX` (`IX12`)
 
 ### 12.4 SEQUENCE
-- [ ] ❌ **P0** `nextval`, `currval`, `setval`, `pg_get_serial_sequence` (`SQ01`, `SQ03`, `SQ06`)
+- [ ] 🟡 **P0** `nextval`, `currval`, `setval`, `pg_get_serial_sequence` (`SQ01`, `SQ03`, `SQ06`) — xong cho sequence gắn với cột (SERIAL, IDENTITY, `DEFAULT nextval('t_id_seq'::regclass)`; bộ đếm dựng lại từ dữ liệu, `setval` không hạ dưới max + 1); `CREATE SEQUENCE` độc lập chưa có
 - [ ] 🟡 P1 `lastval()` không báo lỗi khi chưa có giá trị (`SQ07`)
 - [ ] ❌ P1 `CREATE/ALTER/DROP SEQUENCE` (`SQ01`–`SQ05`)
 
@@ -399,8 +401,8 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ `SET x = v`, `SET x TO v`, `SET LOCAL`, `SET TIME ZONE` (có hiệu lực thật, xem 18.3), `SET NAMES`, `RESET` (`CF01`, `CF02`, `CF05`, `CF07`, `CF08`, `CF11`, `CF12`, `W5_01`–`W5_05`)
 - [x] ✅ `SHOW name` (`CF03`; tên cột chưa đúng)
 - [ ] ❌ P2 `SHOW ALL` (`CF04`)
-- [ ] 🟡 **P0** `set_config(...)`, `current_setting(...)` trả nguyên văn (`CF06`)
-- [ ] 🟡 **P0** `version()`, `current_database()`, `current_schema()`, `current_user`, `session_user`, `current_schemas()` (`CF09`, `CF10`, `X04`)
+- [x] ✅ **P0** `set_config(...)`, `current_setting(...)` trả nguyên văn (`CF06`) — khớp PG
+- [x] ✅ **P0** `version()`, `current_database()`, `current_schema()`, `current_user`, `session_user`, `current_schemas()` (`CF09`, `CF10`, `X04`, `W6_12`, `W6_13`) — khớp PG; `version()` trả `PostgreSQL 16.0 (pglite-rs)`, `DEFAULT current_user` cũng đúng
 
 ## 15. Lệnh tiện ích
 
@@ -417,7 +419,7 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 ## 16. Bảo mật / CSDL
 
 - [x] ✅ `SET ROLE` (chấp nhận) (`SEC07`)
-- [ ] ❌ P2 `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES` (migration có sinh, nên no-op) (`SEC03`, `SEC04`, `SEC08`)
+- [x] ✅ P2 `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES` (migration có sinh, nên no-op) (`SEC03`, `SEC04`, `SEC08`) — khớp PG
 - [ ] ❌ P3 `CREATE/ALTER/DROP ROLE|USER`, `CREATE POLICY` (`SEC01`, `SEC02`, `SEC05`, `SEC06`, `SEC09`)
 - [ ] ❌ P3 `CREATE/DROP DATABASE`, `CREATE TABLESPACE` (`DB01`–`DB03`)
 
@@ -447,10 +449,10 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ P1 `string_to_array` trả JSON thay vì mảng PG (`STR09`) — khớp PG
 - [ ] 🟡 P1 `substring(s FROM 'regex')` (`STR04`)
 - [ ] 🟡 P1 `trim(BOTH|LEADING|TRAILING x FROM s)` (`STR06`)
-- [ ] 🟡 P1 `format('%s %I %L', ...)` (`STR11`)
-- [ ] 🟡 P1 `regexp_replace`, `regexp_matches`, `regexp_split_to_array` (`STR13`)
+- [x] ✅ P1 `format('%s %I %L', ...)` (`STR11`) — khớp PG
+- [ ] 🟡 P1 `regexp_replace`, `regexp_matches`, `regexp_split_to_array` (`STR13`) — đã chạy ở mọi đường (SELECT, WHERE, JOIN, hàm gộp), cờ `g`/`i`/`n`, `\1`; còn lệch: `regexp_matches` ở wire trả mảng JSON thay vì `{b}`, `regexp_matches(..., 'g')` (hàm trả tập) chưa hỗ trợ
 - [ ] ❌ P1 `regexp_split_to_table` (`STR15`)
-- [ ] 🟡 P2 `regexp_like/count/substr/instr` (`STR14`)
+- [ ] 🟡 P2 `regexp_like/count/substr/instr` (`STR14`) — `regexp_like`, `regexp_count`, `regexp_substr` khớp PG; `regexp_instr` chưa có
 - [x] ✅ `md5`, `ascii`, `chr` (`STR16`, `STR17`)
 - [ ] 🟡 P1 `sha256`, `encode`, `decode` (định dạng bytea) (`STR16`)
 - [ ] 🟡 P2 `quote_ident`, `quote_literal`, `quote_nullable` (`STR17`)
@@ -483,9 +485,9 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 ### 18.4 JSON / JSONB
 - [x] ✅ `->`, `->>`, `#>`, `#>>`, `(meta->>'a')::int` (`JS01`, `JS23`)
 - [ ] 🟡 P1 `@>`, `<@`, `?`, `?|`, `?&` với cột `NULL` trả `false` thay vì `NULL` (`JS02`)
-- [ ] 🟡 **P0** `jsonb || jsonb` nối như chuỗi; `jsonb - key`, `#- path` ra `NULL` (`JS03`, `JS03b`)
+- [x] ✅ **P0** `jsonb || jsonb` nối như chuỗi; `jsonb - key`, `#- path` ra `NULL` (`JS03`, `JS03b`) — khớp PG
 - [x] ✅ `jsonb_build_object`, `json_build_object`, `jsonb_build_array`, `json_build_array` (`JS04`)
-- [ ] ⬜ P0 `to_json(row)`, `to_jsonb(row)`, `row_to_json(row)` (chạy được, chưa so giá trị) (`JS05`, `JS05b`)
+- [x] ✅ P0 `to_json(row)`, `to_jsonb(row)`, `row_to_json(row)` và `to_json(giá trị)` (`JS05`, `JS05b`, `W6_04`–`W6_06`) — khớp PG
 - [x] ✅ `jsonb_set`, `jsonb_array_length`, `jsonb_typeof`, `json_typeof`, `jsonb_strip_nulls`, `jsonb_pretty` (`JS06`, `JS11`, `JS12`)
 - [ ] 🟡 P1 `jsonb_insert`, `jsonb_set_lax` (`JS06`)
 - [ ] 🟡 P1 `jsonb_object_keys`, `jsonb_array_elements_text` trong SELECT (`JS08`, `JS10`)

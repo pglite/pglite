@@ -541,6 +541,15 @@ mod tests {
 /// chắc chắn: mục là tham chiếu cột (`col`, `t.col`, `*`, `t.*`), ép kiểu (`x::numeric(5,2)`,
 /// `CAST(x AS ...)`) hoặc literal có kiểu (`TIMESTAMP '...'`). Không khớp số cột thì trả rỗng.
 pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEngine, field_count: usize) -> Vec<Option<DeclType>> {
+    let out = select_decls(sql, storage);
+    if out.len() != field_count {
+        return vec![];
+    }
+    out
+}
+
+/// Kiểu khai báo của từng cột kết quả của một SELECT (suy từ câu lệnh, không chạy), rỗng nếu không suy được.
+pub(crate) fn select_decls(sql: &str, storage: &crate::storage::engine::StorageEngine) -> Vec<Option<DeclType>> {
     use crate::engine::executor::{find_top_level_keyword, is_fully_enclosed_in_parens, split_comma_separated_tokens};
     let Ok(lexed) = crate::engine::frontend::lex(sql) else { return vec![] };
     let mut s = lexed.trim().trim_end_matches(';').trim();
@@ -667,7 +676,7 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
         let decl = expr_decl(e, &col_decl).filter(|d| d.base != "interval" || !e.as_bytes()[..e.len().min(8)].eq_ignore_ascii_case(b"INTERVAL"));
         out.push(decl);
     }
-    if out.len() != field_count || out.iter().all(|d| d.is_none()) {
+    if out.iter().all(|d| d.is_none()) {
         return vec![];
     }
     out
@@ -675,6 +684,30 @@ pub(crate) fn wire_decls(sql: &str, storage: &crate::storage::engine::StorageEng
 
 /// Kiểu khai báo của một biểu thức trong SELECT (đường wire): cột, ép kiểu, literal có kiểu, và một số
 /// dạng suy ra từ chúng (`ts + interval`, `date_trunc(u, ts)`). `col` trả `Some(kiểu?)` khi `e` là cột.
+/// `<biểu thức>::text` theo kiểu khai báo của biểu thức, như PostgreSQL: numeric(p,s) giữ đủ s chữ số
+/// (`450000.00::numeric(12,2)::text` = `450000.00`), jsonb in theo dạng chuẩn (`{"en": "b", "vi": "a"}`).
+/// `None` = không cần định dạng riêng (dùng phép ép thường).
+pub(crate) fn text_cast(inner: &str, v: &Value, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<Value> {
+    if v.is_null() {
+        return None;
+    }
+    let d = expr_decl(inner, col)?;
+    if d.array {
+        return None;
+    }
+    match d.base.as_str() {
+        "numeric" => {
+            let sc = d.scale()?;
+            round_decimal_str(&v.as_str(), sc as usize).map(Value::text)
+        }
+        "jsonb" => {
+            let j: serde_json::Value = serde_json::from_str(v.as_str().trim()).ok()?;
+            Some(Value::text(crate::pg_types::jsonb_text(&j)))
+        }
+        _ => None,
+    }
+}
+
 fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<DeclType> {
     use crate::engine::executor::{find_top_level_keyword, is_fully_enclosed_in_parens};
     let mut e = e.trim();

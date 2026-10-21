@@ -40,6 +40,8 @@ pub struct Table {
     /// Giá trị kế tiếp của các cột SERIAL không phải cột tự tăng chính (`auto_increment`), theo vị trí cột.
     /// Tính lười từ max của cột; xoá khi danh sách cột đổi.
     pub serial_next: HashMap<usize, i64>,
+    /// Cột identity (tên viết thường), từ `SchemaOp::ColumnIdentity`. Rỗng với bảng cũ.
+    pub identity: HashMap<String, crate::storage::catalog::IdentitySpec>,
 }
 
 impl Table {
@@ -101,6 +103,7 @@ impl Table {
             uniq: Vec::new(),
             decl_types: HashMap::new(),
             serial_next: HashMap::new(),
+            identity: HashMap::new(),
         }
     }
 
@@ -716,6 +719,7 @@ impl Table {
             }
             let dropped = self.columns[pos].name.clone();
             self.decl_types.remove(&dropped.to_lowercase());
+            self.identity.remove(&dropped.to_lowercase());
             self.serial_next.clear();
             let uses = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(&dropped));
             // Như PostgreSQL: ràng buộc / index dùng cột bị xoá cũng bị xoá theo.
@@ -752,6 +756,9 @@ impl Table {
         self.columns[idx].name = to.to_string();
         if let Some(d) = self.decl_types.remove(&old.to_lowercase()) {
             self.decl_types.insert(to.to_lowercase(), d);
+        }
+        if let Some(sp) = self.identity.remove(&old.to_lowercase()) {
+            self.identity.insert(to.to_lowercase(), sp);
         }
         let fix = |cols: &mut Vec<String>| {
             for c in cols.iter_mut().filter(|c| c.eq_ignore_ascii_case(&old)) {

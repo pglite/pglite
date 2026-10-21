@@ -780,7 +780,9 @@ mod tests {
 pub fn sqlstate(message: &str) -> &'static str {
     let m = message.to_lowercase();
     let has = |s: &str| m.contains(s);
-    if has("duplicate key value violates unique constraint") || has("could not create unique index") {
+    if has("cannot insert a non-default value into column") || has("can only be updated to default") {
+        "428C9"
+    } else if has("duplicate key value violates unique constraint") || has("could not create unique index") {
         "23505"
     } else if has("violates foreign key constraint") {
         "23503"

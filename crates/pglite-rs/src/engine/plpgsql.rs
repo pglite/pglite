@@ -1236,6 +1236,168 @@ fn default_setting(name: &str) -> Option<&'static str> {
 }
 
 impl Executor {
+    /// Giá trị hiện tại của tham số `name` (viết thường) như SHOW / `current_setting`.
+    pub(crate) fn setting_value(&self, name: &str) -> Option<String> {
+        let name = if name == "time zone" { "timezone" } else { name };
+        self.settings.get(name).cloned().or_else(|| {
+            if name == "timezone" { Some(crate::engine::executor::default_tz().to_string()) } else { default_setting(name).map(|v| v.to_string()) }
+        })
+    }
+
+    /// `current_setting('name' [, missing_ok])` và `set_config('name', 'value', is_local)` với đối số là
+    /// literal: thay bằng giá trị trước khi chạy câu lệnh (trước đây trả nguyên văn câu chữ). `None` nếu không
+    /// đổi gì.
+    pub(crate) fn resolve_setting_calls(&mut self, sql: &str) -> Result<Option<String>, String> {
+        let mut out = sql.to_string();
+        let mut changed = false;
+        let mut from = 0;
+        loop {
+            let b = out.as_bytes();
+            let mut found: Option<(usize, usize, bool)> = None;
+            let mut in_sq = false;
+            let mut i = from;
+            while i < b.len() {
+                if b[i] == b'\'' {
+                    in_sq = !in_sq;
+                } else if !in_sq && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) {
+                    for (kw, is_set) in [("CURRENT_SETTING(", false), ("SET_CONFIG(", true)] {
+                        if b.len() >= i + kw.len() && b[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes()) {
+                            found = Some((i, i + kw.len() - 1, is_set));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let Some((start, open, is_set)) = found else { break };
+            let Some(close) = crate::engine::constraints::matching_paren(&out, open) else { break };
+            let args: Vec<String> = crate::engine::executor::split_function_args(&out[open + 1..close]).into_iter().map(|a| a.trim().to_string()).collect();
+            let lits: Option<Vec<String>> = args.iter().map(|a| string_literal(a).or_else(|| matches!(a.to_lowercase().as_str(), "true" | "false").then(|| a.to_lowercase()))).collect();
+            let Some(lits) = lits else {
+                from = close;
+                continue;
+            };
+            let name = lits.first().map(|n| n.to_lowercase()).unwrap_or_default();
+            let value = if is_set {
+                if lits.len() != 3 {
+                    from = close;
+                    continue;
+                }
+                let v = lits[1].clone();
+                if name == "timezone" || name == "time zone" {
+                    crate::engine::datetime::set_session_tz(&v);
+                    self.settings.insert("timezone".to_string(), v.clone());
+                } else {
+                    self.settings.insert(name.clone(), v.clone());
+                }
+                Some(v)
+            } else {
+                let missing_ok = lits.get(1).map_or(false, |m| m == "true");
+                match self.setting_value(&name) {
+                    Some(v) => Some(v),
+                    None if missing_ok => None,
+                    None => return Err(format!("unrecognized configuration parameter \"{}\"", lits[0])),
+                }
+            };
+            let lit = match value {
+                Some(v) => format!("'{}'", v.replace('\'', "''")),
+                None => "NULL".to_string(),
+            };
+            // cả mục SELECT không alias: tên cột như PostgreSQL
+            let before = out[..start].trim_end().to_uppercase();
+            let after = out[close + 1..].trim_start().to_uppercase();
+            let whole_item = (before.ends_with(',') || before.ends_with("SELECT")) && (after.is_empty() || after.starts_with(',') || after.starts_with("FROM "));
+            let lit = if whole_item { format!("{} AS \"{}\"", lit, if is_set { "set_config" } else { "current_setting" }) } else { lit };
+            out = format!("{}{}{}", &out[..start], lit, &out[close + 1..]);
+            from = start + lit.len();
+            changed = true;
+        }
+        Ok(changed.then_some(out))
+    }
+
+    /// Hàm / từ khoá thông tin phiên trong câu DML: `version()`, `current_database()`, `current_catalog`,
+    /// `current_schema[()]`, `current_schemas(bool)`, `current_user`, `session_user`, `current_role`.
+    /// Thay bằng literal trước khi chạy (trước đây trả nguyên văn câu chữ). `None` nếu không đổi gì.
+    pub(crate) fn resolve_session_info(&self, sql: &str) -> Option<String> {
+        const NAMES: [&str; 8] = ["VERSION", "CURRENT_DATABASE", "CURRENT_CATALOG", "CURRENT_SCHEMAS", "CURRENT_SCHEMA", "CURRENT_USER", "SESSION_USER", "CURRENT_ROLE"];
+        let up = sql.trim_start().to_uppercase();
+        if !["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "VALUES"].iter().any(|k| up.starts_with(k)) {
+            return None;
+        }
+        let b = sql.as_bytes();
+        let mut out = String::with_capacity(sql.len());
+        let mut last = 0;
+        let mut changed = false;
+        let mut in_sq = false;
+        let mut in_dq = false;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' && !in_dq {
+                in_sq = !in_sq;
+            } else if c == b'"' && !in_sq {
+                in_dq = !in_dq;
+            } else if !in_sq && !in_dq && c.is_ascii_alphabetic() && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.' || b[i - 1] >= 0x80)) {
+                let seg = &sql[i..];
+                let hit = |n: &&&str| b.len() >= i + n.len() && b[i..i + n.len()].eq_ignore_ascii_case(n.as_bytes()) && b.get(i + n.len()).map_or(true, |x| !(x.is_ascii_alphanumeric() || *x == b'_'));
+                if let Some(name) = NAMES.iter().find(hit) {
+                    let after = seg[name.len()..].trim_start();
+                    let ws = seg[name.len()..].len() - after.len();
+                    let (value, consumed) = match *name {
+                        "VERSION" | "CURRENT_DATABASE" if after.starts_with('(') && after[1..].trim_start().starts_with(')') => {
+                            let close = name.len() + ws + after.find(')').unwrap() + 1;
+                            let v = if *name == "VERSION" { format!("PostgreSQL {} (pglite-rs)", self.setting_value("server_version").unwrap_or_default()) } else { "postgres".to_string() };
+                            (v, close)
+                        }
+                        "CURRENT_SCHEMAS" if after.starts_with('(') => {
+                            let Some(cl) = after.find(')') else { i += 1; continue };
+                            let arg = after[1..cl].trim().to_lowercase();
+                            let v = if arg == "true" { "{pg_catalog,public}" } else { "{public}" };
+                            (v.to_string(), name.len() + ws + cl + 1)
+                        }
+                        "CURRENT_SCHEMA" => {
+                            if after.starts_with('(') && after[1..].trim_start().starts_with(')') {
+                                ("public".to_string(), name.len() + ws + after.find(')').unwrap() + 1)
+                            } else if after.starts_with('(') {
+                                i += 1;
+                                continue;
+                            } else {
+                                ("public".to_string(), name.len())
+                            }
+                        }
+                        "CURRENT_CATALOG" if !after.starts_with('(') => ("postgres".to_string(), name.len()),
+                        "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" if !after.starts_with('(') => ("postgres".to_string(), name.len()),
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    // cả mục SELECT không alias: tên cột như PostgreSQL
+                    let before = sql[..i].trim_end().to_uppercase();
+                    let tail = sql[i + consumed..].trim_start().to_uppercase();
+                    let whole_item = (before.ends_with(',') || before.ends_with("SELECT")) && (tail.is_empty() || tail.starts_with(',') || tail.starts_with("FROM ") || tail.starts_with("FROM\n"));
+                    let lit = format!("'{}'", value.replace('\'', "''"));
+                    out.push_str(&sql[last..i]);
+                    if whole_item {
+                        out.push_str(&format!("{} AS \"{}\"", lit, name.to_lowercase()));
+                    } else {
+                        out.push_str(&lit);
+                    }
+                    i += consumed;
+                    last = i;
+                    changed = true;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out.push_str(&sql[last..]);
+        changed.then_some(out)
+    }
+
     /// CREATE/DROP EXTENSION, SET, SHOW, RESET, DISCARD... `None` nếu không phải các lệnh này.
     pub(crate) fn handle_session_statement(&mut self, sql: &str, upper: &str) -> Option<Result<QueryResult, String>> {
         let ok = |cmd: &str| Some(Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: cmd.to_string() }));
@@ -1330,9 +1492,7 @@ impl Executor {
             if name == "all" {
                 return Some(Err("SHOW ALL is not supported".to_string()));
             }
-            let value = self.settings.get(&name).cloned().or_else(|| {
-                if name == "timezone" { Some(crate::engine::executor::default_tz().to_string()) } else { default_setting(&name).map(|v| v.to_string()) }
-            });
+            let value = self.setting_value(&name);
             return Some(match value {
                 Some(v) => Ok(QueryResult {
                     rows: vec![serde_json::json!({ name.clone(): v })],

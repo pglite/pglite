@@ -303,6 +303,7 @@ pub fn project_row_planned(
     joined_row: Option<&[Value]>,
     projections: &[PlannedProjectedExpr],
     count_maps: &std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+    params: &[Value],
 ) -> serde_json::Value {
     let mut map = serde_json::Map::with_capacity(projections.len());
     for p in projections {
@@ -336,7 +337,9 @@ pub fn project_row_planned(
                 map.insert(alias.clone(), serde_json::Value::Number(count.into()));
             }
             PlannedProjectedExpr::Compiled { expr, alias } => {
-                let v = expr.eval(primary_row, joined_row, &[]);
+                // tham số của lần chạy này (`SELECT $1 AS p, id FROM t`): trước đây `&[]` nên từ lần chạy
+                // thứ hai (qua plan cache) `$1` ra NULL
+                let v = expr.eval(primary_row, joined_row, params);
                 map.insert(alias.clone(), value_to_json(&v));
             }
             PlannedProjectedExpr::Expr { alias, .. } => {
