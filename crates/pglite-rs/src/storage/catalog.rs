@@ -123,6 +123,79 @@ pub enum SchemaOp {
     /// Cột `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY`: `None` = bỏ identity. Cột vẫn có
     /// `DEFAULT nextval('<bảng>_<cột>_seq'::regclass)` nên bản cũ bỏ qua op này vẫn đọc dữ liệu như thường.
     ColumnIdentity { table: String, column: String, spec: Option<IdentitySpec> },
+    /// `CREATE [OR REPLACE] [MATERIALIZED] VIEW`; `None` = DROP VIEW. Bản cũ bỏ qua (không có view; dữ liệu
+    /// của materialized view là một bảng thường nên bản cũ vẫn đọc được như bảng).
+    View { name: String, def: Option<ViewDef> },
+    /// `CREATE SCHEMA` (`create = true`) / `DROP SCHEMA`.
+    Schema { name: String, create: bool },
+    /// `CREATE` / `ALTER SEQUENCE` độc lập (thuộc tính); `None` = DROP SEQUENCE.
+    Sequence { name: String, spec: Option<SequenceSpec> },
+    /// Giá trị hiện tại của sequence độc lập (ghi ở mỗi `nextval` / `setval` / `RESTART`). Không theo
+    /// giao dịch, như PostgreSQL: ROLLBACK không trả lại số đã cấp.
+    SequenceValue { name: String, last: i64, called: bool },
+    /// `CREATE TYPE ... AS ENUM` / `ALTER TYPE ... ADD VALUE` (danh sách nhãn đầy đủ); `None` = DROP TYPE.
+    EnumType { name: String, labels: Option<Vec<String>> },
+    /// `CREATE DOMAIN`; `None` = DROP DOMAIN. Cột kiểu domain được lưu bằng kiểu gốc + ràng buộc nên bản
+    /// cũ bỏ qua op này vẫn đọc bảng như thường.
+    Domain { name: String, def: Option<DomainDef> },
+}
+
+/// Định nghĩa domain: kiểu gốc và các ràng buộc (biểu thức CHECK dùng từ khoá `VALUE`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DomainDef {
+    pub base: String,
+    pub not_null: bool,
+    pub default: Option<String>,
+    pub checks: Vec<String>,
+}
+
+/// Định nghĩa view: câu truy vấn (đã qua lexer) và danh sách tên cột tuỳ chọn `CREATE VIEW v (a, b)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewDef {
+    pub query: String,
+    pub columns: Vec<String>,
+    /// Materialized view: dữ liệu nằm trong bảng cùng tên, `REFRESH` chạy lại `query`.
+    pub materialized: bool,
+    /// `WITH [CASCADED | LOCAL] CHECK OPTION`: dòng ghi qua view phải thoả điều kiện của view.
+    pub check_option: bool,
+}
+
+/// Thuộc tính của một sequence độc lập.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SequenceSpec {
+    pub start: i64,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub cycle: bool,
+}
+
+/// Sequence độc lập: thuộc tính + giá trị cấp gần nhất (`called = false`: `nextval` kế tiếp trả `last`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequenceState {
+    pub spec: SequenceSpec,
+    pub last: i64,
+    pub called: bool,
+}
+
+/// Các đối tượng không phải bảng (chỉ trong bộ nhớ, dựng lại từ `SchemaOp` khi mở DB). Tên viết thường.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectCatalog {
+    pub views: std::collections::BTreeMap<String, ViewDef>,
+    /// Schema do người dùng tạo (không gồm `public`).
+    pub schemas: std::collections::BTreeSet<String>,
+    /// `DROP SCHEMA public` đã chạy mà chưa `CREATE SCHEMA public` lại.
+    pub public_dropped: bool,
+    pub sequences: std::collections::BTreeMap<String, SequenceState>,
+    pub enums: std::collections::BTreeMap<String, Vec<String>>,
+    pub domains: std::collections::BTreeMap<String, DomainDef>,
+}
+
+impl SchemaOp {
+    /// Op sửa `ObjectCatalog` theo giao dịch (cần lưu trạng thái cũ để ROLLBACK).
+    pub fn is_object_op(&self) -> bool {
+        matches!(self, SchemaOp::View { .. } | SchemaOp::Schema { .. } | SchemaOp::Sequence { .. } | SchemaOp::EnumType { .. } | SchemaOp::Domain { .. })
+    }
 }
 
 /// Thuộc tính identity của một cột.

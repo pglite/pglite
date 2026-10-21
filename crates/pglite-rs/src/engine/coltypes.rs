@@ -430,7 +430,15 @@ pub(crate) fn coerce_for_write(decl: Option<&DeclType>, v: Value) -> Value {
             }
             v
         }
-        _ => v,
+        // kiểu ENUM do người dùng tạo: chỉ nhận nhãn đã khai báo
+        _ => {
+            if let Value::Text(t) = &v {
+                if let Some(false) = crate::engine::objects::enum_has_label(&d.base, t) {
+                    crate::engine::errors::raise(format!("invalid input value for enum {}: \"{}\"", d.base, t));
+                }
+            }
+            v
+        }
     }
 }
 

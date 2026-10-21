@@ -1077,3 +1077,38 @@
 {"id":"W7_19","ok":true,"fields":["id","name","n"],"rows":[["1","alice","5"],["2","v3","3"],["3","carol",null]]}
 {"id":"W7_20","ok":true,"fields":["id","name"],"rows":[["1","v1"],["2","bob"],["3","carol"]]}
 {"id":"W7_21","ok":true,"fields":["j"],"rows":[["\"s\""],["1"],["{\"a\": \"b\"}"]]}
+{"id":"W8_01","ok":true,"fields":["c","l"],"rows":[["7","7"]]}
+{"id":"W8_02","ok":false,"fields":["a"],"rows":[["2"]],"error":"nextval: reached maximum value of sequence \"s\" (2)","sqlstate":"2200H","failed_stmt":3}
+{"id":"W8_03","ok":true,"fields":["a"],"rows":[["1"]]}
+{"id":"W8_04","ok":false,"fields":[],"rows":[],"error":"setval: value 0 is out of bounds for sequence \"s\" (1..9223372036854775807)","sqlstate":"22003","failed_stmt":1}
+{"id":"W8_05","ok":false,"error":"START value (0) cannot be less than MINVALUE (1)","sqlstate":"22023","failed_stmt":0}
+{"id":"W8_06","ok":true,"fields":["b"],"rows":[["-2"]]}
+{"id":"W8_07","ok":true,"fields":["id","x"],"rows":[["1","a"],["2","b"],["10","c"]]}
+{"id":"W8_08","ok":false,"fields":[],"rows":[],"error":"cannot drop sequence s because other objects depend on it","sqlstate":"2BP01","failed_stmt":2}
+{"id":"W8_09","ok":true,"fields":["a"],"rows":[["2"]]}
+{"id":"W8_10","ok":true,"fields":["last_value","is_called"],"rows":[["1","t"]]}
+{"id":"W8_11","ok":true,"fields":["l","c"],"rows":[["4","4"]]}
+{"id":"W8_12","ok":true,"fields":["a","b"],"rows":[["1","alice"],["2","bob"],["3","carol"]]}
+{"id":"W8_13","ok":true,"fields":["k","nm"],"rows":[["2","bob"],["3","carol"]]}
+{"id":"W8_14","ok":true,"fields":["name","c"],"rows":[["alice","2"],["bob","1"]]}
+{"id":"W8_15","ok":false,"fields":[],"rows":[],"error":"relation \"v\" does not exist","sqlstate":"42P01","failed_stmt":2}
+{"id":"W8_16","ok":false,"fields":[],"rows":[],"error":"cannot drop view v because other objects depend on it","sqlstate":"2BP01","failed_stmt":2}
+{"id":"W8_17","ok":false,"fields":[],"rows":[],"error":"\"v\" is not a table","sqlstate":"42809","failed_stmt":1}
+{"id":"W8_18","ok":true,"fields":["table_name","table_type"],"rows":[["t","BASE TABLE"],["u","BASE TABLE"],["v","VIEW"]]}
+{"id":"W8_19","ok":true,"fields":["name","n"],"rows":[["alice","6"],["bob","4"],["carol",null]]}
+{"id":"W8_20","ok":true,"fields":["id","name"],"rows":[["10","ten"]]}
+{"id":"W8_21","ok":false,"fields":[],"rows":[],"error":"cannot update view \"v\"","sqlstate":"55000","failed_stmt":1}
+{"id":"W8_22","ok":true,"fields":["c"],"rows":[["4"]]}
+{"id":"W8_23","ok":false,"fields":[],"rows":[],"error":"schema \"app\" already exists","sqlstate":"42P06","failed_stmt":1}
+{"id":"W8_24","ok":false,"error":"schema \"nope\" does not exist","sqlstate":"3F000","failed_stmt":0}
+{"id":"W8_25","ok":true,"fields":["schema_name"],"rows":[["app"],["information_schema"],["public"]]}
+{"id":"W8_26","ok":true,"fields":["id","v"],"rows":[["1","happy"],["3","ok"],["2","sad"]]}
+{"id":"W8_27","ok":true,"fields":["id"],"rows":[["1"],["3"]]}
+{"id":"W8_28","ok":false,"fields":[],"rows":[],"error":"invalid input value for enum mood: \"bad\"","sqlstate":"22P02","failed_stmt":2}
+{"id":"W8_29","ok":false,"fields":[],"rows":[],"error":"invalid input value for enum mood: \"nope\"","sqlstate":"22P02","failed_stmt":1}
+{"id":"W8_30","ok":true,"fields":["data_type","udt_name"],"rows":[["USER-DEFINED","mood"]]}
+{"id":"W8_31","ok":true,"fields":["r","f","l"],"rows":[["{a,b,c}","a","c"]]}
+{"id":"W8_32","ok":false,"fields":[],"rows":[],"error":"cannot drop type mood because other objects depend on it","sqlstate":"2BP01","failed_stmt":2}
+{"id":"W8_33","ok":true,"fields":["a"],"rows":[["3"]]}
+{"id":"W8_34","ok":false,"fields":[],"rows":[],"error":"domain email does not allow null values","sqlstate":"23502","failed_stmt":2}
+{"id":"W8_35","ok":true,"fields":["n"],"rows":[["1"],["2"],["3"],["4"]]}

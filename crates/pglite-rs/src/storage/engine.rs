@@ -1,4 +1,4 @@
-use crate::storage::catalog::{decode_schema_op, encode_schema_op, ConstraintDef, ConstraintKind, SchemaOp, SCHEMA_OP_VERSION};
+use crate::storage::catalog::{decode_schema_op, encode_schema_op, ConstraintDef, ConstraintKind, ObjectCatalog, SchemaOp, SequenceState, SCHEMA_OP_VERSION};
 use crate::storage::table::Table;
 use crate::storage::wal::{WalManager, WalRecord};
 use crate::types::{value_to_join_key, ColumnDef, Value};
@@ -13,6 +13,8 @@ pub enum UndoAction {
     /// Trạng thái của bảng trước một lệnh DDL trong giao dịch (`None` = bảng chưa tồn tại): ROLLBACK
     /// đặt lại nguyên bảng, như DDL có giao dịch của PostgreSQL.
     RestoreTable { name: String, table: Option<Box<Table>> },
+    /// View / schema / sequence / enum trước một DDL trong giao dịch. Giá trị sequence không bị trả lại.
+    RestoreObjects(Box<ObjectCatalog>),
 }
 
 pub struct StorageEngine {
@@ -32,6 +34,8 @@ pub struct StorageEngine {
     pub tx_ddl_undo: bool,
     /// Bảng tạm `ON COMMIT DROP` của giao dịch đang mở (viết thường).
     pub on_commit_drop: Vec<String>,
+    /// View, schema, sequence độc lập, enum.
+    pub objects: ObjectCatalog,
 }
 
 /// Mốc đầu một câu lệnh (xem `StorageEngine::begin_statement`).
@@ -56,6 +60,7 @@ impl StorageEngine {
             tx_aborted: false,
             tx_ddl_undo: false,
             on_commit_drop: Vec::new(),
+            objects: ObjectCatalog::default(),
         };
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
@@ -204,6 +209,9 @@ impl StorageEngine {
                         if engine.in_transaction && engine.tx_ddl_undo {
                             for t in engine.schema_op_tables(&op) {
                                 engine.push_table_snapshot(&t);
+                            }
+                            if op.is_object_op() {
+                                engine.tx_undo_log.push(UndoAction::RestoreObjects(Box::new(engine.objects.clone())));
                             }
                         }
                         match &op {
@@ -398,12 +406,38 @@ impl StorageEngine {
             for t in self.schema_op_tables(&op) {
                 self.snapshot_table_for_undo(&t);
             }
+            if op.is_object_op() {
+                if !self.tx_ddl_undo {
+                    self.tx_ddl_undo = true;
+                    self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&SchemaOp::TxDdlUndo) });
+                }
+                self.tx_undo_log.push(UndoAction::RestoreObjects(Box::new(self.objects.clone())));
+            }
         }
         // thay đổi catalog chỉ của bảng tạm: không ghi
         let tables = self.schema_op_tables(&op);
         let only_temp = !tables.is_empty() && tables.iter().all(|t| self.wal.temp_tables.contains(&t.to_lowercase()));
         if !only_temp {
             self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&op) });
+        }
+        self.apply_schema_op(&op);
+    }
+
+    /// Giá trị mới của sequence độc lập. Không tính là DDL: câu lệnh lỗi sau đó vẫn được hoàn tác như
+    /// thường (nếu phần WAL này bị cắt cùng câu lệnh thì số đã cấp chỉ có thể cấp lại sau khi mở lại DB,
+    /// mà các dòng dùng số đó cũng đã bị huỷ). Không theo giao dịch, như PostgreSQL.
+    pub fn log_sequence_value(&mut self, name: &str, last: i64, called: bool) {
+        let op = SchemaOp::SequenceValue { name: name.to_string(), last, called };
+        let ddl = self.wal.ddl_appended;
+        self.wal.append(WalRecord::Schema { version: SCHEMA_OP_VERSION, payload: encode_schema_op(&op) });
+        self.wal.ddl_appended = ddl;
+        self.apply_schema_op(&op);
+    }
+
+    /// Áp dụng một thay đổi đối tượng chỉ trong bộ nhớ (view tạm): không ghi WAL, vẫn theo giao dịch.
+    pub fn apply_object_op_unlogged(&mut self, op: SchemaOp) {
+        if self.in_transaction && op.is_object_op() {
+            self.tx_undo_log.push(UndoAction::RestoreObjects(Box::new(self.objects.clone())));
         }
         self.apply_schema_op(&op);
     }
@@ -496,6 +530,58 @@ impl StorageEngine {
                 }
             }
             SchemaOp::TxDdlUndo => {}
+            SchemaOp::View { name, def } => match def {
+                Some(d) => {
+                    self.objects.views.insert(name.to_lowercase(), d.clone());
+                }
+                None => {
+                    self.objects.views.remove(&name.to_lowercase());
+                }
+            },
+            SchemaOp::Schema { name, create } if name.eq_ignore_ascii_case("public") => self.objects.public_dropped = !*create,
+            SchemaOp::Schema { name, create } => {
+                if *create {
+                    self.objects.schemas.insert(name.to_lowercase());
+                } else {
+                    self.objects.schemas.remove(&name.to_lowercase());
+                }
+            }
+            SchemaOp::Sequence { name, spec } => {
+                let key = name.to_lowercase();
+                match spec {
+                    Some(sp) => match self.objects.sequences.get_mut(&key) {
+                        Some(st) => st.spec = *sp,
+                        None => {
+                            self.objects.sequences.insert(key, SequenceState { spec: *sp, last: sp.start, called: false });
+                        }
+                    },
+                    None => {
+                        self.objects.sequences.remove(&key);
+                    }
+                }
+            }
+            SchemaOp::SequenceValue { name, last, called } => {
+                if let Some(st) = self.objects.sequences.get_mut(&name.to_lowercase()) {
+                    st.last = *last;
+                    st.called = *called;
+                }
+            }
+            SchemaOp::Domain { name, def } => match def {
+                Some(d) => {
+                    self.objects.domains.insert(name.to_lowercase(), d.clone());
+                }
+                None => {
+                    self.objects.domains.remove(&name.to_lowercase());
+                }
+            },
+            SchemaOp::EnumType { name, labels } => match labels {
+                Some(l) => {
+                    self.objects.enums.insert(name.to_lowercase(), l.clone());
+                }
+                None => {
+                    self.objects.enums.remove(&name.to_lowercase());
+                }
+            },
             SchemaOp::ColumnIdentity { table, column, spec } => {
                 if let Some(t) = self.get_table_mut(table) {
                     match spec {
@@ -712,6 +798,16 @@ impl StorageEngine {
                     self.tables.remove(&name);
                 }
             },
+            UndoAction::RestoreObjects(mut objs) => {
+                // số đã cấp của sequence không bị trả lại (như PostgreSQL)
+                for (name, st) in objs.sequences.iter_mut() {
+                    if let Some(cur) = self.objects.sequences.get(name) {
+                        st.last = cur.last;
+                        st.called = cur.called;
+                    }
+                }
+                self.objects = *objs;
+            }
         }
     }
 
@@ -740,7 +836,13 @@ impl StorageEngine {
             | SchemaOp::RenameColumn { table, .. }
             | SchemaOp::ColumnTypes { table, .. } => vec![table.clone()],
             SchemaOp::RenameTable { from, to } => vec![from.clone(), to.clone()],
-            SchemaOp::TxDdlUndo => vec![],
+            SchemaOp::TxDdlUndo
+            | SchemaOp::View { .. }
+            | SchemaOp::Schema { .. }
+            | SchemaOp::Sequence { .. }
+            | SchemaOp::SequenceValue { .. }
+            | SchemaOp::EnumType { .. }
+            | SchemaOp::Domain { .. } => vec![],
             SchemaOp::ColumnIdentity { table, .. } => vec![table.clone()],
         };
         if let SchemaOp::RenameColumn { table, .. } | SchemaOp::RenameTable { from: table, .. } = op {

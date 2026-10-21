@@ -797,6 +797,30 @@ pub fn sqlstate(message: &str) -> &'static str {
         "23514"
     } else if has("current transaction is aborted") {
         "25P02"
+    } else if has("schema \"") && has("already exists") {
+        "42P06"
+    } else if has("schema \"") && has("does not exist") {
+        "3F000"
+    } else if (has("type \"") || has("enum label")) && (has("already exists") || has("used more than once")) {
+        "42710"
+    } else if has("type \"") && has("does not exist") {
+        "42704"
+    } else if has("is not an existing enum label") || has("increment must not be zero") || has("must be less than maxvalue") || (has("start value (") || has("restart value (")) && has("cannot be") {
+        "22023"
+    } else if has("reached maximum value of sequence") || has("reached minimum value of sequence") {
+        "2200H"
+    } else if has("out of bounds for sequence") {
+        "22003"
+    } else if has("is not yet defined in this session") || has("cannot insert into view") || has("cannot update view") || has("cannot delete from view") {
+        "55000"
+    } else if has("violates check option for view") {
+        "44000"
+    } else if has("infinite recursion detected in rules") {
+        "42P17"
+    } else if has("\" is not a view") || has("\" is not a table") || has("\" is not a materialized view") {
+        "42809"
+    } else if (has("sequence \"") || has("view \"")) && has("does not exist") && !has("other objects depend") {
+        "42P01"
     } else if has("which is not a composite type") {
         "42809"
     } else if has("time zone") && has("not recognized") || has("invalid value for parameter") || has("not recognized for type") || has("not supported for type") {

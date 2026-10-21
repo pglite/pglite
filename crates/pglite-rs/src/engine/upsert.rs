@@ -371,6 +371,26 @@ impl Executor {
             }
         }
 
+        // `DEFAULT nextval('<sequence độc lập>')` (CREATE SEQUENCE, engine/objects.rs): lấy số từ sequence
+        // đó, kể cả cột khoá chính
+        if !self.storage.objects.sequences.is_empty() {
+            let seq_cols: Vec<(usize, String)> = (0..col_defs.len())
+                .filter_map(|c| {
+                    let d = col_defs[c].default_value.as_deref().filter(|d| crate::engine::sequences::is_nextval_default(d))?;
+                    crate::engine::sequences::default_seq_name(d).filter(|k| self.storage.objects.sequences.contains_key(k)).map(|k| (c, k))
+                })
+                .collect();
+            for (c, k) in &seq_cols {
+                for row in &mut built {
+                    if row[*c].is_null() {
+                        let v = self.standalone_nextval(k)?;
+                        self.remember_seq(k, v);
+                        row[*c] = Value::Int(v);
+                    }
+                }
+            }
+        }
+
         // Cột không phải khoá chính có `DEFAULT nextval(...)` mà để trống: lấy giá trị kế tiếp của bộ đếm
         // (khoá chính thì `Table::insert` cấp từ `auto_increment` như SERIAL).
         {
@@ -380,14 +400,28 @@ impl Executor {
             let seq_cols: Vec<usize> = (0..col_defs.len())
                 .filter(|&c| (Some(c) != table.pk_col_idx || custom_identity(c)) && col_defs[c].default_value.as_deref().map_or(false, crate::engine::sequences::is_nextval_default))
                 .collect();
+            let mut generated: Vec<(String, i64)> = Vec::new();
             for &c in &seq_cols {
                 for row in &mut built {
                     if row[c].is_null() {
-                        row[c] = Value::Int(Executor::take_next_value(table, c));
+                        let v = Executor::take_next_value(table, c);
+                        row[c] = Value::Int(v);
+                        if let Some(name) = crate::engine::sequences::owned_seq_name(table, c) {
+                            generated.push((name, v));
+                        }
                     }
                 }
             }
+            // currval / lastval sau INSERT dùng sequence, như PostgreSQL
+            for (name, v) in generated {
+                self.remember_seq(&name, v);
+            }
         }
+        // khoá chính SERIAL / IDENTITY được `Table::insert` cấp: nhớ số cuối cho currval / lastval
+        let pk_seq: Option<String> = {
+            let table = &self.storage.tables[&clean_table_name];
+            table.pk_col_idx.filter(|&p| built.iter().any(|r| r.get(p).map_or(false, |v| v.is_null()))).and_then(|p| crate::engine::sequences::owned_seq_name(table, p))
+        };
 
         // Kiểu khai báo (numeric(p,s), varchar(n)...): làm tròn / báo lỗi trước khi ghi, kể cả giá trị DEFAULT.
         if !decls.is_empty() {
@@ -447,6 +481,10 @@ impl Executor {
                     }
                 }
                 inserted.extend(first..first + count);
+                if let Some(name) = &pk_seq {
+                    let last = table.auto_increment - 1;
+                    self.remember_seq(name, last);
+                }
                 if undo && count > 0 {
                     self.storage.tx_undo_log.push(UndoAction::DeleteInsertedRows { table: clean_table_name.clone(), count });
                 }

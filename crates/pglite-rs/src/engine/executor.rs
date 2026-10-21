@@ -38,6 +38,10 @@ pub struct Executor {
     json_kinds_cache: HashMap<String, (Option<Vec<JsonCellKind>>, Vec<(String, u64)>)>,
     /// PREPARE tên AS câu lệnh: chỉ sống trong phiên, không ghi xuống đĩa.
     prepared: HashMap<String, String>,
+    /// `currval`: giá trị `nextval` gần nhất của mỗi sequence trong phiên.
+    pub(crate) seq_session: HashMap<String, i64>,
+    /// `lastval`: sequence được dùng gần nhất trong phiên.
+    pub(crate) seq_last_used: Option<String>,
 }
 
 impl Executor {
@@ -50,6 +54,8 @@ impl Executor {
             column_check_cache: HashMap::new(),
             json_kinds_cache: HashMap::new(),
             prepared: HashMap::new(),
+            seq_session: HashMap::new(),
+            seq_last_used: None,
         }
     }
 
@@ -64,6 +70,28 @@ impl Executor {
     }
 
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        // View / sequence độc lập / enum (engine/objects.rs): mở rộng câu lệnh trước mọi đường xử lý
+        if self.storage.stmt_depth == 0 {
+            crate::engine::objects::set_session_enums(&self.storage.objects.enums);
+        }
+        if self.has_expandable_objects() && !(self.storage.in_transaction && self.storage.tx_aborted) {
+            if let Some(res) = self.view_dml(sql, params) {
+                if res.is_err() && self.storage.stmt_depth == 0 && self.storage.in_transaction {
+                    self.storage.tx_aborted = true;
+                }
+                return res;
+            }
+            match self.expand_objects(sql) {
+                Ok(Some(expanded)) => return self.execute(&expanded, params),
+                Ok(None) => {}
+                Err(e) => {
+                    if self.storage.stmt_depth == 0 && self.storage.in_transaction {
+                        self.storage.tx_aborted = true;
+                    }
+                    return Err(e);
+                }
+            }
+        }
         if self.storage.stmt_depth == 0 && !raw_text_mode() && sql.len() > 7 && sql.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("SELECT ")) {
             if let Some(kinds) = self.json_cell_kinds_cached(sql) {
                 return self.execute_typed_json(sql, params, &kinds);
@@ -389,6 +417,10 @@ impl Executor {
         if let Some(res) = self.handle_utility_statement(trimmed, &upper) {
             return res;
         }
+        // VIEW / SCHEMA / SEQUENCE / TYPE (engine/objects.rs)
+        if let Some(res) = self.handle_object_ddl(trimmed, &upper, params) {
+            return res;
+        }
         if upper.contains("NATURAL ") {
             if let Some(rewritten) = self.rewrite_natural_joins(trimmed) {
                 return self.execute_statement(&rewritten, params);
@@ -578,6 +610,11 @@ impl Executor {
         }
 
         if upper.starts_with("SELECT") {
+            if upper.contains("PG_") || upper.contains("INFORMATION_SCHEMA") {
+                if let Some(res) = self.object_catalog_select(trimmed, params) {
+                    return res;
+                }
+            }
             if upper.contains("TABLE_CONSTRAINTS")
                 || upper.contains("KEY_COLUMN_USAGE")
                 || upper.contains("CONSTRAINT_COLUMN_USAGE")
@@ -4562,6 +4599,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let mut t = crate::storage::table::Table::new(name.clone(), cols);
         t.pk_col_idx = None;
         for k in self.user_table_names() {
+            if self.storage.objects.views.get(&k).map_or(false, |v| v.materialized) {
+                continue; // materialized view: không phải bảng
+            }
             let tbl = &self.storage.tables[&k];
             let temp = self.storage.wal.temp_tables.contains(&k.to_lowercase());
             let schema = if temp { "pg_temp_1" } else { "public" };
@@ -4578,6 +4618,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     Value::Bool(temp),
                     tbl.comment.clone().map(Value::text).unwrap_or(Value::Null),
                 ]);
+            }
+        }
+        // view (không có trong pg_tables)
+        if !pg_tables {
+            for (vname, v) in self.storage.objects.views.iter().filter(|(_, v)| !v.materialized) {
+                let _ = v;
+                t.insert(vec![Value::text("litepostgres"), Value::text("public"), Value::text(vname), Value::text("VIEW"), Value::text("NO"), Value::text("public"), Value::Bool(false), Value::Null]);
             }
         }
         let q = replace_relation_name(sql, &["information_schema.tables", "pg_catalog.pg_tables", "pg_tables"], &name);
@@ -4657,6 +4704,12 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         _ => None,
                     };
                     let udt_name = array_udt.as_deref().unwrap_or(udt_name);
+                    // cột kiểu ENUM do người dùng tạo: như PostgreSQL
+                    let enum_udt = table.decl_types.get(&col.name.to_lowercase()).filter(|d| !d.array && self.storage.objects.enums.contains_key(&d.base)).map(|d| d.base.clone());
+                    let (data_type, udt_name) = match &enum_udt {
+                        Some(e) => ("USER-DEFINED", e.as_str()),
+                        None => (data_type, udt_name),
+                    };
 
                     let default_val = col.default_value.as_ref().map(|d| format_attdef_to_sql(d)).or_else(|| {
                         if col.data_type == DataType::Serial {
@@ -12830,7 +12883,7 @@ pub(crate) fn dollar_quote_end(sql: &str, i: usize) -> Option<usize> {
     sql[j + 1..].find(tag).map(|p| j + 1 + p + tag.len())
 }
 
-fn split_sql_statements(sql: &str) -> Vec<String> {
+pub(crate) fn split_sql_statements(sql: &str) -> Vec<String> {
     // Chỉ cắt tại byte ';' (ASCII) nên luôn đúng ranh giới ký tự UTF-8; mỗi câu được chép
     // nguyên lát chuỗi gốc để không làm hỏng tiếng Việt.
     let mut stmts = Vec::new();
@@ -19630,6 +19683,20 @@ impl Drop for RawTextGuard {
 impl Executor {
     /// Thực thi và trả kết quả dạng giao thức Postgres: cột đúng thứ tự, OID, giá trị text chuẩn.
     pub fn execute_wire(&mut self, sql: &str, params: &[Value]) -> Result<crate::pg_types::WireResult, String> {
+        // enum / domain (engine/objects.rs): định dạng theo câu đã viết lại (`enum_range(...)` → mảng...)
+        let typed;
+        let sql = if !self.storage.objects.enums.is_empty() || !self.storage.objects.domains.is_empty() {
+            crate::engine::objects::set_session_enums(&self.storage.objects.enums);
+            match self.rewrite_type_usage(sql) {
+                Ok(Some(s)) => {
+                    typed = s;
+                    typed.as_str()
+                }
+                _ => sql,
+            }
+        } else {
+            sql
+        };
         // cột đầu ra trùng tên (`a.name, b.name`, `*` qua JOIN): đặt alias tạm duy nhất để không cột nào bị
         // gộp, rồi trả lại tên gốc. Chỉ đường wire; JSON (object theo tên cột) giữ hành vi cũ.
         let dedup = self.dedupe_wire_sql(sql);

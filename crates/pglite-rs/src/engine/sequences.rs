@@ -5,18 +5,12 @@
 //! đếm `auto_increment` của bảng (như SERIAL), cột khác dùng `serial_next` (tính lười từ max của cột).
 //! Vì vậy định dạng file DB và WAL không đổi; bộ đếm được dựng lại từ dữ liệu khi mở DB. `setval` không
 //! bao giờ hạ bộ đếm xuống dưới max hiện có + 1 (không thể sinh khoá trùng), và giá trị đặt cao hơn chỉ
-//! giữ trong phiên. `CREATE SEQUENCE` độc lập vẫn chưa hỗ trợ.
+//! giữ trong phiên. Sequence độc lập (`CREATE SEQUENCE`) nằm ở `engine/objects.rs`; các hàm ở đây
+//! rẽ sang đó khi tên là sequence độc lập.
 use super::executor::{contains_ci, find_top_level_keyword, split_function_args, Executor};
 use crate::types::{DataType, Value};
-use std::cell::RefCell;
-use std::collections::HashMap;
 
-thread_local! {
-    /// `currval`: giá trị `nextval` gần nhất của mỗi sequence trong phiên.
-    static LAST_VALUES: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
-}
-
-const FUNCS: [&str; 4] = ["NEXTVAL", "CURRVAL", "SETVAL", "PG_GET_SERIAL_SEQUENCE"];
+const FUNCS: [&str; 5] = ["NEXTVAL", "CURRVAL", "SETVAL", "PG_GET_SERIAL_SEQUENCE", "LASTVAL"];
 
 /// `DEFAULT nextval(...)`: cột tự tăng.
 pub(crate) fn is_nextval_default(def: &str) -> bool {
@@ -25,7 +19,7 @@ pub(crate) fn is_nextval_default(def: &str) -> bool {
 
 /// Câu lệnh có gọi hàm sequence (lọc nhanh).
 pub(crate) fn mentions_sequence_fn(sql: &str) -> bool {
-    const CALLS: [&str; 4] = ["NEXTVAL(", "CURRVAL(", "SETVAL(", "PG_GET_SERIAL_SEQUENCE("];
+    const CALLS: [&str; 5] = ["NEXTVAL(", "CURRVAL(", "SETVAL(", "PG_GET_SERIAL_SEQUENCE(", "LASTVAL("];
     CALLS.iter().any(|f| contains_ci(sql, f))
 }
 
@@ -37,7 +31,7 @@ fn seq_key(name: &str) -> String {
 }
 
 /// Tên sequence ghi trong `DEFAULT nextval('<tên>'::regclass)`.
-fn default_seq_name(def: &str) -> Option<String> {
+pub(crate) fn default_seq_name(def: &str) -> Option<String> {
     let inner = def.trim().get(8..)?;
     let start = inner.find('\'')?;
     let end = inner[start + 1..].find('\'')? + start + 1;
@@ -45,7 +39,7 @@ fn default_seq_name(def: &str) -> Option<String> {
 }
 
 /// Cột có sequence: SERIAL hoặc `DEFAULT nextval(...)`.
-fn owned_seq_name(table: &crate::storage::table::Table, col: usize) -> Option<String> {
+pub(crate) fn owned_seq_name(table: &crate::storage::table::Table, col: usize) -> Option<String> {
     let c = &table.columns[col];
     if let Some(d) = c.default_value.as_deref().filter(|d| is_nextval_default(d)) {
         return default_seq_name(d).or_else(|| Some(format!("{}_{}_seq", table.name, c.name).to_lowercase()));
@@ -90,7 +84,17 @@ fn find_innermost_call(sql: &str) -> Option<(usize, &'static str, usize, usize)>
 }
 
 impl Executor {
+    /// `currval` / `lastval`: nhớ giá trị `nextval` gần nhất của sequence trong phiên (Executor).
+    pub(crate) fn remember_seq(&mut self, key: &str, v: i64) {
+        self.seq_session.insert(key.to_string(), v);
+        self.seq_last_used = Some(key.to_string());
+    }
+
     /// Sequence `key` → (bảng, cột).
+    pub(crate) fn find_owned_sequence_pub(&self, key: &str) -> Option<(String, usize)> {
+        self.find_owned_sequence(key)
+    }
+
     fn find_owned_sequence(&self, key: &str) -> Option<(String, usize)> {
         let mut names: Vec<&String> = self.storage.tables.keys().collect();
         names.sort();
@@ -138,6 +142,13 @@ impl Executor {
     }
 
     fn sequence_call(&mut self, func: &str, args: &[Value]) -> Result<Value, String> {
+        if func == "LASTVAL" {
+            if !args.is_empty() {
+                return Err(format!("function lastval({}) does not exist", args.iter().map(|_| "unknown").collect::<Vec<_>>().join(", ")));
+            }
+            let key = self.seq_last_used.clone().ok_or_else(|| "lastval is not yet defined in this session".to_string())?;
+            return self.seq_session.get(&key).copied().map(Value::Int).ok_or_else(|| "lastval is not yet defined in this session".to_string());
+        }
         if args.iter().take(2).any(|v| v.is_null()) {
             return Ok(Value::Null);
         }
@@ -153,16 +164,34 @@ impl Executor {
         }
         let raw = args.first().map(|v| v.as_str()).unwrap_or_default();
         let key = seq_key(&raw);
+        if func != "CURRVAL" {
+            if let Some(r) = self.standalone_sequence_call(func, &key, args) {
+                let v = r?;
+                if func == "NEXTVAL" || args.get(2).map_or(true, |x| x.as_bool().unwrap_or(true)) {
+                    self.remember_seq(&key, v);
+                }
+                return Ok(Value::Int(v));
+            }
+        } else if self.storage.objects.sequences.contains_key(&key) {
+            return self
+                .seq_session
+                .get(&key)
+                .copied()
+                .map(Value::Int)
+                .ok_or_else(|| format!("currval of sequence \"{}\" is not yet defined in this session", key));
+        }
         let (tname, col) = self.find_owned_sequence(&key).ok_or_else(|| format!("relation \"{}\" does not exist", raw))?;
         match func {
             "NEXTVAL" => {
                 let t = self.storage.tables.get_mut(&tname).unwrap();
                 let v = Self::take_next_value(t, col);
-                LAST_VALUES.with(|m| m.borrow_mut().insert(key, v));
+                self.remember_seq(&key, v);
                 Ok(Value::Int(v))
             }
-            "CURRVAL" => LAST_VALUES
-                .with(|m| m.borrow().get(&key).copied())
+            "CURRVAL" => self
+                .seq_session
+                .get(&key)
+                .copied()
                 .map(Value::Int)
                 .ok_or_else(|| format!("currval of sequence \"{}\" is not yet defined in this session", key)),
             _ => {
@@ -178,7 +207,7 @@ impl Executor {
                     t.serial_next.insert(col, next);
                 }
                 if is_called {
-                    LAST_VALUES.with(|m| m.borrow_mut().insert(key, v));
+                    self.remember_seq(&key, v);
                 }
                 Ok(Value::Int(v))
             }
@@ -213,6 +242,9 @@ impl Executor {
             let mut args = Vec::new();
             for a in raw_args {
                 let a = a.trim();
+                if a.is_empty() {
+                    continue;
+                }
                 let v = if literal(a) {
                     Value::text(&a[1..a.len() - 1])
                 } else if let Ok(i) = a.parse::<i64>() {

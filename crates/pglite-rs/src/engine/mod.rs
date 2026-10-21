@@ -7,6 +7,7 @@ pub mod coltypes;
 pub(crate) mod validate;
 pub mod expr;
 pub mod inttype;
+pub mod objects;
 pub(crate) mod oprewrite;
 pub(crate) mod strfn;
 pub(crate) mod sequences;
