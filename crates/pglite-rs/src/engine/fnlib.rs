@@ -15,7 +15,7 @@ use std::cell::Cell;
 
 /// Hàm do module này sở hữu hoàn toàn (đường biên dịch được phép chuyển thành `FuncCall`).
 pub(crate) fn is_known(name: &str) -> bool {
-    super::catalog_views::is_catalog_fn(name) || super::range::is_range_fn(name) || super::fts::is_fts_fn(name) || super::composite::is_composite_fn(name) || super::geo::is_geo_fn(name) || matches!(
+    super::catalog_views::is_catalog_fn(name) || super::range::is_range_fn(name) || super::fts::is_fts_fn(name) || super::composite::is_composite_fn(name) || super::geo::is_geo_fn(name) || name == "PG_PARTITION_HASH" || matches!(
         name,
         "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND" | "ACOSD" | "ATAND"
             | "ATAN2D" | "SINH" | "COSH" | "TANH" | "ASINH" | "ACOSH" | "ATANH" | "DIV" | "GCD" | "LCM" | "FACTORIAL" | "WIDTH_BUCKET"
@@ -479,6 +479,9 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
     }
     if super::geo::is_geo_fn(name) {
         return super::geo::call_geo_fn(name, args);
+    }
+    if name == "PG_PARTITION_HASH" {
+        return super::partition::call_hash_fn(args);
     }
     // `@@` của full-text search (cùng được viết lại thành pg_atat với jsonb @@ jsonpath)
     if name == "PG_ATAT" && args.len() == 2 {

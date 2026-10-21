@@ -1306,3 +1306,26 @@
 {"id":"W15_33","ok":false,"fields":[],"rows":[],"error":"type \"pair\" already exists","sqlstate":"42710","failed_stmt":1}
 {"id":"W15_34","ok":true,"fields":["p","d"],"rows":[["(1,2)","5"]]}
 {"id":"W15_35","ok":true,"fields":["xmlelement"],"rows":[["<a>x</a>"]]}
+{"id":"W15_36","ok":true,"fields":["ok","id","at","v"],"rows":[["t","1","2024-05-01","a"],["t","2","2025-03-01","b"]]}
+{"id":"W15_37","ok":false,"fields":[],"rows":[],"error":"partition \"ev_x\" would overlap partition \"ev_2024\"","sqlstate":"42P17","failed_stmt":2}
+{"id":"W15_38","ok":false,"fields":[],"rows":[],"error":"new row for relation \"ev_2024\" violates partition constraint","sqlstate":"23514","failed_stmt":2}
+{"id":"W15_39","ok":true,"fields":["a","b"],"rows":[["0","1"]]}
+{"id":"W15_40","ok":true,"fields":["id"],"rows":[["1"]]}
+{"id":"W15_41","ok":true,"fields":["k","n"],"rows":[["a","1"],["b","3"]]}
+{"id":"W15_42","ok":true,"fields":["n","c","s"],"rows":[["10","10","55"]]}
+{"id":"W15_43","ok":true,"fields":["id"],"rows":[["1"],["9"]]}
+{"id":"W15_44","ok":true,"fields":["a","b"],"rows":[["0","1"]]}
+{"id":"W15_45","ok":true,"fields":["a","b","c"],"rows":[["1","1","2"]]}
+{"id":"W15_46","ok":true,"fields":["relname","relkind","relispartition"],"rows":[["ev","p","f"],["ev_2024","r","t"]]}
+{"id":"W15_47","ok":true,"fields":["c"],"rows":[["0"]]}
+{"id":"W15_48","ok":true,"fields":["c"],"rows":[["0"]]}
+{"id":"W15_49","ok":true,"fields":["pub","app"],"rows":[["3","1"]]}
+{"id":"W15_50","ok":true,"fields":["x"],"rows":[["9"]]}
+{"id":"W15_51","ok":false,"fields":[],"rows":[],"error":"relation \"z\" does not exist","sqlstate":"42P01","failed_stmt":4}
+{"id":"W15_52","ok":true,"fields":["nspname","relname"],"rows":[["app","t"],["public","t"]]}
+{"id":"W15_53","ok":true,"fields":["x","y"],"rows":[["20","20"]]}
+{"id":"W15_54","ok":true,"fields":["c"],"rows":[["3"]]}
+{"id":"W15_55","ok":false,"fields":[],"rows":[],"error":"relation \"app.nope\" does not exist","sqlstate":"42P01","failed_stmt":2}
+{"id":"W15_56","ok":false,"fields":[],"rows":[],"error":"insert or update on table \"c\" violates foreign key constraint \"c_pid_fkey\"","sqlstate":"23503","failed_stmt":5}
+{"id":"W15_57","ok":true,"fields":["x","id"],"rows":[["5","1"]]}
+{"id":"W15_58","ok":true,"fields":["x"],"rows":[["3"]]}

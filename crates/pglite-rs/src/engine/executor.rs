@@ -52,6 +52,8 @@ pub struct Executor {
     pub(crate) session: crate::engine::session::SessionState,
     /// Có cột kiểu range không, cache theo (số DDL đã ghi, số bảng) (engine/range.rs).
     range_cols: std::cell::Cell<Option<(u64, usize, bool)>>,
+    /// Có bảng phân vùng không, cache như `range_cols` (engine/partition.rs).
+    pub(crate) part_cache: std::cell::Cell<Option<(u64, usize, bool)>>,
 }
 
 impl Executor {
@@ -71,6 +73,7 @@ impl Executor {
             deferred_checking: Default::default(),
             session: Default::default(),
             range_cols: Default::default(),
+            part_cache: Default::default(),
         }
     }
 
@@ -128,7 +131,9 @@ impl Executor {
             }
         }
         if top && sql.len() > 7 && sql.trim_start().get(..7).is_some_and(|p| p.eq_ignore_ascii_case("SELECT ")) {
-            if let Err(e) = self.check_select_columns_cached(sql) {
+            // tên bảng theo schema / search_path (engine/namespace.rs) trước khi kiểm tra cột
+            let ns_sql = if self.namespaces_active() { self.resolve_namespaces(sql) } else { None };
+            if let Err(e) = self.check_select_columns_cached(ns_sql.as_deref().unwrap_or(sql)) {
                 if self.storage.in_transaction {
                     self.storage.tx_aborted = true;
                 }
@@ -379,6 +384,12 @@ impl Executor {
     pub(crate) fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = crate::engine::frontend::lex(sql)?;
         let mut normalized_sql = normalize_named_sql_params(&clean_sql);
+        // schema namespace (engine/namespace.rs): `app.t` ≠ `public.t`, `search_path`
+        if self.namespaces_active() {
+            if let Some(r) = self.resolve_namespaces(&normalized_sql) {
+                normalized_sql = r;
+            }
+        }
         // kiểu composite (engine/composite.rs): `x::kiểu`, `(x).trường`
         if crate::engine::composite::has_types() && (normalized_sql.contains("::") || normalized_sql.contains(").")) {
             let cols = self.composite_columns();
@@ -467,6 +478,13 @@ impl Executor {
             return res;
         }
         self.read_only_gate(&upper)?;
+        // bảng phân vùng (engine/partition.rs): DDL, ghi định tuyến, đọc qua hợp các partition
+        if let Some(res) = self.handle_partitioning(trimmed, &upper, params) {
+            return res;
+        }
+        if let Some(res) = self.partition_reads(trimmed, params) {
+            return res;
+        }
         if upper.starts_with("COPY ") || upper.starts_with("COPY(") {
             return self.handle_copy(trimmed, params);
         }
@@ -5478,7 +5496,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
     fn user_table_names(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.storage.tables.keys()
-            .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && !k.starts_with("__") && !["table_constraints", "key_column_usage", "constraint_column_usage", "pg_index", "pg_class", "pg_namespace"].contains(&k.as_str()))
+            // `__q<hex>_`: bảng tên có nháy / bảng ở schema người dùng (không phải bảng tạm nội bộ)
+            .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && (!k.starts_with("__") || crate::engine::frontend::decode_ident(k).is_some()) && !["table_constraints", "key_column_usage", "constraint_column_usage", "pg_index", "pg_class", "pg_namespace"].contains(&k.as_str()))
             .cloned()
             .collect();
         keys.sort();
@@ -5508,14 +5527,19 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             }
             let tbl = &self.storage.tables[&k];
             let temp = self.storage.wal.temp_tables.contains(&k.to_lowercase());
-            let schema = if temp { "pg_temp_1" } else { "public" };
+            // bảng ở schema người dùng: tên nội bộ `"app.t"` (engine/namespace.rs)
+            let split = crate::engine::namespace::split_internal(&k, &self.storage.objects.schemas);
+            let schema_owned = split.as_ref().map(|(s, _)| s.clone());
+            let schema = if temp { "pg_temp_1" } else { schema_owned.as_deref().unwrap_or("public") };
+            let shown_name = split.as_ref().map(|(_, n)| n.clone()).unwrap_or_else(|| crate::engine::frontend::decode_ident(&tbl.name).unwrap_or_else(|| tbl.name.clone()));
+            let tbl_name_v = Value::text(&shown_name);
             if pg_tables {
-                t.insert(vec![Value::text(schema), Value::text(&tbl.name), Value::text("postgres"), Value::Null, Value::Bool(!tbl.indexes.is_empty() || tbl.pk_col_idx.is_some()), Value::Bool(false), Value::Bool(false), Value::Bool(false)]);
+                t.insert(vec![Value::text(schema), tbl_name_v.clone(), Value::text("postgres"), Value::Null, Value::Bool(!tbl.indexes.is_empty() || tbl.pk_col_idx.is_some()), Value::Bool(false), Value::Bool(false), Value::Bool(false)]);
             } else {
                 t.insert(vec![
                     Value::text("postgres"),
                     Value::text(schema),
-                    Value::text(&tbl.name),
+                    tbl_name_v.clone(),
                     Value::text(if temp { "LOCAL TEMPORARY" } else { "BASE TABLE" }),
                     Value::text("YES"),
                     Value::text(schema),

@@ -240,6 +240,8 @@ struct Col {
 
 struct Rel {
     oid: i64,
+    /// OID schema
+    nsp: i64,
     name: String,
     /// r | v | m | S | i
     kind: char,
@@ -250,6 +252,8 @@ struct Rel {
     has_triggers: bool,
     checks: i64,
     view_def: Option<String>,
+    /// partition của một bảng phân vùng
+    ispart: bool,
 }
 
 struct Con {
@@ -423,6 +427,10 @@ impl Executor {
         for k in &table_names {
             table_oids.push((k.clone(), next_oid));
             by_name.insert(k.to_lowercase(), next_oid);
+            // `'app.t'::regclass`, `'"My T"'::regclass`: tên đã giải mã
+            if let Some(d) = super::frontend::decode_ident(k) {
+                by_name.insert(d.to_lowercase(), next_oid);
+            }
             next_oid += 1;
         }
         let mut oid = 24576i64;
@@ -640,10 +648,12 @@ impl Executor {
             }
             let has_index = idxs.iter().any(|i| i.rel == *toid);
             let has_triggers = t.meta.keys().any(|k| k.starts_with("trigger:"));
+            let shown = super::namespace::split_internal(key, &objects.schemas);
             rels.push(Rel {
                 oid: *toid,
-                name: t.name.clone(),
-                kind: if matview { 'm' } else { 'r' },
+                nsp: shown.as_ref().and_then(|(sname, _)| schemas.iter().find(|(_, x)| x == sname).map(|(o, _)| *o)).unwrap_or(NS_PUBLIC),
+                name: shown.map(|(_, n)| n).unwrap_or_else(|| super::frontend::decode_ident(&t.name).unwrap_or_else(|| t.name.clone())),
+                kind: if matview { 'm' } else if t.meta.contains_key("partition_by") { 'p' } else { 'r' },
                 temp: self.storage.wal.temp_tables.contains(&key.to_lowercase()),
                 cols,
                 comment: t.comment.clone(),
@@ -651,6 +661,7 @@ impl Executor {
                 has_triggers,
                 checks,
                 view_def: if matview { objects.views.get(key).map(|v| v.query.clone()) } else { None },
+                ispart: t.meta.contains_key("partition_of"),
             });
         }
         // khoá ngoại (cần OID của bảng được tham chiếu)
@@ -711,7 +722,7 @@ impl Executor {
             let o = fresh();
             by_name.insert(name.to_lowercase(), o);
             let cols = v.columns.iter().enumerate().map(|(i, c)| Col { num: i as i64 + 1, name: c.clone(), typid: 25, typmod: -1, notnull: false, default: None, identity: "", generated: "", dims: 0, comment: None }).collect();
-            rels.push(Rel { oid: o, name: name.clone(), kind: 'v', temp: false, cols, comment: None, has_index: false, has_triggers: false, checks: 0, view_def: Some(v.query.clone()) });
+            rels.push(Rel { oid: o, nsp: NS_PUBLIC, name: name.clone(), kind: 'v', temp: false, cols, comment: None, has_index: false, has_triggers: false, checks: 0, view_def: Some(v.query.clone()), ispart: false });
         }
         let mut seqs: Vec<String> = objects.sequences.keys().cloned().collect();
         for r in rels.iter().filter(|r| r.kind == 'r') {
@@ -727,7 +738,7 @@ impl Executor {
         for s in seqs {
             let o = fresh();
             by_name.insert(s.to_lowercase(), o);
-            rels.push(Rel { oid: o, name: s, kind: 'S', temp: false, cols: vec![], comment: None, has_index: false, has_triggers: false, checks: 0, view_def: None });
+            rels.push(Rel { oid: o, nsp: NS_PUBLIC, name: s, kind: 'S', temp: false, cols: vec![], comment: None, has_index: false, has_triggers: false, checks: 0, view_def: None, ispart: false });
         }
         // routine
         let mut procs = Vec::new();
@@ -1124,6 +1135,7 @@ impl Executor {
                 for r in &m.rels {
                     let (am, replident) = match r.kind {
                         'r' | 'm' => (2, "d"),
+                        'p' => (0, "d"),
                         'S' => (0, "n"),
                         _ => (0, "n"),
                     };
@@ -1131,9 +1143,9 @@ impl Executor {
                     push(
                         &mut t,
                         vec![
-                            i(r.oid), s(&r.name), i(NS_PUBLIC), i(0), i(0), i(10), i(am), i(if r.kind == 'v' { 0 } else { r.oid }), i(0), i(0), Value::Float(-1.0), i(0), i(0), i(0),
+                            i(r.oid), s(&r.name), i(r.nsp), i(0), i(0), i(10), i(am), i(if r.kind == 'v' { 0 } else { r.oid }), i(0), i(0), Value::Float(-1.0), i(0), i(0), i(0),
                             b(r.has_index), b(false), s(if r.temp { "t" } else { "p" }), s(r.kind.to_string()), i(if r.kind == 'S' { 3 } else { natts }), i(r.checks), b(r.kind == 'v'),
-                            b(r.has_triggers), b(false), b(false), b(false), b(true), s(replident), b(false), i(0),
+                            b(r.has_triggers), b(r.kind == 'p'), b(false), b(false), b(true), s(replident), b(r.ispart), i(0),
                             if r.kind == 'r' || r.kind == 'm' { s("744") } else { s("0") }, if r.kind == 'r' || r.kind == 'm' { s("1") } else { s("0") }, Value::Null, Value::Null, Value::Null,
                         ],
                     );

@@ -26,6 +26,8 @@ pub(crate) mod range;
 pub(crate) mod fts;
 pub(crate) mod composite;
 pub(crate) mod geo;
+pub(crate) mod partition;
+pub(crate) mod namespace;
 pub(crate) mod sequences;
 pub(crate) mod datetime;
 pub mod executor;

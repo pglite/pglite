@@ -1355,8 +1355,17 @@ impl Executor {
             if self.storage.objects.schemas.contains(&new) || new == "public" {
                 return Err(format!("schema \"{}\" already exists", new));
             }
-            self.storage.log_schema_op(SchemaOp::Schema { name, create: false });
-            self.storage.log_schema_op(SchemaOp::Schema { name: new, create: true });
+            let rels = self.relations_in_schema(&name);
+            self.storage.log_schema_op(SchemaOp::Schema { name: name.clone(), create: false });
+            self.storage.log_schema_op(SchemaOp::Schema { name: new.clone(), create: true });
+            // bảng của schema đổi tên nội bộ theo
+            for r in rels {
+                if self.storage.get_table(&r).is_some() {
+                    let short = crate::engine::frontend::decode_ident(&r).and_then(|d| d.split_once('.').map(|(_, n)| n.to_string())).unwrap_or_default();
+                    let to = crate::engine::namespace::internal_name(&new, &short);
+                    self.execute_statement(&format!("ALTER TABLE {} RENAME TO {}", r, to), &[])?;
+                }
+            }
         }
         Ok(done("ALTER SCHEMA"))
     }
@@ -1400,6 +1409,22 @@ impl Executor {
                     self.storage.log_schema_op(SchemaOp::EnumType { name: e, labels: None });
                 }
                 self.custom_constraints.clear();
+            }
+            // schema người dùng: bảng / view của nó (engine/namespace.rs)
+            if self.storage.objects.schemas.contains(&n) {
+                let rels = self.relations_in_schema(&n);
+                if !rels.is_empty() {
+                    if !cascade {
+                        return Err(format!("cannot drop schema {} because other objects depend on it", n));
+                    }
+                    let views: Vec<String> = rels.iter().filter(|r| self.storage.objects.views.contains_key(*r)).cloned().collect();
+                    self.drop_view_objects(&views)?;
+                    for r in rels {
+                        if self.storage.get_table(&r).is_some() {
+                            self.storage.drop_table(&r);
+                        }
+                    }
+                }
             }
             if self.storage.objects.schemas.contains(&n) || n == "public" {
                 self.storage.log_schema_op(SchemaOp::Schema { name: n, create: false });

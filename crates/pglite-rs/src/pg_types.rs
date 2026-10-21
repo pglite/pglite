@@ -876,6 +876,18 @@ pub fn sqlstate(message: &str) -> &'static str {
     if has("malformed range literal") || has("malformed multirange literal") {
         return "22P02";
     }
+    if has("would overlap partition") || has("empty range bound specified for partition") || has("conflicts with existing default partition") || has("is already a partition") {
+        return "42P17";
+    }
+    if has("no partition of relation") || has("violates partition constraint") || (has("partition constraint of relation") && has("is violated by some row")) {
+        return "23514";
+    }
+    if has("is not a partition of relation") {
+        return "42P01";
+    }
+    if has("\" is not partitioned") || has("is not partitioned") && has("table") {
+        return "42809";
+    }
     if has("prepared transactions are disabled") {
         return "55000";
     }
