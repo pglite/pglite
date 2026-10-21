@@ -64,6 +64,23 @@ fn type_column_name(t: &str) -> String {
 /// Tên cột mặc định PostgreSQL đặt cho một biểu thức trong SELECT.
 pub(crate) fn default_column_name(expr: &str) -> String {
     let mut s = expr.trim();
+    // `(x).trường` / `pg_record_field(x, 'trường', 'kiểu')`: tên trường
+    if s.starts_with('(') {
+        if let Some(close) = super::constraints::matching_paren(s, 0) {
+            let rest = &s[close + 1..];
+            if let Some(f) = rest.strip_prefix('.') {
+                if !f.is_empty() && f.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return f.to_lowercase();
+                }
+            }
+        }
+    }
+    if s.len() > 16 && s[..16].eq_ignore_ascii_case("pg_record_field(") {
+        let parts = super::executor::split_comma_separated_tokens(&s[16..s.len().saturating_sub(1)]);
+        if let Some(f) = parts.get(1) {
+            return f.trim().trim_matches('\'').to_string();
+        }
+    }
     while s.starts_with('(') && s.ends_with(')') && super::executor::is_fully_enclosed_pub(s) {
         let inner = s[1..s.len() - 1].trim();
         if super::executor::split_comma_separated_tokens(inner).len() > 1 {
@@ -134,7 +151,13 @@ pub(crate) fn default_column_name(expr: &str) -> String {
                 if tail.is_empty() || tail.starts_with("OVER") || tail.starts_with("FILTER") || tail.starts_with("WITHIN GROUP") {
                     let n = name.rsplit('.').next().unwrap_or(name).to_lowercase();
                     // hàm gộp hypothetical-set sau khi viết lại `rank(x) WITHIN GROUP (...)`
-                    return n.strip_prefix("pg_hyp_").map(str::to_string).unwrap_or(n);
+                    // hàm nội bộ thay cho cú pháp / toán tử: tên như PG
+                    return match n.as_str() {
+                        "pg_xmlelement" => "xmlelement".to_string(),
+                        "pg_distance" | "pg_range_op" | "pg_range_set" => "?column?".to_string(),
+                        "pg_range_in" | "pg_record_in" => default_column_name(&s[open + 1..close].rsplit(',').next().unwrap_or("").trim().trim_matches('\'')),
+                        _ => n.strip_prefix("pg_hyp_").map(str::to_string).unwrap_or(n),
+                    };
                 }
             }
         }

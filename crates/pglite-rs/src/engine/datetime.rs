@@ -271,6 +271,41 @@ fn frac_text(us: i64) -> String {
     }
 }
 
+/// Điểm thời gian cho biên của range: micro giây (date / timestamp: giờ treo tường; timestamptz: UTC);
+/// `infinity` → `i64::MAX`, `-infinity` → `i64::MIN`.
+pub(crate) fn range_point(s: &str, tz: bool) -> Option<i64> {
+    Some(match parse_ts(s)? {
+        TsVal::At(t) => {
+            if tz {
+                match t.offset {
+                    Some(o) => t.wall - o * US,
+                    None => t.wall - session_off_utc(t.wall) * US,
+                }
+            } else {
+                t.wall
+            }
+        }
+        TsVal::PosInf => i64::MAX,
+        TsVal::NegInf => i64::MIN,
+    })
+}
+
+/// Text của biên range: 0 = date, 1 = timestamp, 2 = timestamptz (theo múi giờ phiên).
+pub(crate) fn fmt_range_point(us: i64, kind: u8) -> String {
+    match us {
+        i64::MAX => "infinity".to_string(),
+        i64::MIN => "-infinity".to_string(),
+        _ => match kind {
+            0 => fmt_date(us),
+            1 => fmt_naive(us),
+            _ => fmt_pg_tz(us),
+        },
+    }
+}
+
+/// Một ngày tính bằng micro giây.
+pub(crate) const DAY_MICROS: i64 = DAY_US;
+
 /// `YYYY-MM-DD HH:MM:SS[.ffffff]` (giờ treo tường).
 pub(crate) fn fmt_naive(wall: i64) -> String {
     let (y, m, d, h, mi, s, f) = split_us(wall);

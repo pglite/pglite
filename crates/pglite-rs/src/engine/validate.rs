@@ -91,7 +91,9 @@ fn top_level_idents(clause: &str) -> Vec<String> {
                 let next = chars.get(k).copied();
                 let prev_cast = clause[..chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>()].trim_end().ends_with("::");
                 let star = i < n && chars[i] == '.'; // t.*
-                if depth == 0 && !prev_cast && !star && next != Some('(') && next != Some('\'') && !KEYWORDS.contains(&word.to_uppercase().as_str()) {
+                // `(x).trường`: truy cập trường của composite, không phải tên cột
+                let field_access = start >= 2 && chars[start - 1] == '.' && chars[start - 2] == ')';
+                if depth == 0 && !prev_cast && !star && !field_access && next != Some('(') && next != Some('\'') && !KEYWORDS.contains(&word.to_uppercase().as_str()) {
                     out.push(word);
                 }
             }
@@ -195,7 +197,11 @@ pub(crate) fn check_select_columns(sql: &str, storage: &StorageEngine) -> Result
                 let (inner, field) = (unquote(inner.trim()), field.trim());
                 if !field.is_empty() && field.chars().all(|c| is_ident_char(c)) {
                     if let Some(i) = table.get_column_index(&inner) {
-                        let ty = crate::engine::coltypes::column_decl(table, i).map(|d| d.sql_name()).unwrap_or_else(|| "text".to_string());
+                        let decl = crate::engine::coltypes::column_decl(table, i);
+                        if decl.as_ref().is_some_and(|d| crate::engine::composite::fields_of(&d.base).is_some()) {
+                            continue;
+                        }
+                        let ty = decl.map(|d| d.sql_name()).unwrap_or_else(|| "text".to_string());
                         return Err(format!("column notation .{} applied to type {}, which is not a composite type", unquote(field), ty));
                     }
                 }

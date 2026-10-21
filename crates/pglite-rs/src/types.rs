@@ -46,6 +46,8 @@ impl DataType {
             "DATE" => DataType::Date,
             "TIME" | "TIMETZ" => DataType::Time,
             "JSONB" | "JSON" => DataType::Jsonb,
+            // daterange / tsrange / int4multirange...: lưu như văn bản (không phải DATE)
+            b if b.ends_with("RANGE") => DataType::Text,
             _ => {
                 if upper.starts_with("UUID") {
                     DataType::Uuid

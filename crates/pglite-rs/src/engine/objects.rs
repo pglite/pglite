@@ -1594,8 +1594,32 @@ impl Executor {
         };
         let name = object_key(&rest[..as_pos]);
         let body = rest[as_pos + 2..].trim();
+        // kiểu composite `AS (a int, b text)` (engine/composite.rs)
+        if body.starts_with('(') {
+            let close = crate::engine::constraints::matching_paren(body, 0).ok_or("syntax error at end of input")?;
+            let mut fields: Vec<(String, String)> = Vec::new();
+            for item in split_comma_separated_tokens(&body[1..close]) {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let sp = item.find(char::is_whitespace).ok_or_else(|| format!("syntax error at or near \"{}\"", item))?;
+                let fname = item[..sp].trim_matches('"').to_lowercase();
+                if fields.iter().any(|(n, _)| *n == fname) {
+                    return Err(format!("column \"{}\" specified more than once", fname));
+                }
+                fields.push((fname, item[sp..].trim().to_lowercase()));
+            }
+            if self.type_name_taken(&name) {
+                return Err(format!("type \"{}\" already exists", name));
+            }
+            let json = serde_json::to_string(&fields).unwrap_or_default();
+            self.storage.log_schema_op(SchemaOp::ObjectMeta { kind: "composite".into(), name: name.clone(), value: Some(json) });
+            crate::engine::composite::set_session_types(&self.storage.objects.extra);
+            return Ok(done("CREATE TYPE"));
+        }
         let Some(list) = strip_kw(body, "ENUM").or_else(|| body.get(..4).filter(|p| p.eq_ignore_ascii_case("ENUM")).map(|_| body[4..].trim_start())) else {
-            let kind = if body.starts_with('(') { "composite types" } else if strip_kw(body, "RANGE").is_some() { "range types" } else { "this kind of type" };
+            let kind = if strip_kw(body, "RANGE").is_some() { "range types" } else { "this kind of type" };
             return Err(format!("CREATE TYPE for {} is not supported", kind));
         };
         let inner = list.trim();
@@ -1700,7 +1724,7 @@ impl Executor {
     /// Tên kiểu đã dùng: enum, domain, hoặc kiểu dựng sẵn.
     fn type_name_taken(&self, name: &str) -> bool {
         let o = &self.storage.objects;
-        o.enums.contains_key(name) || o.domains.contains_key(name) || crate::engine::coltypes::DeclType::parse(name).map_or(false, |d| d.oid().is_some())
+        o.enums.contains_key(name) || o.domains.contains_key(name) || o.extra.contains_key(&("composite".to_string(), name.to_string())) || crate::engine::coltypes::DeclType::parse(name).map_or(false, |d| d.oid().is_some())
     }
 
     // ---------------------------------------------------------------- DOMAIN
@@ -1887,7 +1911,8 @@ impl Executor {
     fn drop_types(&mut self, rest: &str) -> Result<QueryResult, String> {
         let (names, if_exists, cascade) = parse_drop_list(rest);
         for n in &names {
-            if !self.storage.objects.enums.contains_key(n) {
+            let composite = self.storage.objects.extra.contains_key(&("composite".to_string(), n.clone()));
+            if !self.storage.objects.enums.contains_key(n) && !composite {
                 if if_exists {
                     continue;
                 }
@@ -1906,8 +1931,11 @@ impl Executor {
         for n in names {
             if self.storage.objects.enums.contains_key(&n) {
                 self.storage.log_schema_op(SchemaOp::EnumType { name: n, labels: None });
+            } else if self.storage.objects.extra.contains_key(&("composite".to_string(), n.clone())) {
+                self.storage.log_schema_op(SchemaOp::ObjectMeta { kind: "composite".into(), name: n, value: None });
             }
         }
+        crate::engine::composite::set_session_types(&self.storage.objects.extra);
         Ok(done("DROP TYPE"))
     }
 

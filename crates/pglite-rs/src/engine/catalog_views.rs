@@ -441,6 +441,11 @@ impl Executor {
         for name in objects.domains.keys() {
             user_types.push((fresh(), name.clone(), 'd'));
         }
+        for ((kind, name), _) in objects.extra.iter() {
+            if kind == "composite" {
+                user_types.push((fresh(), name.clone(), 'c'));
+            }
+        }
         let schemas: Vec<(i64, String)> = objects.schemas.iter().map(|s| (fresh(), s.clone())).collect();
 
         let mut rels = Vec::new();
@@ -1035,7 +1040,7 @@ impl Executor {
                     vals[4] = i(if *kind == 'e' { 4 } else { -1 });
                     vals[5] = b(*kind == 'e');
                     vals[6] = s(kind.to_string());
-                    vals[7] = s(if *kind == 'e' { "E" } else { "S" });
+                    vals[7] = s(match kind { 'e' => "E", 'c' => "C", _ => "S" });
                     vals[8] = b(false);
                     vals[9] = b(true);
                     vals[10] = s(",");
@@ -1374,7 +1379,7 @@ impl Executor {
 }
 
 /// Biểu thức (vừa viết xong vào `out`, phần sau là `after`) là một mục trần của danh sách SELECT.
-fn bare_select_item(out: &str, after: &str) -> bool {
+pub(crate) fn bare_select_item(out: &str, after: &str) -> bool {
     let before = out.trim_end().to_ascii_lowercase();
     let after = after.trim_start();
     (before.ends_with("select") || before.ends_with(',')) && (after.is_empty() || after.starts_with(',') || after.starts_with("as ") || after.starts_with("from ") || after.starts_with(';'))

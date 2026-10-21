@@ -351,6 +351,20 @@ pub(crate) fn coerce_for_write(decl: Option<&DeclType>, v: Value) -> Value {
     if v.is_null() || d.array {
         return v;
     }
+    if crate::engine::composite::has_types() && crate::engine::composite::fields_of(&d.base).is_some() {
+        return match crate::engine::composite::coerce(&v, &d.base) {
+            Ok(x) => x,
+            Err(e) => {
+                crate::engine::errors::raise(e);
+                v
+            }
+        };
+    }
+    if d.base.ends_with("range") {
+        if let (Some((kind, multi)), Value::Text(t)) = (crate::engine::range::Kind::from_name(&d.base), &v) {
+            return crate::engine::range::call_range_fn("PG_RANGE_IN", &[Value::text(t.as_str()), Value::text(kind.type_name(multi))]).unwrap_or(v);
+        }
+    }
     match d.base.as_str() {
         // múi giờ phiên khác UTC: timestamptz → giờ địa phương khi ghi vào timestamp / date, và ngược lại
         "timestamp" | "timestamptz" | "date" if !crate::engine::datetime::session_is_utc() => {

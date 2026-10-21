@@ -50,6 +50,8 @@ pub struct Executor {
     pub(crate) deferred_checking: std::cell::Cell<bool>,
     /// Cursor, READ ONLY, SET LOCAL, LISTEN/NOTIFY, vùng đệm COPY (engine/session.rs).
     pub(crate) session: crate::engine::session::SessionState,
+    /// Có cột kiểu range không, cache theo (số DDL đã ghi, số bảng) (engine/range.rs).
+    range_cols: std::cell::Cell<Option<(u64, usize, bool)>>,
 }
 
 impl Executor {
@@ -68,6 +70,7 @@ impl Executor {
             constraint_modes: Vec::new(),
             deferred_checking: Default::default(),
             session: Default::default(),
+            range_cols: Default::default(),
         }
     }
 
@@ -85,6 +88,7 @@ impl Executor {
         // View / sequence độc lập / enum (engine/objects.rs): mở rộng câu lệnh trước mọi đường xử lý
         if self.storage.stmt_depth == 0 {
             crate::engine::objects::set_session_enums(&self.storage.objects.enums);
+            crate::engine::composite::set_session_types(&self.storage.objects.extra);
         }
         if self.has_expandable_objects() && !(self.storage.in_transaction && self.storage.tx_aborted) {
             if let Some(res) = self.view_dml(sql, params) {
@@ -374,7 +378,21 @@ impl Executor {
 
     pub(crate) fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = crate::engine::frontend::lex(sql)?;
-        let normalized_sql = normalize_named_sql_params(&clean_sql);
+        let mut normalized_sql = normalize_named_sql_params(&clean_sql);
+        // kiểu composite (engine/composite.rs): `x::kiểu`, `(x).trường`
+        if crate::engine::composite::has_types() && (normalized_sql.contains("::") || normalized_sql.contains(").")) {
+            let cols = self.composite_columns();
+            if let Some(r) = crate::engine::composite::rewrite(&normalized_sql, &|c: &str| cols.iter().find(|(n, _)| n.eq_ignore_ascii_case(c)).map(|(_, t)| t.clone())) {
+                normalized_sql = r;
+            }
+        }
+        // range / multirange (engine/range.rs): ép kiểu, toán tử, lower()/upper() trên range
+        if crate::engine::range::may_need(&normalized_sql, contains_ci(&normalized_sql, "range") || self.has_range_columns()) {
+            let cols = self.range_column_names();
+            if let Some(r) = crate::engine::range::rewrite(&normalized_sql, &|c: &str| cols.iter().any(|x| x.eq_ignore_ascii_case(c))) {
+                normalized_sql = r;
+            }
+        }
 
         let stmts = split_sql_statements(&normalized_sql);
         if stmts.len() > 1 {
@@ -5416,6 +5434,44 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     /// Tên bảng người dùng (bỏ bảng catalog ảo / bảng tạm nội bộ), đã sắp xếp.
+    /// Có bảng nào có cột khai báo kiểu range / multirange (cache theo DDL).
+    fn has_range_columns(&self) -> bool {
+        let key = (self.storage.wal.ddl_appended, self.storage.tables.len());
+        if let Some((d, n, v)) = self.range_cols.get() {
+            if (d, n) == key {
+                return v;
+            }
+        }
+        let v = !self.range_column_names().is_empty();
+        self.range_cols.set(Some((key.0, key.1, v)));
+        v
+    }
+
+    /// (cột, kiểu composite) của mọi bảng.
+    fn composite_columns(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for t in self.storage.tables.values() {
+            for (name, d) in &t.decl_types {
+                if !d.array && crate::engine::composite::fields_of(&d.base).is_some() {
+                    out.push((name.clone(), d.base.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    fn range_column_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in self.storage.tables.values() {
+            for (name, d) in &t.decl_types {
+                if !d.array && crate::engine::range::Kind::from_name(&d.base).is_some() {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn user_table_names_pub(&self) -> Vec<String> {
         self.user_table_names()
     }

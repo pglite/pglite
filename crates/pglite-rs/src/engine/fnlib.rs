@@ -15,7 +15,7 @@ use std::cell::Cell;
 
 /// Hàm do module này sở hữu hoàn toàn (đường biên dịch được phép chuyển thành `FuncCall`).
 pub(crate) fn is_known(name: &str) -> bool {
-    super::catalog_views::is_catalog_fn(name) || matches!(
+    super::catalog_views::is_catalog_fn(name) || super::range::is_range_fn(name) || super::fts::is_fts_fn(name) || super::composite::is_composite_fn(name) || super::geo::is_geo_fn(name) || matches!(
         name,
         "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "SIND" | "COSD" | "TAND" | "COTD" | "ASIND" | "ACOSD" | "ATAND"
             | "ATAN2D" | "SINH" | "COSH" | "TANH" | "ASINH" | "ACOSH" | "ATANH" | "DIV" | "GCD" | "LCM" | "FACTORIAL" | "WIDTH_BUCKET"
@@ -43,7 +43,7 @@ pub(crate) fn is_partial(name: &str) -> bool {
 
 /// Kiểu kết quả (tên kiểu PG) cho đường wire.
 pub(crate) fn result_type(name: &str) -> Option<&'static str> {
-    if let Some(t) = super::catalog_views::catalog_fn_type(name) {
+    if let Some(t) = super::catalog_views::catalog_fn_type(name).or_else(|| super::range::range_fn_type(name)).or_else(|| super::fts::fts_fn_type(name)).or_else(|| super::geo::geo_fn_type(name)) {
         return Some(t);
     }
     Some(match name {
@@ -467,6 +467,24 @@ fn size_pretty(bytes: f64) -> String {
 pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
     if super::catalog_views::is_catalog_fn(name) {
         return super::catalog_views::call_catalog_fn(name, args);
+    }
+    if super::range::is_range_fn(name) {
+        return super::range::call_range_fn(name, args);
+    }
+    if super::fts::is_fts_fn(name) {
+        return super::fts::call_fts_fn(name, args);
+    }
+    if super::composite::is_composite_fn(name) {
+        return super::composite::call_composite_fn(name, args);
+    }
+    if super::geo::is_geo_fn(name) {
+        return super::geo::call_geo_fn(name, args);
+    }
+    // `@@` của full-text search (cùng được viết lại thành pg_atat với jsonb @@ jsonpath)
+    if name == "PG_ATAT" && args.len() == 2 {
+        if let Some(v) = super::fts::atat(&args[0], &args[1]) {
+            return Some(v);
+        }
     }
     // hàm không phụ thuộc NULL ở đối số
     match name {

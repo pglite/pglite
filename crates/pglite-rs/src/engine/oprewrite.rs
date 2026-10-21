@@ -24,7 +24,7 @@
 /// Lọc nhanh, một lượt qua câu (chạy cho mọi câu lệnh): có `@` tiền tố, `|/`, hoặc một trong các từ
 /// khoá ISNULL, NOTNULL, SYMMETRIC, SIMILAR, ZONE, NORMALIZED.
 fn may_need(sql: &str) -> bool {
-    const WORDS: [&[u8]; 12] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS", b"TRIM", b"OVERLAY", b"JSON", b"WITHIN", b"LATERAL"];
+    const WORDS: [&[u8]; 13] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS", b"TRIM", b"OVERLAY", b"JSON", b"WITHIN", b"LATERAL", b"XMLELEMENT"];
     let b = sql.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -32,6 +32,7 @@ fn may_need(sql: &str) -> bool {
         if c == b'@' && !matches!(b.get(i + 1), Some(b'>' | b'@' | b'?')) || c == b'|' && b.get(i + 1) == Some(&b'/') || c == b'^' && b.get(i + 1) == Some(&b'@')
             || c == b'@' && matches!(b.get(i + 1), Some(b'@' | b'?'))
             || c == b'[' && b.get(i + 1) == Some(&b'\'')
+            || c == b'<' && b.get(i + 1) == Some(&b'-') && b.get(i + 2) == Some(&b'>')
         {
             return true;
         }
@@ -71,7 +72,7 @@ fn may_need(sql: &str) -> bool {
 }
 
 /// Mặt nạ "là code" theo byte: false trong chuỗi, định danh có nháy, thân `$$`.
-fn code_mask(s: &str) -> Vec<bool> {
+pub(crate) fn code_mask(s: &str) -> Vec<bool> {
     let b = s.as_bytes();
     let mut m = vec![true; b.len()];
     let mut i = 0;
@@ -130,7 +131,7 @@ fn find_kw(s: &str, m: &[bool], kw: &str, from: usize) -> Option<usize> {
 
 /// Toán hạng "primary" bắt đầu tại `i` (sau khoảng trắng): số, định danh (có dấu chấm) kèm `(...)`,
 /// `[...]`, ngoặc `(...)`, chuỗi `'...'`, có thể có dấu `-`/`+` đơn và chuỗi ép kiểu `::type`. Trả vị trí kết thúc.
-fn primary_end(s: &str, m: &[bool], mut i: usize) -> Option<usize> {
+pub(crate) fn primary_end(s: &str, m: &[bool], mut i: usize) -> Option<usize> {
     let b = s.as_bytes();
     while i < b.len() && b[i].is_ascii_whitespace() {
         i += 1;
@@ -183,7 +184,7 @@ fn primary_end(s: &str, m: &[bool], mut i: usize) -> Option<usize> {
 }
 
 /// Toán hạng primary kết thúc ngay trước `end` (bỏ khoảng trắng): trả vị trí bắt đầu.
-fn primary_start(s: &str, m: &[bool], end: usize) -> Option<usize> {
+pub(crate) fn primary_start(s: &str, m: &[bool], end: usize) -> Option<usize> {
     let b = s.as_bytes();
     let mut j = end;
     while j > 0 && b[j - 1].is_ascii_whitespace() {
@@ -664,6 +665,43 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         };
         s.replace_range(fs..close + 1, &rep);
         from = fs + rep.len();
+        changed = true;
+    }
+
+    // xmlelement(name x, ...) → pg_xmlelement('x', ...) (engine/geo.rs)
+    let mut from = 0;
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "XMLELEMENT", from) else { break };
+        from = p + 10;
+        let rest = &s[p + 10..];
+        let open = p + 10 + (rest.len() - rest.trim_start().len());
+        if s.as_bytes().get(open) != Some(&b'(') {
+            continue;
+        }
+        let inner = s[open + 1..].trim_start();
+        if inner.len() < 5 || !inner[..5].eq_ignore_ascii_case("name ") {
+            continue;
+        }
+        let name_start = open + 1 + (s[open + 1..].len() - inner.len()) + 5;
+        let tail = &s[name_start..];
+        let name_len = tail.trim_start().find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).unwrap_or(tail.trim_start().len());
+        let lead = tail.len() - tail.trim_start().len();
+        let tag = tail.trim_start()[..name_len].trim_matches('"').to_string();
+        let after = name_start + lead + name_len;
+        let rep = format!("pg_xmlelement('{}'", tag);
+        s.replace_range(p..after, &rep);
+        changed = true;
+    }
+
+    // a <-> b: khoảng cách (điểm, vector) — engine/geo.rs
+    loop {
+        let m = code_mask(&s);
+        let b = s.as_bytes();
+        let Some(i) = (0..b.len().saturating_sub(2)).find(|&i| m[i] && b[i] == b'<' && b[i + 1] == b'-' && b[i + 2] == b'>') else { break };
+        let (Some(a), Some(e)) = (primary_start(&s, &m, i), primary_end(&s, &m, i + 3)) else { break };
+        let rep = format!("pg_distance({}, {})", s[a..i].trim(), s[i + 3..e].trim());
+        s.replace_range(a..e, &rep);
         changed = true;
     }
 

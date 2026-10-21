@@ -870,6 +870,12 @@ pub fn sqlstate(message: &str) -> &'static str {
     if has("cursor \"") && has("is not positioned on a row") {
         return "24000";
     }
+    if has("range lower bound must be less than or equal to range upper bound") || has("would not be contiguous") || has("invalid range bound flags") {
+        return "22000";
+    }
+    if has("malformed range literal") || has("malformed multirange literal") {
+        return "22P02";
+    }
     if has("prepared transactions are disabled") {
         return "55000";
     }
