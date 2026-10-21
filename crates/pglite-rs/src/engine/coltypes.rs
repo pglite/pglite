@@ -1093,7 +1093,12 @@ pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Opti
                 }
                 "MIN" | "MAX" | "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" | "ABS" | "ROUND" | "TRUNC" | "FLOOR" | "CEIL" => {
                     let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
-                    let t = pg_typeof(args.first()?, col)?;
+                    // COALESCE / GREATEST / LEAST: kiểu của đối số đầu tiên biết được (vế đầu có thể là subquery)
+                    let t = if matches!(name, "COALESCE" | "GREATEST" | "LEAST") {
+                        args.iter().find_map(|a| pg_typeof(a, col).filter(|t| t != "unknown"))?
+                    } else {
+                        pg_typeof(args.first()?, col)?
+                    };
                     return Some(if matches!(name, "ROUND" | "TRUNC" | "FLOOR" | "CEIL") && t != "double precision" && t != "real" { "numeric".into() } else { t });
                 }
                 "DIV" | "GCD" | "LCM" => {

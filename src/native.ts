@@ -422,6 +422,25 @@ export class PGLiteNative {
     return this.transaction(callback, dbName);
   }
 
+  /** `COPY bảng [(cột, ...)] FROM STDIN [WITH (FORMAT csv, HEADER, ...)]` với dữ liệu text/CSV; trả số dòng đã ghi. */
+  public async copyFrom(sql: string, data: string, params?: any[]): Promise<number> {
+    await this.waitTurn();
+    if (!this.nativeInstance?.copyFrom) throw new Error("[PGLite] native addon does not support COPY FROM (rebuild pglite.node)");
+    return this.callNative(() => this.nativeInstance.copyFrom(sql, data, params));
+  }
+
+  /** `COPY {bảng | (truy vấn)} TO STDOUT [WITH (...)]`: trả dữ liệu text/CSV. */
+  public async copyTo(sql: string, params?: any[]): Promise<string> {
+    await this.waitTurn();
+    if (!this.nativeInstance?.copyTo) throw new Error("[PGLite] native addon does not support COPY TO (rebuild pglite.node)");
+    return this.callNative(() => this.nativeInstance.copyTo(sql, params));
+  }
+
+  /** Thông báo `NOTIFY` / `pg_notify` đã nhận trên các kênh đang `LISTEN` (lấy ra thì xoá). */
+  public notifications(): { channel: string; payload: string }[] {
+    return this.nativeInstance?.notifications ? this.nativeInstance.notifications() : [];
+  }
+
   public async flush(): Promise<void> {
     if (this.nativeInstance?.flush) {
       this.nativeInstance.flush();

@@ -48,6 +48,8 @@ pub struct Executor {
     pub(crate) constraint_modes: Vec<(Option<String>, bool)>,
     /// Đang kiểm tra lại ràng buộc hoãn (COMMIT / SET CONSTRAINTS IMMEDIATE): không hoãn nữa.
     pub(crate) deferred_checking: std::cell::Cell<bool>,
+    /// Cursor, READ ONLY, SET LOCAL, LISTEN/NOTIFY, vùng đệm COPY (engine/session.rs).
+    pub(crate) session: crate::engine::session::SessionState,
 }
 
 impl Executor {
@@ -65,6 +67,7 @@ impl Executor {
             deferred_pending: Default::default(),
             constraint_modes: Vec::new(),
             deferred_checking: Default::default(),
+            session: Default::default(),
         }
     }
 
@@ -198,6 +201,7 @@ impl Executor {
                     return Some(Err(e));
                 }
                 self.clear_deferred_state();
+                self.finish_tx(false);
                 self.plan_cache.clear();
                 Some(Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "ROLLBACK".to_string() }))
             }
@@ -440,6 +444,24 @@ impl Executor {
             return Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "SET CONSTRAINTS".to_string() });
         }
 
+        // cursor, LISTEN/NOTIFY, LOCK, SHOW ALL, PREPARE TRANSACTION (engine/session.rs); COPY (engine/copy.rs)
+        if let Some(res) = self.handle_session_extra(trimmed, &upper, params) {
+            return res;
+        }
+        self.read_only_gate(&upper)?;
+        if upper.starts_with("COPY ") || upper.starts_with("COPY(") {
+            return self.handle_copy(trimmed, params);
+        }
+        if self.session.has_cursors() && (upper.starts_with("UPDATE") || upper.starts_with("DELETE")) && upper.contains("WHERE CURRENT OF ") {
+            if let Some(r) = self.resolve_current_of(trimmed) {
+                return self.execute_statement(&r?, params);
+            }
+        }
+        if crate::engine::executor::contains_ci(trimmed, "pg_notify(") {
+            if let Some(r) = self.resolve_notify_calls(trimmed) {
+                return self.execute_statement(&r, params);
+            }
+        }
         if let Some(res) = self.handle_session_statement(trimmed, &upper) {
             return res;
         }
@@ -510,7 +532,11 @@ impl Executor {
         }
 
         if upper.starts_with("BEGIN") || upper.starts_with("START TRANSACTION") {
+            let fresh = !self.storage.in_transaction;
             self.storage.begin_transaction();
+            if fresh {
+                self.apply_tx_mode(&upper);
+            }
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -525,10 +551,15 @@ impl Executor {
                 let _ = self.storage.rollback();
                 self.plan_cache.clear();
                 self.clear_deferred_state();
+                self.finish_tx(false);
                 return Err(e);
             }
             self.clear_deferred_state();
+            let was_tx = self.storage.in_transaction;
             self.storage.commit()?;
+            if was_tx {
+                self.finish_tx(true);
+            }
             return Ok(QueryResult {
                 rows: vec![],
                 row_count: 0,
@@ -584,6 +615,7 @@ impl Executor {
             self.storage.rollback()?;
             if !self.storage.in_transaction {
                 self.clear_deferred_state();
+                self.finish_tx(false);
             }
             // DDL trong giao dịch đã được hoàn tác: kế hoạch đã cache có thể trỏ tới cột/bảng cũ
             self.plan_cache.clear();
@@ -821,6 +853,9 @@ impl Executor {
             return Ok(res);
         }
 
+        if upper.starts_with("EXPLAIN") && upper[7..].starts_with([' ', '(', '\n', '\t']) {
+            return self.handle_explain(trimmed, params);
+        }
         if upper.starts_with("MERGE ") {
             return self.handle_merge(trimmed, params);
         }
@@ -836,7 +871,7 @@ impl Executor {
             return self.handle_truncate(trimmed);
         }
 
-        Err(format!("Unsupported SQL statement: {}", sql))
+        Err(unsupported_statement_error(trimmed))
     }
 
     fn handle_truncate(&mut self, sql: &str) -> Result<QueryResult, String> {
@@ -3636,7 +3671,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         // hàm số học / ngày giờ lồng trong phép toán: bộ biên dịch JOIN tính sai (nút `Raw` ra
                         // true/false), để `eval_joined_scalar_expr` chuyển sang bộ đánh giá đầy đủ
                         let needs_full = expr_part.contains('(') && joined_needs_full_eval(expr_part, &expr_part.to_uppercase());
-                        let compiled = if slot.is_none() && !needs_full && !expr_part.to_uppercase().contains("SELECT") {
+                        // cột của LATERAL / subquery tương quan là giá trị phụ (extra) không có trong schema: bộ biên
+                        // dịch không đọc được, dùng bộ đánh giá đầy đủ
+                        let has_extras = joins.iter().any(|j| j.is_lateral);
+                        let compiled = if slot.is_none() && !needs_full && !has_extras && !expr_part.to_uppercase().contains("SELECT") {
                             let c = compile_expr_for_joined(expr_part, &joined_schema);
                             if !matches!(c, CompiledExpr::Raw(_)) {
                                 Some(c)
@@ -10674,7 +10712,8 @@ fn eval_joined_scalar_expr(
             return cast_json_val(val, &target_type);
         }
     }
-    if let Some(colon_pos) = t.rfind("::") {
+    // `::` ở cấp ngoài cùng (trước đây `rfind` cắt cả `coalesce(x, '[]'::json)` thành `coalesce(x, '[]'` :: `json)`)
+    if let Some(colon_pos) = find_last_top_level_op(t, "::").filter(|&p| cast_is_outermost(t, p)) {
         let target_expr = t[..colon_pos].trim();
         let target_type = t[colon_pos + 2..].trim().to_uppercase();
         let val = eval_joined_scalar_expr(target_expr, row, params, storage);
@@ -14363,6 +14402,29 @@ pub(crate) fn normalize_named_sql_params_pub(s: &str) -> String {
     normalize_named_sql_params(s)
 }
 
+pub(crate) fn split_top_level_and_pub(s: &str) -> Vec<&str> {
+    split_top_level_and(s)
+}
+
+/// Các nhóm `(...)` sau VALUES của một câu INSERT.
+pub(crate) fn extract_value_groups_pub(sql: &str) -> Vec<String> {
+    match find_top_level_keyword(sql, "VALUES") {
+        Some(p) => extract_value_groups(&sql[p + 6..]).into_iter().map(|g| g.to_string()).collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) fn extract_table_name_and_alias_pub(raw: &str) -> (String, Option<String>) {
+    let (t, a) = extract_table_name_and_alias(raw);
+    (clean_table_name(t).to_string(), a.map(|a| a.trim_matches('"').to_string()))
+}
+
+/// FROM: (bảng gốc, alias, subquery, [(bảng join, alias, điều kiện ON)]).
+pub(crate) fn parse_from_and_joins_pub(s: &str) -> Result<(String, Option<String>, Option<String>, Vec<(String, Option<String>, Option<String>)>), String> {
+    let (base, alias, sub, joins) = parse_from_and_joins(s)?;
+    Ok((base, alias, sub, joins.into_iter().map(|j| (j.table_name, j.alias, j.on_condition)).collect()))
+}
+
 pub(crate) fn contains_ci_pub(s: &str, pat: &str) -> bool {
     contains_ci(s, pat)
 }
@@ -17151,7 +17213,35 @@ pub(crate) fn set_raw_text_mode(on: bool) -> bool {
 }
 
 #[inline(always)]
-fn raw_text_mode() -> bool {
+/// Lệnh không xử lý được: lệnh hợp lệ của PostgreSQL mà engine chưa hỗ trợ → `feature not supported` (0A000);
+/// từ khoá lạ → lỗi cú pháp như PG (42601).
+fn unsupported_statement_error(sql: &str) -> String {
+    const PG_COMMANDS: &[&str] = &[
+        "ABORT", "ALTER", "ANALYZE", "BEGIN", "CALL", "CHECKPOINT", "CLOSE", "CLUSTER", "COMMENT", "COMMIT", "COPY", "CREATE",
+        "DEALLOCATE", "DECLARE", "DELETE", "DISCARD", "DO", "DROP", "END", "EXECUTE", "EXPLAIN", "FETCH", "GRANT", "IMPORT",
+        "INSERT", "LISTEN", "LOAD", "LOCK", "MERGE", "MOVE", "NOTIFY", "PREPARE", "REASSIGN", "REFRESH", "REINDEX", "RELEASE",
+        "RESET", "REVOKE", "ROLLBACK", "SAVEPOINT", "SECURITY", "SELECT", "SET", "SHOW", "START", "TABLE", "TRUNCATE",
+        "UNLISTEN", "UPDATE", "VACUUM", "VALUES", "WITH",
+    ];
+    let first = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ';').next().unwrap_or("");
+    if PG_COMMANDS.iter().any(|k| k.eq_ignore_ascii_case(first)) {
+        let words: Vec<&str> = sql.split_whitespace().take(3).collect();
+        let n = if matches!(first.to_ascii_uppercase().as_str(), "CREATE" | "DROP" | "ALTER") {
+            if words.get(1).is_some_and(|w| w.eq_ignore_ascii_case("OR")) { 3 } else { 2 }
+        } else {
+            1
+        };
+        let mut cmd = words.iter().take(n).map(|w| w.to_ascii_uppercase()).collect::<Vec<_>>().join(" ");
+        if n == 3 {
+            cmd = format!("CREATE {}", sql.split_whitespace().nth(3).unwrap_or("").to_ascii_uppercase());
+        }
+        format!("feature not supported: {} is not supported (Unsupported SQL statement: {})", cmd, sql)
+    } else {
+        format!("syntax error at or near \"{}\"", first)
+    }
+}
+
+pub(crate) fn raw_text_mode() -> bool {
     RAW_TEXT_MODE.with(|m| m.get())
 }
 

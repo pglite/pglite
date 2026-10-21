@@ -101,6 +101,29 @@ impl LitePostgresNative {
         parse_fn.call(None, &[js_str.into_unknown()])
     }
 
+    /// `COPY ... FROM STDIN` với dữ liệu text/CSV; trả số dòng đã ghi.
+    #[napi]
+    pub fn copy_from(&self, sql: String, data: String, params: Option<Vec<serde_json::Value>>) -> Result<u32> {
+        let rust_params = convert_params(params);
+        let mut exec = self.executor.lock();
+        exec.copy_from(&sql, &data, &rust_params).map(|n| n as u32).map_err(Error::from_reason)
+    }
+
+    /// `COPY ... TO STDOUT`: trả dữ liệu text/CSV.
+    #[napi]
+    pub fn copy_to(&self, sql: String, params: Option<Vec<serde_json::Value>>) -> Result<String> {
+        let rust_params = convert_params(params);
+        let mut exec = self.executor.lock();
+        exec.copy_to(&sql, &rust_params).map_err(Error::from_reason)
+    }
+
+    /// Thông báo LISTEN/NOTIFY đã nhận: `[{ channel, payload }]` (lấy ra thì xoá).
+    #[napi]
+    pub fn notifications(&self) -> Result<Vec<serde_json::Value>> {
+        let mut exec = self.executor.lock();
+        Ok(exec.take_notifications().into_iter().map(|(c, p)| serde_json::json!({ "channel": c, "payload": p })).collect())
+    }
+
     #[napi]
     pub fn flush(&self) -> Result<()> {
         let mut exec = self.executor.lock();

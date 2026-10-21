@@ -124,7 +124,7 @@ fn is_volatile(sql: &str) -> bool {
         "now()", "current_timestamp", "current_time", "current_date", "localtime", "clock_timestamp", "statement_timestamp",
         "transaction_timestamp", "timeofday", "random", "uuid", "gen_salt", "crypt(", "pg_backend_pid", "txid_current", "xact_id",
         "pg_postmaster", "version()", "created", "t.*", "to_json(t)", "to_jsonb(t)", "row_to_json", "json_agg(t)", "jsonb_agg(t)",
-        "pg_stat_activity", "tablesample", "size", "inet_server", "pg_sleep",
+        "pg_stat_activity", "tablesample", "size", "inet_server", "pg_sleep", "explain",
     ]
     .iter()
     .any(|k| s.contains(k))

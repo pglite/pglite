@@ -90,6 +90,27 @@ impl PGliteWasm {
         to_js_value(&parsed)
     }
 
+    /// `COPY ... FROM STDIN` với dữ liệu text/CSV; trả số dòng đã ghi.
+    #[wasm_bindgen(js_name = copyFrom)]
+    pub fn copy_from(&mut self, sql: &str, data: &str, params: JsValue) -> Result<u32, JsValue> {
+        let rust_params = parse_params(params)?;
+        self.executor.copy_from(sql, data, &rust_params).map(|n| n as u32).map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// `COPY ... TO STDOUT`: trả dữ liệu text/CSV.
+    #[wasm_bindgen(js_name = copyTo)]
+    pub fn copy_to(&mut self, sql: &str, params: JsValue) -> Result<String, JsValue> {
+        let rust_params = parse_params(params)?;
+        self.executor.copy_to(sql, &rust_params).map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Thông báo LISTEN/NOTIFY đã nhận: `[{ channel, payload }]` (lấy ra thì xoá).
+    #[wasm_bindgen]
+    pub fn notifications(&mut self) -> Result<JsValue, JsValue> {
+        let list: Vec<serde_json::Value> = self.executor.take_notifications().into_iter().map(|(c, p)| json!({ "channel": c, "payload": p })).collect();
+        to_js_value(&list)
+    }
+
     #[wasm_bindgen]
     pub fn flush(&mut self) {
         let _ = self.executor.storage.flush();

@@ -150,8 +150,16 @@ fn substitute_excluded(expr: &str, columns: &[crate::types::ColumnDef], base: us
             i += 1;
             continue;
         }
-        if !sq && i + 9 <= bytes.len() && expr.get(i..i + 9).map_or(false, |x| x.eq_ignore_ascii_case("excluded.")) && (i == 0 || !(ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.')) {
-            let start = i + 9;
+        // `excluded.cột` và dạng có nháy `"excluded"."cột"` (ORM như Drizzle sinh ra)
+        let pre = if !sq && i + 9 <= bytes.len() && expr.get(i..i + 9).map_or(false, |x| x.eq_ignore_ascii_case("excluded.")) {
+            9
+        } else if !sq && i + 11 <= bytes.len() && expr.get(i..i + 11).map_or(false, |x| x.eq_ignore_ascii_case("\"excluded\".")) {
+            11
+        } else {
+            0
+        };
+        if pre > 0 && (i == 0 || !(ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.')) {
+            let start = i + pre;
             let (name, end) = if bytes.get(start) == Some(&b'"') {
                 let close = expr[start + 1..].find('"').map(|p| start + 1 + p).unwrap_or(bytes.len() - 1);
                 (expr[start + 1..close].to_string(), close + 1)

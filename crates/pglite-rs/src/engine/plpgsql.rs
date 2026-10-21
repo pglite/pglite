@@ -1496,7 +1496,11 @@ impl Executor {
     pub(crate) fn setting_value(&self, name: &str) -> Option<String> {
         let name = if name == "time zone" { "timezone" } else { name };
         self.settings.get(name).cloned().or_else(|| {
-            if name == "timezone" { Some(crate::engine::executor::default_tz().to_string()) } else { default_setting(name).map(|v| v.to_string()) }
+            if name == "timezone" {
+                Some(crate::engine::executor::default_tz().to_string())
+            } else {
+                default_setting(name).or_else(|| crate::engine::session::pg_default_setting(name)).map(|v| v.to_string())
+            }
         })
     }
 
@@ -1668,18 +1672,30 @@ impl Executor {
                 Some(Err(format!("extension \"{}\" is not available", name)))
             };
         }
-        if upper.starts_with("DROP EXTENSION") || upper.starts_with("COMMENT ON EXTENSION") || upper.starts_with("DISCARD") || upper.starts_with("LISTEN") || upper.starts_with("UNLISTEN") || upper.starts_with("NOTIFY") {
+        if upper.starts_with("DROP EXTENSION") || upper.starts_with("COMMENT ON EXTENSION") || upper.starts_with("DISCARD") {
             return ok(upper.split_whitespace().next().unwrap_or(""));
         }
         if upper.starts_with("SET ") {
             let mut rest = sql[4..].trim();
+            let mut local = false;
             for kw in ["SESSION ", "LOCAL "] {
                 if rest.to_uppercase().starts_with(kw) {
+                    local |= kw == "LOCAL ";
                     rest = rest[kw.len()..].trim();
                 }
             }
             let up = rest.to_uppercase();
-            if up.starts_with("TRANSACTION") || up.starts_with("CHARACTERISTICS") || up.starts_with("CONSTRAINTS") || up.starts_with("ROLE") || up.starts_with("SESSION AUTHORIZATION") {
+            if up.starts_with("TRANSACTION") {
+                if self.storage.in_transaction {
+                    self.apply_tx_mode(&up);
+                }
+                return ok("SET");
+            }
+            if up.starts_with("CHARACTERISTICS") || up.starts_with("CONSTRAINTS") || up.starts_with("ROLE") || up.starts_with("SESSION AUTHORIZATION") {
+                return ok("SET");
+            }
+            // SET LOCAL ngoài giao dịch: PG chỉ cảnh báo, không có tác dụng
+            if local && !self.storage.in_transaction {
                 return ok("SET");
             }
             let (name, value) = if up.starts_with("TIME ZONE") {
@@ -1726,6 +1742,9 @@ impl Executor {
                     return Some(Err(format!("invalid value for parameter \"TimeZone\": \"{}\"", raw)));
                 }
             }
+            if local {
+                self.remember_local_setting(&name);
+            }
             if value.eq_ignore_ascii_case("DEFAULT") {
                 self.settings.remove(&name);
             } else {
@@ -1745,15 +1764,18 @@ impl Executor {
         if upper.starts_with("SHOW ") {
             let name = sql[5..].trim().trim_matches('"').to_lowercase();
             let name = if name == "time zone" { "timezone".to_string() } else { name };
-            if name == "all" {
-                return Some(Err("SHOW ALL is not supported".to_string()));
-            }
             let value = self.setting_value(&name);
+            // đường wire: tên cột theo PG (`TimeZone`, `DateStyle`); JSON giữ khoá viết thường như cũ
+            let col = if crate::engine::executor::raw_text_mode() {
+                crate::engine::session::canonical_setting_name(&name).map(|n| n.to_string()).unwrap_or_else(|| name.clone())
+            } else {
+                name.clone()
+            };
             return Some(match value {
                 Some(v) => Ok(QueryResult {
-                    rows: vec![serde_json::json!({ name.clone(): v })],
+                    rows: vec![serde_json::json!({ col.clone(): v })],
                     row_count: 1,
-                    fields: vec![crate::types::FieldInfo { name, data_type: "text".to_string() }],
+                    fields: vec![crate::types::FieldInfo { name: col, data_type: "text".to_string() }],
                     command: "SHOW".to_string(),
                 }),
                 None => Err(format!("unrecognized configuration parameter \"{}\"", name)),

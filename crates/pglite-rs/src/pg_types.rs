@@ -854,6 +854,28 @@ pub fn sqlstate(message: &str) -> &'static str {
     if message.starts_with("raise: ") {
         return "P0001";
     }
+    // lệnh không hỗ trợ (executor `unsupported_statement_error`): thông điệp chứa nguyên câu SQL, xét trước
+    if message.starts_with("feature not supported: ") {
+        return "0A000";
+    }
+    if message.starts_with("syntax error at or near ") {
+        return "42601";
+    }
+    if has("cursor \"") && has("does not exist") {
+        return "34000";
+    }
+    if has("cursor \"") && has("already exists") {
+        return "42P03";
+    }
+    if has("cursor \"") && has("is not positioned on a row") {
+        return "24000";
+    }
+    if has("prepared transactions are disabled") {
+        return "55000";
+    }
+    if has("prepared transaction with identifier") {
+        return "42704";
+    }
     if has("unrecognized configuration parameter") {
         return "42704";
     }

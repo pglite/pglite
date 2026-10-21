@@ -1211,3 +1211,31 @@
 {"id":"W12_20","ok":true,"fields":["v"],"rows":[["2.25"]]}
 {"id":"W12_21","ok":true,"fields":["c","d"],"rows":[["3","3"]]}
 {"id":"W12_22","ok":true,"fields":["a","b","c"],"rows":[["hello world","hello bob","hello x"]]}
+{"id":"W13_01","ok":true,"fields":["id","name"],"rows":[["1","alice"],["2","bob"]]}
+{"id":"W13_02","ok":true,"fields":["id"],"rows":[["2"]]}
+{"id":"W13_03","ok":true,"fields":["id"],"rows":[["1"]]}
+{"id":"W13_04","ok":true,"fields":["id"],"rows":[["1"]]}
+{"id":"W13_05","ok":true,"fields":["id","name"],"rows":[["1","cur"],["2","bob"],["3","carol"]]}
+{"id":"W13_06","ok":false,"error":"cursor \"nope\" does not exist","sqlstate":"34000","failed_stmt":0}
+{"id":"W13_07","ok":false,"fields":[],"rows":[],"error":"cursor \"c\" already exists","sqlstate":"42P03","failed_stmt":2}
+{"id":"W13_08","ok":true,"fields":["id"],"rows":[["1"],["2"],["3"]]}
+{"id":"W13_09","ok":false,"fields":[],"rows":[],"error":"cursor \"c\" does not exist","sqlstate":"34000","failed_stmt":3}
+{"id":"W13_10","ok":false,"fields":[],"rows":[],"error":"cannot execute UPDATE in a read-only transaction","sqlstate":"25006","failed_stmt":1}
+{"id":"W13_11","ok":false,"fields":[],"rows":[],"error":"cannot execute DELETE in a read-only transaction","sqlstate":"25006","failed_stmt":2}
+{"id":"W13_12","ok":true,"fields":["c"],"rows":[["4"]]}
+{"id":"W13_13","ok":false,"fields":[],"rows":[],"error":"cannot execute CREATE TABLE in a read-only transaction","sqlstate":"25006","failed_stmt":1}
+{"id":"W13_14","ok":true,"fields":["c"],"rows":[["3"]]}
+{"id":"W13_15","ok":false,"fields":[],"rows":[],"error":"relation \"nope\" does not exist","sqlstate":"42P01","failed_stmt":1}
+{"id":"W13_16","ok":true,"fields":["work_mem"],"rows":[["8MB"]]}
+{"id":"W13_17","ok":true,"fields":["work_mem"],"rows":[["4MB"]]}
+{"id":"W13_18","ok":true,"fields":["DateStyle"],"rows":[["ISO, MDY"]]}
+{"id":"W13_19","ok":true,"fields":["w"],"rows":[["4MB"]]}
+{"id":"W13_20","ok":false,"fields":[],"rows":[],"error":"prepared transactions are disabled","sqlstate":"55000","failed_stmt":1}
+{"id":"W13_21","ok":false,"error":"prepared transaction with identifier \"nope\" does not exist","sqlstate":"42704","failed_stmt":0}
+{"id":"W13_22","ok":false,"error":"syntax error at or near \"FOO\"","sqlstate":"42601","failed_stmt":0}
+{"id":"W13_23","ok":true,"fields":[],"rows":[]}
+{"id":"W13_24","ok":true,"fields":[],"rows":[]}
+{"id":"W13_25","ok":true,"fields":["QUERY PLAN"],"rows":[["Seq Scan on t  (cost=0.00..15.20 rows=520 width=129)"]]}
+{"id":"W13_26","ok":true,"fields":["QUERY PLAN"],"rows":[["Index Scan using t_pkey on t"],["  Index Cond: (id = 1)"]]}
+{"id":"W13_27","ok":true,"fields":["QUERY PLAN"],"rows":[["[\n  {\n    \"Plan\": {\n      \"Node Type\": \"Seq Scan\",\n      \"Parallel Aware\": false,\n      \"Async Capable\": false,\n      \"Relation Name\": \"t\",\n      \"Alias\": \"t\",\n      \"Startup Cost\": 0.00,\n      \"Total Cost\": 15.20,\n      \"Plan Rows\": 520,\n      \"Plan Width\": 129,\n      \"Disabled\": false\n    }\n  }\n]"]]}
+{"id":"W13_28","ok":true,"fields":["QUERY PLAN"],"rows":[["Aggregate  (cost=16.50..16.51 rows=1 width=8) (actual time=0.035..0.037 rows=1.00 loops=1)"],["  Buffers: shared hit=1"],["  ->  Seq Scan on t  (cost=0.00..15.20 rows=520 width=0) (actual time=0.025..0.028 rows=3.00 loops=1)"],["        Buffers: shared hit=1"],["Planning:"],["  Buffers: shared hit=2 read=1"],["Planning Time: 0.035 ms"],["Execution Time: 0.108 ms"]]}

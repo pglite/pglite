@@ -240,6 +240,23 @@ impl PGlite {
         self.executor.storage.wal.has_pending()
     }
 
+    /// `COPY bảng [(cột, ...)] FROM STDIN [WITH (FORMAT csv, HEADER, ...)]` với dữ liệu `data`.
+    /// Trả số dòng đã ghi.
+    pub fn copy_from(&mut self, sql: &str, data: &str) -> Result<usize, String> {
+        self.executor.copy_from(sql, data, &[])
+    }
+
+    /// `COPY {bảng | (truy vấn)} TO STDOUT [WITH (...)]`: trả dữ liệu dạng text/CSV.
+    pub fn copy_to(&mut self, sql: &str) -> Result<String, String> {
+        self.executor.copy_to(sql, &[])
+    }
+
+    /// Thông báo `NOTIFY` / `pg_notify` đã nhận trên các kênh phiên đang `LISTEN`: (kênh, nội dung).
+    /// Lấy ra thì hàng đợi được xoá.
+    pub fn take_notifications(&mut self) -> Vec<(String, String)> {
+        self.executor.take_notifications()
+    }
+
     /// Get the database filepath.
     pub fn filepath(&self) -> &str {
         &self.filepath
