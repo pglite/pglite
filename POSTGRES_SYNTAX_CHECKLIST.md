@@ -21,12 +21,13 @@ chỉ được co lại). Dòng nào mọi probe đã khớp được đánh d�
 | Mục 4 (SELECT) | `b4d5b02` | 547 / 959 | 20 (không đổi) | VALUES, TABLE, SELECT INTO / CTAS, FROM ONLY, FETCH ... WITH TIES, GROUPING SETS/ROLLUP/CUBE, biểu thức trên aggregate (sửa `count(*)` ở mục 0); +22 case `W4_*` |
 | Mục 18.3 (ngày giờ) | `c6cadf5` | 613 / 993 | 20 (không đổi) | múi giờ phiên +7, toàn bộ hàm ngày giờ, generate_series/unnest trong FROM, sửa WHERE với `now() - interval` / `::date`, plan cache trả mảng cũ dạng chuỗi; +35 case `W5_*` |
 | Zalo-1054 + lỗi WAIKI (lần 1–2) | `ac748b0` | 666 / 1034 | 20 (không đổi) | regex (`regexp_*`), `format()`, `ANY(mảng)` trong JOIN / subquery, subquery tương quan trong SELECT / UPDATE SET / INSERT VALUES, `DEFAULT nextval(...)` + `setval`/`nextval`/`pg_get_serial_sequence` (sequence gắn với cột), `udt_name` mảng, PL/pgSQL có biến / vòng lặp / `EXECUTE format()`, `CREATE TEMP TABLE` (không xuống WAL), `GRANT`/`REVOKE` no-op, `pg_namespace`, GREATEST/LEAST và phép toán trong JOIN, self-join; +27 `ZA_*`, +14 `BG_*` |
-| Lỗi db-rs (lần 3–5) + P0 | chưa commit | 706 / 1058 | 20 (không đổi) | `$n` trong SELECT qua plan cache, `CASE`/`CAST` quanh GREATEST trong JOIN, ép kiểu hàm gộp trong JOIN, `LIMIT` + nhiều bảng, `EXISTS` tương quan trong JOIN, `current_setting`/`set_config`, `::text` của numeric(p,s)/jsonb, JSON mặc định không đoán sai jsonb / `::text` / chuỗi `{...}` không phải mảng; P0: `GENERATED AS IDENTITY` (`SchemaOp::ColumnIdentity` thêm cuối enum, bản cũ bỏ qua), `version()`/`current_database()`/`current_user`..., `jsonb - key`/`#- path`, cả dòng `json_agg(t)`/`to_json(t)`; +11 `BG_*`, +13 `W6_*` |
+| Lỗi db-rs (lần 3–5) + P0 | `f53bc65` | 706 / 1058 | 20 (không đổi) | `$n` trong SELECT qua plan cache, `CASE`/`CAST` quanh GREATEST trong JOIN, ép kiểu hàm gộp trong JOIN, `LIMIT` + nhiều bảng, `EXISTS` tương quan trong JOIN, `current_setting`/`set_config`, `::text` của numeric(p,s)/jsonb, JSON mặc định không đoán sai jsonb / `::text` / chuỗi `{...}` không phải mảng; P0: `GENERATED AS IDENTITY` (`SchemaOp::ColumnIdentity` thêm cuối enum, bản cũ bỏ qua), `version()`/`current_database()`/`current_user`..., `jsonb - key`/`#- path`, cả dòng `json_agg(t)`/`to_json(t)`; +11 `BG_*`, +13 `W6_*` |
+| P1 không cần metadata (đợt 7) | chưa commit | 758 / 1079 | 20 (không đổi) | cột trùng tên qua JOIN (wire), `information_schema.tables`/`pg_tables` lọc + đúng cột, `UPDATE SET (a, b) = (...)`, `NATURAL JOIN`, `json[b]_object_agg`, `jsonb_each`/`jsonb_array_elements`/`jsonb_object_keys` trong FROM, `ANALYZE`/`VACUUM`/`CHECKPOINT`, `PREPARE`/`EXECUTE`/`DEALLOCATE`; sửa 3 lỗi ghi sai dữ liệu có sẵn: subquery không tương quan trong `UPDATE SET` (ghi `false`), `UPDATE ... FROM` (ghi NULL), `ON CONFLICT DO UPDATE SET` (ghi nguyên văn); jsonb chuỗi vô hướng qua `SELECT *` trên wire mất nháy |
 
 Số golden ở bảng là kết quả của `cargo test --test pg_golden_test`. Script `checklist_status.py` in một con số thấp hơn
 (407/921 sau đợt 2b, 444/937 sau mục 3, 551/993 sau 18.3) vì không tính các case chỉ so được hình dạng (thời gian thực, ngẫu nhiên).
 
-Tổng hợp theo mục (cập nhật 2026-10-21, sau đợt lỗi db-rs + P0): **217 dòng xong / 118 dòng còn lại** (tính cả dòng con).
+Tổng hợp theo mục (cập nhật 2026-10-21, sau đợt 7 — P1 không cần metadata): **227 dòng xong / 108 dòng còn lại** (tính cả dòng con).
 
 | Mục | Xong | Còn | | Mục | Xong | Còn |
 |---|---|---|---|---|---|---|
@@ -91,9 +92,9 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 
 ## 0. Vấn đề xuyên suốt (nên sửa trước)
 
-- [ ] 🟡 **P0** Hàm/biểu thức chưa hỗ trợ bị **trả nguyên văn dạng chuỗi** thay vì báo lỗi `42883`/`42703`. Ví dụ `SELECT nope FROM t` → `"nope"`; `regexp_replace(...)`, `format(...)`, `to_date(...)` trả lại chính câu chữ. (`ERR03`, `STR11`, `X02`) — cột không tồn tại đã báo `42703`; hàm không tồn tại (`42883`) làm sau đợt 5 — các ví dụ đã có hàm thật (regex, `format`, `to_date`); hàm chưa hỗ trợ khác (vd. `regexp_instr`) vẫn trả nguyên văn
+- [ ] 🟡 **P0** Hàm/biểu thức chưa hỗ trợ bị **trả nguyên văn dạng chuỗi** thay vì báo lỗi `42883`/`42703`. Ví dụ `SELECT nope FROM t` → `"nope"`; `regexp_replace(...)`, `format(...)`, `to_date(...)` trả lại chính câu chữ. (`ERR03`, `STR11`, `X02`) — cột không tồn tại đã báo `42703`; hàm không tồn tại (`42883`) làm sau đợt 5 — các ví dụ đã có hàm thật (regex, `format`, `to_date`); hàm chưa hỗ trợ khác (vd. `regexp_instr`) vẫn trả nguyên văn — khớp PG
 - [x] ✅ **P0** Cột không tồn tại trong `WHERE` bị bỏ qua, trả 0 dòng mà không báo lỗi. (`ERR09`) — khớp PG
-- [ ] 🟡 **P0** `SELECT a.name, b.name` hoặc `SELECT *` qua JOIN **mất cột trùng tên**. PG giữ cả hai cột. (`X10`, `J10`, `S41`, `J15`, `J17`, `J19`)
+- [x] ✅ **P0** `SELECT a.name, b.name` hoặc `SELECT *` qua JOIN **mất cột trùng tên**. PG giữ cả hai cột. (`X10`, `J10`, `S41`, `J15`, `J17`, `J19`) — khớp PG trên đường wire (alias tạm rồi trả tên gốc); kết quả JSON là object theo tên cột nên giữ hành vi cũ (cột sau đè cột trước, như node-postgres)
 - [x] ✅ **P0** `'abc'::int` trả `NULL` thay vì lỗi `22P02`. (`ERR10`) — khớp PG
 - [x] ✅ **P0** Chia số nguyên: `7 / 2` → `3`, `-7 / 2` → `-3` như PG (literal nguyên, cột INT/BIGINT/SMALLINT, `::int`, `count()`); cột NUMERIC vẫn chia thực (`F08`, `F08b`, `W2_01`, `W2_15`, `W2_16`) — khớp PG
 - [x] ✅ **P0** `1/0` không báo lỗi `22012`, kể cả trong transaction. (`ERR05`, `X15`) — khớp PG
@@ -245,8 +246,8 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 
 - [x] ✅ `[INNER] JOIN`, `LEFT [OUTER]`, `RIGHT [OUTER]`, `FULL [OUTER]`, `CROSS` (`J01`–`J07`, `J05b`, `J06b`)
 - [x] ✅ `JOIN ... USING (col)` (`J08`)
-- [ ] ❌ P2 `NATURAL JOIN` (`J09`)
-- [ ] 🟡 P0 Self-join chọn cột trùng tên (`a.name, b.name`) bị mất cột (`J10`, `X10`)
+- [x] ✅ P2 `NATURAL JOIN` (`J09`, `W7_07`) — khớp PG (viết lại thành `JOIN ... USING (cột chung)`)
+- [x] ✅ P0 Self-join chọn cột trùng tên (`a.name, b.name`) bị mất cột (`J10`, `X10`) — khớp PG
 - [x] ✅ JOIN với derived table, `LEFT JOIN LATERAL (...)`, 3+ bảng, điều kiện ON phức hợp, anti-join (`J11`–`J15`, `J13b`)
 - [ ] ❌ P2 `LATERAL` với hàm trả tập (`J20`)
 - [ ] 🟡 P2 JOIN trong ngoặc `FROM (a JOIN b ON ...)` chỉ trả cột bảng đầu (`J16`)
@@ -267,7 +268,7 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ `json_agg(col)`, `jsonb_agg(col)` (`A04b`)
 - [x] ✅ P0 `json_agg(t)` với cả dòng, kể cả theo alias `json_agg(x) FROM t x` (`A04`, `W6_01`–`W6_03`) — khớp PG (trong JOIN: chưa)
 - [x] ✅ P1 `json_agg(t ORDER BY ...)` (`X11`, `W6_02`) — khớp PG (`X11` chỉ khác giá trị `now()` của cột `created`)
-- [ ] ❌ P1 `json_object_agg`, `jsonb_object_agg` (`A05`)
+- [x] ✅ P1 `json_object_agg`, `jsonb_object_agg` (`A05`) — khớp PG
 - [x] ✅ `bool_and`, `bool_or`, `every` (`A06`)
 - [x] ✅ `agg(...) FILTER (WHERE ...)` (`A08`)
 - [ ] 🟡 P2 `bit_and`, `bit_or` (`A07`)
@@ -302,8 +303,8 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ `SET a = expr WHERE`, `RETURNING`, alias, `jsonb_set` (`U01`, `U02`, `U07`, `U09`)
 - [x] ✅ `UPDATE ... FROM`, `WITH ... UPDATE ... FROM` (`U05`, `U08`)
 - [x] ✅ `SET col = DEFAULT` (`U06`)
-- [ ] ❌ P1 `SET (a, b) = (v1, v2)` (`U03`)
-- [ ] ❌ P2 `SET (a, b) = (SELECT ...)` (`U04`)
+- [x] ✅ P1 `SET (a, b) = (v1, v2)` (`U03`) — khớp PG
+- [x] ✅ P2 `SET (a, b) = (SELECT ...)` (`U04`) — khớp PG
 - [ ] ❌ P2 `SET arr[1] = ...` (`U10`)
 - [ ] ⬜ P3 `WHERE CURRENT OF cursor`
 
@@ -410,8 +411,8 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ `LISTEN`, `NOTIFY`, `UNLISTEN`, `DISCARD ALL`, `COMMENT ON` (chấp nhận) (`UT12`, `UT13`, `UT15`–`UT17`)
 - [ ] 🟡 P2 `pg_notify()` (`UT14`)
 - [ ] ❌ P1 `EXPLAIN [ANALYZE] [(FORMAT JSON)]` (`UT01`–`UT03`)
-- [ ] ❌ P2 `ANALYZE`, `VACUUM`, `CHECKPOINT` (nên no-op) (`UT04`–`UT07`)
-- [ ] ❌ P1 `PREPARE / EXECUTE / DEALLOCATE` (`UT08`, `UT09`)
+- [x] ✅ P2 `ANALYZE`, `VACUUM`, `CHECKPOINT` (nên no-op) (`UT04`–`UT07`) — khớp PG
+- [x] ✅ P1 `PREPARE / EXECUTE / DEALLOCATE` (`UT08`, `UT09`, `W7_11`, `W7_12`) — khớp PG; chỉ sống trong phiên, không ghi xuống đĩa
 - [ ] ❌ P2 Cursor `DECLARE / FETCH / CLOSE` (`UT10`, `UT11`)
 - [x] ✅ P2 `obj_description`, `col_description` (`CAT20`) — khớp PG
 - [ ] ❌ P3 `CLUSTER`, `SECURITY LABEL`, `IMPORT FOREIGN SCHEMA`, FDW, publication, statistics (`UT20`–`UT22`)
@@ -426,8 +427,8 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 ## 17. System catalog
 
 - [x] ✅ `information_schema.columns` (`CAT02`)
-- [ ] 🟡 **P1** `SELECT table_name FROM information_schema.tables` trả **mọi cột** thay vì cột được chọn (`CAT01`)
-- [ ] 🟡 P1 `pg_tables` cũng trả mọi cột và sai tên cột (`CAT13`)
+- [x] ✅ **P1** `SELECT table_name FROM information_schema.tables` trả **mọi cột** thay vì cột được chọn (`CAT01`) — khớp PG
+- [x] ✅ P1 `pg_tables` cũng trả mọi cột và sai tên cột (`CAT13`) — khớp PG
 - [ ] 🟡 P1 `information_schema.table_constraints`, `.key_column_usage`, `.schemata`: catalog tên `litepostgres` (PG: tên DB), thiếu NOT NULL constraint, thiếu schema hệ thống (`CAT03`, `CAT04`, `CAT06`)
 - [ ] 🟡 P1 `pg_class`, `pg_namespace`, `pg_constraint`, `pg_index` sai cột / thiếu dòng hệ thống (`CAT07`, `CAT10`, `CAT12`, `CAT17`)
 - [ ] ❌ P1 `information_schema.referential_constraints`, `.views` (`CAT05`, `CAT21`)
@@ -491,7 +492,7 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 - [x] ✅ `jsonb_set`, `jsonb_array_length`, `jsonb_typeof`, `json_typeof`, `jsonb_strip_nulls`, `jsonb_pretty` (`JS06`, `JS11`, `JS12`)
 - [ ] 🟡 P1 `jsonb_insert`, `jsonb_set_lax` (`JS06`)
 - [ ] 🟡 P1 `jsonb_object_keys`, `jsonb_array_elements_text` trong SELECT (`JS08`, `JS10`)
-- [ ] ❌ P1 `jsonb_each`, `jsonb_array_elements` trong FROM (`JS07`, `JS09`)
+- [ ] 🟡 P1 `jsonb_each`, `jsonb_array_elements` trong FROM (`JS07`, `JS09`) — xong với đối số hằng/tham số, `WITH ORDINALITY`, alias cột (`JS09`, `W7_08`–`W7_10`, `W7_17`); còn: hai hàm trùng tên cột trong một FROM (`JS07`), đối số tham chiếu cột (LATERAL)
 - [ ] ❌ P2 `jsonb_to_record(set)`, `jsonb_populate_record` (`JS13`–`JS15`)
 - [ ] 🟡 P2 jsonpath `jsonb_path_query`, `jsonb_path_exists`, `@?`, `@@` (`JS16`)
 - [ ] 🟡 P2 Subscript `jsonb['a']` (`JS17b`)
@@ -540,7 +541,7 @@ CREATE TABLE u (id SERIAL PRIMARY KEY, t_id INT REFERENCES t(id), v TEXT);
 
 ## Lộ trình gợi ý (phần còn lại)
 
-1. **Mục 0** (còn lại): lỗi `42883` khi gặp hàm không biết (sau đợt 5), mất cột trùng tên trong kết quả JSON (đợt 3), scale của numeric khi tính toán. Đã xong: chia nguyên, chia 0, cast, tràn số, cột không tồn tại, định dạng wire của timestamp/numeric/mảng/ROW/bytea/jsonb.
+1. **Mục 0** (còn lại): lỗi `42883` khi gặp hàm không biết (sau đợt 5), scale của numeric khi tính toán. Đã xong: chia nguyên, chia 0, cast, tràn số, cột không tồn tại, định dạng wire của timestamp/numeric/mảng/ROW/bytea/jsonb.
 2. **P0 còn lại**: IDENTITY, sequence functions, `version()`/`current_*()`/`set_config`, `jsonb ||`/`-`, `unnest`.
 3. **P1**: `generate_series`, regex functions, `to_date/to_timestamp`, `AT TIME ZONE`, `json_object_agg`, views, `CREATE SCHEMA`, enum, `VALUES` độc lập, `CREATE TABLE AS`, `TEMP TABLE`, catalog (`pg_attribute`, `pg_type`, `pg_index`, cột được chọn trong `information_schema.tables`), `EXPLAIN`, `PREPARE/EXECUTE`, `COPY FROM STDIN`.
 4. **P2–P3**: functions/triggers, MERGE, partitioning, grouping sets, FTS, range, SQL/JSON, quyền hạn.

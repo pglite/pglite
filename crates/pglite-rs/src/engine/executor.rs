@@ -36,6 +36,8 @@ pub struct Executor {
     column_check_cache: HashMap<String, Option<(String, u64)>>,
     /// `json_cell_kinds` theo câu SQL, kèm dấu vân tay kiểu cột của các bảng trong FROM (đổi schema thì tính lại).
     json_kinds_cache: HashMap<String, (Option<Vec<JsonCellKind>>, Vec<(String, u64)>)>,
+    /// PREPARE tên AS câu lệnh: chỉ sống trong phiên, không ghi xuống đĩa.
+    prepared: HashMap<String, String>,
 }
 
 impl Executor {
@@ -47,6 +49,7 @@ impl Executor {
             settings: HashMap::new(),
             column_check_cache: HashMap::new(),
             json_kinds_cache: HashMap::new(),
+            prepared: HashMap::new(),
         }
     }
 
@@ -164,6 +167,169 @@ impl Executor {
         }
     }
 
+    /// ANALYZE / VACUUM / CHECKPOINT (không có thống kê hay dọn dẹp gì để làm: chỉ kiểm tra bảng tồn tại)
+    /// và PREPARE / EXECUTE / DEALLOCATE (câu lệnh chuẩn bị theo phiên, chỉ ở bộ nhớ).
+    fn handle_utility_statement(&mut self, sql: &str, upper: &str) -> Option<Result<QueryResult, String>> {
+        let first = upper.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+        let ok = |cmd: &str| Some(Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: cmd.to_string() }));
+        match first {
+            "ANALYZE" | "ANALYSE" | "VACUUM" => {
+                if first == "VACUUM" && self.storage.in_transaction {
+                    return Some(Err("VACUUM cannot run inside a transaction block".to_string()));
+                }
+                // bỏ các tuỳ chọn (FULL, VERBOSE, (opt, ...)) để lấy danh sách bảng
+                let mut rest = sql[first.len()..].trim();
+                if rest.starts_with('(') {
+                    rest = rest.find(')').map(|i| rest[i + 1..].trim()).unwrap_or("");
+                }
+                loop {
+                    let w = rest.split_whitespace().next().unwrap_or("").to_uppercase();
+                    if ["FULL", "FREEZE", "VERBOSE", "ANALYZE", "ANALYSE", "SKIP_LOCKED"].contains(&w.as_str()) {
+                        rest = rest[w.len()..].trim();
+                    } else {
+                        break;
+                    }
+                }
+                for item in split_comma_separated_tokens(rest) {
+                    let name = item.split('(').next().unwrap_or("").trim().trim_matches('"');
+                    let name = name.strip_prefix("public.").unwrap_or(name);
+                    if !name.is_empty() && self.storage.get_table(name).is_none() && self.storage.get_table(&name.to_lowercase()).is_none() {
+                        return Some(Err(format!("relation \"{}\" does not exist", name)));
+                    }
+                }
+                ok(if first == "VACUUM" { "VACUUM" } else { "ANALYZE" })
+            }
+            "CHECKPOINT" if sql.len() == first.len() => ok("CHECKPOINT"),
+            "PREPARE" if !upper.starts_with("PREPARE TRANSACTION") => {
+                let as_pos = find_top_level_keyword(sql, "AS")?;
+                let head = sql[7..as_pos].trim();
+                let name = head.split('(').next().unwrap_or("").trim().trim_matches('"').to_lowercase();
+                if name.is_empty() {
+                    return None;
+                }
+                if self.prepared.contains_key(&name) {
+                    return Some(Err(format!("prepared statement \"{}\" already exists", name)));
+                }
+                self.prepared.insert(name, sql[as_pos + 2..].trim().to_string());
+                ok("PREPARE")
+            }
+            "EXECUTE" => {
+                let rest = sql[7..].trim();
+                let (name, args) = match rest.find('(') {
+                    Some(i) if rest.ends_with(')') => (rest[..i].trim(), &rest[i + 1..rest.len() - 1]),
+                    _ => (rest, ""),
+                };
+                let name = name.trim_matches('"').to_lowercase();
+                let Some(stmt) = self.prepared.get(&name).cloned() else {
+                    return Some(Err(format!("prepared statement \"{}\" does not exist", name)));
+                };
+                let mut values = Vec::new();
+                for arg in split_comma_separated_tokens(args) {
+                    if arg.is_empty() {
+                        continue;
+                    }
+                    let r = match self.execute_statement(&format!("SELECT {} AS v", arg), &[]) {
+                        Ok(r) => r,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let v = r.rows.first().and_then(|row| row.get("v")).cloned().unwrap_or(serde_json::Value::Null);
+                    values.push(match v {
+                        serde_json::Value::Null => Value::Null,
+                        serde_json::Value::Bool(b) => Value::Bool(b),
+                        serde_json::Value::Number(n) => n.as_i64().map(Value::Int).unwrap_or_else(|| Value::Float(n.as_f64().unwrap_or(0.0))),
+                        serde_json::Value::String(s) => Value::text(s),
+                        other => Value::text(other.to_string()),
+                    });
+                }
+                Some(self.execute(&stmt, &values))
+            }
+            "DEALLOCATE" => {
+                let mut rest = sql[10..].trim();
+                if rest.to_uppercase().starts_with("PREPARE ") {
+                    rest = rest[8..].trim();
+                }
+                if rest.eq_ignore_ascii_case("ALL") {
+                    self.prepared.clear();
+                } else {
+                    let name = rest.trim_matches('"').to_lowercase();
+                    if self.prepared.remove(&name).is_none() {
+                        return Some(Err(format!("prepared statement \"{}\" does not exist", name)));
+                    }
+                }
+                ok("DEALLOCATE")
+            }
+            _ => None,
+        }
+    }
+
+    /// `a NATURAL [LEFT|RIGHT|FULL|INNER] JOIN b` → `a ... JOIN b USING (các cột trùng tên)`; không có cột
+    /// chung thì thành CROSS JOIN như PostgreSQL. Cột bên trái lấy từ các bảng đứng trước trong FROM.
+    fn rewrite_natural_joins(&self, sql: &str) -> Option<String> {
+        let from = find_top_level_keyword(sql, "FROM")?;
+        let nat = from + find_top_level_keyword(&sql[from..], "NATURAL")?;
+        let after = &sql[nat + 7..];
+        let words: Vec<&str> = after.split_whitespace().collect();
+        let mut wi = 0;
+        let mut kind = String::new();
+        while wi < words.len() && ["LEFT", "RIGHT", "FULL", "INNER", "OUTER"].contains(&words[wi].to_uppercase().as_str()) {
+            if !words[wi].eq_ignore_ascii_case("OUTER") && !words[wi].eq_ignore_ascii_case("INNER") {
+                kind = format!("{} ", words[wi].to_uppercase());
+            }
+            wi += 1;
+        }
+        if !words.get(wi)?.eq_ignore_ascii_case("JOIN") {
+            return None;
+        }
+        let tbl_word = words.get(wi + 1)?;
+        let tbl_name = clean_table_name(tbl_word);
+        let right = self.storage.get_table(&tbl_name)?;
+        // vị trí ngay sau tên bảng bên phải trong `after`
+        let mut pos = 0;
+        for w in &words[..wi + 2] {
+            pos = pos + after[pos..].find(w)? + w.len();
+        }
+        let mut rest = &after[pos..];
+        // alias tuỳ chọn
+        let mut alias = String::new();
+        let rw: Vec<&str> = rest.split_whitespace().take(2).collect();
+        const STOP: [&str; 14] = ["WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "JOIN", "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "NATURAL", "UNION", "HAVING"];
+        let mut take = 0;
+        if rw.first().map_or(false, |w| w.eq_ignore_ascii_case("AS")) {
+            take = 2;
+        } else if rw.first().map_or(false, |w| !STOP.contains(&w.to_uppercase().as_str()) && !w.starts_with(['(', ',', ';', ')'])) {
+            take = 1;
+        }
+        for _ in 0..take {
+            let w = rest.split_whitespace().next()?;
+            let p = rest.find(w)? + w.len();
+            if !w.eq_ignore_ascii_case("AS") {
+                alias = w.to_string();
+            }
+            rest = &rest[p..];
+        }
+        if rest.trim_start().to_uppercase().starts_with("ON ") || rest.trim_start().to_uppercase().starts_with("USING") {
+            return None;
+        }
+        let mut left_cols: Vec<String> = Vec::new();
+        for w in sql[from + 4..nat].split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')') {
+            if let Some(t) = self.storage.get_table(&clean_table_name(w)).filter(|_| !w.is_empty()) {
+                for c in &t.columns {
+                    if !left_cols.contains(&c.name) {
+                        left_cols.push(c.name.clone());
+                    }
+                }
+            }
+        }
+        let common: Vec<&String> = left_cols.iter().filter(|c| right.columns.iter().any(|rc| &rc.name == *c)).collect();
+        let target = if alias.is_empty() { tbl_word.to_string() } else { format!("{} {}", tbl_word, alias) };
+        let join = if common.is_empty() {
+            format!("CROSS JOIN {}", target)
+        } else {
+            format!("{}JOIN {} USING ({})", kind, target, common.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "))
+        };
+        Some(format!("{}{}{}", &sql[..nat], join, rest))
+    }
+
     pub(crate) fn execute_statement(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let clean_sql = crate::engine::frontend::lex(sql)?;
         let normalized_sql = normalize_named_sql_params(&clean_sql);
@@ -218,6 +384,14 @@ impl Executor {
         for (kw, tag) in [("GRANT ", "GRANT"), ("REVOKE ", "REVOKE"), ("ALTER DEFAULT PRIVILEGES", "ALTER DEFAULT PRIVILEGES")] {
             if upper.starts_with(kw) {
                 return Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: tag.to_string() });
+            }
+        }
+        if let Some(res) = self.handle_utility_statement(trimmed, &upper) {
+            return res;
+        }
+        if upper.contains("NATURAL ") {
+            if let Some(rewritten) = self.rewrite_natural_joins(trimmed) {
+                return self.execute_statement(&rewritten, params);
             }
         }
         // version(), current_database(), current_user... (engine/plpgsql.rs)
@@ -466,8 +640,15 @@ impl Executor {
                 });
             }
 
-            if (upper.contains("FROM INFORMATION_SCHEMA.TABLES") || upper.contains("FROM PG_TABLES"))
+            if (upper.contains("FROM INFORMATION_SCHEMA.TABLES") || upper.contains("FROM PG_TABLES") || upper.contains("FROM PG_CATALOG.PG_TABLES"))
                 && !upper.contains("JOIN") {
+                // `SELECT * FROM ...` không WHERE: giữ nguyên kết quả cũ (các khoá riêng của bản cũ); còn lại chạy
+                // trên bảng tạm trong bộ nhớ có cột chuẩn PostgreSQL để WHERE / danh sách cột / ORDER BY đúng.
+                let legacy = find_top_level_keyword(trimmed, "WHERE").is_none()
+                    && trimmed[6..find_top_level_keyword(trimmed, "FROM").unwrap_or(6)].trim() == "*";
+                if !legacy {
+                    return self.catalog_tables_generic(trimmed, params);
+                }
                 let mut table_keys: Vec<String> = self.storage.tables.keys()
                     .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && *k != "table_constraints" && *k != "key_column_usage" && *k != "constraint_column_usage" && *k != "pg_index" && *k != "pg_class" && *k != "pg_namespace" && !k.starts_with("__ephemeral_"))
                     .cloned().collect();
@@ -1501,6 +1682,9 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
     /// lại thành `FROM __srf_N AS alias` rồi chạy như truy vấn thường. `None` nếu FROM không có dạng này.
     fn try_srf_from(&mut self, select_clause: &str, is_distinct: bool, after_from: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
         let up = after_from.to_uppercase();
+        if JSON_SRFS.iter().any(|f| up.starts_with(f) && up[f.len()..].starts_with('(')) {
+            return self.try_json_srf_from(select_clause, is_distinct, after_from, params);
+        }
         let fname = if up.starts_with("GENERATE_SERIES(") {
             "generate_series"
         } else if up.starts_with("UNNEST(") {
@@ -1640,6 +1824,130 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
             }
             (r, p)
         });
+        Some(res)
+    }
+
+    /// `FROM jsonb_each(...) [AS a[(cột, ...)]], jsonb_array_elements(...) ...` với đối số hằng / tham số:
+    /// mỗi hàm thành một bảng tạm trong bộ nhớ, phần còn lại của câu chạy như thường. Đối số tham chiếu
+    /// cột (LATERAL) → `None`.
+    fn try_json_srf_from(&mut self, select_clause: &str, is_distinct: bool, after_from: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let stop_words = ["WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "HAVING", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "UNION", "WINDOW", "FETCH", "FOR", "ON"];
+        let mut rest = after_from;
+        let mut new_from = Vec::new();
+        let mut temps = Vec::new();
+        loop {
+            let up = rest.to_uppercase();
+            let Some(fname) = JSON_SRFS.iter().find(|f| up.starts_with(*f) && up[f.len()..].starts_with('(')) else { break };
+            let open = fname.len();
+            let close = crate::engine::constraints::matching_paren(rest, open)?;
+            let args = split_function_args(&rest[open + 1..close]);
+            if args.len() != 1 || !is_constant_arg(&args[0]) {
+                for t in &temps {
+                    self.storage.tables.remove(t);
+                }
+                return None;
+            }
+            let v = eval_sql_expr(&args[0], &[], None, &[], None, params);
+            let mut r = rest[close + 1..].trim_start();
+            let mut ordinality = false;
+            if r.len() >= 15 && r.as_bytes()[..15].eq_ignore_ascii_case(b"WITH ORDINALITY") {
+                ordinality = true;
+                r = r[15..].trim_start();
+            }
+            let lname = fname.to_lowercase();
+            let mut alias = lname.clone();
+            let mut col_names: Vec<String> = Vec::new();
+            let r2 = if r.len() >= 3 && r.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") { r[3..].trim_start() } else { r };
+            let wl = r2.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).unwrap_or(r2.len());
+            let word = &r2[..wl];
+            if !word.is_empty() && !stop_words.iter().any(|w| w.eq_ignore_ascii_case(word)) {
+                alias = word.trim_matches('"').to_string();
+                r = r2[wl..].trim_start();
+                if r.starts_with('(') {
+                    let c = crate::engine::constraints::matching_paren(r, 0)?;
+                    col_names = split_comma_separated_tokens(&r[1..c]).into_iter().map(|x| x.trim().trim_matches('"').to_string()).collect();
+                    r = r[c + 1..].trim_start();
+                }
+            }
+            let parsed: Option<serde_json::Value> = match &v {
+                Value::Null => None,
+                Value::Text(t) => serde_json::from_str(t.trim()).ok(),
+                other => Some(value_to_json(other)),
+            };
+            let as_text = lname.ends_with("_text");
+            let jsonb_col = if as_text { DataType::Text } else { DataType::Jsonb };
+            let cell = |j: &serde_json::Value| -> Value {
+                match j {
+                    serde_json::Value::Null if as_text => Value::Null,
+                    serde_json::Value::String(st) if as_text => Value::text(st),
+                    other if as_text => Value::text(other.to_string()),
+                    other => Value::text(other.to_string()),
+                }
+            };
+            let (mut defs, rows): (Vec<(String, DataType)>, Vec<Vec<Value>>) = if lname.contains("_each") {
+                let Some(serde_json::Value::Object(m)) = parsed.clone().or(Some(serde_json::Value::Object(Default::default()))) else {
+                    return Some(Err(format!("cannot call {} on a non-object", lname)));
+                };
+                let mut items: Vec<(String, serde_json::Value)> = m.into_iter().collect();
+                if lname.starts_with("jsonb") {
+                    items.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+                }
+                (vec![("key".into(), DataType::Text), ("value".into(), jsonb_col)], items.iter().map(|(k, v)| vec![Value::text(k), cell(v)]).collect())
+            } else if lname.contains("_object_keys") {
+                let Some(serde_json::Value::Object(m)) = parsed.clone().or(Some(serde_json::Value::Object(Default::default()))) else {
+                    return Some(Err(format!("cannot call {} on a non-object", lname)));
+                };
+                let mut keys: Vec<String> = m.keys().cloned().collect();
+                if lname.starts_with("jsonb") {
+                    keys.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+                }
+                let n = if col_names.is_empty() && alias != lname { alias.clone() } else { lname.clone() };
+                (vec![(n, DataType::Text)], keys.into_iter().map(|k| vec![Value::text(k)]).collect())
+            } else {
+                let Some(serde_json::Value::Array(a)) = parsed.clone().or(Some(serde_json::Value::Array(vec![]))) else {
+                    return Some(Err("cannot extract elements from an object".to_string()));
+                };
+                (vec![("value".into(), jsonb_col)], a.iter().map(|x| vec![cell(x)]).collect())
+            };
+            if ordinality {
+                defs.push(("ordinality".into(), DataType::BigInt));
+            }
+            for (i, n) in col_names.iter().enumerate() {
+                if let Some(d) = defs.get_mut(i) {
+                    d.0 = n.clone();
+                }
+            }
+            let tmp = format!("__srf_{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1_000_000);
+            let cdefs = defs.iter().map(|(n, dt)| crate::types::ColumnDef { name: n.clone(), data_type: dt.clone(), is_primary_key: false, is_nullable: true, default_value: None, comment: None }).collect();
+            let mut table = crate::storage::table::Table::new(tmp.clone(), cdefs);
+            table.pk_col_idx = None;
+            for (i, mut row) in rows.into_iter().enumerate() {
+                if ordinality {
+                    row.push(Value::Int(i as i64 + 1));
+                }
+                table.insert(row);
+            }
+            self.storage.tables.insert(tmp.clone(), table);
+            new_from.push(format!("{} AS {}", tmp, alias));
+            temps.push(tmp);
+            rest = r;
+            if let Some(after_comma) = rest.strip_prefix(',') {
+                let ac = after_comma.trim_start();
+                let acu = ac.to_uppercase();
+                if JSON_SRFS.iter().any(|f| acu.starts_with(f) && acu[f.len()..].starts_with('(')) {
+                    rest = ac;
+                    continue;
+                }
+            }
+            break;
+        }
+        let sel = if is_distinct { format!("DISTINCT {}", select_clause) } else { select_clause.to_string() };
+        let q = format!("SELECT {} FROM {} {}", sel, new_from.join(", "), rest);
+        let res = self.handle_select(q.trim_end(), params);
+        for t in &temps {
+            self.storage.tables.remove(t);
+        }
         Some(res)
     }
 
@@ -4226,6 +4534,59 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         res
     }
 
+    /// Tên bảng người dùng (bỏ bảng catalog ảo / bảng tạm nội bộ), đã sắp xếp.
+    fn user_table_names(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.storage.tables.keys()
+            .filter(|k| !k.starts_with("information_schema.") && !k.starts_with("pg_catalog.") && !k.starts_with("__") && !["table_constraints", "key_column_usage", "constraint_column_usage", "pg_index", "pg_class", "pg_namespace"].contains(&k.as_str()))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// `information_schema.tables` / `pg_tables` như bảng tạm trong bộ nhớ (không ghi WAL). Có cột chuẩn
+    /// PostgreSQL và cả các khoá của bản cũ (`schema_name`, `is_temporary`, `comment`).
+    fn catalog_tables_generic(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        let col = |n: &str, dt: DataType| crate::types::ColumnDef { name: n.to_string(), data_type: dt, is_primary_key: false, is_nullable: true, default_value: None, comment: None };
+        let pg_tables = !contains_ci(sql, "information_schema.tables");
+        let names: Vec<&str> = if pg_tables {
+            vec!["schemaname", "tablename", "tableowner", "tablespace", "hasindexes", "hasrules", "hastriggers", "rowsecurity"]
+        } else {
+            vec!["table_catalog", "table_schema", "table_name", "table_type", "is_insertable_into", "schema_name", "is_temporary", "comment"]
+        };
+        let cols: Vec<crate::types::ColumnDef> = names.iter().map(|n| {
+            let bool_col = ["hasindexes", "hasrules", "hastriggers", "rowsecurity", "is_temporary"].contains(n);
+            col(n, if bool_col { DataType::Boolean } else { DataType::Text })
+        }).collect();
+        let name = "__pglite_info_tables".to_string();
+        let mut t = crate::storage::table::Table::new(name.clone(), cols);
+        t.pk_col_idx = None;
+        for k in self.user_table_names() {
+            let tbl = &self.storage.tables[&k];
+            let temp = self.storage.wal.temp_tables.contains(&k.to_lowercase());
+            let schema = if temp { "pg_temp_1" } else { "public" };
+            if pg_tables {
+                t.insert(vec![Value::text(schema), Value::text(&tbl.name), Value::text("postgres"), Value::Null, Value::Bool(!tbl.indexes.is_empty() || tbl.pk_col_idx.is_some()), Value::Bool(false), Value::Bool(false), Value::Bool(false)]);
+            } else {
+                t.insert(vec![
+                    Value::text("litepostgres"),
+                    Value::text(schema),
+                    Value::text(&tbl.name),
+                    Value::text(if temp { "LOCAL TEMPORARY" } else { "BASE TABLE" }),
+                    Value::text("YES"),
+                    Value::text(schema),
+                    Value::Bool(temp),
+                    tbl.comment.clone().map(Value::text).unwrap_or(Value::Null),
+                ]);
+            }
+        }
+        let q = replace_relation_name(sql, &["information_schema.tables", "pg_catalog.pg_tables", "pg_tables"], &name);
+        self.storage.tables.insert(name.clone(), t);
+        let res = self.handle_select(&q, params).map(|(r, _)| r);
+        self.storage.tables.remove(&name);
+        res
+    }
+
     fn handle_information_schema_columns_query(&self, _sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         let schema_filter = params.first().and_then(|v| match v {
             Value::Text(s) => Some(s.as_str()),
@@ -6110,6 +6471,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 };
                 projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr, agg_order: agg_order.clone() });
                 fields.push(FieldInfo { name: alias, data_type: "array".to_string() });
+            } else if let Some((k, v, jsonb)) = parse_object_agg_call(agg_expr).filter(|_| upper_agg.ends_with(')')) {
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::ObjectAgg(k, v, jsonb)), col_idx: None, filter_expr, agg_order: agg_order.clone() });
+                fields.push(FieldInfo { name: alias, data_type: if jsonb { "jsonb".to_string() } else { "json".to_string() } });
             } else if (upper_agg.starts_with("JSON_AGG(") || upper_agg.starts_with("JSONB_AGG(")) && upper_agg.ends_with(')') {
                 let is_jsonb = upper_agg.starts_with("JSONB_AGG(");
                 let prefix_len = if is_jsonb { 10 } else { 9 };
@@ -6371,6 +6735,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                                 }
                             }
                             serde_json::Value::Array(arr)
+                        }
+                        AggFunc::ObjectAgg(k, v, jsonb) => {
+                            let pairs = target_indices.iter().map(|&ri| (eval_sql_expr(k, &table.rows[ri], Some(table), &[], None, params), eval_sql_expr(v, &table.rows[ri], Some(table), &[], None, params))).collect();
+                            object_agg_json(pairs, *jsonb)
                         }
                         AggFunc::JsonAggExpr(expr_str) | AggFunc::JsonbAggExpr(expr_str) => {
                             let (expr_str, ordered) = agg_order_rows(expr_str, table, &target_indices, params);
@@ -6782,6 +7150,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
                     }
+                    AggFunc::ObjectAgg(k, v, jsonb) => {
+                        let pairs = (0..table.rows.len()).filter(|&i| !table.is_deleted[i]).map(|i| (eval_sql_expr(k, &table.rows[i], Some(table), &[], None, params), eval_sql_expr(v, &table.rows[i], Some(table), &[], None, params))).collect();
+                        row_map.insert(spec.alias.clone(), object_agg_json(pairs, *jsonb));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: if *jsonb { "jsonb".to_string() } else { "json".to_string() } });
+                    }
                     AggFunc::JsonAggExpr(expr_str) | AggFunc::JsonbAggExpr(expr_str) => {
                         let live: Vec<usize> = (0..table.rows.len()).filter(|&i| !table.is_deleted[i]).collect();
                         let (expr_str, ordered) = agg_order_rows(expr_str, table, &live, params);
@@ -7162,6 +7535,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         row_map.insert(spec.alias.clone(), serde_json::Value::Array(arr));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "json".to_string() });
                     }
+                    AggFunc::ObjectAgg(k, v, jsonb) => {
+                        let pairs = matched_indices.iter().map(|&i| (eval_sql_expr(k, &table.rows[i], Some(table), &[], None, params), eval_sql_expr(v, &table.rows[i], Some(table), &[], None, params))).collect();
+                        row_map.insert(spec.alias.clone(), object_agg_json(pairs, *jsonb));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: if *jsonb { "jsonb".to_string() } else { "json".to_string() } });
+                    }
                     AggFunc::JsonAggExpr(expr_str) | AggFunc::JsonbAggExpr(expr_str) => {
                         let (expr_str, ordered) = agg_order_rows(expr_str, table, &matched_indices, params);
                         let expr_str = expr_str.as_str();
@@ -7363,7 +7741,46 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         Ok(Some(out))
     }
 
+    /// `SET c = (SELECT ... FROM ...)` không tương quan: chạy subquery một lần, thay bằng hằng (trước đây bộ
+    /// đánh giá biểu thức không chạy được subquery và ghi `false` vào cột). Subquery tương quan để nguyên.
+    pub(crate) fn resolve_uncorrelated_set_subqueries(&mut self, set_clause: &str, params: &[Value]) -> Result<String, String> {
+        if !contains_ci(set_clause, "SELECT") {
+            return Ok(set_clause.to_string());
+        }
+        let b = set_clause.as_bytes();
+        let mut out = String::with_capacity(set_clause.len());
+        let mut last = 0;
+        let mut in_sq = false;
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\'' {
+                in_sq = !in_sq;
+            } else if !in_sq && b[i] == b'(' && set_clause[i + 1..].trim_start().get(..6).map_or(false, |p| p.eq_ignore_ascii_case("SELECT")) {
+                let Some(close) = crate::engine::constraints::matching_paren(set_clause, i) else { break };
+                let sub = &set_clause[i + 1..close];
+                if find_top_level_keyword(sub, "FROM").is_some() && !subquery_is_correlated(sub) {
+                    let (res, _) = self.handle_select(sub.trim(), params)?;
+                    if res.rows.len() > 1 {
+                        return Err("more than one row returned by a subquery used as an expression".to_string());
+                    }
+                    let v = res.rows.first().and_then(|row| row.as_object()).and_then(|o| o.values().next()).map(json_to_value).unwrap_or(Value::Null);
+                    out.push_str(&set_clause[last..i]);
+                    out.push_str(&Self::value_as_sql_literal(&v));
+                    last = close + 1;
+                }
+                i = close + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out.push_str(&set_clause[last..]);
+        Ok(out)
+    }
+
     fn handle_update(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        if let Some(expanded) = expand_multi_column_set(sql)? {
+            return self.handle_update(&expanded, params);
+        }
         if let Some((head, set_part, from_list, where_clause, returning)) = crate::engine::dml_join::split_update_from(sql) {
             return self.handle_update_from(head, set_part, from_list, where_clause, returning, params);
         }
@@ -7374,7 +7791,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let table_name = clean_table_name(sql[6..set_idx].trim());
 
         let set_end = where_idx.or(returning_idx).unwrap_or(sql.len());
-        let set_clause = sql[set_idx + 3..set_end].trim();
+        let set_clause_owned = self.resolve_uncorrelated_set_subqueries(sql[set_idx + 3..set_end].trim(), params)?;
+        let set_clause = set_clause_owned.as_str();
 
         let (where_clause, returning_cols) = match (where_idx, returning_idx) {
             (Some(w_idx), Some(r_idx)) => (Some(sql[w_idx + 5..r_idx].trim()), Some(sql[r_idx + 9..].trim())),
@@ -10572,9 +10990,14 @@ fn eval_group_aggregate_expr(
         return serde_json::Value::Array(arr);
     }
 
+    if let Some((k, v, jsonb)) = parse_object_agg_call(t).filter(|_| t.ends_with(')')) {
+        let pairs = row_indices.iter().map(|&ri| (json_to_value(&eval_joined_scalar_expr(&k, &all_rows[ri], params, storage)), json_to_value(&eval_joined_scalar_expr(&v, &all_rows[ri], params, storage)))).collect();
+        return object_agg_json(pairs, jsonb);
+    }
+
     // 6. JSONB_AGG(expr) / JSON_AGG(expr)
     if (upper.starts_with("JSONB_AGG(") || upper.starts_with("JSON_AGG(")) && t.ends_with(')') {
-        let inner = t[10..t.len() - 1].trim();
+        let inner = t[t.find('(').unwrap() + 1..t.len() - 1].trim();
         let mut arr = Vec::new();
         for &ri in row_indices {
             let v_json = eval_joined_scalar_expr(inner, &all_rows[ri], params, storage);
@@ -11707,6 +12130,8 @@ enum AggFunc {
     JsonbAgg(usize),
     JsonAggExpr(String),
     JsonbAggExpr(String),
+    /// json_object_agg / jsonb_object_agg(khoá, giá trị); bool = jsonb
+    ObjectAgg(String, String, bool),
     BoolAnd(usize),
     BoolOr(usize),
     BoolAndExpr(String),
@@ -11717,6 +12142,54 @@ enum AggFunc {
 struct AggSpec {
     func: AggFunc,
     alias: String,
+}
+
+/// `json_object_agg(k, v)` / `jsonb_object_agg(k, v)` trên các dòng đã lọc. json giữ thứ tự và dạng text của
+/// PostgreSQL (`{ "k" : v }`), jsonb là object (khoá trùng giữ giá trị cuối). Không có dòng → NULL.
+fn object_agg_json(pairs: Vec<(Value, Value)>, jsonb: bool) -> serde_json::Value {
+    if pairs.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let to_json = |v: &Value| match v {
+        Value::Text(st) if st.trim_start().starts_with(['{', '[']) => serde_json::from_str::<serde_json::Value>(st.trim()).unwrap_or_else(|_| serde_json::Value::String(st.to_string())),
+        Value::Text(st) => serde_json::Value::String(st.to_string()),
+        other => value_to_json(other),
+    };
+    let key_text = |k: &Value| match k {
+        Value::Text(st) => st.to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => value_to_json(other).to_string(),
+    };
+    if jsonb {
+        let mut m = serde_json::Map::new();
+        for (k, v) in &pairs {
+            m.insert(key_text(k), to_json(v));
+        }
+        serde_json::Value::Object(m)
+    } else {
+        let items: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("{} : {}", serde_json::Value::String(key_text(k)), crate::pg_types::jsonb_text(&to_json(v))))
+            .collect();
+        serde_json::Value::String(format!("{{ {} }}", items.join(", ")))
+    }
+}
+
+/// Tách `json_object_agg(` / `jsonb_object_agg(` ở đầu `t`: (đối số khoá, đối số giá trị, jsonb).
+fn parse_object_agg_call(t: &str) -> Option<(String, String, bool)> {
+    let up = t.trim_start().to_uppercase();
+    let jsonb = up.starts_with("JSONB_OBJECT_AGG(");
+    if !jsonb && !up.starts_with("JSON_OBJECT_AGG(") {
+        return None;
+    }
+    let t = t.trim_start();
+    let open = t.find('(')?;
+    let close = find_matching_paren(t, open)?;
+    let args = split_function_args(&t[open + 1..close]);
+    if args.len() != 2 {
+        return None;
+    }
+    Some((args[0].trim().to_string(), args[1].trim().to_string(), jsonb))
 }
 
 fn find_matching_paren(s: &str, start_open_paren: usize) -> Option<usize> {
@@ -11915,6 +12388,11 @@ fn parse_aggregation_item(part_trim: &str, table: &crate::storage::table::Table,
                         specs.push(AggSpec { func: AggFunc::StringAgg(col_idx, delim), alias });
                     }
                 }
+            }
+        } else if let Some(o_idx) = upper.find("JSON_OBJECT_AGG(").or_else(|| upper.find("JSONB_OBJECT_AGG(")) {
+            if let Some((k, v, jsonb)) = parse_object_agg_call(&part_trim[o_idx..]) {
+                let alias = get_alias(if jsonb { "jsonb_object_agg" } else { "json_object_agg" });
+                specs.push(AggSpec { func: AggFunc::ObjectAgg(k, v, jsonb), alias });
             }
         } else if let Some(j_idx) = upper.find("JSON_AGG(") {
             if let Some(close_p) = find_matching_paren(part_trim, j_idx + 8) {
@@ -12118,6 +12596,112 @@ pub fn find_top_level_keyword(sql: &str, kw: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// `UPDATE ... SET (a, b) = (x, y)` / `= ROW(x, y)` / `= (SELECT e1, e2 FROM ...)` → `SET a = x, b = y`
+/// (dạng SELECT tách thành từng subquery vô hướng `a = (SELECT e1 FROM ...)`). `None` nếu không có dạng này.
+fn expand_multi_column_set(sql: &str) -> Result<Option<String>, String> {
+    let Some(set_idx) = find_top_level_keyword(sql, "SET") else { return Ok(None) };
+    let start = set_idx + 3;
+    let rest = &sql[start..];
+    if !rest.trim_start().starts_with('(') && !rest.contains(", (") && !rest.contains(",(") {
+        return Ok(None);
+    }
+    let end = ["WHERE", "RETURNING", "FROM"].iter().filter_map(|k| find_top_level_keyword(rest, k)).min().unwrap_or(rest.len());
+    let set_clause = &rest[..end];
+    let mut changed = false;
+    let mut out_items = Vec::new();
+    for item in split_comma_separated_tokens(set_clause) {
+        if !item.starts_with('(') {
+            out_items.push(item.to_string());
+            continue;
+        }
+        let Some(close) = find_matching_paren(item, 0) else { return Ok(None) };
+        let after = item[close + 1..].trim_start();
+        let Some(rhs) = after.strip_prefix('=') else { return Ok(None) };
+        let cols: Vec<&str> = split_comma_separated_tokens(&item[1..close]);
+        let mut rhs = rhs.trim();
+        if rhs.len() > 3 && rhs[..3].eq_ignore_ascii_case("ROW") && rhs[3..].trim_start().starts_with('(') {
+            rhs = rhs[3..].trim_start();
+        }
+        if !rhs.starts_with('(') || find_matching_paren(rhs, 0) != Some(rhs.len() - 1) {
+            return Err("source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".to_string());
+        }
+        let inner = rhs[1..rhs.len() - 1].trim();
+        let exprs: Vec<String> = if inner.len() > 6 && inner[..6].eq_ignore_ascii_case("SELECT") && !inner.as_bytes()[6].is_ascii_alphanumeric() {
+            let from = find_top_level_keyword(inner, "FROM");
+            let list = &inner[6..from.unwrap_or(inner.len())];
+            let tail = from.map(|f| &inner[f..]).unwrap_or("");
+            split_projection_items(list)
+                .iter()
+                .map(|it| {
+                    let it = it.trim();
+                    // bỏ alias `AS x` (không ảnh hưởng giá trị)
+                    let e = find_top_level_keyword(it, "AS").map(|a| it[..a].trim()).unwrap_or(it);
+                    format!("(SELECT {} {})", e, tail).trim_end().to_string()
+                })
+                .collect()
+        } else {
+            split_comma_separated_tokens(inner).iter().map(|e| e.to_string()).collect()
+        };
+        if exprs.len() != cols.len() {
+            return Err(format!("number of columns does not match number of values"));
+        }
+        for (c, e) in cols.iter().zip(exprs) {
+            out_items.push(format!("{} = {}", c, e));
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(format!("{} {} {}", &sql[..start], out_items.join(", "), &rest[end..])))
+}
+
+/// Hậu tố alias tạm cho cột đầu ra trùng tên trên đường wire (xem `dedupe_wire_sql`).
+const DUP_MARK: &str = "#dup";
+
+/// Hàm trả về tập trên JSON dùng được trong FROM (đủ dài trước, để `JSONB_EACH_TEXT` không khớp `JSONB_EACH`).
+const JSON_SRFS: &[&str] = &["JSONB_EACH_TEXT", "JSON_EACH_TEXT", "JSONB_EACH", "JSON_EACH", "JSONB_ARRAY_ELEMENTS_TEXT", "JSON_ARRAY_ELEMENTS_TEXT", "JSONB_ARRAY_ELEMENTS", "JSON_ARRAY_ELEMENTS", "JSONB_OBJECT_KEYS", "JSON_OBJECT_KEYS"];
+
+/// Đối số không tham chiếu cột: chuỗi hằng / tham số `$n`, có thể kèm `::json[b]` / `::text`.
+fn is_constant_arg(a: &str) -> bool {
+    let mut t = a.trim();
+    for c in ["::jsonb", "::json", "::text"] {
+        if t.len() > c.len() && t[t.len() - c.len()..].eq_ignore_ascii_case(c) {
+            t = t[..t.len() - c.len()].trim_end();
+        }
+    }
+    (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 && !t[1..t.len() - 1].replace("''", "").contains('\''))
+        || (t.starts_with('$') && t[1..].chars().all(|c| c.is_ascii_digit()) && t.len() > 1)
+}
+
+/// Thay tên quan hệ (không phân biệt hoa thường, đủ ranh giới từ, ngoài chuỗi) bằng `to`; mẫu dài đặt trước.
+pub(crate) fn replace_relation_name(sql: &str, pats: &[&str], to: &str) -> String {
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c >= 0x80;
+    let mut q = String::with_capacity(sql.len());
+    let mut in_sq = false;
+    let mut i = 0;
+    'outer: while i < b.len() {
+        if b[i] == b'\'' {
+            in_sq = !in_sq;
+        }
+        if !in_sq && (i == 0 || !ident(b[i - 1])) {
+            for p in pats {
+                let pb = p.as_bytes();
+                if i + pb.len() <= b.len() && b[i..i + pb.len()].eq_ignore_ascii_case(pb) && (i + pb.len() == b.len() || !ident(b[i + pb.len()])) {
+                    q.push_str(to);
+                    i += pb.len();
+                    continue 'outer;
+                }
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        q.push(ch);
+        i += ch.len_utf8();
+    }
+    q
 }
 
 /// Biểu thức DEFAULT lưu trong ColumnDef (cùng dạng với CREATE TABLE).
@@ -12764,7 +13348,7 @@ fn normalize_named_sql_params(sql: &str) -> String {
     result
 }
 
-const AGG_NAMES: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG", "STRING_AGG", "JSON_AGG", "JSONB_AGG"];
+const AGG_NAMES: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG", "STRING_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG"];
 
 fn is_hidden_agg_key(k: &str) -> bool {
     k.starts_with("__agg") && k.ends_with("__")
@@ -19046,6 +19630,10 @@ impl Drop for RawTextGuard {
 impl Executor {
     /// Thực thi và trả kết quả dạng giao thức Postgres: cột đúng thứ tự, OID, giá trị text chuẩn.
     pub fn execute_wire(&mut self, sql: &str, params: &[Value]) -> Result<crate::pg_types::WireResult, String> {
+        // cột đầu ra trùng tên (`a.name, b.name`, `*` qua JOIN): đặt alias tạm duy nhất để không cột nào bị
+        // gộp, rồi trả lại tên gốc. Chỉ đường wire; JSON (object theo tên cột) giữ hành vi cũ.
+        let dedup = self.dedupe_wire_sql(sql);
+        let sql = dedup.as_deref().unwrap_or(sql);
         let res = {
             let _guard = RawTextGuard(set_raw_text_mode(true));
             self.execute(sql, params)?
@@ -19059,7 +19647,105 @@ impl Executor {
             apply_wire_decls(&mut wire, &res, &decls);
             apply_wire_items(&mut wire, &res, shape_sql);
         }
+        if dedup.is_some() {
+            for f in &mut wire.fields {
+                if let Some(p) = f.name.find(DUP_MARK) {
+                    f.name.truncate(p);
+                }
+            }
+        }
         Ok(wire)
+    }
+
+    /// SELECT (một câu) có cột đầu ra trùng tên → câu viết lại với alias `"tên#dupN"` cho lần xuất hiện thứ
+    /// 2 trở đi; `*` / `x.*` trên nhiều bảng thật được khai triển thành `alias.cột`. `None` nếu không trùng.
+    fn dedupe_wire_sql(&self, sql: &str) -> Option<String> {
+        let t = sql.trim().trim_end_matches(';').trim();
+        if t.len() < 7 || !t[..7].eq_ignore_ascii_case("SELECT ") || t.contains("--") || t.contains("/*") || t.contains('$') && t.contains("$$") {
+            return None;
+        }
+        let from = find_top_level_keyword(t, "FROM")?;
+        let mut list = t[7..from].trim();
+        let mut head = "SELECT ".to_string();
+        if list.len() > 9 && list[..9].eq_ignore_ascii_case("DISTINCT ") {
+            if list[9..].trim_start().to_uppercase().starts_with("ON") {
+                return None;
+            }
+            head.push_str("DISTINCT ");
+            list = list[9..].trim();
+        }
+        let after = &t[from + 4..];
+        let end = ["WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW", "UNION", "INTERSECT", "EXCEPT", "FOR", "FETCH"]
+            .iter()
+            .filter_map(|k| find_top_level_keyword(after, k))
+            .min()
+            .unwrap_or(after.len());
+        let from_text = after[..end].trim();
+        let items = split_projection_items(list);
+        let has_star = items.iter().any(|i| i.trim() == "*" || i.trim().ends_with(".*"));
+        // bảng trong FROM (chỉ cần khi có `*`)
+        let mut tables: Vec<(String, String)> = Vec::new();
+        if has_star {
+            let up = from_text.to_uppercase();
+            if up.contains("USING") || up.contains("NATURAL") || up.contains("LATERAL") || from_text.starts_with('(') {
+                return None;
+            }
+            let (base, base_alias, base_sub, joins) = parse_from_and_joins(from_text).ok()?;
+            if base_sub.is_some() || joins.is_empty() || joins.iter().any(|j| j.subquery.is_some()) {
+                return None;
+            }
+            tables.push((base_alias.clone().unwrap_or_else(|| base.clone()), base));
+            for j in joins {
+                tables.push((j.alias.clone().unwrap_or_else(|| j.table_name.clone()), j.table_name));
+            }
+        }
+        let mut out: Vec<(String, String)> = Vec::new(); // (biểu thức, tên đầu ra)
+        for it in &items {
+            let it = it.trim();
+            if it == "*" || it.ends_with(".*") {
+                let q = it.strip_suffix(".*").map(|q| q.trim_matches('"'));
+                for (alias, name) in &tables {
+                    if q.map_or(false, |q| !q.eq_ignore_ascii_case(alias)) {
+                        continue;
+                    }
+                    let tbl = self.storage.get_table(&clean_table_name(name))?;
+                    for c in &tbl.columns {
+                        out.push((format!("{}.\"{}\"", alias, c.name), c.name.clone()));
+                    }
+                }
+                if q.is_some() && !tables.iter().any(|(a, _)| q.map_or(false, |q| q.eq_ignore_ascii_case(a))) {
+                    return None;
+                }
+                continue;
+            }
+            let name = if let Some(a) = find_top_level_keyword(it, "AS") {
+                it[a + 2..].trim().trim_matches('"').to_string()
+            } else if it.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '"') {
+                it.rsplit('.').next().unwrap_or(it).trim_matches('"').to_lowercase()
+            } else {
+                // biểu thức không alias: tên do bộ thực thi đặt; không đụng tới
+                format!("\u{0}{}", out.len())
+            };
+            out.push((it.to_string(), name));
+        }
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut changed = false;
+        let mut rendered = Vec::with_capacity(out.len());
+        for (expr, name) in &out {
+            let n = seen.entry(name.clone()).or_insert(0);
+            *n += 1;
+            if *n > 1 && !name.starts_with('\u{0}') {
+                changed = true;
+                let base = find_top_level_keyword(expr, "AS").map(|a| expr[..a].trim()).unwrap_or(expr);
+                rendered.push(format!("{} AS \"{}{}{}\"", base, name, DUP_MARK, n));
+            } else {
+                rendered.push(expr.clone());
+            }
+        }
+        if !changed {
+            return None;
+        }
+        Some(format!("{}{} {}", head, rendered.join(", "), &t[from..]))
     }
 
     /// Trả về các cột kết quả và số tham số `$n` mà không ghi dữ liệu.

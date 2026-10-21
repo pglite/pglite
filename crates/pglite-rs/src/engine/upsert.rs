@@ -241,6 +241,15 @@ impl Executor {
             Some(p) => (body[..p].trim(), Some(parse_on_conflict(&body[p..])?)),
             None => (body, None),
         };
+        // DO UPDATE SET c = (SELECT ... FROM ...) không tương quan: tính một lần thành hằng
+        let mut on_conflict = on_conflict;
+        if let Some(OnConflict { action: ConflictAction::Update { assignments, .. }, .. }) = on_conflict.as_mut() {
+            for (_, e) in assignments.iter_mut() {
+                if contains_ci(e, "SELECT") {
+                    *e = self.resolve_uncorrelated_set_subqueries(e, params)?;
+                }
+            }
+        }
 
         let into = find_top_level_keyword(body, "INTO").ok_or("Missing INTO in INSERT")?;
         let after_into = body[into + 4..].trim_start();

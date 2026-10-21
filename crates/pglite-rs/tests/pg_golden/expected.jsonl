@@ -1056,3 +1056,24 @@
 {"id":"W6_11","ok":true,"fields":["id","v","s"],"rows":[["1","a","public.idt3_id_seq"],["2","b","public.idt3_id_seq"]]}
 {"id":"W6_12","ok":true,"fields":["d","s","u","su","cs"],"rows":[["postgres","public","postgres","postgres","{pg_catalog,public}"]]}
 {"id":"W6_13","ok":true,"fields":["by_user"],"rows":[["postgres"]]}
+{"id":"W7_01","ok":true,"fields":["tablename"],"rows":[["u"]]}
+{"id":"W7_02","ok":true,"fields":["count"],"rows":[["1"]]}
+{"id":"W7_03","ok":true,"fields":["json_object_agg"],"rows":[["{ \"alice\" : 5, \"bob\" : 3 }"]]}
+{"id":"W7_04","ok":true,"fields":["t_id","jsonb_object_agg"],"rows":[["1","{\"1\": \"v1\", \"2\": \"v2\"}"],["2","{\"3\": \"v3\"}"]]}
+{"id":"W7_05","ok":true,"fields":["name","n"],"rows":[["v3","2"]]}
+{"id":"W7_06","ok":true,"fields":["v","t_id"],"rows":[["z","2"]]}
+{"id":"W7_07","ok":true,"fields":["name","v"],"rows":[["alice","v1"],["bob","v2"],["carol","v3"]]}
+{"id":"W7_08","ok":true,"fields":["key","value"],"rows":[["a","y"],["b","x"]]}
+{"id":"W7_09","ok":true,"fields":["v","i"],"rows":[["{\"a\": 1}","1"],["2","2"],["\"s\"","3"]]}
+{"id":"W7_10","ok":true,"fields":["k"],"rows":[["a"],["bb"]]}
+{"id":"W7_11","ok":true,"fields":["id"],"rows":[["2"]]}
+{"id":"W7_12","ok":false,"error":"prepared statement \"nope\" does not exist","sqlstate":"26000","failed_stmt":0}
+{"id":"W7_13","ok":false,"fields":[],"rows":[],"error":"VACUUM cannot run inside a transaction block","sqlstate":"25001","failed_stmt":1}
+{"id":"W7_14","ok":false,"error":"relation \"nope_table\" does not exist","sqlstate":"42P01","failed_stmt":0}
+{"id":"W7_15","ok":true,"fields":["id","id","name"],"rows":[["1","2","alice"],["2","3","bob"]]}
+{"id":"W7_16","ok":true,"fields":["id","id"],"rows":[["1","1"],["1","2"],["2","3"]]}
+{"id":"W7_17","ok":true,"fields":["key"],"rows":[["x"],["y"]]}
+{"id":"W7_18","ok":true,"fields":["id","name"],"rows":[["1","alice"],["2","v3"],["3","carol"]]}
+{"id":"W7_19","ok":true,"fields":["id","name","n"],"rows":[["1","alice","5"],["2","v3","3"],["3","carol",null]]}
+{"id":"W7_20","ok":true,"fields":["id","name"],"rows":[["1","v1"],["2","bob"],["3","carol"]]}
+{"id":"W7_21","ok":true,"fields":["j"],"rows":[["\"s\""],["1"],["{\"a\": \"b\"}"]]}

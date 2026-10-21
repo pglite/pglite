@@ -245,6 +245,11 @@ fn string_to_pg_text(s: &str, oid: u32) -> String {
                     return jsonb_text(&v);
                 }
             }
+            // chuỗi không phải JSON hợp lệ = chuỗi vô hướng đã giải mã (`SELECT *` giải mã ô jsonb): trả lại
+            // dạng JSON có nháy như PostgreSQL (`"s"`)
+            if serde_json::from_str::<serde_json::Value>(t).is_err() {
+                return serde_json::Value::String(s.to_string()).to_string();
+            }
             s.to_string()
         }
         OID_BOOL => match s.trim().to_lowercase().as_str() {
@@ -822,6 +827,12 @@ pub fn sqlstate(message: &str) -> &'static str {
         "3B001"
     } else if has("can only be used in transaction blocks") {
         "25P01"
+    } else if has("cannot run inside a transaction block") {
+        "25001"
+    } else if has("prepared statement") && has("does not exist") {
+        "26000"
+    } else if has("prepared statement") && has("already exists") {
+        "42P05"
     } else if has("relation") && has("already exists") {
         "42P07"
     } else if has("column") && (has("already exists") || has("specified more than once")) {

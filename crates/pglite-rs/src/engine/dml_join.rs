@@ -72,7 +72,9 @@ impl Executor {
         let decls = self.storage.get_table(&key).map(|t| t.decl_types_vec()).unwrap_or_default();
         let mut assigns: Vec<(usize, Option<String>)> = Vec::new();
         let mut extra = Vec::new();
-        for (j, a) in split_comma_separated_tokens(set_part).into_iter().enumerate() {
+        // SET c = (SELECT ... FROM ...) không tương quan: tính một lần thành hằng
+        let set_part = self.resolve_uncorrelated_set_subqueries(set_part, params)?;
+        for (j, a) in split_comma_separated_tokens(&set_part).into_iter().enumerate() {
             let eq = a.find('=').ok_or("Invalid assignment in SET clause")?;
             let col = a[..eq].trim();
             let col = col.rsplit('.').next().unwrap_or(col).trim().trim_matches('"');

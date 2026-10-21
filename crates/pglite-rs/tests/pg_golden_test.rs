@@ -129,6 +129,7 @@ fn is_volatile(sql: &str) -> bool {
     .iter()
     .any(|k| s.contains(k))
         || s.contains("select * from t ")
+        || s.contains("select * from t,")
         || s.ends_with("select * from t")
 }
 
