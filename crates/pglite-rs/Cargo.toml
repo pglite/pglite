@@ -38,6 +38,9 @@ hex = "0.4"
 base64 = "0.22"
 regex = "1.10"
 unicode-normalization = "0.1"
+# pgcrypto: crypt()/gen_salt('bf') (chỉ hàm bcrypt thô, không kéo getrandom), hmac()
+bcrypt = { version = "0.17", default-features = false }
+hmac = "0.12"
 
 # Node.js native addon dependencies
 napi = { version = "2.16.14", default-features = false, features = ["napi4", "async", "serde-json"], optional = true }

@@ -16,15 +16,22 @@ thread_local! {
 
 /// Tên hàm (đã viết hoa, kèm `(`) do module này xử lý: lọc nhanh trước khi gọi `try_eval`.
 pub(crate) fn is_strfn_name(upper: &str) -> bool {
-    upper.starts_with("REGEXP_") || upper.starts_with("FORMAT(") || upper.starts_with("GREATEST(") || upper.starts_with("LEAST(")
+    upper.starts_with("REGEXP_")
+        || upper.starts_with("FORMAT(")
+        || upper.starts_with("GREATEST(")
+        || upper.starts_with("LEAST(")
+        || upper.find('(').is_some_and(|p| {
+            let n = upper[..p].trim_end();
+            super::fnlib::is_known(n) || super::fnlib::is_partial(n)
+        })
 }
 
 /// Tên hàm (viết hoa, không kèm ngoặc) có trong module.
 pub(crate) fn is_known(name: &str) -> bool {
     matches!(
         name,
-        "REGEXP_REPLACE" | "REGEXP_MATCH" | "REGEXP_MATCHES" | "REGEXP_SPLIT_TO_ARRAY" | "REGEXP_COUNT" | "REGEXP_LIKE" | "REGEXP_SUBSTR" | "FORMAT" | "GREATEST" | "LEAST"
-    )
+        "REGEXP_REPLACE" | "REGEXP_MATCH" | "REGEXP_MATCHES" | "REGEXP_SPLIT_TO_ARRAY" | "REGEXP_COUNT" | "REGEXP_LIKE" | "REGEXP_SUBSTR" | "REGEXP_INSTR" | "FORMAT" | "GREATEST" | "LEAST"
+    ) || super::fnlib::is_known(name)
 }
 
 /// `quote_ident`: nháy kép khi không phải tên thường viết thường.
@@ -49,7 +56,10 @@ fn quote_literal_or_null(v: &Value) -> String {
     if v.is_null() {
         return "NULL".to_string();
     }
-    let s = v.as_str();
+    quote_literal_text(&v.as_str())
+}
+
+pub(crate) fn quote_literal_text(s: &str) -> String {
     let body = s.replace('\'', "''");
     if s.contains('\\') { format!("E'{}'", body.replace('\\', "\\\\")) } else { format!("'{}'", body) }
 }
@@ -284,6 +294,31 @@ fn split(re: &regex::Regex, s: &str) -> Vec<Option<String>> {
     out
 }
 
+/// Đối số là một chuỗi hằng không phải số nguyên (`substring(s FROM '[0-9]+')` dạng regex, khác `FROM 2`).
+pub(crate) fn is_text_literal(arg: &str) -> bool {
+    let a = arg.trim();
+    a.len() >= 2 && a.starts_with('\'') && a.ends_with('\'') && a[1..a.len() - 1].trim().parse::<i64>().is_err()
+}
+
+/// `substring(s FROM 'regex')`: nhóm bắt đầu tiên nếu mẫu có ngoặc, không thì cả đoạn khớp; không khớp → NULL.
+pub(crate) fn substring_regex(s: &Value, pat: &Value) -> Value {
+    if s.is_null() || pat.is_null() {
+        return Value::Null;
+    }
+    let text = s.as_str();
+    let Some(re) = compile(&pat.as_str(), &parse_flags("").ok().unwrap()) else {
+        super::errors::raise(format!("invalid regular expression: {}", pat.as_str()));
+        return Value::Null;
+    };
+    match re.captures(&text) {
+        Some(c) => {
+            let m = if c.len() > 1 { c.get(1) } else { c.get(0) };
+            m.map_or(Value::Null, |m| Value::text(m.as_str()))
+        }
+        None => Value::Null,
+    }
+}
+
 /// Đánh giá `name(args)` nếu là hàm regex. `eval` tính một đối số. `None` = không phải hàm của module.
 pub(crate) fn try_eval(s: &str, upper: &str, eval: &dyn Fn(&str) -> Value) -> Option<Value> {
     let open = s.find('(')?;
@@ -291,15 +326,36 @@ pub(crate) fn try_eval(s: &str, upper: &str, eval: &dyn Fn(&str) -> Value) -> Op
         return None;
     }
     let name = upper[..open].trim();
-    if !is_known(name) {
+    if !is_known(name) && !super::fnlib::is_partial(name) {
         return None;
     }
-    let args: Vec<Value> = super::executor::split_function_args(&s[open + 1..s.len() - 1]).iter().map(|a| eval(a)).collect();
+    let raw = super::executor::split_function_args(&s[open + 1..s.len() - 1]);
+    if matches!(name, "JSON_VALUE" | "JSON_QUERY" | "JSON_EXISTS" | "JSON_OBJECT") {
+        return super::fnlib::sql_json(name, &raw, eval);
+    }
+    let args: Vec<Value> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            // normalize(s, NFKC): dạng chuẩn là từ khoá, không phải biểu thức
+            if i == 1 && name == "NORMALIZE" && a.trim().chars().all(|c| c.is_ascii_alphanumeric()) {
+                Value::text(a.trim())
+            } else if i == 0 && matches!(name, "SCALE" | "MIN_SCALE" | "TRIM_SCALE") && a.trim().contains('.') && a.trim().parse::<f64>().is_ok() {
+                // hằng numeric giữ nguyên chữ số 0 cuối (`scale(1.230)` = 3)
+                Value::text(a.trim())
+            } else {
+                eval(a)
+            }
+        })
+        .collect();
     call(name, &args)
 }
 
 /// Gọi hàm `name` (viết hoa) với đối số đã tính. `None` = không phải hàm / sai số đối số.
 pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
+    if super::fnlib::is_known(name) || super::fnlib::is_partial(name) {
+        return super::fnlib::call(name, args);
+    }
     if name == "GREATEST" || name == "LEAST" {
         let greatest = name == "GREATEST";
         let mut best: Option<Value> = None;
@@ -457,6 +513,51 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Option<Value> {
             let found = re.captures_iter(&text[from..]).nth(nth as usize - 1).and_then(|c| c.get(sub).map(|m| m.as_str().to_string()));
             Some(found.map_or(Value::Null, Value::text))
         }
+        "REGEXP_INSTR" => {
+            // regexp_instr(s, re [, start [, N [, endoption [, flags [, subexpr]]]]])
+            let start = int_arg(2).unwrap_or(1);
+            let nth = int_arg(3).unwrap_or(1);
+            if start < 1 || nth < 1 {
+                return fail(format!("invalid value for parameter \"{}\": {}", if start < 1 { "start" } else { "n" }, if start < 1 { start } else { nth }));
+            }
+            let end_opt = int_arg(4).unwrap_or(0);
+            let flags = match flags_at(5) {
+                Ok(f) => f,
+                Err(e) => return fail(e),
+            };
+            let sub = int_arg(6).unwrap_or(0).max(0) as usize;
+            let Some(re) = get_re(&flags) else { return fail(format!("invalid regular expression: {}", pat)) };
+            let from = char_start(&text, start);
+            let pos = re.captures_iter(&text[from..]).nth(nth as usize - 1).and_then(|c| c.get(sub)).map(|m| {
+                let byte = from + if end_opt != 0 { m.end() } else { m.start() };
+                text[..byte].chars().count() as i64 + 1
+            });
+            Some(Value::Int(pos.unwrap_or(0)))
+        }
         _ => None,
     }
+}
+
+/// `regexp_matches(s, re, flags)` dạng hàm trả tập: mỗi lần khớp một mảng nhóm bắt (cờ `g` = mọi lần khớp).
+pub(crate) fn regexp_matches_rows(text: &str, pat: &str, flags: &str) -> Result<Vec<Value>, String> {
+    let f = parse_flags(flags)?;
+    let re = compile(pat, &f).ok_or_else(|| format!("invalid regular expression: {}", pat))?;
+    let mut out = Vec::new();
+    for caps in re.captures_iter(text) {
+        out.push(text_array(captures_of(&caps)));
+        if !f.global {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// `regexp_split_to_table(s, re [, flags])`.
+pub(crate) fn regexp_split_rows(text: &str, pat: &str, flags: &str) -> Result<Vec<Value>, String> {
+    let f = parse_flags(flags)?;
+    if f.global {
+        return Err("regexp_split_to_table() does not support the \"global\" option".into());
+    }
+    let re = compile(pat, &f).ok_or_else(|| format!("invalid regular expression: {}", pat))?;
+    Ok(split(&re, text).into_iter().map(|p| p.map_or(Value::Null, Value::text)).collect())
 }

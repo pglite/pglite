@@ -174,6 +174,9 @@ pub fn to_pg_text(v: &serde_json::Value, oid: u32) -> Option<String> {
             if oid == OID_BOOL {
                 return Some(if n.as_f64().unwrap_or(0.0) != 0.0 { "t" } else { "f" }.to_string());
             }
+            if (oid == OID_FLOAT8 || oid == OID_FLOAT4) && n.is_f64() {
+                return Some(float8_text(n.as_f64().unwrap_or(0.0)));
+            }
             Some(n.to_string())
         }
         J::String(s) => Some(string_to_pg_text(s, oid)),
@@ -195,6 +198,29 @@ pub fn to_pg_text(v: &serde_json::Value, oid: u32) -> Option<String> {
         }
         J::Object(_) => Some(v.to_string()),
     }
+}
+
+/// Text output của float8 như PostgreSQL (`extra_float_digits = 1`): số ngắn nhất khôi phục đúng giá trị,
+/// không có `.0`; dạng mũ `1e+20`, `1.5e-05` khi số mũ < -4 hoặc >= 15.
+pub fn float8_text(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    let exp = x.abs().log10().floor() as i32;
+    if (-4..15).contains(&exp) {
+        let s = format!("{}", x);
+        return s.strip_suffix(".0").map(str::to_string).unwrap_or(s);
+    }
+    let e = format!("{:e}", x);
+    let (m, ex) = e.split_once('e').unwrap_or((&e, "0"));
+    let ex: i32 = ex.parse().unwrap_or(0);
+    format!("{}e{}{:02}", m, if ex < 0 { '-' } else { '+' }, ex.abs())
 }
 
 /// Text output của jsonb như PostgreSQL: `{"a": 1, "b": [1, 2]}`, khoá xếp theo độ dài rồi theo byte,
@@ -594,7 +620,7 @@ pub fn infer_expr_type(expr: &str, col_type: &dyn Fn(&str) -> Option<String>) ->
         }
         "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "POSITION" | "STRPOS" | "ARRAY_LENGTH" | "CARDINALITY" | "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => "integer",
         "EXTRACT" | "DATE_PART" => "numeric",
-        "RANDOM" | "PI" | "SQRT" | "POWER" | "POW" | "LN" | "LOG" | "EXP" | "PERCENT_RANK" | "CUME_DIST" => "float8",
+        "RANDOM" | "PI" | "SQRT" | "CBRT" | "POWER" | "POW" | "LN" | "EXP" | "DEGREES" | "RADIANS" | "PERCENT_RANK" | "CUME_DIST" => "float8",
         "BOOL_AND" | "BOOL_OR" | "EVERY" | "EXISTS" => "bool",
         "STRING_AGG" | "CONCAT" | "CONCAT_WS" | "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "BTRIM" | "SUBSTRING" | "SUBSTR" | "LEFT" | "RIGHT" | "REPLACE" | "TO_CHAR" | "LPAD" | "RPAD" | "INITCAP" | "MD5" | "REPEAT" | "REVERSE" | "SPLIT_PART" | "FORMAT" | "QUOTE_IDENT" | "QUOTE_LITERAL" | "ENCODE" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION" | "FORMAT_TYPE" => "text",
         "JSON_AGG" | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_OBJECT_AGG" | "TO_JSON" | "ROW_TO_JSON" => "json",
@@ -609,7 +635,24 @@ pub fn infer_expr_type(expr: &str, col_type: &dyn Fn(&str) -> Option<String>) ->
         "TO_DATE" => "date",
         "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => "uuid",
         "TO_NUMBER" => "numeric",
-        _ => return None,
+        "PERCENTILE_DISC" | "MODE" | "ANY_VALUE" | "BIT_AND" | "BIT_OR" | "BIT_XOR" => {
+            let key = if fname == "PERCENTILE_DISC" { args.and_then(|a| split_top_level_commas(a).into_iter().nth(1).map(str::to_string)) } else { first_arg.clone() };
+            return key.as_deref().and_then(|a| infer_expr_type(a, col_type));
+        }
+        _ if crate::engine::fnlib::agg_result_type(fname).is_some() => match crate::engine::fnlib::agg_result_type(fname)? {
+            "double precision" => "float8",
+            "bigint" => "int8",
+            "xml" => "text",
+            t => t,
+        },
+        _ => match crate::engine::fnlib::result_type(fname)? {
+            "double precision" => "float8",
+            "bigint" | "xid8" => "int8",
+            "boolean" => "bool",
+            "integer[]" => return Some("array(\"INT\")".to_string()),
+            "void" => "text",
+            t => t,
+        },
     };
     Some(t.to_string())
 }
@@ -785,6 +828,9 @@ mod tests {
 pub fn sqlstate(message: &str) -> &'static str {
     let m = message.to_lowercase();
     let has = |s: &str| m.contains(s);
+    if has("unrecognized configuration parameter") {
+        return "42704";
+    }
     if has("cannot insert a non-default value into column") || has("can only be updated to default") {
         "428C9"
     } else if has("duplicate key value violates unique constraint") || has("could not create unique index") {

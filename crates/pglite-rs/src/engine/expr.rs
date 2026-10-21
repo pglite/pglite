@@ -697,6 +697,9 @@ impl CompiledExpr {
             CompiledExpr::JsonContains(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
                 if let (Some(lj), Some(rj)) = (crate::engine::executor::parse_val_to_json(&vl), crate::engine::executor::parse_val_to_json(&vr)) {
                     Value::Bool(crate::engine::executor::json_contains_check(&lj, &rj))
                 } else {
@@ -706,6 +709,9 @@ impl CompiledExpr {
             CompiledExpr::JsonContained(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
                 if let (Some(lj), Some(rj)) = (crate::engine::executor::parse_val_to_json(&vl), crate::engine::executor::parse_val_to_json(&vr)) {
                     Value::Bool(crate::engine::executor::json_contains_check(&rj, &lj))
                 } else {
@@ -715,6 +721,9 @@ impl CompiledExpr {
             CompiledExpr::JsonHasKey(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
                 if let Some(lj) = crate::engine::executor::parse_val_to_json(&vl) {
                     Value::Bool(crate::engine::executor::json_has_key_check(&lj, &vr.as_str()))
                 } else {
@@ -724,6 +733,9 @@ impl CompiledExpr {
             CompiledExpr::JsonHasAnyKey(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
                 if let Some(lj) = crate::engine::executor::parse_val_to_json(&vl) {
                     let keys = crate::engine::executor::parse_str_or_json_keys(&vr);
                     Value::Bool(keys.iter().any(|k| crate::engine::executor::json_has_key_check(&lj, k)))
@@ -734,6 +746,9 @@ impl CompiledExpr {
             CompiledExpr::JsonHasAllKeys(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
                 if let Some(lj) = crate::engine::executor::parse_val_to_json(&vl) {
                     let keys = crate::engine::executor::parse_str_or_json_keys(&vr);
                     Value::Bool(!keys.is_empty() && keys.iter().all(|k| crate::engine::executor::json_has_key_check(&lj, k)))
@@ -744,6 +759,9 @@ impl CompiledExpr {
             CompiledExpr::ArrayOverlap(l, r) => {
                 let vl = l.eval(primary_row, joined_row, params);
                 let vr = r.eval(primary_row, joined_row, params);
+                if vl.is_null() || vr.is_null() {
+                    return Value::Null;
+                }
                 Value::Bool(crate::engine::executor::array_overlap_check(&vl, &vr))
             }
 
@@ -1955,8 +1973,7 @@ fn eval_func_call(name: &str, args: &[Value]) -> Value {
                 if decimals == 0 {
                     Value::Int(f.round() as i64)
                 } else {
-                    let multiplier = 10f64.powi(decimals as i32);
-                    Value::Float((f * multiplier).round() / multiplier)
+                    Value::Float(crate::engine::fnlib::round_dec(f, decimals))
                 }
             } else {
                 Value::Null

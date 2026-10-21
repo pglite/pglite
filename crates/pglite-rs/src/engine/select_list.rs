@@ -95,7 +95,7 @@ pub(crate) fn default_column_name(expr: &str) -> String {
     let case_expr = up.starts_with("CASE") && up.ends_with("END");
     if !case_expr
         && (super::executor::find_top_level_math_op(s, &['+', '-', '*', '/', '%']).is_some_and(|(p, _)| !s[..p].trim().is_empty())
-            || ["||", "#>", "=", "<", ">", "@>", "<@", "~"].iter().any(|op| super::executor::find_top_level_op(s, op).is_some_and(|p| p > 0))
+            || ["||", "#>", "=", "<", ">", "@>", "<@", "~", "&&"].iter().any(|op| super::executor::find_top_level_op(s, op).is_some_and(|p| p > 0))
             || ["LIKE", "ILIKE", "IN", "BETWEEN", "IS", "AND", "OR", "SIMILAR"].iter().any(|k| find_top_level_keyword(s, k).is_some_and(|p| p > 0)))
     {
         return "?column?".to_string();
@@ -132,7 +132,9 @@ pub(crate) fn default_column_name(expr: &str) -> String {
             if let Some(close) = super::constraints::matching_paren(s, open) {
                 let tail = s[close + 1..].trim().to_uppercase();
                 if tail.is_empty() || tail.starts_with("OVER") || tail.starts_with("FILTER") || tail.starts_with("WITHIN GROUP") {
-                    return name.rsplit('.').next().unwrap_or(name).to_lowercase();
+                    let n = name.rsplit('.').next().unwrap_or(name).to_lowercase();
+                    // hàm gộp hypothetical-set sau khi viết lại `rank(x) WITHIN GROUP (...)`
+                    return n.strip_prefix("pg_hyp_").map(str::to_string).unwrap_or(n);
                 }
             }
         }
@@ -322,6 +324,14 @@ pub(crate) fn normalize_select_sql(sql: &str) -> Option<String> {
     Some(format!("{} {} {}", t[..list_start].trim_end(), out_items.join(", "), &t[end..]).trim_end().to_string())
 }
 
+/// Tên mặc định PostgreSQL của một biểu thức trên đường wire: như `default_column_name` sau khi viết lại
+/// cú pháp (`trim(LEADING ...)` → `ltrim`), và `trim(x)` → `btrim` (object JSON giữ tên cũ `trim`).
+pub(crate) fn wire_default_name(expr: &str) -> String {
+    let rewritten = super::oprewrite::rewrite(expr);
+    let n = default_column_name(rewritten.as_deref().unwrap_or(expr));
+    if n == "trim" { "btrim".into() } else { n }
+}
+
 /// Tên cột PostgreSQL cho từng phần tử của danh sách SELECT (đường wire): alias nếu có, ngược lại tên
 /// mặc định (`?column?`, `int4`, `count`...) — kể cả khi nhiều cột trùng tên, điều mà kết quả dạng object
 /// không giữ được. `None` khi không chắc (có `*`, không phải SELECT, nhiều câu lệnh...). Cờ đi kèm:
@@ -361,7 +371,7 @@ pub(crate) fn wire_names(sql: &str) -> Option<Vec<(String, bool, String)>> {
         } else if let (Some((expr, alias)), false) = (implicit_alias(it), is_column_ref(it)) {
             (alias, true, expr)
         } else {
-            (default_column_name(it), is_column_ref(it), it)
+            (wire_default_name(it), is_column_ref(it), it)
         };
         out.push((super::frontend::decode_all(&name).into_owned(), certain, expr.to_string()));
     }
@@ -392,6 +402,13 @@ pub(crate) fn wire_shape(expr: &str) -> Option<WireShape> {
         s = inner;
     }
     let up = s.to_uppercase();
+    // nối mảng: `0 || ARRAY[1]`, `arr || 3`
+    if let Some(p) = super::executor::find_top_level_op(s, "||") {
+        let (l, r) = (&s[..p], &s[p + 2..]);
+        if [l, r].iter().any(|x| matches!(wire_shape(x), Some(WireShape::Array { .. }))) {
+            return Some(WireShape::Array { constructor: false });
+        }
+    }
     if up.starts_with("ARRAY[") && s.ends_with(']') {
         return Some(WireShape::Array { constructor: true });
     }
@@ -405,6 +422,10 @@ pub(crate) fn wire_shape(expr: &str) -> Option<WireShape> {
         }
     }
     let open = s.find('(')?;
+    // percentile_cont/disc(ARRAY[...]) WITHIN GROUP (...): mảng kết quả
+    if up.starts_with("PERCENTILE_") && s[open + 1..].trim_start().to_uppercase().starts_with("ARRAY[") {
+        return Some(WireShape::Array { constructor: false });
+    }
     if !s.ends_with(')') || super::constraints::matching_paren(s, open) != Some(s.len() - 1) {
         return None;
     }
@@ -415,7 +436,7 @@ pub(crate) fn wire_shape(expr: &str) -> Option<WireShape> {
         | "ARRAY_REPLACE" | "ARRAY_AGG" | "ARRAY_FILL" | "ARRAY_POSITIONS" | "TRIM_ARRAY" | "ARRAY_REVERSE" | "ARRAY_SORT"
         | "ARRAY_SHUFFLE" | "ARRAY_SAMPLE" => Some(WireShape::Array { constructor: false }),
         "DECODE" => Some(WireShape::ByteaText),
-        "SHA224" | "SHA256" | "SHA384" | "SHA512" => Some(WireShape::ByteaHex),
+        "SHA224" | "SHA256" | "SHA384" | "SHA512" | "DIGEST" | "HMAC" => Some(WireShape::ByteaHex),
         _ => None,
     }
 }

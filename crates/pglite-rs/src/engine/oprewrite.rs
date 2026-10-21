@@ -6,18 +6,29 @@
 //!   cột `?column?` như PostgreSQL);
 //! - `x [NOT] SIMILAR TO 'mẫu' [ESCAPE 'c']` → `x ~ '^(?:regex)$'` / `x !~ ...`;
 //! - `x AT TIME ZONE z` → `timezone(z, x)` (cùng hàm PostgreSQL dùng; tên cột `timezone`);
-//! - `x IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED` → `[NOT] is_normalized(x, 'NFC')`.
+//! - `x IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED` → `[NOT] is_normalized(x, 'NFC')`;
+//! - cú pháp từ khoá trong lời gọi hàm: `trim([BOTH|LEADING|TRAILING] [x] FROM s)` → `btrim/ltrim/rtrim(s[, x])`
+//!   (đúng tên cột PG), `overlay(s PLACING r FROM n [FOR m])` → `overlay(s, r, n[, m])`;
+//! - `a ^@ b` → `(starts_with(a, b) = TRUE)`;
+//! - jsonpath: `a @? b` → `(jsonb_path_exists(a, b) = TRUE)`, `a @@ b` → `(pg_atat(a, b) = TRUE)`;
+//! - SQL/JSON `x IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [WITH|WITHOUT UNIQUE [KEYS]]` → `(pg_is_json(...) = TRUE|FALSE)`;
+//! - hàm gộp `WITHIN GROUP (ORDER BY k [DESC])`: `percentile_cont(f) ...` → `percentile_cont(f, k, 'asc')`,
+//!   `mode() ...` → `mode(k, 'asc')`, `rank(x) ...` → `pg_hyp_rank(x, k, 'asc')` (tên cột vẫn là `rank`);
+//! - subscript jsonb bằng chuỗi `x['a'][0]` → `(x -> 'a' -> 0)`.
 //! Chuỗi `'...'`, định danh `"..."` và thân `$$...$$` không bị đụng tới.
 
 /// Lọc nhanh, một lượt qua câu (chạy cho mọi câu lệnh): có `@` tiền tố, `|/`, hoặc một trong các từ
 /// khoá ISNULL, NOTNULL, SYMMETRIC, SIMILAR, ZONE, NORMALIZED.
 fn may_need(sql: &str) -> bool {
-    const WORDS: [&[u8]; 7] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS"];
+    const WORDS: [&[u8]; 11] = [b"ISNULL", b"NOTNULL", b"SYMMETRIC", b"SIMILAR", b"ZONE", b"NORMALIZED", b"OVERLAPS", b"TRIM", b"OVERLAY", b"JSON", b"WITHIN"];
     let b = sql.as_bytes();
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
-        if c == b'@' && !matches!(b.get(i + 1), Some(b'>' | b'@' | b'?')) || c == b'|' && b.get(i + 1) == Some(&b'/') {
+        if c == b'@' && !matches!(b.get(i + 1), Some(b'>' | b'@' | b'?')) || c == b'|' && b.get(i + 1) == Some(&b'/') || c == b'^' && b.get(i + 1) == Some(&b'@')
+            || c == b'@' && matches!(b.get(i + 1), Some(b'@' | b'?'))
+            || c == b'[' && b.get(i + 1) == Some(&b'\'')
+        {
             return true;
         }
         if c.is_ascii_alphabetic() {
@@ -383,6 +394,207 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         let bv = s[b_start..end].trim().to_string();
         let rep = format!("LEAST({a}, {bv}) AND GREATEST({a}, {bv}) ");
         s.replace_range(p..end, &rep);
+        changed = true;
+    }
+
+    // trim(BOTH|LEADING|TRAILING [x] FROM s), trim(x FROM s), overlay(s PLACING r FROM n [FOR m])
+    for kw in ["TRIM", "OVERLAY"] {
+        let mut from = 0;
+        loop {
+            let m = code_mask(&s);
+            let Some(p) = find_kw(&s, &m, kw, from) else { break };
+            from = p + kw.len();
+            let open = p + kw.len() + (s[p + kw.len()..].len() - s[p + kw.len()..].trim_start().len());
+            if s.as_bytes().get(open) != Some(&b'(') {
+                continue;
+            }
+            let Some(close) = super::constraints::matching_paren(&s, open) else { break };
+            let inner = s[open + 1..close].to_string();
+            let top = |t: &str, k: &str| super::executor::find_top_level_keyword(t, k);
+            let rep = if kw == "TRIM" {
+                let t = inner.trim_start();
+                let first = t.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_ascii_uppercase();
+                let (func, rest) = match first.as_str() {
+                    "BOTH" => ("btrim", &t[4..]),
+                    "LEADING" => ("ltrim", &t[7..]),
+                    "TRAILING" => ("rtrim", &t[8..]),
+                    _ => ("btrim", t),
+                };
+                match top(rest, "FROM") {
+                    Some(f) => {
+                        let chars = rest[..f].trim();
+                        let src = rest[f + 4..].trim();
+                        if chars.is_empty() { format!("{}({})", func, src) } else { format!("{}({}, {})", func, src, chars) }
+                    }
+                    None if func != "btrim" || rest.len() != t.len() => format!("{}({})", func, rest.trim()),
+                    None => continue,
+                }
+            } else {
+                let Some(pl) = top(&inner, "PLACING") else { continue };
+                let after = &inner[pl + 7..];
+                let Some(f) = top(after, "FROM") else { continue };
+                let tail = &after[f + 4..];
+                match top(tail, "FOR") {
+                    Some(fo) => format!("overlay({}, {}, {}, {})", inner[..pl].trim(), after[..f].trim(), tail[..fo].trim(), tail[fo + 3..].trim()),
+                    None => format!("overlay({}, {}, {})", inner[..pl].trim(), after[..f].trim(), tail.trim()),
+                }
+            };
+            s.replace_range(p..close + 1, &rep);
+            from = p + rep.len();
+            changed = true;
+        }
+    }
+
+    // a ^@ b → (starts_with(a, b) = TRUE)
+    loop {
+        let m = code_mask(&s);
+        let Some(i) = (0..s.len().saturating_sub(1)).find(|&i| m[i] && s.as_bytes()[i] == b'^' && s.as_bytes()[i + 1] == b'@') else { break };
+        let (Some(a), Some(e)) = (primary_start(&s, &m, i), primary_end(&s, &m, i + 2)) else { break };
+        let rep = format!("(starts_with({}, {}) = TRUE)", s[a..i].trim(), s[i + 2..e].trim());
+        s.replace_range(a..e, &rep);
+        changed = true;
+    }
+
+    // f(...) WITHIN GROUP (ORDER BY k [ASC|DESC] [NULLS ...])
+    let mut from = 0;
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "WITHIN", from) else { break };
+        from = p + 6;
+        let Some(g) = find_kw(&s, &m, "GROUP", p + 6).filter(|g| s[p + 6..*g].trim().is_empty()) else { continue };
+        let Some(open) = s[g + 5..].find('(').map(|o| g + 5 + o).filter(|o| s[g + 5..*o].trim().is_empty()) else { continue };
+        let Some(close) = super::constraints::matching_paren(&s, open) else { break };
+        let ob = s[open + 1..close].trim();
+        if ob.len() < 8 || !ob[..8].eq_ignore_ascii_case("ORDER BY") {
+            continue;
+        }
+        let mut key = ob[8..].trim().to_string();
+        for suf in [" NULLS FIRST", " NULLS LAST"] {
+            if key.to_ascii_uppercase().ends_with(suf) {
+                key.truncate(key.len() - suf.len());
+            }
+        }
+        let ku = key.to_ascii_uppercase();
+        let dir = if ku.ends_with(" DESC") {
+            key.truncate(key.len() - 5);
+            "desc"
+        } else {
+            if ku.ends_with(" ASC") {
+                key.truncate(key.len() - 4);
+            }
+            "asc"
+        };
+        let call_end = s[..p].trim_end().len();
+        if !s[..call_end].ends_with(')') {
+            continue;
+        }
+        let Some(fs) = primary_start(&s, &m, call_end) else { continue };
+        let call = &s[fs..call_end];
+        let Some(fo) = call.find('(') else { continue };
+        let fname = call[..fo].trim().to_ascii_lowercase();
+        let direct = call[fo + 1..call.len() - 1].trim();
+        let rep = match fname.as_str() {
+            "percentile_cont" | "percentile_disc" => format!("{}({}, {}, '{}')", fname, direct, key.trim(), dir),
+            "mode" => format!("mode({}, '{}')", key.trim(), dir),
+            "rank" | "dense_rank" | "percent_rank" | "cume_dist" => format!("pg_hyp_{}({}, {}, '{}')", fname, direct, key.trim(), dir),
+            _ => continue,
+        };
+        s.replace_range(fs..close + 1, &rep);
+        from = fs + rep.len();
+        changed = true;
+    }
+
+    // a @? b, a @@ b (jsonpath; @@ của full-text search cũng đi qua pg_atat)
+    loop {
+        let m = code_mask(&s);
+        let b = s.as_bytes();
+        let Some(i) = (1..b.len().saturating_sub(1)).find(|&i| m[i] && b[i] == b'@' && matches!(b[i + 1], b'?' | b'@') && !matches!(b[i - 1], b'@' | b'<')) else { break };
+        let (Some(a), Some(e)) = (primary_start(&s, &m, i), primary_end(&s, &m, i + 2)) else { break };
+        let func = if b[i + 1] == b'?' { "jsonb_path_exists" } else { "pg_atat" };
+        let rep = format!("({}({}, {}) = TRUE)", func, s[a..i].trim(), s[i + 2..e].trim());
+        s.replace_range(a..e, &rep);
+        changed = true;
+    }
+
+    // x IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [WITH|WITHOUT UNIQUE [KEYS]]
+    let mut from = 0;
+    loop {
+        let m = code_mask(&s);
+        let Some(p) = find_kw(&s, &m, "JSON", from) else { break };
+        from = p + 4;
+        let before = s[..p].trim_end();
+        let (neg, is_end) = if before.len() >= 6 && before[before.len() - 3..].eq_ignore_ascii_case("NOT") && before[..before.len() - 3].trim_end().to_ascii_uppercase().ends_with(" IS") {
+            (true, before[..before.len() - 3].trim_end().len() - 2)
+        } else if before.to_ascii_uppercase().ends_with(" IS") {
+            (false, before.len() - 2)
+        } else {
+            continue;
+        };
+        let Some(a) = primary_start(&s, &m, is_end) else { continue };
+        let mut end = p + 4;
+        let mut kind = "VALUE";
+        let mut unique = false;
+        let next_word = |pos: usize| -> (usize, String) {
+            let r = &s[pos..];
+            let t = r.trim_start();
+            let st = pos + (r.len() - t.len());
+            let w: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            (st + w.len(), w.to_ascii_uppercase())
+        };
+        let (e1, w1) = next_word(end);
+        if ["VALUE", "SCALAR", "ARRAY", "OBJECT"].contains(&w1.as_str()) {
+            kind = match w1.as_str() {
+                "VALUE" => "VALUE",
+                "SCALAR" => "SCALAR",
+                "ARRAY" => "ARRAY",
+                _ => "OBJECT",
+            };
+            end = e1;
+        }
+        let (e2, w2) = next_word(end);
+        if w2 == "WITH" || w2 == "WITHOUT" {
+            let (e3, w3) = next_word(e2);
+            if w3 == "UNIQUE" {
+                unique = w2 == "WITH";
+                end = e3;
+                let (e4, w4) = next_word(end);
+                if w4 == "KEYS" {
+                    end = e4;
+                }
+            }
+        }
+        let rep = format!("(pg_is_json({}, '{}', {}) = {})", s[a..is_end].trim(), kind, unique, if neg { "FALSE" } else { "TRUE" });
+        s.replace_range(a..end, &rep);
+        from = a + rep.len();
+        changed = true;
+    }
+
+    // x['a'][0] (subscript jsonb bằng chuỗi) → (x -> 'a' -> 0)
+    loop {
+        let m = code_mask(&s);
+        let b = s.as_bytes();
+        let Some(i) = (1..b.len().saturating_sub(1)).find(|&i| {
+            m[i] && b[i] == b'[' && b[i + 1] == b'\'' && (b[i - 1] == b')' || is_word(b[i - 1])) && !(i >= 5 && b[i - 5..i].eq_ignore_ascii_case(b"ARRAY") && (i == 5 || !is_word(b[i - 6])))
+        }) else {
+            break;
+        };
+        let Some(a) = primary_start(&s, &m, i) else { break };
+        let mut keys = Vec::new();
+        let mut k = i;
+        while k < s.len() && s.as_bytes()[k] == b'[' {
+            let Some(close) = s[k..].find(']').map(|e| k + e) else { break };
+            let inner = s[k + 1..close].trim().to_string();
+            if inner.is_empty() || inner.contains(':') {
+                break;
+            }
+            keys.push(inner);
+            k = close + 1;
+        }
+        if keys.is_empty() {
+            break;
+        }
+        let rep = format!("({} -> {})", s[a..i].trim(), keys.join(" -> "));
+        s.replace_range(a..k, &rep);
         changed = true;
     }
 

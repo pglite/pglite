@@ -1719,6 +1719,18 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
     /// lại thành `FROM __srf_N AS alias` rồi chạy như truy vấn thường. `None` nếu FROM không có dạng này.
     fn try_srf_from(&mut self, select_clause: &str, is_distinct: bool, after_from: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
         let up = after_from.to_uppercase();
+        if up.starts_with("ROWS FROM") && after_from[9..].trim_start().starts_with('(') {
+            return self.try_rows_from(select_clause, is_distinct, after_from, params);
+        }
+        if up.starts_with("JSON_TABLE(") {
+            return self.try_generic_srf_from("JSON_TABLE", select_clause, is_distinct, after_from, params);
+        }
+        if let Some(p) = up.find('(') {
+            let n = up[..p].trim_end();
+            if crate::engine::srf::is_srf(n, false) && !JSON_SRFS.contains(&n) {
+                return self.try_generic_srf_from(n, select_clause, is_distinct, after_from, params);
+            }
+        }
         if JSON_SRFS.iter().any(|f| up.starts_with(f) && up[f.len()..].starts_with('(')) {
             return self.try_json_srf_from(select_clause, is_distinct, after_from, params);
         }
@@ -1862,6 +1874,277 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
             (r, p)
         });
         Some(res)
+    }
+
+    /// `FROM ROWS FROM (f1(...), f2(...)) [WITH ORDINALITY] [AS] a[(cột, ...)]`: mỗi hàm chạy như
+    /// `SELECT * FROM fi(...)`, các cột được ghép theo dòng (hàm ngắn hơn đệm NULL) thành một bảng tạm.
+    fn try_rows_from(&mut self, select_clause: &str, is_distinct: bool, after_from: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
+        let open = 9 + after_from[9..].find('(')?;
+        let close = crate::engine::constraints::matching_paren(after_from, open)?;
+        let calls = split_function_args(&after_from[open + 1..close]);
+        let mut rest = after_from[close + 1..].trim_start();
+        let mut ordinality = false;
+        if rest.len() >= 15 && rest.as_bytes()[..15].eq_ignore_ascii_case(b"WITH ORDINALITY") {
+            ordinality = true;
+            rest = rest[15..].trim_start();
+        }
+        let stop_words = ["WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "HAVING", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "UNION", "WINDOW", "FETCH", "FOR", "ON"];
+        let r2 = if rest.len() >= 3 && rest.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") { rest[3..].trim_start() } else { rest };
+        let wl = r2.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).unwrap_or(r2.len());
+        let word = &r2[..wl];
+        let mut alias = "rows_from".to_string();
+        let mut col_list: Vec<String> = Vec::new();
+        if !word.is_empty() && !stop_words.iter().any(|w| w.eq_ignore_ascii_case(word)) {
+            alias = word.trim_matches('"').to_string();
+            rest = r2[wl..].trim_start();
+            if rest.starts_with('(') {
+                let c = crate::engine::constraints::matching_paren(rest, 0)?;
+                col_list = split_comma_separated_tokens(&rest[1..c]).into_iter().map(|x| x.trim().trim_matches('"').to_string()).collect();
+                rest = rest[c + 1..].trim_start();
+            }
+        }
+        if rest.starts_with(',') || has_top_level_join(rest) {
+            return None;
+        }
+        // (tên cột, kiểu, giá trị theo dòng)
+        let mut cols: Vec<(String, DataType, Vec<Value>)> = Vec::new();
+        for call in &calls {
+            let r = match self.handle_select(&format!("SELECT * FROM {}", call.trim()), params) {
+                Ok((r, _)) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            for f in &r.fields {
+                let vals = r.rows.iter().map(|row| row.get(&f.name).map(json_to_value).unwrap_or(Value::Null)).collect();
+                cols.push((f.name.clone(), DataType::from_sql_str(&f.data_type), vals));
+            }
+        }
+        let nrows = cols.iter().map(|c| c.2.len()).max().unwrap_or(0);
+        if ordinality {
+            cols.push(("ordinality".into(), DataType::BigInt, (1..=nrows as i64).map(Value::Int).collect()));
+        }
+        for (i, n) in col_list.iter().enumerate() {
+            if let Some(c) = cols.get_mut(i) {
+                c.0 = n.clone();
+            }
+        }
+        // tên trùng (hai generate_series): tên phụ, được bỏ hậu tố ở đường wire như cột trùng tên của JOIN
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for c in cols.iter_mut() {
+            let k = seen.entry(c.0.clone()).or_insert(0);
+            *k += 1;
+            if *k > 1 {
+                c.0 = format!("{}{}{}", c.0, DUP_MARK, k);
+            }
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!("__srf_{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 4_000_000);
+        let defs = cols.iter().map(|(n, dt, _)| crate::types::ColumnDef { name: n.clone(), data_type: dt.clone(), is_primary_key: false, is_nullable: true, default_value: None, comment: None }).collect();
+        let mut table = crate::storage::table::Table::new(tmp.clone(), defs);
+        table.pk_col_idx = None;
+        for r in 0..nrows {
+            table.insert(cols.iter().map(|c| c.2.get(r).cloned().unwrap_or(Value::Null)).collect());
+        }
+        self.storage.tables.insert(tmp.clone(), table);
+        let sel = if is_distinct { format!("DISTINCT {}", select_clause) } else { select_clause.to_string() };
+        let q = format!("SELECT {} FROM {} AS {} {}", sel, tmp, alias, rest);
+        let res = self.handle_select(q.trim_end(), params);
+        self.storage.tables.remove(&tmp);
+        Some(res)
+    }
+
+    /// `FROM <hàm trả tập của engine/srf.rs>(...) [WITH ORDINALITY] [AS] a[(cột [kiểu], ...)] ...`: tính các dòng
+    /// thành bảng tạm rồi chạy phần còn lại như truy vấn thường. Kèm bảng khác / LATERAL → `None`.
+    fn try_generic_srf_from(&mut self, name: &str, select_clause: &str, is_distinct: bool, after_from: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
+        let open = after_from.find('(')?;
+        let close = crate::engine::constraints::matching_paren(after_from, open)?;
+        let raw_args = split_function_args(&after_from[open + 1..close]);
+        let mut rest = after_from[close + 1..].trim_start();
+        let mut ordinality = false;
+        if rest.len() >= 15 && rest.as_bytes()[..15].eq_ignore_ascii_case(b"WITH ORDINALITY") {
+            ordinality = true;
+            rest = rest[15..].trim_start();
+        }
+        let lname = name.to_lowercase();
+        let mut alias = lname.clone();
+        let mut col_list: Vec<String> = Vec::new();
+        let stop_words = ["WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "HAVING", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "UNION", "WINDOW", "FETCH", "FOR", "ON"];
+        let r2 = if rest.len() >= 3 && rest.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") { rest[3..].trim_start() } else { rest };
+        let wl = r2.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"')).unwrap_or(r2.len());
+        let word = &r2[..wl];
+        let mut aliased = false;
+        if !word.is_empty() && !stop_words.iter().any(|w| w.eq_ignore_ascii_case(word)) {
+            alias = word.trim_matches('"').to_string();
+            aliased = true;
+            rest = r2[wl..].trim_start();
+            if rest.starts_with('(') {
+                let c = crate::engine::constraints::matching_paren(rest, 0)?;
+                col_list = split_comma_separated_tokens(&rest[1..c]).into_iter().map(|x| x.trim().to_string()).collect();
+                rest = rest[c + 1..].trim_start();
+            }
+        }
+        if rest.starts_with(',') || has_top_level_join(rest) {
+            return None;
+        }
+        // cột của hàm record: `AS x(a int, b text)` hoặc kiểu bảng ở đối số đầu (`NULL::t`)
+        let mut record_cols: Vec<(String, String)> = Vec::new();
+        if crate::engine::srf::needs_record_columns(name) {
+            if name.contains("POPULATE") {
+                let base = raw_args.first()?;
+                let ty = base.rsplit("::").next().unwrap_or("").trim().trim_matches('"');
+                let Some(t) = self.storage.get_table(&clean_table_name(ty)) else {
+                    return Some(Err(format!("type \"{}\" does not exist", ty)));
+                };
+                record_cols = t.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), crate::engine::coltypes::column_decl(t, i).map(|d| d.sql_name()).unwrap_or_else(|| "text".into()))).collect();
+            } else {
+                if col_list.is_empty() {
+                    return Some(Err("a column definition list is required for functions returning \"record\"".into()));
+                }
+                for c in &col_list {
+                    let mut it = c.splitn(2, char::is_whitespace);
+                    let n = it.next().unwrap_or("").trim_matches('"').to_string();
+                    let t = it.next().unwrap_or("text").trim().to_string();
+                    record_cols.push((n, t));
+                }
+                col_list.clear();
+            }
+        }
+        let args: Vec<Value> = if name == "JSON_TABLE" {
+            vec![]
+        } else {
+            raw_args.iter().enumerate().map(|(i, a)| if i == 0 && name.contains("POPULATE") { Value::Null } else { eval_sql_expr(a, &[], None, &[], None, params) }).collect()
+        };
+        if let Some(e) = crate::engine::errors::take() {
+            return Some(Err(e));
+        }
+        let out = if name == "JSON_TABLE" {
+            crate::engine::srf::json_table(&after_from[open + 1..close], &|e: &str| eval_sql_expr(e, &[], None, &[], None, params))
+        } else {
+            crate::engine::srf::eval(name, &args, &record_cols)
+        };
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => return Some(Err(e)),
+        };
+        let mut cols = out.cols;
+        if cols.len() == 1 && aliased && col_list.is_empty() && !crate::engine::srf::needs_record_columns(name) && name != "JSON_TABLE" {
+            cols[0].0 = alias.clone();
+        }
+        for (i, n) in col_list.iter().enumerate() {
+            if let Some(c) = cols.get_mut(i) {
+                c.0 = n.trim_matches('"').to_string();
+            }
+        }
+        if ordinality {
+            cols.push((col_list.get(cols.len()).cloned().unwrap_or_else(|| "ordinality".into()), DataType::BigInt, None));
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!("__srf_{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 2_000_000);
+        let defs = cols.iter().map(|(n, dt, _)| crate::types::ColumnDef { name: n.clone(), data_type: dt.clone(), is_primary_key: false, is_nullable: true, default_value: None, comment: None }).collect();
+        let mut table = crate::storage::table::Table::new(tmp.clone(), defs);
+        table.pk_col_idx = None;
+        for (i, mut row) in out.rows.into_iter().enumerate() {
+            if ordinality {
+                row.push(Value::Int(i as i64 + 1));
+            }
+            table.insert(row);
+        }
+        self.storage.tables.insert(tmp.clone(), table);
+        let sel = if is_distinct { format!("DISTINCT {}", select_clause) } else { select_clause.to_string() };
+        let q = format!("SELECT {} FROM {} AS {} {}", sel, tmp, alias, rest);
+        let res = self.handle_select(q.trim_end(), params);
+        self.storage.tables.remove(&tmp);
+        Some(res.map(|(mut r, p)| {
+            for (n, _, pg) in &cols {
+                if let (Some(t), Some(f)) = (pg, r.fields.iter_mut().find(|f| &f.name == n)) {
+                    f.data_type = t.to_string();
+                }
+            }
+            (r, p)
+        }))
+    }
+
+    /// `SELECT f(...), ...` không có FROM, trong đó có hàm trả tập của `engine/srf.rs`: các hàm được tính thành
+    /// cột của một bảng tạm (chạy song song như PostgreSQL 10+, hàm ngắn hơn được đệm NULL), biểu thức khác giữ
+    /// nguyên. `None` nếu không có hàm như vậy.
+    fn try_select_list_srf(&mut self, sql: &str, params: &[Value]) -> Option<Result<(QueryResult, Option<ExecutionPlan>), String>> {
+        let list = sql[6..].trim();
+        let mut end = list.len();
+        for kw in ["ORDER BY", "LIMIT", "OFFSET", "WHERE", "GROUP BY", "HAVING", "UNION", "INTERSECT", "EXCEPT"] {
+            if let Some(p) = find_top_level_keyword(list, kw) {
+                end = end.min(p);
+            }
+        }
+        let (mut head, mut body) = ("", list[..end].trim());
+        if body.len() > 9 && body[..9].eq_ignore_ascii_case("DISTINCT ") {
+            head = "DISTINCT ";
+            body = body[9..].trim_start();
+        }
+        let tail = list[end..].trim();
+        let items = split_projection_items(body);
+        let mut cols: Vec<(Vec<Value>, DataType, Option<&'static str>)> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut srf_pos: Vec<(usize, usize)> = Vec::new();
+        let mut rendered = Vec::with_capacity(items.len());
+        for it in &items {
+            let it = it.trim();
+            let (expr, alias) = match rfind_top_level_as(&it.to_uppercase()) {
+                Some(p) => (it[..p].trim(), Some(it[p + 4..].trim().trim_matches('"').to_string())),
+                None => (it, None),
+            };
+            let (call, cast) = match find_last_top_level_op(expr, "::").filter(|&p| cast_is_outermost(expr, p)) {
+                Some(p) if expr[..p].trim_end().ends_with(')') => (expr[..p].trim_end(), &expr[p..]),
+                _ => (expr, ""),
+            };
+            let srf = call.find('(').filter(|&o| call.ends_with(')') && is_fully_enclosed_in_parens(&call[o..])).and_then(|o| {
+                let n = call[..o].trim().to_uppercase();
+                crate::engine::srf::is_srf(&n, true).then_some((n, o))
+            });
+            let Some((n, o)) = srf else {
+                rendered.push(it.to_string());
+                continue;
+            };
+            let args: Vec<Value> = split_function_args(&call[o + 1..call.len() - 1]).iter().map(|a| eval_sql_expr(a, &[], None, &[], None, params)).collect();
+            if let Some(e) = crate::engine::errors::take() {
+                return Some(Err(e));
+            }
+            let out = match crate::engine::srf::eval(&n, &args, &[]) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
+            let (_, dt, pg) = out.cols.into_iter().next()?;
+            let name = alias.unwrap_or_else(|| crate::engine::select_list::default_column_name(expr));
+            // cột bảng tạm mang luôn tên đầu ra (đường JSON nhận kiểu jsonb theo tên cột); trùng tên → tên phụ
+            let col = if names.contains(&name) { format!("__srfcol{}", cols.len()) } else { name.clone() };
+            rendered.push(if cast.is_empty() && col == name { format!("\"{}\"", col) } else { format!("\"{}\"{} AS \"{}\"", col, cast, name) });
+            srf_pos.push((rendered.len() - 1, cols.len()));
+            names.push(col);
+            cols.push((out.rows.into_iter().map(|mut r| r.swap_remove(0)).collect(), dt, if cast.is_empty() { pg } else { None }));
+        }
+        if cols.is_empty() {
+            return None;
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = format!("__srf_{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 3_000_000);
+        let defs = cols.iter().zip(&names).map(|((_, dt, _), n)| crate::types::ColumnDef { name: n.clone(), data_type: dt.clone(), is_primary_key: false, is_nullable: true, default_value: None, comment: None }).collect();
+        let mut table = crate::storage::table::Table::new(tmp.clone(), defs);
+        table.pk_col_idx = None;
+        let nrows = cols.iter().map(|c| c.0.len()).max().unwrap_or(0);
+        for r in 0..nrows {
+            table.insert(cols.iter().map(|c| c.0.get(r).cloned().unwrap_or(Value::Null)).collect());
+        }
+        self.storage.tables.insert(tmp.clone(), table);
+        let q = format!("SELECT {}{} FROM {} {}", head, rendered.join(", "), tmp, tail);
+        let res = self.handle_select(q.trim_end(), params);
+        self.storage.tables.remove(&tmp);
+        Some(res.map(|(mut r, p)| {
+            // kiểu PG riêng (text[] của regexp_matches) cho cột chưa bị ép kiểu
+            for (i, k) in &srf_pos {
+                if let (Some(t), Some(f)) = (cols[*k].2, r.fields.get_mut(*i)) {
+                    f.data_type = t.to_string();
+                }
+            }
+            (r, p)
+        }))
     }
 
     /// `FROM jsonb_each(...) [AS a[(cột, ...)]], jsonb_array_elements(...) ...` với đối số hằng / tham số:
@@ -2599,7 +2882,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             && correlated_where.is_empty()
             && pushdown.intermediate_predicates.iter().all(|p| p.is_empty())
             && !select_clause.to_uppercase().starts_with("DISTINCT ")
-            && !AGG_NAMES.iter().any(|a| contains_ci(select_clause, &format!("{}(", a)))
+            && !mentions_call(select_clause, AGG_NAMES)
             && !select_clause.to_uppercase().contains("OVER(");
 
         let mut current_rows: Vec<CombinedRow> = Vec::with_capacity(base_table.active_count);
@@ -4829,6 +5112,13 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 return self.handle_select(q.trim_end(), params);
             }
         }
+        if (contains_ci(sql, "_KEYS(") || contains_ci(sql, "_ELEMENTS") || contains_ci(sql, "PATH_QUERY(") || contains_ci(sql, "REGEXP_MATCHES(") || contains_ci(sql, "SPLIT_TO_TABLE(") || contains_ci(sql, "GENERATE_SUBSCRIPTS("))
+            && find_top_level_keyword(sql, "FROM").is_none()
+        {
+            if let Some(r) = self.try_select_list_srf(sql, params) {
+                return r;
+            }
+        }
         if contains_ci(sql, "WITH TIES") {
             if let Some(r) = self.select_with_ties(sql, params)? {
                 return Ok((r, None));
@@ -5146,7 +5436,8 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         {
             let up_sel = select_clause.to_uppercase();
             let agg_with_order = up_sel.contains("_AGG(") && find_top_level_keyword(select_clause, "ORDER BY").is_none() && up_sel.contains(" ORDER BY ");
-            if (up_sel.contains(" FILTER (") || up_sel.contains(" FILTER(") || agg_with_order) && !up_sel.contains(" OVER") && clauses.join_clause.is_none() {
+            let extra_agg = mentions_call(select_clause, crate::engine::fnlib::EXTRA_AGGS);
+            if (up_sel.contains(" FILTER (") || up_sel.contains(" FILTER(") || agg_with_order || extra_agg) && !up_sel.contains(" OVER") && clauses.join_clause.is_none() {
                 return Ok((self.handle_group_by_query(table, select_clause, &clauses, params)?, None));
             }
         }
@@ -6551,6 +6842,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(func), col_idx: None, filter_expr, agg_order: agg_order.clone() });
                     fields.push(FieldInfo { name: alias, data_type: "text".to_string() });
                 }
+            } else if let Some((name, args)) = extra_agg_call(agg_expr) {
+                let dt = crate::engine::fnlib::agg_result_type(&name).unwrap_or("text").to_string();
+                projections.push(GroupProjItem { name: raw_expr.to_string(), alias: alias.clone(), func: Some(AggFunc::Extra(name, args)), col_idx: None, filter_expr, agg_order: agg_order.clone() });
+                fields.push(FieldInfo { name: alias, data_type: dt });
             } else {
                 let col = clean_col_name(raw_expr);
                 if let Some(c_idx) = table.get_column_index(col) {
@@ -6809,6 +7104,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             }
                             serde_json::Value::Array(arr)
                         }
+                        AggFunc::Extra(name, args) => {
+                            let rows: Vec<Vec<Value>> = target_indices.iter().map(|&ri| args.iter().map(|a| eval_sql_expr(a, &table.rows[ri], Some(table), &[], None, params)).collect()).collect();
+                            value_to_json(&crate::engine::fnlib::agg_finalize(name, &rows))
+                        }
                         AggFunc::SumExpr(expr_str) => {
                             let mut sum = 0.0;
                             for &ri in &target_indices {
@@ -6990,6 +7289,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             .count();
                         row_map.insert(spec.alias.clone(), json!(count));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::Extra(name, args) => {
+                        let rows: Vec<Vec<Value>> = (0..table.rows.len()).filter(|&i| !table.is_deleted[i]).map(|ri| args.iter().map(|a| eval_sql_expr(a, &table.rows[ri], Some(table), &[], None, params)).collect()).collect();
+                        row_map.insert(spec.alias.clone(), value_to_json(&crate::engine::fnlib::agg_finalize(name, &rows)));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: crate::engine::fnlib::agg_result_type(name).unwrap_or("text").to_string() });
                     }
                     AggFunc::CountExpr(expr) => {
                         let count = (0..table.rows.len())
@@ -7372,6 +7676,11 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                             .count();
                         row_map.insert(spec.alias.clone(), json!(count));
                         fields.push(FieldInfo { name: spec.alias.clone(), data_type: "int8".to_string() });
+                    }
+                    AggFunc::Extra(name, args) => {
+                        let rows: Vec<Vec<Value>> = matched_indices.iter().copied().map(|ri| args.iter().map(|a| eval_sql_expr(a, &table.rows[ri], Some(table), &[], None, params)).collect()).collect();
+                        row_map.insert(spec.alias.clone(), value_to_json(&crate::engine::fnlib::agg_finalize(name, &rows)));
+                        fields.push(FieldInfo { name: spec.alias.clone(), data_type: crate::engine::fnlib::agg_result_type(name).unwrap_or("text").to_string() });
                     }
                     AggFunc::CountExpr(expr) => {
                         let count = matched_indices.iter()
@@ -9470,7 +9779,7 @@ fn parse_subquery_from_and_clauses<'a>(
 /// Biểu thức trên dòng JOIN nên tính bằng `eval_sql_expr` (xem chỗ gọi): có phép toán `+ - * / %` ở cấp ngoài
 /// cùng, hoặc là lời gọi hàm số học / ngày giờ; không chứa subquery hay hàm gộp.
 fn joined_needs_full_eval(t: &str, upper: &str) -> bool {
-    if contains_ci(t, "SELECT") || AGG_NAMES.iter().any(|a| contains_ci(t, &format!("{}(", a))) || t.contains("->") || t.contains("#>") {
+    if contains_ci(t, "SELECT") || mentions_call(t, AGG_NAMES) || t.contains("->") || t.contains("#>") {
         return false;
     }
     const FULL_FNS: [&str; 13] = ["ROUND(", "CEIL(", "CEILING(", "FLOOR(", "ABS(", "TRUNC(", "EXTRACT(", "DATE_PART(", "DATE_TRUNC(", "AGE(", "GREATEST(", "LEAST(", "CAST("];
@@ -10545,6 +10854,12 @@ fn eval_joined_scalar_expr(
         let open_p = t.find('(').unwrap();
         let inner = &t[open_p + 1..t.len() - 1];
         let args = split_function_args(inner);
+        if args.len() == 2 && crate::engine::strfn::is_text_literal(&args[1]) {
+            let base = eval_joined_scalar_expr(&args[0], row, params, storage);
+            let pat = eval_joined_scalar_expr(&args[1], row, params, storage);
+            let v = crate::engine::strfn::substring_regex(&json_to_value(&base), &json_to_value(&pat));
+            return value_to_json(&v);
+        }
         if args.len() >= 2 {
             let base = eval_joined_scalar_expr(&args[0], row, params, storage);
             if base.is_null() { return serde_json::Value::Null; }
@@ -10622,9 +10937,7 @@ fn eval_joined_scalar_expr(
                 if decimals == 0 {
                     return serde_json::json!(f.round() as i64);
                 } else {
-                    let multiplier = 10f64.powi(decimals as i32);
-                    let rounded = (f * multiplier).round() / multiplier;
-                    return serde_json::json!(rounded);
+                    return serde_json::json!(crate::engine::fnlib::round_dec(f, decimals));
                 }
             }
         }
@@ -10788,7 +11101,7 @@ fn eval_group_aggregate_expr(
     let upper = t.to_uppercase();
 
     // ép kiểu bọc ngoài hàm gộp: `count(*)::int`, `CAST(sum(x) AS bigint)` (trước đây ra NULL trên đường JOIN)
-    let has_agg = |e: &str| AGG_NAMES.iter().any(|a| contains_ci(e, &format!("{}(", a)));
+    let has_agg = |e: &str| mentions_call(e, AGG_NAMES);
     if let Some(p) = find_last_top_level_op(t, "::").filter(|&p| cast_is_outermost(t, p)) {
         let inner = t[..p].trim();
         if has_agg(inner) {
@@ -10884,6 +11197,36 @@ fn eval_group_aggregate_expr(
                 let plain = format!("{}({})", &t[..open], base_args);
                 return eval_group_aggregate_expr(&plain, all_rows, &sorted, params, storage);
             }
+        }
+    }
+
+    // hàm gộp bổ sung (thống kê, bit, percentile/mode/hypothetical, any_value, SQL/JSON): engine/fnlib.rs
+    if let Some(open) = t.find('(') {
+        let name = upper[..open].trim();
+        if crate::engine::fnlib::EXTRA_AGGS.contains(&name) && t.ends_with(')') && is_fully_enclosed_in_parens(&t[open..]) {
+            let inner = &t[open + 1..t.len() - 1];
+            let mut args = split_function_args(inner);
+            if name == "JSON_OBJECTAGG" && args.len() == 1 {
+                // JSON_OBJECTAGG(k VALUE v) / (k : v)
+                let a = args[0].clone();
+                if let Some(p) = find_top_level_keyword(&a, "VALUE").or_else(|| find_top_level_op(&a, ":").filter(|&p| !a[p..].starts_with("::") && !a[..p].ends_with(':'))) {
+                    let w = if a[p..].starts_with(':') { 1 } else { 5 };
+                    args = vec![a[..p].trim().to_string(), a[p + w..].trim().to_string()];
+                }
+            }
+            // mệnh đề SQL/JSON (`ABSENT ON NULL`, `RETURNING ...`) ở cuối đối số cuối: bỏ qua
+            if let Some(last) = args.last_mut() {
+                for kw in ["NULL ON NULL", "ABSENT ON NULL", "RETURNING", "WITH UNIQUE", "WITHOUT UNIQUE"] {
+                    if let Some(p) = find_top_level_keyword(last, kw) {
+                        last.truncate(p);
+                    }
+                }
+            }
+            let rows: Vec<Vec<Value>> = row_indices
+                .iter()
+                .map(|&ri| args.iter().map(|a| json_to_value(&eval_joined_scalar_expr(a.trim(), &all_rows[ri], params, storage))).collect())
+                .collect();
+            return value_to_json(&crate::engine::fnlib::agg_finalize(name, &rows));
         }
     }
 
@@ -12190,6 +12533,35 @@ enum AggFunc {
     BoolAndExpr(String),
     BoolOrExpr(String),
     CountExpr(String),
+    /// hàm gộp của engine/fnlib.rs (`EXTRA_AGGS`): tên viết hoa + biểu thức đối số
+    Extra(String, Vec<String>),
+}
+
+/// `name(args)` là hàm gộp bổ sung (`fnlib::EXTRA_AGGS`): tên viết hoa và đối số (JSON_OBJECTAGG `k VALUE v`
+/// tách thành hai; mệnh đề SQL/JSON ở cuối bị bỏ).
+fn extra_agg_call(e: &str) -> Option<(String, Vec<String>)> {
+    let open = e.find('(')?;
+    let name = e[..open].trim().to_uppercase();
+    if !crate::engine::fnlib::EXTRA_AGGS.contains(&name.as_str()) || !e.ends_with(')') || !is_fully_enclosed_in_parens(&e[open..]) {
+        return None;
+    }
+    let mut args = split_function_args(&e[open + 1..e.len() - 1]);
+    if name == "JSON_OBJECTAGG" && args.len() == 1 {
+        let a = args[0].clone();
+        if let Some(p) = find_top_level_keyword(&a, "VALUE").or_else(|| find_top_level_op(&a, ":").filter(|&p| !a[p..].starts_with("::") && !a[..p].ends_with(':'))) {
+            let w = if a[p..].starts_with(':') { 1 } else { 5 };
+            args = vec![a[..p].trim().to_string(), a[p + w..].trim().to_string()];
+        }
+    }
+    if let Some(last) = args.last_mut() {
+        for kw in ["NULL ON NULL", "ABSENT ON NULL", "RETURNING", "WITH UNIQUE", "WITHOUT UNIQUE"] {
+            if let Some(p) = find_top_level_keyword(last, kw) {
+                last.truncate(p);
+            }
+        }
+        *last = last.trim().to_string();
+    }
+    Some((name, args))
 }
 
 struct AggSpec {
@@ -13401,7 +13773,36 @@ fn normalize_named_sql_params(sql: &str) -> String {
     result
 }
 
-const AGG_NAMES: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG", "STRING_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG"];
+/// `s` có lời gọi `tên(` với tên thuộc `names` (không phân biệt hoa thường, đủ ranh giới từ phía trước).
+/// Một lượt quét, không cấp phát — chạy cho mọi câu SELECT.
+pub(crate) fn mentions_call(s: &str, names: &[&str]) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while let Some(off) = b[i..].iter().position(|&c| c == b'(') {
+        let p = i + off;
+        let mut st = p;
+        while st > 0 && (b[st - 1].is_ascii_alphanumeric() || b[st - 1] == b'_') {
+            st -= 1;
+        }
+        if st < p {
+            let w = &s[st..p];
+            if names.iter().any(|n| n.len() == w.len() && n.eq_ignore_ascii_case(w)) {
+                return true;
+            }
+        }
+        i = p + 1;
+    }
+    false
+}
+
+const AGG_NAMES: &[&str] = &[
+    "COUNT", "SUM", "AVG", "MIN", "MAX", "BOOL_AND", "BOOL_OR", "EVERY", "ARRAY_AGG", "STRING_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG",
+    // engine/fnlib.rs EXTRA_AGGS
+    "BIT_AND", "BIT_OR", "BIT_XOR", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP", "CORR", "COVAR_POP", "COVAR_SAMP",
+    "REGR_SLOPE", "REGR_INTERCEPT", "REGR_COUNT", "REGR_R2", "REGR_AVGX", "REGR_AVGY", "REGR_SXX", "REGR_SYY", "REGR_SXY", "ANY_VALUE",
+    "PERCENTILE_CONT", "PERCENTILE_DISC", "MODE", "PG_HYP_RANK", "PG_HYP_DENSE_RANK", "PG_HYP_PERCENT_RANK", "PG_HYP_CUME_DIST", "XMLAGG",
+    "JSON_ARRAYAGG", "JSON_OBJECTAGG",
+];
 
 fn is_hidden_agg_key(k: &str) -> bool {
     k.starts_with("__agg") && k.ends_with("__")
@@ -13461,7 +13862,7 @@ fn find_aggregate_calls(e: &str) -> Vec<std::ops::Range<usize>> {
 #[allow(clippy::type_complexity)]
 fn split_aggregate_expressions(select_clause: &str) -> (Option<String>, Vec<(String, String, Vec<(std::ops::Range<usize>, String)>)>) {
     let up = select_clause.to_uppercase();
-    if !AGG_NAMES.iter().any(|n| up.contains(&format!("{}(", n))) || up.contains(" OVER") {
+    if !mentions_call(&up, AGG_NAMES) || up.contains(" OVER") {
         return (None, vec![]);
     }
     let items = split_projection_items(select_clause);
@@ -14474,6 +14875,13 @@ fn parse_value(token: &str, params: &[Value]) -> Value {
         IN_CONST_EVAL.with(|f| f.set(false));
         if !v.is_null() && v.as_str() != t {
             return v;
+        }
+    }
+    // `tên(...)` mà engine không biết hàm nào như vậy: lỗi 42883 như PostgreSQL (trước đây trả nguyên văn)
+    if t.ends_with(')') {
+        if let Some(msg) = crate::engine::known_fns::unknown_function_error(t) {
+            crate::engine::errors::raise(msg);
+            return Value::Null;
         }
     }
     Value::text(t)
@@ -15548,7 +15956,7 @@ fn is_pg_array_literal(s: &str) -> bool {
     false
 }
 
-fn parse_pg_array_to_json(trimmed: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_pg_array_to_json(trimmed: &str) -> Option<serde_json::Value> {
     if trimmed == "{}" {
         return Some(serde_json::Value::Array(vec![]));
     }
@@ -15604,6 +16012,16 @@ fn parse_pg_array_to_json(trimmed: &str) -> Option<serde_json::Value> {
         return Some(serde_json::Value::Array(items));
     }
     None
+}
+
+/// Biểu thức là lời gọi hàm băm trả bytea mà engine biểu diễn bằng chuỗi hex không `\\x` (sha256(), digest()...).
+fn is_hex_hash_call(e: &str) -> bool {
+    let u = e.trim().to_ascii_uppercase();
+    ["SHA224(", "SHA256(", "SHA384(", "SHA512(", "DIGEST(", "HMAC("].iter().any(|p| u.starts_with(p)) && u.ends_with(')')
+}
+
+pub(crate) fn raw_bytes_pub(val: &Value) -> Vec<u8> {
+    get_raw_bytes(val)
 }
 
 fn get_raw_bytes(val: &Value) -> Vec<u8> {
@@ -16299,6 +16717,11 @@ fn get_returning_fields(table: &crate::storage::table::Table, r_cols: &str) -> V
 
 /// Giá trị DEFAULT khi INSERT (tham số của lệnh dùng được trong biểu thức).
 pub(crate) fn eval_default_for_insert(def_str: &str, params: &[Value]) -> Value {
+    // DB cũ có thể lưu DEFAULT dạng chữ không tính được: giữ hành vi cũ, không báo hàm lạ
+    crate::engine::known_fns::without_check(|| eval_default_inner(def_str, params))
+}
+
+fn eval_default_inner(def_str: &str, params: &[Value]) -> Value {
     let up = def_str.trim().to_uppercase();
     // `DEFAULT nextval('t_id_seq'::regclass)`: để trống, bộ đếm của bảng cấp giá trị (engine/sequences.rs)
     if crate::engine::sequences::is_nextval_default(def_str) {
@@ -17742,6 +18165,9 @@ pub(crate) fn eval_sql_expr(
     if let Some(pos) = s.find(" @> ") {
         let left = eval_sql_expr(s[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(s[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
         if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
             if json_contains_check(&l, &r) {
                 return Value::Bool(true);
@@ -17752,6 +18178,9 @@ pub(crate) fn eval_sql_expr(
     if let Some(pos) = s.find(" <@ ") {
         let left = eval_sql_expr(s[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(s[pos + 4..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
         if let (Some(l), Some(r)) = (parse_val_to_json(&left), parse_val_to_json(&right)) {
             if json_contains_check(&r, &l) {
                 return Value::Bool(true);
@@ -17762,11 +18191,17 @@ pub(crate) fn eval_sql_expr(
     if let Some(pos) = find_top_level_op(s, "&&") {
         let left = eval_sql_expr(s[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(s[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
         return Value::Bool(array_overlap_check(&left, &right));
     }
     if let Some(pos) = find_top_level_op(s, "?|") {
         let left = eval_sql_expr(s[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(s[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
         if let Some(l) = parse_val_to_json(&left) {
             let keys = parse_str_or_json_keys(&right);
             return Value::Bool(keys.iter().any(|k| json_has_key_check(&l, k)));
@@ -17776,6 +18211,9 @@ pub(crate) fn eval_sql_expr(
     if let Some(pos) = find_top_level_op(s, "?&") {
         let left = eval_sql_expr(s[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(s[pos + 2..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
         if let Some(l) = parse_val_to_json(&left) {
             let keys = parse_str_or_json_keys(&right);
             return Value::Bool(!keys.is_empty() && keys.iter().all(|k| json_has_key_check(&l, k)));
@@ -17785,6 +18223,9 @@ pub(crate) fn eval_sql_expr(
     if let Some(pos) = find_top_level_op(s, "?") {
         let left = eval_sql_expr(s[..pos].trim(), primary_row, primary_table, joined_row, joined_table, params);
         let right = eval_sql_expr(s[pos + 1..].trim(), primary_row, primary_table, joined_row, joined_table, params);
+        if left.is_null() || right.is_null() {
+            return Value::Null;
+        }
         if let Some(l) = parse_val_to_json(&left) {
             return Value::Bool(json_has_key_check(&l, &right.as_str()));
         }
@@ -18007,7 +18448,7 @@ pub(crate) fn eval_sql_expr(
             let data_val = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
             let fmt_val = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
             if data_val.is_null() || fmt_val.is_null() { return Value::Null; }
-            let raw = get_raw_bytes(&data_val);
+            let raw = if is_hex_hash_call(&args[0]) { hex::decode(data_val.as_str().trim_start_matches("\\x")).unwrap_or_else(|_| get_raw_bytes(&data_val)) } else { get_raw_bytes(&data_val) };
             let fmt = fmt_val.as_str().to_lowercase();
             return match fmt.as_str() {
                 "hex" => Value::text(hex::encode(raw)),
@@ -18242,7 +18683,9 @@ pub(crate) fn eval_sql_expr(
     if let Some(open_bracket) = s.rfind('[') {
         if s.ends_with(']') && open_bracket > 0 {
             let col_part = s[..open_bracket].trim();
-            if !col_part.eq_ignore_ascii_case("ARRAY") {
+            // `a || ARRAY[2]`: `[...]` thuộc vế phải, không phải subscript của cả biểu thức
+            let compound = find_top_level_op(col_part, "||").is_some() || find_top_level_math_op(col_part, &['+', '-', '*', '/', '%']).is_some_and(|(p, _)| p > 0);
+            if !col_part.eq_ignore_ascii_case("ARRAY") && !compound && !col_part.to_uppercase().ends_with(" ARRAY") {
                 let idx_part = s[open_bracket + 1..s.len() - 1].trim();
                 // slice: a[lo:hi], a[lo:], a[:hi] (chỉ số từ 1, hai đầu tính cả; ngoài miền → mảng rỗng)
                 if let Some(colon) = idx_part.find(':').filter(|_| !idx_part.contains("::") && !idx_part.contains('\'')) {
@@ -19264,6 +19707,12 @@ pub(crate) fn eval_sql_expr(
         let open_p = s.find('(').unwrap();
         let inner = &s[open_p + 1..s.len() - 1];
         let args = split_function_args(inner);
+        if args.len() == 2 && crate::engine::strfn::is_text_literal(&args[1]) {
+            // substring(s FROM 'regex') / substring(s, 'regex')
+            let base = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
+            let pat = eval_sql_expr(&args[1], primary_row, primary_table, joined_row, joined_table, params);
+            return crate::engine::strfn::substring_regex(&base, &pat);
+        }
         if args.len() >= 2 {
             let base = eval_sql_expr(&args[0], primary_row, primary_table, joined_row, joined_table, params);
             if base.is_null() { return Value::Null; }
@@ -19357,9 +19806,7 @@ pub(crate) fn eval_sql_expr(
                 if decimals == 0 {
                     return Value::Int(f.round() as i64);
                 } else {
-                    let multiplier = 10f64.powi(decimals as i32);
-                    let rounded = (f * multiplier).round() / multiplier;
-                    return Value::Float(rounded);
+                    return Value::Float(crate::engine::fnlib::round_dec(f, decimals));
                 }
             }
         }
@@ -19714,11 +20161,10 @@ impl Executor {
             apply_wire_decls(&mut wire, &res, &decls);
             apply_wire_items(&mut wire, &res, shape_sql);
         }
-        if dedup.is_some() {
-            for f in &mut wire.fields {
-                if let Some(p) = f.name.find(DUP_MARK) {
-                    f.name.truncate(p);
-                }
+        // tên phụ của cột trùng tên (dedupe ở trên, `ROWS FROM` hai hàm cùng tên): trả lại tên gốc
+        for f in &mut wire.fields {
+            if let Some(p) = f.name.find(DUP_MARK) {
+                f.name.truncate(p);
             }
         }
         Ok(wire)
@@ -19731,7 +20177,14 @@ impl Executor {
         if t.len() < 7 || !t[..7].eq_ignore_ascii_case("SELECT ") || t.contains("--") || t.contains("/*") || t.contains('$') && t.contains("$$") {
             return None;
         }
-        let from = find_top_level_keyword(t, "FROM")?;
+        // không có FROM: danh sách chọn kết thúc ở mệnh đề kế tiếp (hoặc cuối câu)
+        let from = find_top_level_keyword(t, "FROM").unwrap_or_else(|| {
+            ["WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "UNION", "INTERSECT", "EXCEPT", "INTO"]
+                .iter()
+                .filter_map(|k| find_top_level_keyword(t, k))
+                .min()
+                .unwrap_or(t.len())
+        });
         let mut list = t[7..from].trim();
         let mut head = "SELECT ".to_string();
         if list.len() > 9 && list[..9].eq_ignore_ascii_case("DISTINCT ") {
@@ -19741,7 +20194,8 @@ impl Executor {
             head.push_str("DISTINCT ");
             list = list[9..].trim();
         }
-        let after = &t[from + 4..];
+        let has_from = t[from..].len() >= 4 && t[from..from + 4].eq_ignore_ascii_case("FROM");
+        let after = if has_from { &t[from + 4..] } else { "" };
         let end = ["WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW", "UNION", "INTERSECT", "EXCEPT", "FOR", "FETCH"]
             .iter()
             .filter_map(|k| find_top_level_keyword(after, k))
@@ -19790,8 +20244,8 @@ impl Executor {
             } else if it.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '"') {
                 it.rsplit('.').next().unwrap_or(it).trim_matches('"').to_lowercase()
             } else {
-                // biểu thức không alias: tên do bộ thực thi đặt; không đụng tới
-                format!("\u{0}{}", out.len())
+                // biểu thức không alias: tên mặc định kiểu PG (`encode`, `?column?`...)
+                crate::engine::select_list::wire_default_name(it)
             };
             out.push((it.to_string(), name));
         }

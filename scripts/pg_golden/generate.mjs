@@ -16,6 +16,7 @@ const imp = (p) => import(pathToFileURL(join(pkgDir, 'dist', p)).href)
 const { PGlite } = await imp('index.js')
 const { pgcrypto } = await imp('contrib/pgcrypto.js')
 const { uuid_ossp } = await imp('contrib/uuid_ossp.js')
+const { unaccent } = await imp('contrib/unaccent.js')
 
 // Giữ nguyên text output của PostgreSQL cho mọi OID (giống query_wire của pglite-rs).
 const parsers = {}
@@ -32,7 +33,7 @@ if (only) {
   }
 }
 
-const base = new PGlite({ extensions: { pgcrypto, uuid_ossp }, parsers })
+const base = new PGlite({ extensions: { pgcrypto, uuid_ossp, unaccent }, parsers })
 for (const s of setup) await base.query(s)
 
 const out = []

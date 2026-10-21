@@ -1112,3 +1112,38 @@
 {"id":"W8_33","ok":true,"fields":["a"],"rows":[["3"]]}
 {"id":"W8_34","ok":false,"fields":[],"rows":[],"error":"domain email does not allow null values","sqlstate":"23502","failed_stmt":2}
 {"id":"W8_35","ok":true,"fields":["n"],"rows":[["1"],["2"],["3"],["4"]]}
+{"id":"W9_01","ok":true,"fields":["div","gcd","lcm","factorial","width_bucket","width_bucket"],"rows":[["-3","5","0","1","0","6"]]}
+{"id":"W9_02","ok":true,"fields":["sind","cosd","atan2d","round"],"rows":[["0.5","0.5","45","0.642093"]]}
+{"id":"W9_03","ok":true,"fields":["to_char","to_char","to_char","to_char"],"rows":[["-1,234.57"," 0.50"," 0012","1234.00"]]}
+{"id":"W9_04","ok":true,"fields":["to_number","to_hex","to_hex"],"rows":[["-12345.67","ffffffff","100000000"]]}
+{"id":"W9_05","ok":true,"fields":["regexp_instr","regexp_instr","substring"],"rows":[["5","3","123"]]}
+{"id":"W9_06","ok":true,"fields":["m"],"rows":[["{1}"],["{22}"],["{333}"]]}
+{"id":"W9_07","ok":true,"fields":["w"],"rows":[["a"],["b"],["c"]]}
+{"id":"W9_08","ok":true,"fields":["jsonb_path_query"],"rows":[["5"]]}
+{"id":"W9_09","ok":true,"fields":["jsonb_path_query_array","jsonb_path_query_first","jsonb_path_match"],"rows":[["[2, 4]","8","t"]]}
+{"id":"W9_10","ok":true,"fields":["jsonb_path_exists","jsonb_path_exists"],"rows":[[null,"t"]]}
+{"id":"W9_11","ok":true,"fields":["jsonb_insert","jsonb_set_lax"],"rows":[["{\"a\": [1, 2, 9]}","{\"a\": 1}"]]}
+{"id":"W9_12","ok":true,"fields":["a","b"],"rows":[["2",null],["1","x"]]}
+{"id":"W9_13","ok":true,"fields":["array_sort","array_reverse","array_positions","trim_array"],"rows":[["{a,b,NULL}","{3,2,1}","{1,3}","{}"]]}
+{"id":"W9_14","ok":true,"fields":["cardinality","array_ndims","array_fill"],"rows":[["0",null,"{{7,7},{7,7}}"]]}
+{"id":"W9_15","ok":true,"fields":["round","round","regr_intercept","regr_count"],"rows":[["1.414214","1.000000","7","2"]]}
+{"id":"W9_16","ok":true,"fields":["flag","percentile_cont","mode"],"rows":[["f","2","bob"],["t","1","alice"],[null,"3","carol"]]}
+{"id":"W9_17","ok":true,"fields":["percentile_disc"],"rows":[["{1,3}"]]}
+{"id":"W9_18","ok":true,"fields":["cume_dist","percent_rank"],"rows":[["0.75","0.3333333333333333"]]}
+{"id":"W9_19","ok":true,"fields":["bit_xor","?column?"],"rows":[["1","t"]]}
+{"id":"W9_20","ok":true,"fields":["json_value","json_query","json_exists"],"rows":[["x","[1, 2]","f"]]}
+{"id":"W9_21","ok":true,"fields":["?column?","?column?","?column?"],"rows":[["t","f","f"]]}
+{"id":"W9_22","ok":true,"fields":["v"],"rows":[["20"]]}
+{"id":"W9_23","ok":true,"fields":["i","n","v"],"rows":[["1","a","1"],["2","b",null]]}
+{"id":"W9_24","ok":true,"fields":["a","b"],"rows":[["1","5"],["2","6"],[null,"7"]]}
+{"id":"W9_25","ok":true,"fields":["encode","encode","crypt","crypt"],"rows":[["a9993e364706816aba3e25717850c26c9cd0d89d","ed7e724d3a91554aaa2043041d9c5305","$1$abcdefgh$IQtUouv7y7Q9dRWkQEPCc.","$2a$06$abcdefghijklmnopqrstuuXOw8daVruAKMR3X3ty3bsuEmsp0E2Ba"]]}
+{"id":"W9_26","ok":true,"fields":["unaccent"],"rows":[["Tieng Viet Da Nang"]]}
+{"id":"W9_27","ok":false,"error":"function nope_fn(integer) does not exist","sqlstate":"42883","failed_stmt":0}
+{"id":"W9_28","ok":true,"fields":["?column?","?column?","round","trunc"],"rows":[["3.00","0.30","1.01","2.5"]]}
+{"id":"W9_29","ok":true,"fields":["scale","trim_scale","min_scale"],"rows":[["3","10","0"]]}
+{"id":"W9_30","ok":true,"fields":["json_object","json_object"],"rows":[["{\"a\" : \"1\", \"b\" : \"2\"}","{\"k\" : \"v\"}"]]}
+{"id":"W9_31","ok":true,"fields":["generate_subscripts"],"rows":[["1"],["2"]]}
+{"id":"W9_32","ok":true,"fields":["corr"],"rows":[[null]]}
+{"id":"W9_33","ok":true,"fields":["array_position","width_bucket"],"rows":[["4","3"]]}
+{"id":"W9_34","ok":true,"fields":["v","k"],"rows":[["x","1"],["y","1"]]}
+{"id":"W9_35","ok":true,"fields":["md5","encode","encode"],"rows":[["0cc175b9c0f1b6a831c399e269772661","YQ==","61"]]}

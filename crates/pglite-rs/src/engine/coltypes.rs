@@ -725,6 +725,13 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
     if let Some(d) = col(e) {
         return d;
     }
+    // hằng số: `3` → int4/int8, `1.50` → numeric giữ scale 2 (như PostgreSQL in `1.50`)
+    if !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit() || b == b'.') && e.bytes().filter(|b| *b == b'.').count() <= 1 && e.bytes().any(|b| b.is_ascii_digit()) {
+        return match e.split_once('.') {
+            None => DeclType::parse(if e.parse::<i64>().is_ok_and(|v| i32::try_from(v).is_ok()) { "int4" } else if e.parse::<i64>().is_ok() { "int8" } else { "numeric" }),
+            Some((_, frac)) => Some(numeric_with_scale(frac.len() as i64)),
+        };
+    }
     // so sánh / logic ở cấp ngoài cùng: kết quả boolean (`::` phía sau chỉ thuộc một vế)
     let upper_e = e.to_ascii_uppercase();
     if upper_e.starts_with("SELECT") || upper_e.starts_with("WITH") || upper_e.starts_with("VALUES") {
@@ -772,16 +779,27 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
             ("date", "interval") | ("interval", "date") => DeclType::parse("timestamp"),
             ("interval", "interval") => DeclType::parse("interval"),
             ("jsonb", "text" | "") if e.as_bytes()[p] == b'-' => DeclType::parse("jsonb"),
-            (a, b) => numeric_result(a, b),
+            // numeric ± numeric: scale = max của hai vế (số nguyên có scale 0)
+            (a, b) => numeric_result(a, b).map(|d| match (dec_scale(&dl), dec_scale(&dr)) {
+                (Some(x), Some(y)) if d.base == "numeric" => numeric_with_scale(x.max(y)),
+                _ => d,
+            }),
         };
     }
-    if let Some((p, _)) = crate::engine::executor::find_top_level_math_op(e, &['*', '/', '%']) {
+    if let Some((p, op)) = crate::engine::executor::find_top_level_math_op(e, &['*', '/', '%']) {
         let (l, r) = (e[..p].trim(), e[p + 1..].trim());
         if l.is_empty() {
             return None;
         }
-        let base = |d: Option<DeclType>| d.filter(|d| !d.array).map(|d| d.base).unwrap_or_default();
-        return numeric_result(&base(expr_decl(l, col)), &base(expr_decl(r, col)));
+        let (dl, dr) = (expr_decl(l, col), expr_decl(r, col));
+        let base = |d: &Option<DeclType>| d.as_ref().filter(|d| !d.array).map(|d| d.base.clone()).unwrap_or_default();
+        // numeric * numeric: scale = tổng hai scale; `%`: scale lớn hơn; `/` phụ thuộc giá trị → không ép
+        return numeric_result(&base(&dl), &base(&dr)).map(|d| match (op, dec_scale(&dl), dec_scale(&dr)) {
+            ('*', Some(x), Some(y)) if d.base == "numeric" => numeric_with_scale(x + y),
+            ('%', Some(x), Some(y)) if d.base == "numeric" => numeric_with_scale(x.max(y)),
+            ('/', _, _) => DeclType::parse(&d.base).unwrap_or(d),
+            _ => d,
+        });
     }
     if let Some(p) = crate::engine::executor::find_last_top_level_op(e, "::") {
         return DeclType::parse(&e[p + 2..]);
@@ -814,6 +832,19 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
             };
             if let Some(t) = fixed {
                 return DeclType::parse(t);
+            }
+            // round/trunc(numeric, n) → scale n; một đối số → scale 0
+            if matches!(fname.as_str(), "ROUND" | "TRUNC") {
+                let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
+                let d = expr_decl(args.first()?, col)?;
+                if d.array || !matches!(d.base.as_str(), "numeric" | "int2" | "int4" | "int8") {
+                    return None;
+                }
+                let sc = match args.get(1) {
+                    Some(n) => n.trim().parse::<i64>().ok()?,
+                    None => 0,
+                };
+                return Some(numeric_with_scale(sc.max(0)));
             }
             if fname == "DATE_BIN" {
                 let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
@@ -879,6 +910,21 @@ fn expr_decl(e: &str, col: &dyn Fn(&str) -> Option<Option<DeclType>>) -> Option<
 
 /// Kiểu kết quả phép tính số học giữa hai kiểu khai báo (rỗng = chưa biết): numeric thắng số nguyên,
 /// float8 thắng tất cả; chỉ trả khi một vế đã biết là numeric/float (phần số nguyên do engine lo).
+/// `numeric` với scale cố định (độ chính xác tối đa).
+fn numeric_with_scale(s: i64) -> DeclType {
+    DeclType { base: "numeric".into(), mods: vec![1000, s], array: false }
+}
+
+/// Scale thập phân đã biết của một kiểu: số nguyên = 0, numeric(p,s) = s; còn lại `None`.
+fn dec_scale(d: &Option<DeclType>) -> Option<i64> {
+    let d = d.as_ref().filter(|d| !d.array)?;
+    match d.base.as_str() {
+        "int2" | "int4" | "int8" | "serial" | "bigserial" | "smallserial" => Some(0),
+        "numeric" => d.scale(),
+        _ => None,
+    }
+}
+
 fn numeric_result(a: &str, b: &str) -> Option<DeclType> {
     let rank = |t: &str| match t {
         "int2" | "int4" | "int8" | "serial" | "bigserial" | "smallserial" => Some(1),
@@ -1024,7 +1070,7 @@ pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Opti
                 "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "TO_JSON" | "JSON_AGG" | "JSON_OBJECT_AGG" => "json",
                 "STRING_TO_ARRAY" | "REGEXP_MATCH" | "REGEXP_MATCHES" | "REGEXP_SPLIT_TO_ARRAY" => "text[]",
                 "REGEXP_REPLACE" | "REGEXP_SUBSTR" => "text",
-                "REGEXP_COUNT" => "integer",
+                "REGEXP_COUNT" | "REGEXP_INSTR" => "integer",
                 "REGEXP_LIKE" => "boolean",
                 "PG_TYPEOF" => "regtype",
                 "IS_NORMALIZED" | "ISFINITE" | "OVERLAPS" => "boolean",
@@ -1050,7 +1096,13 @@ pub(crate) fn pg_typeof(e: &str, col: &dyn Fn(&str) -> Option<DeclType>) -> Opti
                     let t = pg_typeof(args.first()?, col)?;
                     return Some(if matches!(name, "ROUND" | "TRUNC" | "FLOOR" | "CEIL") && t != "double precision" && t != "real" { "numeric".into() } else { t });
                 }
-                _ => return None,
+                "DIV" | "GCD" | "LCM" => {
+                    let args = crate::engine::executor::split_comma_separated_tokens(&e[open + 1..e.len() - 1]);
+                    let t = pg_typeof(args.first()?, col)?;
+                    return Some(if name == "DIV" && t != "numeric" { "numeric".into() } else { t });
+                }
+                "TO_CHAR" => "text",
+                _ => crate::engine::fnlib::result_type(name)?,
             };
             return Some(r.into());
         }
