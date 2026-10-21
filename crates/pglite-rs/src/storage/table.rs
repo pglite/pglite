@@ -42,6 +42,8 @@ pub struct Table {
     pub serial_next: HashMap<usize, i64>,
     /// Cột identity (tên viết thường), từ `SchemaOp::ColumnIdentity`. Rỗng với bảng cũ.
     pub identity: HashMap<String, crate::storage::catalog::IdentitySpec>,
+    /// Thuộc tính phụ từ `SchemaOp::TableMeta` (xem ở đó). Rỗng với bảng cũ.
+    pub meta: std::collections::BTreeMap<String, String>,
 }
 
 impl Table {
@@ -104,6 +106,7 @@ impl Table {
             decl_types: HashMap::new(),
             serial_next: HashMap::new(),
             identity: HashMap::new(),
+            meta: std::collections::BTreeMap::new(),
         }
     }
 
@@ -133,11 +136,32 @@ impl Table {
         }
         let mut uniq = Vec::with_capacity(specs.len());
         for (name, cols, pred) in specs {
-            let Some(col_idx) = cols.iter().map(|c| self.get_column_index(c)).collect::<Option<Vec<usize>>>() else {
+            // phần khoá: cột, hoặc biểu thức (`lower(name)`) được biên dịch một lần
+            let mut col_idx = Vec::with_capacity(cols.len());
+            let mut exprs = Vec::with_capacity(cols.len());
+            let mut ok = true;
+            for c in &cols {
+                match self.get_column_index(c) {
+                    Some(i) => {
+                        col_idx.push(i);
+                        exprs.push(None);
+                    }
+                    None if c.contains('(') || c.contains(|ch: char| "+-*/|:".contains(ch)) => {
+                        col_idx.push(usize::MAX);
+                        exprs.push(Some(crate::engine::expr::compile_expr(c, Some(self), None, None, None)));
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
                 continue;
-            };
+            }
             let predicate = pred.as_deref().map(|p| crate::engine::expr::compile_expr(p, Some(self), None, None, None));
-            uniq.push(UniqueIdx { name, cols: col_idx, predicate, map: HashMap::new() });
+            let nulls_not_distinct = self.meta.contains_key(&format!("nulls_not_distinct:{}", name.to_lowercase()));
+            uniq.push(UniqueIdx { name, cols: col_idx, exprs, nulls_not_distinct, predicate, map: HashMap::new() });
         }
         for u in &mut uniq {
             for (r, row) in self.rows.iter().enumerate() {
@@ -187,6 +211,17 @@ impl Table {
         for u in &mut self.uniq {
             u.remove(row, row_idx);
         }
+    }
+
+    /// Cột generated: (vị trí cột, biểu thức). Rỗng ⇒ không tốn gì ở đường ghi.
+    pub fn generated_columns(&self) -> Vec<(usize, String)> {
+        if self.meta.is_empty() {
+            return Vec::new();
+        }
+        self.meta
+            .iter()
+            .filter_map(|(k, e)| k.strip_prefix("generated:").and_then(|c| self.get_column_index(c)).map(|i| (i, e.clone())))
+            .collect()
     }
 
     /// Cột cho bản ghi `CreateTable` (TRUNCATE): khoá tự đoán không được ghi thành khoá khai báo.
@@ -720,6 +755,7 @@ impl Table {
             let dropped = self.columns[pos].name.clone();
             self.decl_types.remove(&dropped.to_lowercase());
             self.identity.remove(&dropped.to_lowercase());
+            self.meta.remove(&format!("generated:{}", dropped.to_lowercase()));
             self.serial_next.clear();
             let uses = |cols: &[String]| cols.iter().any(|c| c.eq_ignore_ascii_case(&dropped));
             // Như PostgreSQL: ràng buộc / index dùng cột bị xoá cũng bị xoá theo.
@@ -759,6 +795,14 @@ impl Table {
         }
         if let Some(sp) = self.identity.remove(&old.to_lowercase()) {
             self.identity.insert(to.to_lowercase(), sp);
+        }
+        if let Some(e) = self.meta.remove(&format!("generated:{}", old.to_lowercase())) {
+            self.meta.insert(format!("generated:{}", to.to_lowercase()), crate::storage::catalog::rename_identifier(&e, &old, to));
+        }
+        let gen_keys: Vec<String> = self.meta.keys().filter(|k| k.starts_with("generated:")).cloned().collect();
+        for k in gen_keys {
+            let e = crate::storage::catalog::rename_identifier(&self.meta[&k], &old, to);
+            self.meta.insert(k, e);
         }
         let fix = |cols: &mut Vec<String>| {
             for c in cols.iter_mut().filter(|c| c.eq_ignore_ascii_case(&old)) {

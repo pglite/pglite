@@ -135,7 +135,8 @@ fn foreign_keys_are_enforced_with_actions() {
     assert!(e.contains("tenant_members_user_id_fkey"), "{e}");
     // RESTRICT: tenant 2 còn invoice
     let e = err(&mut db, "DELETE FROM tenants WHERE id = 2");
-    assert!(e.contains("violates foreign key constraint \"invoices_tenant_id_fkey\" on table \"invoices\""), "{e}");
+    // như PostgreSQL: RESTRICT có thông điệp riêng (SQLSTATE 23001)
+    assert!(e.contains("violates RESTRICT setting of foreign key constraint \"invoices_tenant_id_fkey\" on table \"invoices\""), "{e}");
     assert_eq!(count(&mut db, "tenant_members"), 3, "cascade của lệnh lỗi phải bị huỷ");
     // CASCADE + SET NULL khi xoá user 1
     exec_all(&mut db, &["DELETE FROM users WHERE id = 1"]);

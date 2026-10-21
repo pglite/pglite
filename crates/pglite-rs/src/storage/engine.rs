@@ -582,6 +582,21 @@ impl StorageEngine {
                     self.objects.enums.remove(&name.to_lowercase());
                 }
             },
+            SchemaOp::TableMeta { table, key, value } => {
+                if let Some(t) = self.get_table_mut(table) {
+                    match value {
+                        Some(v) => {
+                            t.meta.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            t.meta.remove(key);
+                        }
+                    }
+                    if key.starts_with("nulls_not_distinct:") {
+                        t.rebuild_unique_indexes();
+                    }
+                }
+            }
             SchemaOp::ColumnIdentity { table, column, spec } => {
                 if let Some(t) = self.get_table_mut(table) {
                     match spec {
@@ -843,7 +858,7 @@ impl StorageEngine {
             | SchemaOp::SequenceValue { .. }
             | SchemaOp::EnumType { .. }
             | SchemaOp::Domain { .. } => vec![],
-            SchemaOp::ColumnIdentity { table, .. } => vec![table.clone()],
+            SchemaOp::ColumnIdentity { table, .. } | SchemaOp::TableMeta { table, .. } => vec![table.clone()],
         };
         if let SchemaOp::RenameColumn { table, .. } | SchemaOp::RenameTable { from: table, .. } = op {
             out.extend(

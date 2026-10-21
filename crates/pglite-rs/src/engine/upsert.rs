@@ -341,6 +341,25 @@ impl Executor {
             }
         }
         let decls = self.storage.get_table(&table_name).map(|t| t.decl_types_vec()).unwrap_or_default();
+        // cột GENERATED ALWAYS AS (...) STORED: chỉ nhận DEFAULT (như PostgreSQL), giá trị được tính sau
+        let generated = self.storage.get_table(&table_name).map(|t| t.generated_columns()).unwrap_or_default();
+        if !generated.is_empty() {
+            let gen_pos: Vec<(usize, usize)> = col_indices.iter().enumerate().filter_map(|(p, &c)| generated.iter().any(|(g, _)| *g == c).then_some((p, c))).collect();
+            if let Some(&(_, c0)) = gen_pos.first() {
+                let up_src = source.to_uppercase();
+                let explicit = if up_src.starts_with("VALUES") {
+                    extract_value_groups(&source[6..]).iter().any(|g| {
+                        let toks = split_comma_separated_tokens(g);
+                        gen_pos.iter().any(|(p, _)| toks.get(*p).map_or(false, |t| !t.trim().eq_ignore_ascii_case("DEFAULT")))
+                    })
+                } else {
+                    !up_src.starts_with("DEFAULT VALUES")
+                };
+                if explicit {
+                    return Err(format!("cannot insert a non-DEFAULT value into column \"{}\"", col_defs[c0].name));
+                }
+            }
+        }
 
         // 1. Dựng mọi dòng định chèn (chưa sửa gì)
         let defaults_row = |params: &[Value]| -> Vec<Value> {
@@ -446,6 +465,12 @@ impl Executor {
             table.pk_col_idx.filter(|&p| built.iter().any(|r| r.get(p).map_or(false, |v| v.is_null()))).and_then(|p| crate::engine::sequences::owned_seq_name(table, p))
         };
 
+        if !generated.is_empty() {
+            let table = &self.storage.tables[&clean_table_name];
+            for row in &mut built {
+                super::executor::apply_generated(table, &generated, row, params);
+            }
+        }
         // Kiểu khai báo (numeric(p,s), varchar(n)...): làm tròn / báo lỗi trước khi ghi, kể cả giá trị DEFAULT.
         if !decls.is_empty() {
             for row in &mut built {
@@ -654,6 +679,20 @@ impl Executor {
                 out.extend(t.uniq.iter().enumerate().filter(|(_, u)| u.name.eq_ignore_ascii_case(name)).map(|(i, _)| Arbiter::Unique(i)));
                 if out.is_empty() {
                     return Err(format!("constraint \"{}\" for table \"{}\" does not exist", name, t.name.to_lowercase()));
+                }
+            }
+            // ON CONFLICT (lower(name)): index UNIQUE trên đúng các biểu thức đó (so theo chữ, bỏ khoảng trắng)
+            ConflictTarget::Columns(cols) if cols.iter().any(|c| t.get_column_index(c).is_none() && c.contains('(')) => {
+                let norm = |x: &str| x.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase();
+                let want: Vec<String> = cols.iter().map(|c| norm(c)).collect();
+                for (i, u) in t.uniq.iter().enumerate() {
+                    let spec = t.indexes.iter().find(|ix| ix.name == u.name).map(|ix| ix.cols.iter().map(|c| norm(c)).collect::<Vec<_>>());
+                    if spec.as_ref().is_some_and(|s| s.len() == want.len() && s.iter().all(|c| want.contains(c))) {
+                        out.push(Arbiter::Unique(i));
+                    }
+                }
+                if out.is_empty() {
+                    return Err("there is no unique or exclusion constraint matching the ON CONFLICT specification".into());
                 }
             }
             ConflictTarget::Columns(cols) => {

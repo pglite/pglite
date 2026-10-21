@@ -218,15 +218,29 @@ impl Executor {
         // dòng): replay chỉ biết `default_val`, nên ghi thêm UPDATE cho chúng.
         let mut fixups: Vec<(RowIdentity, Value)> = Vec::new();
         let new_col_idx;
+        // ADD COLUMN ... GENERATED ALWAYS AS (expr) STORED: tính cho từng dòng hiện có
+        let gen_expr: Option<String> = {
+            let up = rest_def.to_ascii_uppercase();
+            up.find("GENERATED ALWAYS AS").and_then(|g| {
+                let after = rest_def[g + 19..].trim_start();
+                let close = super::constraints::matching_paren(after, 0)?;
+                after.starts_with('(').then(|| after[1..close].trim().to_string())
+            })
+        };
+        let gen_vals: Option<Vec<Value>> = gen_expr.as_ref().map(|e| {
+            let t = self.storage.get_table(table_name).unwrap();
+            t.rows.iter().map(|r| super::executor::eval_sql_expr(e, r, Some(t), &[], None, &[])).collect()
+        });
         self.storage.snapshot_table_for_undo(table_name);
         {
             let table = self.storage.get_table_mut(table_name).unwrap();
             table.columns.push(col_def.clone());
             new_col_idx = table.columns.len() - 1;
-            for row in &mut table.rows {
-                let cell = match col_def.default_value {
-                    Some(ref expr_str) => eval_default_value(expr_str),
-                    None => default_val.clone(),
+            for (ri, row) in table.rows.iter_mut().enumerate() {
+                let cell = match (&gen_vals, &col_def.default_value) {
+                    (Some(g), _) => g[ri].clone(),
+                    (None, Some(expr_str)) => eval_default_value(expr_str),
+                    (None, None) => default_val.clone(),
                 };
                 let cell = crate::engine::coltypes::coerce_for_write(add_col_decl.as_ref(), coerce_update_val(&col_def, cell));
                 row.push(cell);
@@ -253,6 +267,10 @@ impl Executor {
             for rec in identity.update_records(table_name.to_string(), vec![(new_col_idx, new_val)]) {
                 self.storage.wal.append(rec);
             }
+        }
+        if let Some(e) = gen_expr {
+            let name = self.storage.get_table(table_name).unwrap().columns[new_col_idx].name.to_lowercase();
+            self.storage.log_schema_op(SchemaOp::TableMeta { table: table_name.to_string(), key: format!("generated:{}", name), value: Some(e) });
         }
         let new_defs = {
             let cols = self.storage.get_table(table_name).unwrap().columns.clone();
@@ -407,8 +425,64 @@ impl Executor {
             };
             return self.alter_column_type(table, idx, &cur, type_str, using);
         }
+        // ADD GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(...)]
+        if op.len() >= 13 && op[..13].eq_ignore_ascii_case("ADD GENERATED") {
+            let (has_default, is_identity) = {
+                let t = self.storage.get_table(table).unwrap();
+                // SERIAL có DEFAULT nextval ngầm
+                let serial = cur.data_type == DataType::Serial || t.decl_type(idx).is_some_and(|d| d.base.ends_with("serial"));
+                (cur.default_value.is_some() || serial, t.identity.contains_key(&cur.name.to_lowercase()))
+            };
+            if is_identity {
+                return Err(format!("column \"{}\" of relation \"{}\" is already an identity column", cur.name, table));
+            }
+            if has_default {
+                return Err(format!("column \"{}\" of relation \"{}\" already has a default value", cur.name, table));
+            }
+            if cur.is_nullable {
+                return Err(format!("column \"{}\" of relation \"{}\" must be declared NOT NULL before identity can be added", cur.name, table));
+            }
+            let spec = super::executor::parse_identity_clause(&op[4..]).ok_or("syntax error in ADD GENERATED")?;
+            let default = format!("nextval('{}_{}_seq'::regclass)", table.to_lowercase(), cur.name.to_lowercase());
+            set(ColumnDef { default_value: Some(default), ..cur.clone() }, self);
+            self.storage.log_schema_op(SchemaOp::ColumnIdentity { table: table.to_string(), column: cur.name.clone(), spec: Some(spec) });
+            return Ok(());
+        }
+        // SET GENERATED {ALWAYS | BY DEFAULT}
+        if op.len() >= 13 && op[..13].eq_ignore_ascii_case("SET GENERATED") {
+            let sp = self.storage.get_table(table).unwrap().identity.get(&cur.name.to_lowercase()).copied();
+            let Some(mut sp) = sp else {
+                return Err(format!("column \"{}\" of relation \"{}\" is not an identity column", cur.name, table));
+            };
+            sp.always = op[13..].trim().to_ascii_uppercase().starts_with("ALWAYS");
+            self.storage.log_schema_op(SchemaOp::ColumnIdentity { table: table.to_string(), column: cur.name.clone(), spec: Some(sp) });
+            return Ok(());
+        }
+        // DROP IDENTITY [IF EXISTS]
+        if op.len() >= 13 && op[..13].eq_ignore_ascii_case("DROP IDENTITY") {
+            let is_identity = self.storage.get_table(table).unwrap().identity.contains_key(&cur.name.to_lowercase());
+            if !is_identity {
+                if op.to_ascii_uppercase().contains("IF EXISTS") {
+                    return Ok(());
+                }
+                return Err(format!("column \"{}\" of relation \"{}\" is not an identity column", cur.name, table));
+            }
+            self.storage.log_schema_op(SchemaOp::ColumnIdentity { table: table.to_string(), column: cur.name.clone(), spec: None });
+            set(ColumnDef { default_value: None, ..cur.clone() }, self);
+            return Ok(());
+        }
+        // DROP EXPRESSION: cột generated thành cột thường (giữ giá trị)
+        if op.len() >= 15 && op[..15].eq_ignore_ascii_case("DROP EXPRESSION") {
+            let key = format!("generated:{}", cur.name.to_lowercase());
+            if self.storage.get_table(table).unwrap().meta.contains_key(&key) {
+                self.storage.log_schema_op(SchemaOp::TableMeta { table: table.to_string(), key, value: None });
+            } else if !op.to_ascii_uppercase().contains("IF EXISTS") {
+                return Err(format!("column \"{}\" of relation \"{}\" is not a stored generated column", cur.name, table));
+            }
+            return Ok(());
+        }
         // SET STATISTICS / SET STORAGE / SET (...) / RESET: không ảnh hưởng dữ liệu
-        for kw in ["SET STATISTICS", "SET STORAGE", "SET (", "RESET (", "SET COMPRESSION", "DROP IDENTITY", "ADD GENERATED", "SET GENERATED", "DROP EXPRESSION"] {
+        for kw in ["SET STATISTICS", "SET STORAGE", "SET (", "RESET (", "SET COMPRESSION"] {
             if op.len() >= kw.len() && op.get(..kw.len()).map_or(false, |p| p.eq_ignore_ascii_case(kw)) {
                 return Ok(());
             }

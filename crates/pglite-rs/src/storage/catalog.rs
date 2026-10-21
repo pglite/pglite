@@ -138,6 +138,12 @@ pub enum SchemaOp {
     /// `CREATE DOMAIN`; `None` = DROP DOMAIN. Cột kiểu domain được lưu bằng kiểu gốc + ràng buộc nên bản
     /// cũ bỏ qua op này vẫn đọc bảng như thường.
     Domain { name: String, def: Option<DomainDef> },
+    /// Thuộc tính phụ của một bảng dạng khoá → giá trị (`None` = xoá khoá). Bản cũ bỏ qua op này; bản mới gặp
+    /// khoá lạ cũng bỏ qua, nên thêm loại thuộc tính mới không cần biến thể mới. Khoá đang dùng:
+    /// `generated:<cột>` = biểu thức `GENERATED ALWAYS AS (...) STORED` (giá trị vẫn được lưu trong dòng nên
+    /// bản cũ đọc được dữ liệu); `nulls_not_distinct:<ràng buộc/index>`; `deferrable:<ràng buộc>` =
+    /// `immediate` | `deferred`; `unlogged`; `inherits` = danh sách bảng cha.
+    TableMeta { table: String, key: String, value: Option<String> },
 }
 
 /// Định nghĩa domain: kiểu gốc và các ràng buộc (biểu thức CHECK dùng từ khoá `VALUE`).
@@ -258,6 +264,10 @@ pub fn ukey_part(v: &Value) -> Option<UKeyPart> {
 pub struct UniqueIdx {
     pub name: String,
     pub cols: Vec<usize>,
+    /// Phần khoá là biểu thức (`CREATE UNIQUE INDEX ... (lower(name))`): cùng độ dài với `cols`, `None` = cột.
+    pub exprs: Vec<Option<crate::engine::expr::CompiledExpr>>,
+    /// `UNIQUE NULLS NOT DISTINCT`: NULL bằng NULL.
+    pub nulls_not_distinct: bool,
     pub predicate: Option<crate::engine::expr::CompiledExpr>,
     /// Khoá -> các dòng sống mang khoá đó. Thường chỉ một dòng; nhiều dòng khi DB cũ có sẵn dữ liệu
     /// trùng (không kiểm tra lúc replay).
@@ -272,8 +282,20 @@ impl UniqueIdx {
             }
         }
         let mut k = Vec::with_capacity(self.cols.len());
-        for &c in &self.cols {
-            k.push(ukey_part(row.get(c)?)?);
+        for (i, &c) in self.cols.iter().enumerate() {
+            let computed;
+            let v = match self.exprs.get(i).and_then(|e| e.as_ref()) {
+                Some(e) => {
+                    computed = e.eval(row, None, &[]);
+                    &computed
+                }
+                None => row.get(c)?,
+            };
+            match ukey_part(v) {
+                Some(p) => k.push(p),
+                None if self.nulls_not_distinct => k.push(UKeyPart::Text(CompactString::new("\u{0}NULL"))),
+                None => return None,
+            }
         }
         Some(k)
     }

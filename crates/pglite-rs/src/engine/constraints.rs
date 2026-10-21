@@ -280,6 +280,29 @@ fn show_val(v: &Value) -> String {
     }
 }
 
+/// `(cột hoặc biểu thức, ...)=(giá trị, ...)` của một index UNIQUE (phần biểu thức được tính trên dòng).
+fn unique_key_detail(table: &Table, u: &crate::storage::catalog::UniqueIdx, row: &[Value]) -> String {
+    if u.exprs.iter().all(|e| e.is_none()) {
+        return key_detail(table, &u.cols, row);
+    }
+    let specs: Vec<String> = table.indexes.iter().find(|ix| ix.name == u.name).map(|ix| ix.cols.clone()).unwrap_or_default();
+    let mut names = Vec::new();
+    let mut vals = Vec::new();
+    for (i, &c) in u.cols.iter().enumerate() {
+        match u.exprs.get(i).and_then(|e| e.as_ref()) {
+            Some(e) => {
+                names.push(specs.get(i).cloned().unwrap_or_else(|| "?".into()));
+                vals.push(show_val(&e.eval(row, None, &[])));
+            }
+            None => {
+                names.push(table.columns[c].name.clone());
+                vals.push(show_val(&row[c]));
+            }
+        }
+    }
+    format!("({})=({})", names.join(", "), vals.join(", "))
+}
+
 fn key_detail(table: &Table, cols: &[usize], row: &[Value]) -> String {
     let names: Vec<&str> = cols.iter().map(|&c| table.columns[c].name.as_str()).collect();
     let vals: Vec<String> = cols.iter().map(|&c| show_val(&row[c])).collect();
@@ -375,6 +398,49 @@ impl Executor {
     }
 
     /// Mọi khoá ngoại trỏ TỚI bảng `parent`.
+    /// Ràng buộc `name` của bảng `t` đang ở chế độ hoãn (chỉ trong giao dịch): `DEFERRABLE INITIALLY DEFERRED`
+    /// hoặc `SET CONSTRAINTS ... DEFERRED` (lệnh sau cùng thắng).
+    pub(crate) fn constraint_deferred(&self, t: &Table, name: &str) -> bool {
+        if !self.storage.in_transaction || self.deferred_checking.get() || t.meta.is_empty() {
+            return false;
+        }
+        let lname = name.to_lowercase();
+        let Some(mode) = t.meta.get(&format!("deferrable:{}", lname)) else { return false };
+        for (n, d) in self.constraint_modes.iter().rev() {
+            if n.as_deref().map_or(true, |n| n == lname) {
+                return *d;
+            }
+        }
+        mode == "deferred"
+    }
+
+    /// Kiểm tra lại toàn bộ khoá ngoại của các bảng có kiểm tra bị hoãn.
+    pub(crate) fn check_deferred_constraints(&mut self) -> Result<(), String> {
+        let tables: Vec<String> = std::mem::take(&mut *self.deferred_pending.borrow_mut()).into_iter().collect();
+        if tables.is_empty() {
+            return Ok(());
+        }
+        self.deferred_checking.set(true);
+        let mut res = Ok(());
+        for t in tables {
+            let rows: Vec<usize> = match self.storage.get_table(&t) {
+                Some(tb) => (0..tb.rows.len()).filter(|&i| !tb.is_deleted[i]).collect(),
+                None => continue,
+            };
+            if let Err(e) = self.verify_rows(&t, &rows, None) {
+                res = Err(e);
+                break;
+            }
+        }
+        self.deferred_checking.set(false);
+        res
+    }
+
+    pub(crate) fn clear_deferred_state(&mut self) {
+        self.deferred_pending.borrow_mut().clear();
+        self.constraint_modes.clear();
+    }
+
     fn referencing_fks(&self, parent: &str) -> Vec<ResolvedFk> {
         let mut out = Vec::new();
         let Some(p) = self.storage.get_table(parent) else {
@@ -484,7 +550,8 @@ impl Executor {
         if not_null.is_empty() && t.uniq.is_empty() && t.constraints.is_empty() {
             return Ok(());
         }
-        let touches = |cols: &[usize]| changed.map_or(true, |ch| cols.iter().any(|c| ch.contains(c)));
+        // phần khoá là biểu thức (`usize::MAX`) có thể phụ thuộc mọi cột: luôn kiểm tra
+        let touches = |cols: &[usize]| changed.map_or(true, |ch| cols.iter().any(|c| *c == usize::MAX || ch.contains(c)));
         let checks: Vec<(String, crate::engine::expr::CompiledExpr)> = t
             .constraints
             .iter()
@@ -527,10 +594,17 @@ impl Executor {
                 if let Some(k) = u.key(row) {
                     if u.map.get(&k).map_or(false, |l| l.iter().any(|&o| o != r)) {
                         let _ = ui;
+                        if t.meta.contains_key(&format!("exclusion:{}", u.name.to_lowercase())) {
+                            return Err(format!(
+                                "conflicting key value violates exclusion constraint \"{}\" (Key {} conflicts with existing key.)",
+                                u.name,
+                                unique_key_detail(t, u, row)
+                            ));
+                        }
                         return Err(format!(
                             "duplicate key value violates unique constraint \"{}\" (Key {} already exists.)",
                             u.name,
-                            key_detail(t, &u.cols, row)
+                            unique_key_detail(t, u, row)
                         ));
                     }
                 }
@@ -544,6 +618,10 @@ impl Executor {
                 let vals: Vec<Value> = child_cols.iter().map(|&c| row[c].clone()).collect();
                 if vals.iter().any(|v| v.is_null()) {
                     continue; // MATCH SIMPLE: có NULL thì không kiểm tra
+                }
+                if self.constraint_deferred(t, name) {
+                    self.deferred_pending.borrow_mut().insert(t.name.to_lowercase());
+                    continue;
                 }
                 if self.find_rows_with(parent, parent_cols, &vals, None, 1).is_empty() {
                     return Err(format!(
@@ -581,8 +659,23 @@ impl Executor {
     }
 
     /// Sửa các ô của một dòng, ghi WAL và undo như UPDATE thường (đổi khoá chính = DELETE + INSERT).
-    pub(crate) fn update_row_logged(&mut self, table: &str, row_idx: usize, updates: Vec<(usize, Value)>) {
+    pub(crate) fn update_row_logged(&mut self, table: &str, row_idx: usize, mut updates: Vec<(usize, Value)>) {
         let clean = table.to_lowercase();
+        // cột generated (ON CONFLICT DO UPDATE, UPDATE ... FROM, MERGE): tính lại trên dòng mới
+        if let Some(t) = self.storage.get_table(&clean) {
+            let generated = t.generated_columns();
+            if !generated.is_empty() && row_idx < t.rows.len() {
+                let mut new_row = t.rows[row_idx].clone();
+                for (c, v) in &updates {
+                    new_row[*c] = v.clone();
+                }
+                super::executor::apply_generated(t, &generated, &mut new_row, &[]);
+                for (g, _) in &generated {
+                    updates.retain(|(c, _)| c != g);
+                    updates.push((*g, new_row[*g].clone()));
+                }
+            }
+        }
         let undo = self.storage.undo_enabled();
         let (identity, moves_key, old_vals, new_row) = {
             let Some(t) = self.storage.get_table_mut(&clean) else {
@@ -658,7 +751,7 @@ impl Executor {
                     FkAction::SetNull | FkAction::SetDefault => {
                         self.fk_set_children(&fk, &children, fk.on_delete)?;
                     }
-                    FkAction::Restrict => return Err(still_referenced(&fk, &key, self)),
+                    FkAction::Restrict => return Err(restrict_violation(&fk, &key, self)),
                     FkAction::NoAction => deferred.push((fk.clone(), key)),
                 }
             }
@@ -667,6 +760,12 @@ impl Executor {
                 let pending = std::mem::take(&mut deferred);
                 for (fk, key) in pending {
                     if !self.find_rows_with(&fk.child, &fk.child_cols, &key, None, 1).is_empty() {
+                        // DEFERRABLE: dòng con có thể được sửa trước COMMIT
+                        let deferred_fk = self.storage.get_table(&fk.child).is_some_and(|c| self.constraint_deferred(c, &fk.name));
+                        if deferred_fk {
+                            self.deferred_pending.borrow_mut().insert(fk.child.clone());
+                            continue;
+                        }
                         return Err(still_referenced(&fk, &key, self));
                     }
                 }
@@ -723,7 +822,15 @@ impl Executor {
                         }
                     }
                     FkAction::SetNull | FkAction::SetDefault => self.fk_set_children(&fk, &children, fk.on_update)?,
-                    FkAction::Restrict | FkAction::NoAction => return Err(still_referenced(&fk, &old_key, self)),
+                    FkAction::Restrict => return Err(restrict_violation(&fk, &old_key, self)),
+                    FkAction::NoAction => {
+                        // DEFERRABLE: dòng con có thể được sửa trước COMMIT
+                        if self.storage.get_table(&fk.child).is_some_and(|c| self.constraint_deferred(c, &fk.name)) {
+                            self.deferred_pending.borrow_mut().insert(fk.child.clone());
+                            continue;
+                        }
+                        return Err(still_referenced(&fk, &old_key, self));
+                    }
                 }
             }
         }
@@ -830,11 +937,23 @@ impl Executor {
     /// Dữ liệu hiện có có trùng khoá trên một `CREATE UNIQUE INDEX` (có thể một phần) không.
     pub(crate) fn validate_unique_index(&self, table: &str, def: &IndexDef) -> Result<(), String> {
         let t = self.storage.get_table(table).ok_or_else(|| format!("relation \"{}\" does not exist", table))?;
-        let Some(cols) = def.cols.iter().map(|c| t.get_column_index(c)).collect::<Option<Vec<usize>>>() else {
-            return Ok(()); // index trên biểu thức: chỉ lưu, không ép
-        };
+        let mut cols = Vec::new();
+        let mut exprs = Vec::new();
+        for c in &def.cols {
+            match t.get_column_index(c) {
+                Some(i) => {
+                    cols.push(i);
+                    exprs.push(None);
+                }
+                None => {
+                    cols.push(usize::MAX);
+                    exprs.push(Some(crate::engine::expr::compile_expr(c, Some(t), None, None, None)));
+                }
+            }
+        }
         let predicate = def.predicate.as_deref().map(|p| crate::engine::expr::compile_expr(p, Some(t), None, None, None));
-        let probe = crate::storage::catalog::UniqueIdx { name: def.name.clone(), cols: cols.clone(), predicate, map: Default::default() };
+        let nulls_not_distinct = t.meta.contains_key(&format!("nulls_not_distinct:{}", def.name.to_lowercase()));
+        let probe = crate::storage::catalog::UniqueIdx { name: def.name.clone(), cols: cols.clone(), exprs, nulls_not_distinct, predicate, map: Default::default() };
         let mut seen = std::collections::HashSet::new();
         for r in 0..t.rows.len() {
             if t.is_deleted[r] {
@@ -842,7 +961,7 @@ impl Executor {
             }
             if let Some(k) = probe.key(&t.rows[r]) {
                 if !seen.insert(k) {
-                    return Err(format!("could not create unique index \"{}\" (Key {} is duplicated.)", def.name, key_detail(t, &cols, &t.rows[r])));
+                    return Err(format!("could not create unique index \"{}\" (Key {} is duplicated.)", def.name, unique_key_detail(t, &probe, &t.rows[r])));
                 }
             }
         }
@@ -901,6 +1020,12 @@ fn type_error(col: &ColumnDef, v: &Value) -> Option<String> {
         _ => {}
     }
     None
+}
+
+/// `ON DELETE/UPDATE RESTRICT`: thông điệp và SQLSTATE 23001 như PostgreSQL.
+fn restrict_violation(fk: &ResolvedFk, key: &[Value], ex: &Executor) -> String {
+    let base = still_referenced(fk, key, ex);
+    base.replacen("violates foreign key constraint", "violates RESTRICT setting of foreign key constraint", 1)
 }
 
 fn still_referenced(fk: &ResolvedFk, key: &[Value], ex: &Executor) -> String {

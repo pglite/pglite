@@ -831,6 +831,18 @@ pub fn sqlstate(message: &str) -> &'static str {
     if has("unrecognized configuration parameter") {
         return "42704";
     }
+    if has("already has a default value") || has("is already an identity column") || has("is not an identity column") || has("before identity can be added") {
+        return "55000";
+    }
+    if has("no unique or exclusion constraint matching the on conflict") {
+        return "42P10";
+    }
+    if has("violates restrict setting of foreign key constraint") {
+        return "23001";
+    }
+    if has("violates exclusion constraint") {
+        return "23P01";
+    }
     if has("cannot insert a non-default value into column") || has("can only be updated to default") {
         "428C9"
     } else if has("duplicate key value violates unique constraint") || has("could not create unique index") {

@@ -1167,3 +1167,25 @@
 {"id":"W10_18","ok":true,"fields":["id","v"],"rows":[["1","v1"],["2","v2"],["3","v3"]]}
 {"id":"W10_19","ok":true,"fields":["merge_action","id","v"],"rows":[["UPDATE","1","q"]]}
 {"id":"W10_20","ok":false,"error":"column \"nope\" does not exist","sqlstate":"42703","failed_stmt":0}
+{"id":"W11_01","ok":true,"fields":["a","b","c"],"rows":[["1","x","X1"],["2","y","Y2"]]}
+{"id":"W11_02","ok":false,"fields":[],"rows":[],"error":"column \"b\" can only be updated to DEFAULT","sqlstate":"428C9","failed_stmt":1}
+{"id":"W11_03","ok":true,"fields":["a","b"],"rows":[["1","2"]]}
+{"id":"W11_04","ok":true,"fields":["id","n2"],"rows":[["1","10"],["2","6"],["3",null]]}
+{"id":"W11_05","ok":true,"fields":["id","t_id","v"],"rows":[["1",null,"a"]]}
+{"id":"W11_06","ok":true,"fields":["c"],"rows":[["2"]]}
+{"id":"W11_07","ok":false,"fields":[],"rows":[],"error":"duplicate key value violates unique constraint \"nd2_a_b_key\"","sqlstate":"23505","failed_stmt":2}
+{"id":"W11_08","ok":true,"fields":["c"],"rows":[["2"]]}
+{"id":"W11_09","ok":false,"fields":[],"rows":[],"error":"duplicate key value violates unique constraint \"ux\"","sqlstate":"23505","failed_stmt":1}
+{"id":"W11_10","ok":false,"fields":[],"rows":[],"error":"duplicate key value violates unique constraint \"ux\"","sqlstate":"23505","failed_stmt":2}
+{"id":"W11_11","ok":true,"fields":["id","v"],"rows":[["1","merged"],["2","v2"],["3","v3"]]}
+{"id":"W11_12","ok":false,"fields":[],"rows":[],"error":"insert or update on table \"c\" violates foreign key constraint \"c_p_fkey\"","sqlstate":"23503","failed_stmt":4}
+{"id":"W11_13","ok":true,"fields":["p"],"rows":[["2"]]}
+{"id":"W11_14","ok":false,"fields":[],"rows":[],"error":"insert or update on table \"c\" violates foreign key constraint \"c_p_fkey\"","sqlstate":"23503","failed_stmt":4}
+{"id":"W11_15","ok":true,"fields":["p"],"rows":[["0"],["20"]]}
+{"id":"W11_16","ok":false,"fields":[],"rows":[],"error":"update or delete on table \"p\" violates RESTRICT setting of foreign key constraint \"c_p_fkey\" on table \"c\"","sqlstate":"23001","failed_stmt":4}
+{"id":"W11_17","ok":true,"fields":["p"],"rows":[[null]]}
+{"id":"W11_18","ok":true,"fields":["id","v"],"rows":[["1","a"]]}
+{"id":"W11_19","ok":false,"fields":[],"rows":[],"error":"null value in column \"k\" of relation \"ig\" violates not-null constraint","sqlstate":"23502","failed_stmt":2}
+{"id":"W11_20","ok":true,"fields":["a","b"],"rows":[["2","1"]]}
+{"id":"W11_21","ok":false,"fields":[],"rows":[],"error":"conflicting key value violates exclusion constraint \"ex2_a_b_excl\"","sqlstate":"23P01","failed_stmt":2}
+{"id":"W11_22","ok":true,"fields":["id","t_id","v","a"],"rows":[["1",null,"x","9"]]}

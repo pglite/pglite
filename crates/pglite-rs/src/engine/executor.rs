@@ -42,6 +42,12 @@ pub struct Executor {
     pub(crate) seq_session: HashMap<String, i64>,
     /// `lastval`: sequence được dùng gần nhất trong phiên.
     pub(crate) seq_last_used: Option<String>,
+    /// Ràng buộc DEFERRABLE: bảng con có kiểm tra khoá ngoại bị hoãn tới COMMIT trong giao dịch hiện tại.
+    pub(crate) deferred_pending: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// `SET CONSTRAINTS`: (ALL → `None` tên), `true` = DEFERRED; chỉ sống trong giao dịch.
+    pub(crate) constraint_modes: Vec<(Option<String>, bool)>,
+    /// Đang kiểm tra lại ràng buộc hoãn (COMMIT / SET CONSTRAINTS IMMEDIATE): không hoãn nữa.
+    pub(crate) deferred_checking: std::cell::Cell<bool>,
 }
 
 impl Executor {
@@ -56,6 +62,9 @@ impl Executor {
             prepared: HashMap::new(),
             seq_session: HashMap::new(),
             seq_last_used: None,
+            deferred_pending: Default::default(),
+            constraint_modes: Vec::new(),
+            deferred_checking: Default::default(),
         }
     }
 
@@ -188,6 +197,7 @@ impl Executor {
                 if let Err(e) = self.storage.rollback() {
                     return Some(Err(e));
                 }
+                self.clear_deferred_state();
                 self.plan_cache.clear();
                 Some(Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "ROLLBACK".to_string() }))
             }
@@ -404,6 +414,32 @@ impl Executor {
         if upper.starts_with("DO ") || upper.starts_with("DO$") || upper.starts_with("DO\n") || upper.starts_with("DO\t") {
             return self.handle_do_block(trimmed);
         }
+        // SET CONSTRAINTS {ALL | tên, ...} {DEFERRED | IMMEDIATE}
+        if upper.starts_with("SET CONSTRAINTS ") {
+            let body = trimmed[16..].trim().trim_end_matches(';').trim();
+            let bu = body.to_ascii_uppercase();
+            let (list, deferred) = if bu.ends_with(" DEFERRED") {
+                (&body[..body.len() - 9], true)
+            } else if bu.ends_with(" IMMEDIATE") {
+                (&body[..body.len() - 10], false)
+            } else {
+                return Err(format!("syntax error at or near \"{}\"", body));
+            };
+            if self.storage.in_transaction {
+                if list.trim().eq_ignore_ascii_case("ALL") {
+                    self.constraint_modes.push((None, deferred));
+                } else {
+                    for n in split_comma_separated_tokens(list) {
+                        self.constraint_modes.push((Some(n.trim().trim_matches('"').to_lowercase()), deferred));
+                    }
+                }
+                if !deferred {
+                    self.check_deferred_constraints()?;
+                }
+            }
+            return Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "SET CONSTRAINTS".to_string() });
+        }
+
         if let Some(res) = self.handle_session_statement(trimmed, &upper) {
             return res;
         }
@@ -456,6 +492,14 @@ impl Executor {
         }
 
         if upper.starts_with("COMMIT") || upper == "END" {
+            // ràng buộc DEFERRABLE INITIALLY DEFERRED: kiểm tra lúc COMMIT; vi phạm → ROLLBACK như PostgreSQL
+            if let Err(e) = self.check_deferred_constraints() {
+                let _ = self.storage.rollback();
+                self.plan_cache.clear();
+                self.clear_deferred_state();
+                return Err(e);
+            }
+            self.clear_deferred_state();
             self.storage.commit()?;
             return Ok(QueryResult {
                 rows: vec![],
@@ -510,6 +554,9 @@ impl Executor {
 
         if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
             self.storage.rollback()?;
+            if !self.storage.in_transaction {
+                self.clear_deferred_state();
+            }
             // DDL trong giao dịch đã được hoàn tác: kế hoạch đã cache có thể trỏ tới cột/bảng cũ
             self.plan_cache.clear();
             return Ok(QueryResult {
@@ -584,6 +631,11 @@ impl Executor {
         if upper.starts_with("CREATE TABLE") {
             return self.handle_create_table(trimmed);
         }
+        // UNLOGGED chỉ là gợi ý về WAL của PostgreSQL: bảng ở đây vẫn bền như bảng thường
+        if upper.starts_with("CREATE UNLOGGED TABLE") {
+            let plain = format!("CREATE TABLE{}", &trimmed["CREATE UNLOGGED TABLE".len()..]);
+            return self.handle_create_table(&plain);
+        }
 
         if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") {
             return self.handle_create_index(trimmed);
@@ -595,6 +647,12 @@ impl Executor {
 
         if upper.starts_with("DROP INDEX") {
             return self.handle_drop_index(trimmed);
+        }
+        if upper.starts_with("ALTER INDEX ") {
+            return self.handle_alter_index(trimmed);
+        }
+        if upper.starts_with("REINDEX ") || upper == "REINDEX" {
+            return self.handle_reindex(trimmed);
         }
 
         if upper.starts_with("INSERT INTO") {
@@ -903,6 +961,14 @@ impl Executor {
                     self.storage.wal.append(WalRecord::Schema {
                         version: crate::storage::catalog::SCHEMA_OP_VERSION,
                         payload: crate::storage::catalog::encode_schema_op(&crate::storage::catalog::SchemaOp::ColumnIdentity { table: table_name.to_string(), column, spec: Some(sp) }),
+                    });
+                }
+                // thuộc tính phụ (generated, nulls_not_distinct...) cũng phải được dựng lại khi replay
+                let metas: Vec<(String, String)> = self.storage.get_table(table_name).map(|t| t.meta.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+                for (key, value) in metas {
+                    self.storage.wal.append(WalRecord::Schema {
+                        version: crate::storage::catalog::SCHEMA_OP_VERSION,
+                        payload: crate::storage::catalog::encode_schema_op(&crate::storage::catalog::SchemaOp::TableMeta { table: table_name.to_string(), key, value: Some(value) }),
                     });
                 }
             }
@@ -3816,6 +3882,82 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         done
     }
 
+    /// `ALTER INDEX [IF EXISTS] tên RENAME TO mới` (DropIndex + CreateIndex với tên mới: op có sẵn, bản cũ đọc
+    /// được); `SET (...)`, `RESET (...)`, `SET TABLESPACE` = không làm gì.
+    fn handle_alter_index(&mut self, sql: &str) -> Result<QueryResult, String> {
+        let mut rest = sql.trim().trim_end_matches(';').trim()[12..].trim();
+        let if_exists = rest.to_uppercase().starts_with("IF EXISTS ");
+        if if_exists {
+            rest = rest[10..].trim();
+        }
+        let name = strip_schema_keep_case(rest.split_whitespace().next().unwrap_or(""));
+        let action = rest[rest.split_whitespace().next().unwrap_or("").len()..].trim();
+        let au = action.to_ascii_uppercase();
+        let owner = self.storage.tables.iter().find(|(_, t)| t.indexes.iter().any(|ix| ix.name.eq_ignore_ascii_case(&name))).map(|(k, _)| k.clone());
+        let done = || Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "ALTER INDEX".to_string() });
+        let Some(table) = owner else {
+            // index của ràng buộc UNIQUE/PK cũng là index trong PG: đổi tên ràng buộc
+            let cons_owner = self.storage.tables.iter().find(|(_, t)| t.constraints.iter().any(|c| c.name.eq_ignore_ascii_case(&name))).map(|(k, _)| k.clone());
+            if let (Some(table), true) = (cons_owner, au.starts_with("RENAME TO ")) {
+                let new_name = action[10..].trim().trim_matches('"').to_string();
+                let def = self.storage.get_table(&table).and_then(|t| t.constraints.iter().find(|c| c.name.eq_ignore_ascii_case(&name)).cloned()).unwrap();
+                self.storage.log_schema_op(crate::storage::catalog::SchemaOp::DropConstraint { table: table.clone(), name: def.name.clone() });
+                self.storage.log_schema_op(crate::storage::catalog::SchemaOp::AddConstraint { table, def: crate::storage::catalog::ConstraintDef { name: new_name, ..def } });
+                self.plan_cache.clear();
+                return done();
+            }
+            if if_exists {
+                return done();
+            }
+            return Err(format!("relation \"{}\" does not exist", name));
+        };
+        if au.starts_with("RENAME TO ") {
+            let new_name = action[10..].trim().trim_matches('"').to_string();
+            if self.storage.tables.values().any(|t| t.indexes.iter().any(|ix| ix.name.eq_ignore_ascii_case(&new_name))) {
+                return Err(format!("relation \"{}\" already exists", new_name));
+            }
+            let def = self.storage.get_table(&table).and_then(|t| t.indexes.iter().find(|ix| ix.name.eq_ignore_ascii_case(&name)).cloned()).unwrap();
+            self.storage.log_schema_op(crate::storage::catalog::SchemaOp::DropIndex { table: table.clone(), name: def.name.clone() });
+            self.storage.log_schema_op(crate::storage::catalog::SchemaOp::CreateIndex { table, def: crate::storage::catalog::IndexDef { name: new_name, ..def } });
+            self.plan_cache.clear();
+            return done();
+        }
+        if au.starts_with("SET") || au.starts_with("RESET") || au.starts_with("ALTER COLUMN") || au.starts_with("ATTACH PARTITION") {
+            return done();
+        }
+        Err(format!("syntax error at or near \"{}\"", action.split_whitespace().next().unwrap_or("")))
+    }
+
+    /// `REINDEX {INDEX | TABLE | SCHEMA | DATABASE | SYSTEM} [CONCURRENTLY] tên`: dựng lại index UNIQUE trong
+    /// bộ nhớ (index không lưu trên đĩa); chỉ kiểm tra đối tượng tồn tại.
+    fn handle_reindex(&mut self, sql: &str) -> Result<QueryResult, String> {
+        let body = sql.trim().trim_end_matches(';').trim()[7..].trim();
+        let mut words: Vec<&str> = body.split_whitespace().collect();
+        if words.first().is_some_and(|w| w.starts_with('(')) {
+            words.remove(0);
+        }
+        let kind = words.first().map(|w| w.to_ascii_uppercase()).unwrap_or_default();
+        let name = words.iter().skip(1).find(|w| !w.eq_ignore_ascii_case("CONCURRENTLY")).map(|w| strip_schema_keep_case(w)).unwrap_or_default();
+        match kind.as_str() {
+            "TABLE" => {
+                let t = self.storage.get_table_mut(&name).ok_or_else(|| format!("relation \"{}\" does not exist", name))?;
+                t.rebuild_unique_indexes();
+            }
+            "INDEX" => {
+                if !self.storage.tables.values().any(|t| t.indexes.iter().any(|ix| ix.name.eq_ignore_ascii_case(&name)) || t.constraints.iter().any(|c| c.name.eq_ignore_ascii_case(&name))) {
+                    return Err(format!("relation \"{}\" does not exist", name));
+                }
+            }
+            "SCHEMA" | "DATABASE" | "SYSTEM" => {
+                for t in self.storage.tables.values_mut() {
+                    t.rebuild_unique_indexes();
+                }
+            }
+            _ => return Err(format!("syntax error at or near \"{}\"", kind)),
+        }
+        Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "REINDEX".to_string() })
+    }
+
     fn handle_drop_index(&mut self, sql: &str) -> Result<QueryResult, String> {
         let mut rest = sql.trim().trim_end_matches(';').trim()[10..].trim();
         if rest.to_uppercase().starts_with("CONCURRENTLY ") {
@@ -4114,9 +4256,10 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     fn handle_create_table(&mut self, sql: &str) -> Result<QueryResult, String> {
         // Simple CREATE TABLE parser
         let after_create = sql[12..].trim();
-        let (name_part, body_part) = if let Some(open_paren) = after_create.find('(') {
-            let close_paren = after_create.rfind(')').ok_or("Missing closing parenthesis in CREATE TABLE")?;
-            (&after_create[..open_paren].trim(), &after_create[open_paren + 1..close_paren].trim())
+        let (name_part, body_part, suffix) = if let Some(open_paren) = after_create.find('(') {
+            // dấu đóng khớp với dấu mở (sau nó có thể là INHERITS (...), WITH (...), PARTITION BY ...)
+            let close_paren = crate::engine::constraints::matching_paren(after_create, open_paren).or_else(|| after_create.rfind(')')).ok_or("Missing closing parenthesis in CREATE TABLE")?;
+            (&after_create[..open_paren].trim(), &after_create[open_paren + 1..close_paren].trim(), after_create[close_paren + 1..].trim())
         } else {
             return Err("Invalid CREATE TABLE syntax".to_string());
         };
@@ -4138,6 +4281,21 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         let mut defs: Vec<crate::storage::catalog::ConstraintDef> = Vec::new();
         let mut decl_types: Vec<(String, String)> = Vec::new();
         let mut identities: Vec<(String, crate::storage::catalog::IdentitySpec)> = Vec::new();
+        // thuộc tính phụ (SchemaOp::TableMeta): generated, nulls_not_distinct, inherits...
+        let mut metas: Vec<(String, String)> = Vec::new();
+
+        // INHERITS (cha, ...): cột của bảng cha đứng trước (cùng NOT NULL, kiểu khai báo, CHECK)
+        let su = suffix.to_ascii_uppercase();
+        if su.starts_with("INHERITS") {
+            let open = suffix.find('(').ok_or("syntax error at or near \"INHERITS\"")?;
+            let close = crate::engine::constraints::matching_paren(suffix, open).ok_or("syntax error at or near \"INHERITS\"")?;
+            let parents: Vec<String> = split_comma_separated_tokens(&suffix[open + 1..close]).into_iter().map(|p| strip_schema_keep_case(p.trim())).collect();
+            for p in &parents {
+                let pt = self.storage.get_table(p).ok_or_else(|| format!("relation \"{}\" does not exist", p))?;
+                self.copy_columns_like(pt, &mut columns, &mut decl_types, &mut defs, &table_name, true, false, true, false);
+            }
+            metas.push(("inherits".into(), parents.join(",")));
+        }
 
         for col_def_str in split_comma_separated_tokens(body_part) {
             let col_def_str = col_def_str.trim();
@@ -4151,22 +4309,100 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     table_level_pks.extend(cols.iter().cloned());
                     defs.retain(|d| !matches!(d.kind, crate::storage::catalog::ConstraintKind::PrimaryKey { .. }));
                 }
+                if matches!(def.kind, crate::storage::catalog::ConstraintKind::Unique { .. }) && col_def_str.to_ascii_uppercase().contains("NULLS NOT DISTINCT") {
+                    metas.push((format!("nulls_not_distinct:{}", def.name.to_lowercase()), "1".into()));
+                }
+                if let Some(mode) = deferrable_mode(col_def_str) {
+                    metas.push((format!("deferrable:{}", def.name.to_lowercase()), mode.into()));
+                }
                 defs.push(def);
                 continue;
             }
             let upper_def = col_def_str.to_uppercase();
-            if upper_def.starts_with("CONSTRAINT") || upper_def.starts_with("EXCLUDE") || upper_def.starts_with("LIKE ") {
+            if upper_def.starts_with("EXCLUDE") || upper_def.starts_with("CONSTRAINT") && find_top_level_keyword(col_def_str, "EXCLUDE").is_some() {
+                // EXCLUDE chỉ với toán tử `=`: tương đương UNIQUE; toán tử khác (&&, <->...) chưa hỗ trợ
+                let open = col_def_str.find('(').ok_or("syntax error at or near \"EXCLUDE\"")?;
+                let close = crate::engine::constraints::matching_paren(col_def_str, open).ok_or("syntax error at or near \"EXCLUDE\"")?;
+                let mut cols = Vec::new();
+                for el in split_comma_separated_tokens(&col_def_str[open + 1..close]) {
+                    let w = find_top_level_keyword(&el, "WITH").ok_or("syntax error in EXCLUDE")?;
+                    if el[w + 4..].trim() != "=" {
+                        return Err("EXCLUDE constraints with operators other than = are not supported".to_string());
+                    }
+                    cols.push(el[..w].trim().trim_matches('"').to_string());
+                }
+                let name = if upper_def.starts_with("CONSTRAINT") {
+                    col_def_str[10..].trim_start().split_whitespace().next().unwrap_or("").trim_matches('"').to_string()
+                } else {
+                    format!("{}_{}_excl", table_name.to_lowercase(), cols.join("_").to_lowercase())
+                };
+                metas.push((format!("exclusion:{}", name.to_lowercase()), "1".into()));
+                defs.push(crate::storage::catalog::ConstraintDef { name, kind: crate::storage::catalog::ConstraintKind::Unique { cols } });
+                continue;
+            }
+            if upper_def.starts_with("LIKE ") {
+                // LIKE bảng [INCLUDING|EXCLUDING {DEFAULTS|CONSTRAINTS|INDEXES|IDENTITY|GENERATED|ALL} ...]
+                let rest = col_def_str[5..].trim();
+                let src = strip_schema_keep_case(rest.split_whitespace().next().unwrap_or(""));
+                let ru = rest.to_ascii_uppercase();
+                let has = |opt: &str| ru.contains(&format!("INCLUDING {}", opt)) || ru.contains("INCLUDING ALL") && !ru.contains(&format!("EXCLUDING {}", opt));
+                let st = self.storage.get_table(&src).ok_or_else(|| format!("relation \"{}\" does not exist", src))?;
+                let (defaults, constraints, indexes, identity) = (has("DEFAULTS"), has("CONSTRAINTS"), has("INDEXES"), has("IDENTITY"));
+                self.copy_columns_like(st, &mut columns, &mut decl_types, &mut defs, &table_name, constraints, indexes, defaults, identity);
+                if identity {
+                    for c in &st.columns {
+                        if let Some(sp) = st.identity.get(&c.name.to_lowercase()) {
+                            identities.push((c.name.clone(), *sp));
+                        }
+                    }
+                }
+                if has("GENERATED") {
+                    for (i, e) in st.generated_columns() {
+                        metas.push((format!("generated:{}", st.columns[i].name.to_lowercase()), e));
+                    }
+                }
+                if indexes {
+                    for c in &mut columns {
+                        if st.pk_enforced && st.pk_col_idx.map(|p| st.columns[p].name.eq_ignore_ascii_case(&c.name)).unwrap_or(false) {
+                            c.is_primary_key = true;
+                            c.is_nullable = false;
+                        }
+                    }
+                }
+                continue;
+            }
+            if upper_def.starts_with("CONSTRAINT") {
                 continue;
             }
 
             let (mut col, rest_def) = parse_column_definition(col_def_str);
+            // GENERATED ALWAYS AS (expr) [STORED]: giá trị tính lúc ghi, lưu trong dòng
+            let rest_up = rest_def.to_ascii_uppercase();
+            if let Some(g) = rest_up.find("GENERATED ALWAYS AS") {
+                let after = rest_def[g + 19..].trim_start();
+                if after.starts_with('(') {
+                    let close = crate::engine::constraints::matching_paren(after, 0).ok_or("syntax error in GENERATED column")?;
+                    metas.push((format!("generated:{}", col.name.to_lowercase()), after[1..close].trim().to_string()));
+                    col.default_value = None;
+                }
+            }
+            if rest_up.contains("UNIQUE NULLS NOT DISTINCT") {
+                metas.push((format!("nulls_not_distinct:{}_{}_key", table_name.to_lowercase(), col.name.to_lowercase()), "1".into()));
+            }
             // GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(START WITH n INCREMENT BY m)]
             if let Some(spec) = parse_identity_clause(rest_def) {
                 col.default_value = Some(format!("nextval('{}_{}_seq'::regclass)", table_name.to_lowercase(), col.name.to_lowercase()));
                 col.is_nullable = false;
                 identities.push((col.name.clone(), spec));
             }
+            let before_defs = defs.len();
             crate::engine::constraints::parse_column_constraints(&table_name, &col.name, rest_def, &mut defs);
+            if let Some(mode) = deferrable_mode(rest_def) {
+                // DEFERRABLE áp cho ràng buộc khoá ngoại (REFERENCES) của cột vừa đọc
+                if let Some(fk) = defs[before_defs..].iter().rev().find(|d| matches!(d.kind, crate::storage::catalog::ConstraintKind::ForeignKey { .. })) {
+                    metas.push((format!("deferrable:{}", fk.name.to_lowercase()), mode.into()));
+                }
+            }
             if let Some(d) = crate::engine::coltypes::DeclType::parse(rest_def).filter(|d| d.is_informative()) {
                 decl_types.push((col.name.clone(), d.canonical()));
             }
@@ -4208,6 +4444,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             for (column, spec) in identities {
                 self.storage.log_schema_op(crate::storage::catalog::SchemaOp::ColumnIdentity { table: table_name.clone(), column, spec: Some(spec) });
             }
+            for (key, value) in metas {
+                self.storage.log_schema_op(crate::storage::catalog::SchemaOp::TableMeta { table: table_name.clone(), key, value: Some(value) });
+            }
         }
 
         Ok(QueryResult {
@@ -4216,6 +4455,56 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
             fields: vec![],
             command: "CREATE TABLE".to_string(),
         })
+    }
+
+    /// Chép cột của `src` (LIKE / INHERITS) vào cuối `columns`: tên, kiểu, NOT NULL; DEFAULT nếu `defaults`,
+    /// CHECK nếu `constraints`, PK/UNIQUE nếu `indexes` (tên ràng buộc theo bảng mới như PostgreSQL).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_columns_like(
+        &self,
+        src: &crate::storage::table::Table,
+        columns: &mut Vec<ColumnDef>,
+        decl_types: &mut Vec<(String, String)>,
+        defs: &mut Vec<crate::storage::catalog::ConstraintDef>,
+        new_table: &str,
+        constraints: bool,
+        indexes: bool,
+        defaults: bool,
+        _identity: bool,
+    ) {
+        use crate::storage::catalog::{ConstraintDef, ConstraintKind};
+        for (i, c) in src.columns.iter().enumerate() {
+            if columns.iter().any(|x| x.name.eq_ignore_ascii_case(&c.name)) {
+                continue;
+            }
+            let mut nc = c.clone();
+            nc.is_primary_key = false;
+            nc.is_nullable = c.is_nullable && !(src.pk_enforced && src.pk_col_idx == Some(i));
+            if !defaults || src.identity.contains_key(&c.name.to_lowercase()) {
+                nc.default_value = None;
+            }
+            // SERIAL: DEFAULT nextval chỉ đi theo khi INCLUDING DEFAULTS (như PG); kiểu thì giữ nguyên
+            if nc.data_type == crate::types::DataType::Serial && !defaults {
+                nc.data_type = crate::types::DataType::Integer;
+            }
+            nc.comment = None;
+            if let Some(d) = crate::engine::coltypes::column_decl(src, i) {
+                let d = if d.base.ends_with("serial") && !defaults { crate::engine::coltypes::DeclType { base: match d.base.as_str() { "bigserial" => "int8", "smallserial" => "int2", _ => "int4" }.into(), ..d } } else { d };
+                decl_types.push((c.name.clone(), d.canonical()));
+            }
+            columns.push(nc);
+        }
+        for d in &src.constraints {
+            match &d.kind {
+                ConstraintKind::Check { .. } if constraints => {
+                    defs.push(ConstraintDef { name: d.name.replacen(&src.name.to_lowercase(), &new_table.to_lowercase(), 1), kind: d.kind.clone() });
+                }
+                ConstraintKind::Unique { .. } | ConstraintKind::PrimaryKey { .. } if indexes => {
+                    defs.push(ConstraintDef { name: d.name.replacen(&src.name.to_lowercase(), &new_table.to_lowercase(), 1), kind: d.kind.clone() });
+                }
+                _ => {}
+            }
+        }
     }
 
     fn handle_comment_on_table(&mut self, sql: &str) -> Result<QueryResult, String> {
@@ -8398,6 +8687,9 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 if table.identity.get(&table.columns[col_idx].name.to_lowercase()).map_or(false, |sp| sp.always) && !val_str.trim().eq_ignore_ascii_case("DEFAULT") {
                     return Err(format!("column \"{}\" can only be updated to DEFAULT", table.columns[col_idx].name));
                 }
+                if !val_str.trim().eq_ignore_ascii_case("DEFAULT") && table.meta.contains_key(&format!("generated:{}", table.columns[col_idx].name.to_lowercase())) {
+                    return Err(format!("column \"{}\" can only be updated to DEFAULT", table.columns[col_idx].name));
+                }
                 raw_assignments.push((col_idx, val_str));
             }
 
@@ -8423,6 +8715,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                 None
             };
 
+            let generated = table.generated_columns();
             // Bước 1: tính giá trị mới cho mọi dòng khớp (mỗi dòng chỉ đọc chính nó), chưa sửa gì.
             let compute_updates = |table: &crate::storage::table::Table, i: usize| -> Vec<(usize, Value)> {
                 let row_assignments: Option<Vec<(usize, String)>> = per_row_set.as_ref().and_then(|m| m.get(&i)).map(|clause| {
@@ -8435,7 +8728,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                         })
                         .collect()
                 });
-                row_assignments.as_ref().unwrap_or(&raw_assignments).iter().map(|&(c_idx, ref v_str)| {
+                let mut ups: Vec<(usize, Value)> = row_assignments.as_ref().unwrap_or(&raw_assignments).iter().map(|&(c_idx, ref v_str)| {
                     // SET col = DEFAULT: giá trị mặc định của cột (trước đây ghi chữ "DEFAULT")
                     let raw_val = if v_str.trim().eq_ignore_ascii_case("DEFAULT") {
                         table.columns[c_idx].default_value.as_deref().map(eval_default_value).unwrap_or(Value::Null)
@@ -8444,7 +8737,20 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
                     };
                     let coerced = crate::engine::coltypes::coerce_for_write(table.decl_type(c_idx), coerce_update_val(&table.columns[c_idx], raw_val));
                     (c_idx, coerced)
-                }).collect()
+                }).collect();
+                // cột generated: tính lại trên dòng mới
+                if !generated.is_empty() {
+                    let mut new_row = table.rows[i].clone();
+                    for (c, v) in &ups {
+                        new_row[*c] = v.clone();
+                    }
+                    apply_generated(table, &generated, &mut new_row, params);
+                    for (g, _) in &generated {
+                        ups.retain(|(c, _)| c != g);
+                        ups.push((*g, new_row[*g].clone()));
+                    }
+                }
+                ups
             };
             let mut planned: Vec<(usize, Vec<(usize, Value)>)> = Vec::new();
             if let Some(target_pk) = pk_target {
@@ -8498,6 +8804,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
 
             // Bước 3: áp dụng.
             changed_cols.extend(raw_assignments.iter().map(|(c, _)| *c));
+            changed_cols.extend(generated.iter().map(|(c, _)| *c));
             for (i, updates) in planned {
                 updated_rows.push(i);
                 if referenced {
@@ -16982,6 +17289,26 @@ fn get_returning_fields(table: &crate::storage::table::Table, r_cols: &str) -> V
 }
 
 /// Giá trị DEFAULT khi INSERT (tham số của lệnh dùng được trong biểu thức).
+/// `DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trong định nghĩa ràng buộc → `deferred` / `immediate`.
+fn deferrable_mode(def: &str) -> Option<&'static str> {
+    let u = def.to_ascii_uppercase();
+    let p = u.find("DEFERRABLE")?;
+    if u[..p].trim_end().ends_with("NOT") {
+        return None;
+    }
+    Some(if u[p..].contains("INITIALLY DEFERRED") { "deferred" } else { "immediate" })
+}
+
+/// Tính các cột `GENERATED ALWAYS AS (...) STORED` của `row` từ các cột còn lại (sau khi đã có giá trị mới).
+pub(crate) fn apply_generated(table: &crate::storage::table::Table, generated: &[(usize, String)], row: &mut [Value], params: &[Value]) {
+    for (c, expr) in generated {
+        let v = eval_sql_expr(expr, row, Some(table), &[], None, params);
+        if *c < row.len() {
+            row[*c] = crate::engine::coltypes::coerce_for_write(table.decl_type(*c), coerce_update_val(&table.columns[*c], v));
+        }
+    }
+}
+
 pub(crate) fn eval_default_for_insert(def_str: &str, params: &[Value]) -> Value {
     // DB cũ có thể lưu DEFAULT dạng chữ không tính được: giữ hành vi cũ, không báo hàm lạ
     crate::engine::known_fns::without_check(|| eval_default_inner(def_str, params))
