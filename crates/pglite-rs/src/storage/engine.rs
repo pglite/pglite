@@ -36,6 +36,9 @@ pub struct StorageEngine {
     pub on_commit_drop: Vec<String>,
     /// View, schema, sequence độc lập, enum.
     pub objects: ObjectCatalog,
+    /// Số lần đã đặt trigger (`TableMeta` khoá `trigger:`) từ khi mở DB: 0 = chắc chắn không có trigger nào,
+    /// UPDATE / DELETE khỏi phải dò bảng đích (có thể lớn hơn số thật sau DROP — chỉ dùng để lọc nhanh).
+    pub trigger_count: usize,
 }
 
 /// Mốc đầu một câu lệnh (xem `StorageEngine::begin_statement`).
@@ -61,6 +64,7 @@ impl StorageEngine {
             tx_ddl_undo: false,
             on_commit_drop: Vec::new(),
             objects: ObjectCatalog::default(),
+            trigger_count: 0,
         };
 
         let mut table_hist_cols: HashMap<String, Vec<String>> = HashMap::new();
@@ -582,7 +586,21 @@ impl StorageEngine {
                     self.objects.enums.remove(&name.to_lowercase());
                 }
             },
+            SchemaOp::ObjectMeta { kind, name, value } => {
+                let k = (kind.clone(), name.clone());
+                match value {
+                    Some(v) => {
+                        self.objects.extra.insert(k, v.clone());
+                    }
+                    None => {
+                        self.objects.extra.remove(&k);
+                    }
+                }
+            }
             SchemaOp::TableMeta { table, key, value } => {
+                if key.starts_with("trigger:") && value.is_some() {
+                    self.trigger_count += 1;
+                }
                 if let Some(t) = self.get_table_mut(table) {
                     match value {
                         Some(v) => {
@@ -857,7 +875,8 @@ impl StorageEngine {
             | SchemaOp::Sequence { .. }
             | SchemaOp::SequenceValue { .. }
             | SchemaOp::EnumType { .. }
-            | SchemaOp::Domain { .. } => vec![],
+            | SchemaOp::Domain { .. }
+            | SchemaOp::ObjectMeta { .. } => vec![],
             SchemaOp::ColumnIdentity { table, .. } | SchemaOp::TableMeta { table, .. } => vec![table.clone()],
         };
         if let SchemaOp::RenameColumn { table, .. } | SchemaOp::RenameTable { from: table, .. } = op {

@@ -15,6 +15,8 @@ pub(crate) mod jsonpath;
 pub(crate) mod srf;
 pub(crate) mod known_fns;
 pub(crate) mod merge;
+pub(crate) mod routines;
+pub(crate) mod triggers;
 pub(crate) mod sequences;
 pub(crate) mod datetime;
 pub mod executor;

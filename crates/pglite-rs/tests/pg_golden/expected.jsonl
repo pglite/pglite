@@ -1189,3 +1189,25 @@
 {"id":"W11_20","ok":true,"fields":["a","b"],"rows":[["2","1"]]}
 {"id":"W11_21","ok":false,"fields":[],"rows":[],"error":"conflicting key value violates exclusion constraint \"ex2_a_b_excl\"","sqlstate":"23P01","failed_stmt":2}
 {"id":"W11_22","ok":true,"fields":["id","t_id","v","a"],"rows":[["1",null,"x","9"]]}
+{"id":"W12_01","ok":true,"fields":["a","b"],"rows":[["6","12"]]}
+{"id":"W12_02","ok":true,"fields":["id"],"rows":[["2"]]}
+{"id":"W12_03","ok":true,"fields":["f"],"rows":[["55"]]}
+{"id":"W12_04","ok":true,"fields":["a","b"],"rows":[["x","y"]]}
+{"id":"W12_05","ok":true,"fields":["i","sq"],"rows":[["1","1"],["2","4"],["3","9"]]}
+{"id":"W12_06","ok":true,"fields":["id","name"],"rows":[["1","alice"],["2","bob"]]}
+{"id":"W12_07","ok":true,"fields":["a","b"],"rows":[["t","20"]]}
+{"id":"W12_08","ok":true,"fields":["s"],"rows":[["6"]]}
+{"id":"W12_09","ok":true,"fields":["x"],"rows":[["42"]]}
+{"id":"W12_10","ok":false,"fields":[],"rows":[],"error":"p() is a procedure","sqlstate":"42809","failed_stmt":1}
+{"id":"W12_11","ok":true,"fields":["m"],"rows":[["UPDATE:AFTER:STATEMENT:st"]]}
+{"id":"W12_12","ok":true,"fields":["m"],"rows":[["INSERT:n"],["UPDATE:m"],["DELETE:m"]]}
+{"id":"W12_13","ok":true,"fields":["id","v"],"rows":[["7","LOW"],["8","low"]]}
+{"id":"W12_14","ok":true,"fields":["v"],"rows":[["low"]]}
+{"id":"W12_15","ok":true,"fields":["id","name","n"],"rows":[["1","alice#","0"]]}
+{"id":"W12_16","ok":true,"fields":["c"],"rows":[["3"]]}
+{"id":"W12_17","ok":false,"fields":[],"rows":[],"error":"function \"f\" already exists with same argument types","sqlstate":"42723","failed_stmt":1}
+{"id":"W12_18","ok":true,"fields":["v"],"rows":[["2"]]}
+{"id":"W12_19","ok":true,"fields":["ok"],"rows":[["1"]]}
+{"id":"W12_20","ok":true,"fields":["v"],"rows":[["2.25"]]}
+{"id":"W12_21","ok":true,"fields":["c","d"],"rows":[["3","3"]]}
+{"id":"W12_22","ok":true,"fields":["a","b","c"],"rows":[["hello world","hello bob","hello x"]]}

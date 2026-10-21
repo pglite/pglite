@@ -35,9 +35,14 @@ enum Stmt {
     Exit { when: Option<String> },
     Continue { when: Option<String> },
     GetDiagnostics { target: String },
-    Raise { level: String, message: String, args: Vec<String> },
+    Raise { level: String, message: String, args: Vec<String>, errcode: Option<String> },
     Null,
-    Return,
+    /// `RETURN [biểu thức]` (hàm / trigger); DO chỉ dùng dạng không biểu thức
+    Return(Option<String>),
+    /// `RETURN NEXT [biểu thức]` (hàm SETOF)
+    ReturnNext(Option<String>),
+    /// `RETURN QUERY câu_lệnh` / `RETURN QUERY EXECUTE biểu_thức [USING ...]`
+    ReturnQuery { sql: String, dynamic: bool, using: Vec<String> },
 }
 
 #[derive(Debug)]
@@ -48,7 +53,7 @@ struct Decl {
 }
 
 #[derive(Debug)]
-struct Block {
+pub(crate) struct Block {
     decls: Vec<Decl>,
     body: Vec<Stmt>,
     /// (điều kiện như `others`, `duplicate_object`; các lệnh xử lý)
@@ -365,14 +370,25 @@ impl<'a> Parser<'a> {
                 } else {
                     ("EXCEPTION".to_string(), rest.clone())
                 };
-                // bỏ `USING ...`
-                let body = match find_top_level_keyword(&body, "USING") {
-                    Some(p) => body[..p].trim().to_string(),
-                    None => body,
+                // `USING ERRCODE = '22023' | 'tên_điều_kiện', MESSAGE = ...`
+                let (body, errcode) = match find_top_level_keyword(&body, "USING") {
+                    Some(p) => {
+                        let opts = body[p + 5..].to_string();
+                        let mut code = None;
+                        for o in split_args(&opts) {
+                            if let Some(eq) = o.find('=') {
+                                if o[..eq].trim().eq_ignore_ascii_case("ERRCODE") {
+                                    code = string_literal(o[eq + 1..].trim()).or_else(|| Some(o[eq + 1..].trim().to_string()));
+                                }
+                            }
+                        }
+                        (body[..p].trim().to_string(), code)
+                    }
+                    None => (body, None),
                 };
                 let parts = split_args(&body);
                 let message = parts.first().map(|m| raise_message(m)).unwrap_or_default();
-                out.push(Stmt::Raise { level, message, args: parts.into_iter().skip(1).collect() });
+                out.push(Stmt::Raise { level, message, args: parts.into_iter().skip(1).collect(), errcode });
                 continue;
             }
             if self.eat_kw("NULL") {
@@ -381,9 +397,28 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.eat_kw("RETURN") {
-                let _ = self.read_until(&[]);
+                if self.eat_kw("NEXT") {
+                    let e = self.read_until(&[]);
+                    self.eat_semicolon();
+                    out.push(Stmt::ReturnNext((!e.trim().is_empty()).then(|| e.trim().to_string())));
+                    continue;
+                }
+                if self.eat_kw("QUERY") {
+                    if self.eat_kw("EXECUTE") {
+                        let expr = self.read_until(&["USING"]);
+                        let using = if self.eat_kw("USING") { split_args(&self.read_until(&[])) } else { Vec::new() };
+                        self.eat_semicolon();
+                        out.push(Stmt::ReturnQuery { sql: expr, dynamic: true, using });
+                    } else {
+                        let q = self.read_until(&[]);
+                        self.eat_semicolon();
+                        out.push(Stmt::ReturnQuery { sql: q, dynamic: false, using: Vec::new() });
+                    }
+                    continue;
+                }
+                let e = self.read_until(&[]);
                 self.eat_semicolon();
-                out.push(Stmt::Return);
+                out.push(Stmt::Return((!e.trim().is_empty()).then(|| e.trim().to_string())));
                 continue;
             }
             if self.eat_kw("PERFORM") {
@@ -575,6 +610,48 @@ fn string_literal(s: &str) -> Option<String> {
     None
 }
 
+/// Mã SQLSTATE của một tên điều kiện PL/pgSQL (phụ lục A của PostgreSQL), các tên thường gặp.
+fn condition_sqlstate(cond: &str) -> Option<&'static str> {
+    Some(match cond {
+        "unique_violation" => "23505",
+        "foreign_key_violation" => "23503",
+        "not_null_violation" => "23502",
+        "check_violation" => "23514",
+        "restrict_violation" => "23001",
+        "exclusion_violation" => "23P01",
+        "division_by_zero" => "22012",
+        "numeric_value_out_of_range" => "22003",
+        "invalid_text_representation" => "22P02",
+        "invalid_parameter_value" => "22023",
+        "string_data_right_truncation" => "22001",
+        "datetime_field_overflow" => "22008",
+        "raise_exception" => "P0001",
+        "no_data_found" => "P0002",
+        "too_many_rows" => "P0003",
+        "undefined_table" => "42P01",
+        "undefined_column" => "42703",
+        "undefined_function" => "42883",
+        "duplicate_table" => "42P07",
+        "duplicate_object" => "42710",
+        "syntax_error" => "42601",
+        "feature_not_supported" => "0A000",
+        "insufficient_privilege" => "42501",
+        "serialization_failure" => "40001",
+        "deadlock_detected" => "40P01",
+        "object_not_in_prerequisite_state" => "55000",
+        _ => return None,
+    })
+}
+
+/// Tên điều kiện → mã (cho `RAISE ... USING ERRCODE = 'unique_violation'`); mã 5 ký tự giữ nguyên.
+pub(crate) fn errcode_of(code: &str) -> String {
+    let c = code.trim().trim_matches('\'');
+    if c.len() == 5 && c.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return c.to_ascii_uppercase();
+    }
+    condition_sqlstate(&c.to_ascii_lowercase()).unwrap_or("P0001").to_string()
+}
+
 /// `'Bảng % đã tồn tại'` -> chuỗi định dạng.
 fn raise_message(s: &str) -> String {
     string_literal(s).unwrap_or_else(|| s.trim().to_string())
@@ -583,6 +660,16 @@ fn raise_message(s: &str) -> String {
 /// Lỗi `msg` có khớp điều kiện `WHEN cond` của PL/pgSQL không.
 fn error_matches(cond: &str, msg: &str) -> bool {
     let m = msg.to_lowercase();
+    // `WHEN SQLSTATE '22023'` và tên điều kiện có mã SQLSTATE: so theo mã của lỗi
+    let state = crate::pg_types::sqlstate(msg);
+    if let Some(code) = cond.strip_prefix("sqlstate").map(|c| c.trim().trim_matches('\'')) {
+        return state.eq_ignore_ascii_case(code);
+    }
+    if let Some(code) = condition_sqlstate(cond) {
+        if state == code {
+            return true;
+        }
+    }
     match cond {
         "others" => true,
         "duplicate_object" | "duplicate_table" | "duplicate_column" | "duplicate_schema" | "duplicate_function" => m.contains("already exists"),
@@ -591,7 +678,7 @@ fn error_matches(cond: &str, msg: &str) -> bool {
         "foreign_key_violation" => m.contains("foreign key"),
         "not_null_violation" => m.contains("not-null"),
         "check_violation" => m.contains("check constraint"),
-        "raise_exception" => m.starts_with("raise:"),
+        "raise_exception" => m.starts_with("raise:") || m.starts_with("raise[p0001]"),
         "feature_not_supported" => m.contains("unsupported") || m.contains("not supported"),
         "invalid_text_representation" | "data_exception" => m.contains("invalid input syntax"),
         "no_data_found" => m.contains("query returned no rows"),
@@ -662,9 +749,18 @@ struct Var {
 
 /// Biến của các khối đang chạy (trong cùng trước).
 #[derive(Default)]
-struct Env {
+pub(crate) struct Env {
     scopes: Vec<HashMap<String, Var>>,
     row_count: i64,
+    /// giá trị của `RETURN biểu_thức` (hàm vô hướng) / bản ghi (`RETURN NEW`)
+    pub(crate) ret: Option<Value>,
+    pub(crate) ret_record: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+    /// các dòng của `RETURN NEXT` / `RETURN QUERY` (hàm SETOF / TABLE)
+    pub(crate) ret_rows: Vec<serde_json::Value>,
+    /// `FOUND`
+    found: bool,
+    /// giá trị cuối của các tham số OUT / INOUT (hàm có OUT không RETURN biểu thức)
+    pub(crate) out_values: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Env {
@@ -706,7 +802,98 @@ fn column_names(ex: &Executor) -> std::collections::HashSet<String> {
     ex.storage.tables.values().flat_map(|t| t.columns.iter().map(|c| c.name.to_lowercase())).collect()
 }
 
+thread_local! {
+    /// Thân hàm PL/pgSQL đã parse, theo nội dung thân (gọi hàm nhiều lần không parse lại).
+    static BODY_CACHE: std::cell::RefCell<HashMap<String, std::rc::Rc<Block>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+fn parse_body(body: &str) -> Result<std::rc::Rc<Block>, String> {
+    if let Some(b) = BODY_CACHE.with(|c| c.borrow().get(body).cloned()) {
+        return Ok(b);
+    }
+    let mut p = Parser { s: body, pos: 0 };
+    let block = p.parse_block()?;
+    p.skip_ws();
+    if p.pos < body.len() {
+        return Err(format!("syntax error in function body near \"{}\"", snippet(&body[p.pos..])));
+    }
+    let rc = std::rc::Rc::new(block);
+    BODY_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 512 {
+            c.clear();
+        }
+        c.insert(body.to_string(), rc.clone());
+    });
+    Ok(rc)
+}
+
 impl Executor {
+    /// Kiểm tra cú pháp thân PL/pgSQL (lúc CREATE FUNCTION).
+    pub(crate) fn plpgsql_check(&mut self, body: &str) -> Result<(), String> {
+        parse_body(body).map(|_| ())
+    }
+
+    /// Chạy thân hàm PL/pgSQL với các biến (tên, giá trị, kiểu) và bản ghi (NEW / OLD của trigger).
+    pub(crate) fn run_plpgsql_body(&mut self, body: &str, vars: Vec<(String, Value, String)>, records: Vec<(String, Option<serde_json::Map<String, serde_json::Value>>)>, null_records: &[String]) -> Result<Env, String> {
+        let block = parse_body(body)?;
+        let mut env = Env::default();
+        let mut scope = HashMap::new();
+        for (n, v, ty) in vars {
+            let set = true;
+            scope.insert(n.to_lowercase(), Var { val: VarVal::Scalar(v), ty, set });
+        }
+        for (n, r) in records {
+            // `set = false`: bản ghi NULL của trigger (RETURN nó = RETURN NULL)
+            let set = !null_records.contains(&n);
+            scope.insert(n, Var { val: VarVal::Record(r), ty: "record".into(), set });
+        }
+        env.scopes.push(scope);
+        let flow = self.run_block(&mut env, &block, 0)?;
+        let _ = flow;
+        // tham số OUT: giá trị cuối
+        let names: Vec<String> = match env.get("__out_params") {
+            Some(Var { val: VarVal::Scalar(Value::Text(t)), .. }) => t.split(',').filter(|n| !n.is_empty()).map(|n| n.to_string()).collect(),
+            _ => Vec::new(),
+        };
+        for n in names {
+            if let Some(Var { val: VarVal::Scalar(v), .. }) = env.get(&n) {
+                let j = super::executor::value_to_json_pub(v);
+                env.out_values.insert(n, j);
+            }
+        }
+        Ok(env)
+    }
+
+    /// Thay tham số của hàm SQL (theo tên, cả `tên_hàm.tham_số`) bằng hằng. Tên trùng cột của một bảng thì cột
+    /// được ưu tiên như PostgreSQL (`set = false`).
+    pub(crate) fn subst_routine_params(&self, sql: &str, fname: &str, named: &[(String, Value)], set: bool) -> Result<String, String> {
+        if named.is_empty() {
+            return Ok(sql.to_string());
+        }
+        // `tên_hàm.tham_số` luôn là tham số
+        let mut s = sql.to_string();
+        for (n, v) in named {
+            let q = format!("{}.{}", fname, n);
+            let mut out = String::new();
+            let mut rest = s.as_str();
+            while let Some(p) = rest.to_lowercase().find(&q) {
+                out.push_str(&rest[..p]);
+                out.push_str(&literal(v));
+                rest = &rest[p + q.len()..];
+            }
+            out.push_str(rest);
+            s = out;
+        }
+        let mut env = Env::default();
+        let mut scope = HashMap::new();
+        for (n, v) in named {
+            scope.insert(n.to_lowercase(), Var { val: VarVal::Scalar(v.clone()), ty: String::new(), set });
+        }
+        env.scopes.push(scope);
+        self.do_subst(&env, &s)
+    }
+
     pub(crate) fn handle_do_block(&mut self, sql: &str) -> Result<QueryResult, String> {
         let body = do_body(sql)?;
         let mut p = Parser { s: &body, pos: 0 };
@@ -866,6 +1053,16 @@ impl Executor {
     }
 
     fn do_assign(&mut self, env: &mut Env, target: &str, v: Value) -> Result<(), String> {
+        // `rec.cột := v` (NEW.cột trong trigger)
+        if let (None, Some((rec, field))) = (env.get(target), target.split_once('.')) {
+            let var = env.get_mut(rec).ok_or_else(|| format!("\"{}\" is not a known variable", target))?;
+            let VarVal::Record(r) = &mut var.val else { return Err(format!("\"{}\" is not a record variable", rec)) };
+            let map = r.get_or_insert_with(Default::default);
+            let key = map.keys().find(|k| k.eq_ignore_ascii_case(field)).cloned().ok_or_else(|| format!("record \"{}\" has no field \"{}\"", rec, field))?;
+            map.insert(key, super::executor::value_to_json_pub(&v));
+            var.set = true;
+            return Ok(());
+        }
         let var = env.get_mut(target).ok_or_else(|| format!("\"{}\" is not a known variable", target))?;
         var.val = match &var.val {
             VarVal::Record(_) => return Err(format!("cannot assign a scalar to record variable \"{}\"", target)),
@@ -1165,7 +1362,7 @@ impl Executor {
                     let n = env.row_count;
                     self.do_assign(env, target, Value::Int(n))?;
                 }
-                Stmt::Raise { level, message, args } => {
+                Stmt::Raise { level, message, args, errcode } => {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
                         vals.push(self.do_eval(env, a)?);
@@ -1190,12 +1387,71 @@ impl Executor {
                         }
                     }
                     if level == "EXCEPTION" {
-                        return Err(format!("raise: {}", text));
+                        return Err(match errcode {
+                            Some(c) => format!("raise[{}]: {}", errcode_of(c), text),
+                            None => format!("raise: {}", text),
+                        });
                     }
                     eprintln!("[pglite-rs] {}: {}", level, text);
                 }
                 Stmt::Null => {}
-                Stmt::Return => return Ok(Flow::Return),
+                Stmt::Return(None) => return Ok(Flow::Return),
+                Stmt::Return(Some(e)) => {
+                    // RETURN NEW / RETURN OLD / RETURN r: bản ghi; NULL trong trigger = bỏ dòng
+                    let name = e.trim().to_lowercase();
+                    if let Some(Var { val: VarVal::Record(r), set, .. }) = env.get(&name) {
+                        env.ret_record = Some(if *set { r.clone() } else { None });
+                    } else if name == "null" {
+                        env.ret_record = Some(None);
+                        env.ret = Some(Value::Null);
+                    } else {
+                        let v = self.do_eval(env, e)?;
+                        env.ret = Some(v);
+                    }
+                    return Ok(Flow::Return);
+                }
+                Stmt::ReturnNext(e) => {
+                    let row = match e {
+                        Some(e) => {
+                            let name = e.trim().to_lowercase();
+                            match env.get(&name) {
+                                Some(Var { val: VarVal::Record(Some(r)), .. }) => serde_json::Value::Object(r.clone()),
+                                _ => {
+                                    let v = self.do_eval(env, e)?;
+                                    serde_json::json!({ "__v": super::executor::value_to_json_pub(&v) })
+                                }
+                            }
+                        }
+                        // RETURN NEXT không biểu thức: giá trị hiện tại của các tham số OUT
+                        None => {
+                            let mut m = serde_json::Map::new();
+                            if let Some(outs) = env.get("__out_params") {
+                                if let VarVal::Scalar(Value::Text(names)) = &outs.val {
+                                    for n in names.split(',').filter(|n| !n.is_empty()) {
+                                        if let Some(Var { val: VarVal::Scalar(v), .. }) = env.get(n) {
+                                            m.insert(n.to_string(), super::executor::value_to_json_pub(v));
+                                        }
+                                    }
+                                }
+                            }
+                            serde_json::Value::Object(m)
+                        }
+                    };
+                    env.ret_rows.push(row);
+                }
+                Stmt::ReturnQuery { sql, dynamic, using } => {
+                    let res = if *dynamic {
+                        let q = self.do_eval(env, sql)?;
+                        let mut params = Vec::with_capacity(using.len());
+                        for u in using {
+                            params.push(self.do_eval(env, u)?);
+                        }
+                        self.do_run(&q.as_str(), &params)?
+                    } else {
+                        self.do_exec(env, sql, &[])?
+                    };
+                    env.ret_rows.extend(res.rows.into_iter());
+                }
             }
         }
         Ok(Flow::Continue)

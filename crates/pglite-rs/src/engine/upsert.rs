@@ -300,6 +300,19 @@ impl Executor {
             };
             (indices, table.columns.clone(), table.name.to_lowercase())
         };
+        // DEFAULT gọi hàm do người dùng định nghĩa: thay bằng giá trị giữ chỗ, tính lại cho từng dòng sau khi dựng
+        let mut col_defs = col_defs;
+        let mut udf_defaults: Vec<(usize, String)> = Vec::new();
+        if self.has_routines() {
+            for (i, c) in col_defs.iter_mut().enumerate() {
+                if let Some(d) = c.default_value.clone() {
+                    if !self.routine_calls_in(&d).is_empty() {
+                        c.default_value = Some(format!("'\u{1}udfdefault:{}'", i));
+                        udf_defaults.push((i, d));
+                    }
+                }
+            }
+        }
         let user_override_src: String;
         if overriding_user && source.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("VALUES")) {
             let table = self.storage.get_table(&table_name).ok_or_else(|| format!("Table {} not found", table_name))?;
@@ -465,6 +478,18 @@ impl Executor {
             table.pk_col_idx.filter(|&p| built.iter().any(|r| r.get(p).map_or(false, |v| v.is_null()))).and_then(|p| crate::engine::sequences::owned_seq_name(table, p))
         };
 
+        if !udf_defaults.is_empty() {
+            for row in &mut built {
+                for (i, d) in &udf_defaults {
+                    if matches!(row.get(*i), Some(Value::Text(t)) if t.as_str() == format!("\u{1}udfdefault:{}", i)) {
+                        let r = self.execute_statement(&format!("SELECT ({}) AS __d", d), params)?;
+                        let v = r.rows.first().and_then(|r| r.get("__d")).map(super::executor::json_to_value).unwrap_or(Value::Null);
+                        let t = &self.storage.tables[&clean_table_name];
+                        row[*i] = crate::engine::coltypes::coerce_for_write(t.decl_type(*i), super::executor::coerce_update_val(&t.columns[*i], v));
+                    }
+                }
+            }
+        }
         if !generated.is_empty() {
             let table = &self.storage.tables[&clean_table_name];
             for row in &mut built {
@@ -483,6 +508,23 @@ impl Executor {
             }
             if let Some(e) = crate::engine::errors::take() {
                 return Err(e);
+            }
+        }
+        // trigger (engine/triggers.rs): BEFORE STATEMENT, BEFORE ROW (có thể sửa / bỏ dòng)
+        let has_triggers = self.storage.trigger_count > 0 && !self.storage.tables[&clean_table_name].meta.is_empty() && !self.table_triggers(&clean_table_name).is_empty();
+        if has_triggers {
+            self.fire_statement_triggers(&clean_table_name, "before", "insert")?;
+            if self.has_row_triggers(&clean_table_name, "insert") {
+                let mut kept = Vec::with_capacity(built.len());
+                for row in std::mem::take(&mut built) {
+                    if let Some(mut r) = self.fire_row_triggers(&clean_table_name, "before", "insert", None, Some(row), &[])? {
+                        if !generated.is_empty() {
+                            super::executor::apply_generated(&self.storage.tables[&clean_table_name], &generated, &mut r, params);
+                        }
+                        kept.push(r);
+                    }
+                }
+                built = kept;
             }
         }
         let upsert = on_conflict.is_some();
@@ -646,6 +688,15 @@ impl Executor {
             self.fk_on_parent_update(&clean_table_name, &old_rows)?;
         }
 
+        if has_triggers {
+            if self.has_row_triggers(&clean_table_name, "insert") {
+                let rows: Vec<Vec<Value>> = inserted.iter().map(|&i| self.storage.tables[&clean_table_name].rows[i].clone()).collect();
+                for r in rows {
+                    self.fire_row_triggers(&clean_table_name, "after", "insert", None, Some(r), &[])?;
+                }
+            }
+            self.fire_statement_triggers(&clean_table_name, "after", "insert")?;
+        }
         let fields = match returning {
             Some(r) => returning_fields(&self.storage.tables[&clean_table_name], r, &returned_rows),
             None => vec![],

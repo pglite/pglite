@@ -454,6 +454,34 @@ impl Executor {
             return res;
         }
         // VIEW / SCHEMA / SEQUENCE / TYPE (engine/objects.rs)
+        // CREATE / DROP TRIGGER, ALTER TABLE ... ENABLE / DISABLE TRIGGER (engine/triggers.rs)
+        if upper.starts_with("CREATE") && find_top_level_keyword(trimmed, "TRIGGER").is_some_and(|p| upper[..p].split_whitespace().all(|w| matches!(w, "CREATE" | "OR" | "REPLACE" | "CONSTRAINT"))) {
+            return self.create_trigger(trimmed);
+        }
+        if upper.starts_with("DROP TRIGGER") {
+            return self.drop_trigger(trimmed);
+        }
+        if upper.starts_with("ALTER TABLE") && (upper.contains(" ENABLE TRIGGER ") || upper.contains(" DISABLE TRIGGER ") || upper.contains(" ENABLE ALWAYS TRIGGER ") || upper.contains(" ENABLE REPLICA TRIGGER ")) {
+            let rest = trimmed[11..].trim();
+            let rest = rest.strip_prefix("IF EXISTS ").unwrap_or(rest).trim();
+            let tname = strip_schema_keep_case(rest.split_whitespace().next().unwrap_or("")).to_lowercase();
+            let enable = !upper.contains(" DISABLE TRIGGER ");
+            let which = trimmed[upper.find(" TRIGGER ").unwrap() + 9..].trim().trim_end_matches(';').to_string();
+            self.alter_trigger_state(&tname, &which, enable)?;
+            return Ok(QueryResult { rows: vec![], row_count: 0, fields: vec![], command: "ALTER TABLE".to_string() });
+        }
+        // CREATE / DROP FUNCTION / PROCEDURE, CALL (engine/routines.rs)
+        if (upper.starts_with("CREATE") || upper.starts_with("DROP") || upper.starts_with("CALL")) && (upper.contains("FUNCTION") || upper.contains("PROCEDURE") || upper.contains("ROUTINE") || upper.starts_with("CALL")) {
+            if let Some(res) = self.handle_routine_ddl(trimmed, &upper, params) {
+                return res;
+            }
+        }
+        // lời gọi hàm do người dùng định nghĩa trong câu lệnh
+        if self.has_routines() && !(upper.starts_with("CREATE") || upper.starts_with("DROP") || upper.starts_with("ALTER") || upper.starts_with("DO")) {
+            if let Some(res) = self.resolve_routine_calls(trimmed, params) {
+                return res;
+            }
+        }
         if let Some(res) = self.handle_object_ddl(trimmed, &upper, params) {
             return res;
         }
@@ -8614,6 +8642,31 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
         if let Some(expanded) = expand_multi_column_set(sql)? {
             return self.handle_update(&expanded, params);
         }
+        // bảng có trigger: đường riêng chạy trigger quanh từng dòng / câu lệnh (engine/triggers.rs)
+        if let Some(set_idx) = (self.storage.trigger_count > 0).then(|| find_top_level_keyword(sql, "SET")).flatten() {
+            let tname = clean_table_name(extract_table_name_and_alias(sql[6..set_idx].trim()).0).to_string();
+            if self.storage.get_table(&tname).is_some_and(|t| !t.meta.is_empty()) && !self.table_triggers(&tname).is_empty() {
+                if !self.has_row_triggers(&tname, "update") {
+                    self.fire_statement_triggers(&tname, "before", "update")?;
+                    let r = self.handle_update_plain(sql, params)?;
+                    self.fire_statement_triggers(&tname, "after", "update")?;
+                    return Ok(r);
+                }
+                if let Some((head, set_part, from_list, where_clause, returning)) = crate::engine::dml_join::split_update_from(sql) {
+                    return self.update_with_triggers(head, set_part, Some(from_list), where_clause, returning, params);
+                }
+                let where_idx = find_top_level_keyword(sql, "WHERE");
+                let returning_idx = find_top_level_keyword(sql, "RETURNING");
+                let set_end = where_idx.or(returning_idx).unwrap_or(sql.len());
+                let where_clause = where_idx.map(|w| sql[w + 5..returning_idx.filter(|&r| r > w).unwrap_or(sql.len())].trim());
+                let returning = returning_idx.map(|r| sql[r + 9..].trim());
+                return self.update_with_triggers(sql[6..set_idx].trim(), sql[set_idx + 3..set_end].trim(), None, where_clause, returning, params);
+            }
+        }
+        self.handle_update_plain(sql, params)
+    }
+
+    fn handle_update_plain(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         if let Some((head, set_part, from_list, where_clause, returning)) = crate::engine::dml_join::split_update_from(sql) {
             return self.handle_update_from(head, set_part, from_list, where_clause, returning, params);
         }
@@ -8902,6 +8955,31 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     }
 
     fn handle_delete(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
+        // bảng có trigger (engine/triggers.rs)
+        if let Some(from_idx) = (self.storage.trigger_count > 0).then(|| find_top_level_keyword(sql, "FROM")).flatten() {
+            let after = &sql[from_idx + 4..];
+            let end = ["USING", "WHERE", "RETURNING"].iter().filter_map(|k| find_top_level_keyword(after, k)).min().unwrap_or(after.len());
+            let tname = clean_table_name(extract_table_name_and_alias(after[..end].trim()).0).to_string();
+            if self.storage.get_table(&tname).is_some_and(|t| !t.meta.is_empty()) && !self.table_triggers(&tname).is_empty() {
+                if !self.has_row_triggers(&tname, "delete") {
+                    self.fire_statement_triggers(&tname, "before", "delete")?;
+                    let r = self.handle_delete_plain(sql, params)?;
+                    self.fire_statement_triggers(&tname, "after", "delete")?;
+                    return Ok(r);
+                }
+                let using = find_top_level_keyword(after, "USING");
+                let where_idx = find_top_level_keyword(after, "WHERE");
+                let ret_idx = find_top_level_keyword(after, "RETURNING");
+                let using_list = using.map(|u| after[u + 5..where_idx.or(ret_idx).filter(|&x| x > u).unwrap_or(after.len())].trim());
+                let where_clause = where_idx.map(|w| after[w + 5..ret_idx.filter(|&r| r > w).unwrap_or(after.len())].trim());
+                let returning = ret_idx.map(|r| after[r + 9..].trim());
+                return self.delete_with_triggers(after[..end].trim(), using_list, where_clause, returning, params);
+            }
+        }
+        self.handle_delete_plain(sql, params)
+    }
+
+    fn handle_delete_plain(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, String> {
         if let Some((head, using_list, where_clause, returning)) = crate::engine::dml_join::split_delete_using(sql) {
             return self.handle_delete_using(head, using_list, where_clause, returning, params);
         }
@@ -14265,6 +14343,26 @@ fn normalize_named_sql_params(sql: &str) -> String {
 
 /// `s` có lời gọi `tên(` với tên thuộc `names` (không phân biệt hoa thường, đủ ranh giới từ phía trước).
 /// Một lượt quét, không cấp phát — chạy cho mọi câu SELECT.
+/// Bản ghi dạng text của PostgreSQL: `(1,abc,)` (NULL = rỗng, giá trị có ký tự đặc biệt được bọc nháy kép).
+pub(crate) fn json_record_text(m: &serde_json::Map<String, serde_json::Value>) -> String {
+    let parts: Vec<String> = m
+        .values()
+        .map(|v| match v {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(s) => {
+                if s.is_empty() || s.contains([',', '(', ')', '"', '\\', ' ']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.clone() }
+            }
+            serde_json::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    format!("({})", parts.join(","))
+}
+
+pub(crate) fn normalize_named_sql_params_pub(s: &str) -> String {
+    normalize_named_sql_params(s)
+}
+
 pub(crate) fn contains_ci_pub(s: &str, pat: &str) -> bool {
     contains_ci(s, pat)
 }

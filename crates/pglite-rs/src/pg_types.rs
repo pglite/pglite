@@ -200,6 +200,20 @@ pub fn to_pg_text(v: &serde_json::Value, oid: u32) -> Option<String> {
     }
 }
 
+/// `&'static str` của một mã SQLSTATE tuỳ ý (từ RAISE ... USING ERRCODE). Mã thường gặp lấy từ bảng; mã lạ
+/// được giữ trong một tập dùng chung để không cấp phát lại.
+pub fn intern_sqlstate(code: &str) -> &'static str {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> = std::sync::OnceLock::new();
+    let set = SEEN.get_or_init(Default::default);
+    let mut g = set.lock().unwrap();
+    if let Some(s) = g.get(code) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(code.to_string().into_boxed_str());
+    g.insert(leaked);
+    leaked
+}
+
 /// Text output của float8 như PostgreSQL (`extra_float_digits = 1`): số ngắn nhất khôi phục đúng giá trị,
 /// không có `.0`; dạng mũ `1e+20`, `1.5e-05` khi số mũ < -4 hoặc >= 15.
 pub fn float8_text(x: f64) -> String {
@@ -828,6 +842,18 @@ mod tests {
 pub fn sqlstate(message: &str) -> &'static str {
     let m = message.to_lowercase();
     let has = |s: &str| m.contains(s);
+    // RAISE EXCEPTION của PL/pgSQL: `raise: ...` = P0001, `raise[22023]: ...` = mã của USING ERRCODE
+    if let Some(rest) = message.strip_prefix("raise[") {
+        if let Some(code) = rest.get(..5).filter(|_| rest.as_bytes().get(5) == Some(&b']')) {
+            return match code.to_ascii_uppercase().as_str() {
+                c if c.len() == 5 => crate::pg_types::intern_sqlstate(c),
+                _ => "P0001",
+            };
+        }
+    }
+    if message.starts_with("raise: ") {
+        return "P0001";
+    }
     if has("unrecognized configuration parameter") {
         return "42704";
     }
@@ -836,6 +862,12 @@ pub fn sqlstate(message: &str) -> &'static str {
     }
     if has("no unique or exclusion constraint matching the on conflict") {
         return "42P10";
+    }
+    if has("already exists with same argument types") {
+        return "42723";
+    }
+    if has("() is a procedure") {
+        return "42809";
     }
     if has("violates restrict setting of foreign key constraint") {
         return "23001";

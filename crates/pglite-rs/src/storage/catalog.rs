@@ -144,6 +144,9 @@ pub enum SchemaOp {
     /// bản cũ đọc được dữ liệu); `nulls_not_distinct:<ràng buộc/index>`; `deferrable:<ràng buộc>` =
     /// `immediate` | `deferred`; `unlogged`; `inherits` = danh sách bảng cha.
     TableMeta { table: String, key: String, value: Option<String> },
+    /// Đối tượng không thuộc bảng, dạng loại + tên → định nghĩa (JSON); `None` = DROP. Bản cũ bỏ qua. Loại đang
+    /// dùng: `routine` (CREATE FUNCTION / PROCEDURE, tên = chữ ký `tên(kiểu,...)`).
+    ObjectMeta { kind: String, name: String, value: Option<String> },
 }
 
 /// Định nghĩa domain: kiểu gốc và các ràng buộc (biểu thức CHECK dùng từ khoá `VALUE`).
@@ -195,12 +198,14 @@ pub struct ObjectCatalog {
     pub sequences: std::collections::BTreeMap<String, SequenceState>,
     pub enums: std::collections::BTreeMap<String, Vec<String>>,
     pub domains: std::collections::BTreeMap<String, DomainDef>,
+    /// `SchemaOp::ObjectMeta`: (loại, tên) → định nghĩa JSON.
+    pub extra: std::collections::BTreeMap<(String, String), String>,
 }
 
 impl SchemaOp {
     /// Op sửa `ObjectCatalog` theo giao dịch (cần lưu trạng thái cũ để ROLLBACK).
     pub fn is_object_op(&self) -> bool {
-        matches!(self, SchemaOp::View { .. } | SchemaOp::Schema { .. } | SchemaOp::Sequence { .. } | SchemaOp::EnumType { .. } | SchemaOp::Domain { .. })
+        matches!(self, SchemaOp::View { .. } | SchemaOp::Schema { .. } | SchemaOp::Sequence { .. } | SchemaOp::EnumType { .. } | SchemaOp::Domain { .. } | SchemaOp::ObjectMeta { .. })
     }
 }
 
