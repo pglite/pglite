@@ -95,7 +95,7 @@ pub(crate) enum TsVal {
 }
 
 fn now_utc_us() -> i64 {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let d = crate::unix_now();
     (d.as_secs() as i64) * US + (d.subsec_micros() as i64)
 }
 

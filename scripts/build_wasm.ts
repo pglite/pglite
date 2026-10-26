@@ -21,7 +21,8 @@ execSync(
 
 // 2. Generate wasm-bindgen bindings
 console.log("⚡ Generating JS/TS bindings via wasm-bindgen...");
-const wasmBinary = resolve(cratePath, "target/wasm32-unknown-unknown/release/pglite_rs.wasm");
+// The crate is part of a Cargo workspace, so build output lands in the workspace root target/.
+const wasmBinary = resolve(projectRoot, "target/wasm32-unknown-unknown/release/pglite_rs.wasm");
 const wasmBindgenBin = process.env.WASM_BINDGEN_PATH || "wasm-bindgen";
 
 try {

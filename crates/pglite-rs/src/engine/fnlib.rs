@@ -1547,7 +1547,7 @@ fn clean(x: f64) -> f64 {
 
 /// UUID v7 (RFC 9562): 48 bit mili giây Unix + ngẫu nhiên.
 fn uuid_v7() -> String {
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let ms = crate::unix_now().as_millis() as u64;
     let mut b = *uuid::Uuid::new_v4().as_bytes();
     b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
     b[6] = (b[6] & 0x0f) | 0x70;

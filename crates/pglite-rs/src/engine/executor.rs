@@ -11601,7 +11601,7 @@ fn eval_joined_scalar_expr(
     }
 
     if upper == "RANDOM()" {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(12345);
+        let nanos = crate::unix_now().subsec_nanos();
         let rand = ((nanos % 1_000_000) as f64) / 1_000_000.0;
         return serde_json::json!(rand);
     }
@@ -15449,9 +15449,7 @@ fn eval_age(dt1: &DateTimeParts, dt2: &DateTimeParts) -> String {
 }
 
 pub(crate) fn get_current_timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now();
-    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let duration = crate::unix_now();
     let secs = duration.as_secs();
     let millis = duration.subsec_millis();
 
@@ -20645,7 +20643,7 @@ pub(crate) fn eval_sql_expr(
     }
 
     if upper == "RANDOM()" {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(12345);
+        let nanos = crate::unix_now().subsec_nanos();
         let rand = ((nanos % 1_000_000) as f64) / 1_000_000.0;
         return Value::Float(rand);
     }

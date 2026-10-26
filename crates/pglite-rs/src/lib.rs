@@ -52,6 +52,19 @@ pub use storage::StorageEngine;
 pub use pg_types::{sqlstate, DescribeResult, WireField, WireResult};
 pub use types::{ColumnDef, DataType, FieldInfo, QueryResult, Value};
 
+/// Time since the Unix epoch. `SystemTime::now()` panics on wasm32-unknown-unknown, so the WASM
+/// build reads the JavaScript clock instead.
+pub(crate) fn unix_now() -> std::time::Duration {
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-binding"))]
+    {
+        std::time::Duration::from_secs_f64(js_sys::Date::now() / 1000.0)
+    }
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm-binding")))]
+    {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+    }
+}
+
 /// High-level embedded PostgreSQL database client for native Rust applications.
 pub struct PGlite {
     executor: Executor,
