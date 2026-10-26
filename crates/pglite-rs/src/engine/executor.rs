@@ -1195,10 +1195,10 @@ impl Executor {
         let left = &s[..pos];
         let mut right = s[pos + op.len()..].trim_start();
         let mut all = false;
-        if right.len() > 3 && right[..3].eq_ignore_ascii_case("ALL") && right.as_bytes()[3].is_ascii_whitespace() {
+        if right.len() > 3 && right.as_bytes()[..3].eq_ignore_ascii_case(b"ALL") && right.as_bytes()[3].is_ascii_whitespace() {
             all = true;
             right = right[3..].trim_start();
-        } else if right.len() > 8 && right[..8].eq_ignore_ascii_case("DISTINCT") && right.as_bytes()[8].is_ascii_whitespace() {
+        } else if right.len() > 8 && right.as_bytes()[..8].eq_ignore_ascii_case(b"DISTINCT") && right.as_bytes()[8].is_ascii_whitespace() {
             right = right[8..].trim_start();
         }
         let (names, lrows, fields) = self.eval_set_expr(left, params)?;
@@ -2407,7 +2407,7 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
             }
         }
         let (mut head, mut body) = ("", list[..end].trim());
-        if body.len() > 9 && body[..9].eq_ignore_ascii_case("DISTINCT ") {
+        if body.len() > 9 && body.as_bytes()[..9].eq_ignore_ascii_case(b"DISTINCT ") {
             head = "DISTINCT ";
             body = body[9..].trim_start();
         }
@@ -2683,7 +2683,7 @@ fn replace_identifier_token(sql: &str, target: &str, replacement: &str) -> Strin
     /// nhanh `CorrelatedCount`). `None` nếu không đổi gì.
     fn correlated_select_subqueries_as_lateral(sql: &str) -> Option<String> {
         let s = sql.trim();
-        if s.len() < 7 || !s[..7].eq_ignore_ascii_case("SELECT ") || !contains_ci(s, "(SELECT") && !contains_ci(s, "( SELECT") {
+        if s.len() < 7 || !s.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") || !contains_ci(s, "(SELECT") && !contains_ci(s, "( SELECT") {
             return None;
         }
         let from = find_top_level_keyword(s, "FROM")?;
@@ -5314,7 +5314,7 @@ fn substitute_correlated_references(sql: &str, row: &CombinedRow) -> String {
     /// `None` = giữ đường cũ (mọi cột khác vẫn đoán như trước, để DB / app cũ nhận đúng dữ liệu như trước).
     fn json_cell_kinds(&self, sql: &str) -> Option<Vec<JsonCellKind>> {
         let t = sql.trim();
-        if t.len() < 8 || !t[..7].eq_ignore_ascii_case("SELECT ") || t.contains(';') {
+        if t.len() < 8 || !t.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") || t.contains(';') {
             return None;
         }
         let up = t.to_uppercase();
@@ -11841,7 +11841,7 @@ fn eval_group_aggregate_expr(
             let tail = t[p + 6..].trim();
             if p > 0 && tail.starts_with('(') && tail.ends_with(')') && is_fully_enclosed_in_parens(tail) {
                 let inner = tail[1..tail.len() - 1].trim();
-                if inner.len() > 6 && inner[..6].eq_ignore_ascii_case("WHERE ") {
+                if inner.len() > 6 && inner.as_bytes()[..6].eq_ignore_ascii_case(b"WHERE ") {
                     let cond = inner[6..].trim();
                     let kept: Vec<usize> = row_indices.iter().copied().filter(|&ri| eval_condition_on_row(&all_rows[ri], cond, params)).collect();
                     let agg = t[..p].trim();
@@ -13760,14 +13760,14 @@ fn expand_multi_column_set(sql: &str) -> Result<Option<String>, String> {
         let Some(rhs) = after.strip_prefix('=') else { return Ok(None) };
         let cols: Vec<&str> = split_comma_separated_tokens(&item[1..close]);
         let mut rhs = rhs.trim();
-        if rhs.len() > 3 && rhs[..3].eq_ignore_ascii_case("ROW") && rhs[3..].trim_start().starts_with('(') {
+        if rhs.len() > 3 && rhs.as_bytes()[..3].eq_ignore_ascii_case(b"ROW") && rhs[3..].trim_start().starts_with('(') {
             rhs = rhs[3..].trim_start();
         }
         if !rhs.starts_with('(') || find_matching_paren(rhs, 0) != Some(rhs.len() - 1) {
             return Err("source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".to_string());
         }
         let inner = rhs[1..rhs.len() - 1].trim();
-        let exprs: Vec<String> = if inner.len() > 6 && inner[..6].eq_ignore_ascii_case("SELECT") && !inner.as_bytes()[6].is_ascii_alphanumeric() {
+        let exprs: Vec<String> = if inner.len() > 6 && inner.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") && !inner.as_bytes()[6].is_ascii_alphanumeric() {
             let from = find_top_level_keyword(inner, "FROM");
             let list = &inner[6..from.unwrap_or(inner.len())];
             let tail = from.map(|f| &inner[f..]).unwrap_or("");
@@ -16410,7 +16410,7 @@ fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
         return false;
     }
     if text.is_ascii() && prefix.is_ascii() {
-        text[..prefix.len()].eq_ignore_ascii_case(prefix)
+        text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     } else {
         let t_low = text.to_lowercase();
         let p_low = prefix.to_lowercase();
@@ -21066,7 +21066,7 @@ impl Executor {
     /// 2 trở đi; `*` / `x.*` trên nhiều bảng thật được khai triển thành `alias.cột`. `None` nếu không trùng.
     fn dedupe_wire_sql(&self, sql: &str) -> Option<String> {
         let t = sql.trim().trim_end_matches(';').trim();
-        if t.len() < 7 || !t[..7].eq_ignore_ascii_case("SELECT ") || t.contains("--") || t.contains("/*") || t.contains('$') && t.contains("$$") {
+        if t.len() < 7 || !t.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") || t.contains("--") || t.contains("/*") || t.contains('$') && t.contains("$$") {
             return None;
         }
         // không có FROM: danh sách chọn kết thúc ở mệnh đề kế tiếp (hoặc cuối câu)
@@ -21079,7 +21079,7 @@ impl Executor {
         });
         let mut list = t[7..from].trim();
         let mut head = "SELECT ".to_string();
-        if list.len() > 9 && list[..9].eq_ignore_ascii_case("DISTINCT ") {
+        if list.len() > 9 && list.as_bytes()[..9].eq_ignore_ascii_case(b"DISTINCT ") {
             if list[9..].trim_start().to_uppercase().starts_with("ON") {
                 return None;
             }

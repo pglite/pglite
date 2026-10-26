@@ -310,7 +310,7 @@ fn resolve_seq_spec(o: &SeqOptions, old: Option<&SequenceSpec>) -> Result<Sequen
 /// Bỏ `IF EXISTS` và `CASCADE` / `RESTRICT` ở cuối: (danh sách tên, if_exists, cascade).
 fn parse_drop_list(rest: &str) -> (Vec<String>, bool, bool) {
     let mut rest = rest.trim().trim_end_matches(';').trim();
-    let if_exists = rest.len() > 10 && rest[..10].eq_ignore_ascii_case("IF EXISTS ");
+    let if_exists = rest.len() > 10 && rest.as_bytes()[..10].eq_ignore_ascii_case(b"IF EXISTS ");
     if if_exists {
         rest = rest[10..].trim();
     }
@@ -327,7 +327,7 @@ fn parse_drop_list(rest: &str) -> (Vec<String>, bool, bool) {
 /// Bỏ một tiền tố từ khoá (không phân biệt hoa thường) nếu có, theo sau là khoảng trắng.
 fn strip_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     let s = s.trim_start();
-    (s.len() > kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw) && s.as_bytes()[kw.len()].is_ascii_whitespace()).then(|| s[kw.len()..].trim_start())
+    (s.len() > kw.len() && s.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) && s.as_bytes()[kw.len()].is_ascii_whitespace()).then(|| s[kw.len()..].trim_start())
 }
 
 /// Chuỗi nhãn `'a'` → `a`.
@@ -1086,7 +1086,7 @@ impl Executor {
         let as_pos = find_top_level_keyword(&sql[view_kw..], "AS").map(|p| view_kw + p).ok_or("syntax error: CREATE VIEW requires AS")?;
         let mut head = sql[view_kw..as_pos].trim();
         let mut if_not_exists = false;
-        if head.len() > 14 && head[..14].eq_ignore_ascii_case("IF NOT EXISTS ") {
+        if head.len() > 14 && head.as_bytes()[..14].eq_ignore_ascii_case(b"IF NOT EXISTS ") {
             if_not_exists = true;
             head = head[14..].trim();
         }

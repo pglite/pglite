@@ -52,7 +52,7 @@ fn ok(cmd: &str, n: usize) -> QueryResult {
 }
 
 fn word_at(s: &str, kw: &str) -> bool {
-    s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw) && s[kw.len()..].chars().next().map_or(true, |c| !(c.is_alphanumeric() || c == '_'))
+    s.len() >= kw.len() && s.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) && s[kw.len()..].chars().next().map_or(true, |c| !(c.is_alphanumeric() || c == '_'))
 }
 
 /// Tên bảng ở đầu `s` (có thể kèm schema / nháy) và phần còn lại.
@@ -304,7 +304,7 @@ impl Executor {
             "DROP" if upper.starts_with("DROP TABLE") => {
                 // xoá bảng cha thì xoá luôn các partition (như PG)
                 let rest = sql.trim_start()[10..].trim_start();
-                let rest = if rest.len() > 9 && rest[..9].eq_ignore_ascii_case("IF EXISTS") { &rest[9..] } else { rest };
+                let rest = if rest.len() > 9 && rest.as_bytes()[..9].eq_ignore_ascii_case(b"IF EXISTS") { &rest[9..] } else { rest };
                 let names: Vec<String> = split_comma_separated_tokens(rest.split_whitespace().take_while(|w| !w.eq_ignore_ascii_case("CASCADE") && !w.eq_ignore_ascii_case("RESTRICT")).collect::<Vec<_>>().join(" ").as_str()).iter().map(|n| take_name(n).0).collect();
                 let parents: Vec<String> = names.iter().filter(|n| self.part_by(n).is_some()).cloned().collect();
                 if parents.is_empty() {
@@ -400,7 +400,7 @@ impl Executor {
         let t = sql.trim().trim_end_matches(';').trim();
         let tpos = find_top_level_keyword(t, "TABLE").unwrap();
         let mut rest = t[tpos + 5..].trim_start();
-        let if_not_exists = rest.len() > 13 && rest[..13].eq_ignore_ascii_case("IF NOT EXISTS");
+        let if_not_exists = rest.len() > 13 && rest.as_bytes()[..13].eq_ignore_ascii_case(b"IF NOT EXISTS");
         if if_not_exists {
             rest = rest[13..].trim_start();
         }
@@ -452,7 +452,7 @@ impl Executor {
             };
             let bound = if br.to_ascii_uppercase().starts_with("DEFAULT") {
                 "DEFAULT".to_string()
-            } else if br.len() >= 10 && br[..10].eq_ignore_ascii_case("FOR VALUES") {
+            } else if br.len() >= 10 && br.as_bytes()[..10].eq_ignore_ascii_case(b"FOR VALUES") {
                 let bu = br[10..].trim();
                 let bound_end = find_top_level_keyword(bu, "PARTITION BY").unwrap_or(bu.len());
                 bu[..bound_end].trim().to_string()
@@ -570,7 +570,7 @@ impl Executor {
         let br = after_child.trim_start();
         let bound = if br.to_ascii_uppercase().starts_with("DEFAULT") {
             "DEFAULT".to_string()
-        } else if br.len() >= 10 && br[..10].eq_ignore_ascii_case("FOR VALUES") {
+        } else if br.len() >= 10 && br.as_bytes()[..10].eq_ignore_ascii_case(b"FOR VALUES") {
             br[10..].trim().to_string()
         } else {
             return Err("syntax error at or near \"ATTACH\"".to_string());

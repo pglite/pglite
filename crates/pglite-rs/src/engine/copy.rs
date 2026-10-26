@@ -42,7 +42,7 @@ fn unquote_opt(v: &str) -> String {
 fn parse_opts(s: &str) -> Result<CopyOpts, String> {
     let mut o = CopyOpts::default();
     let mut t = s.trim();
-    if t.len() >= 4 && t[..4].eq_ignore_ascii_case("WITH") {
+    if t.len() >= 4 && t.as_bytes()[..4].eq_ignore_ascii_case(b"WITH") {
         t = t[4..].trim_start();
     }
     let set_csv = |o: &mut CopyOpts, on: bool| {

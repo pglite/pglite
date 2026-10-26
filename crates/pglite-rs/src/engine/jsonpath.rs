@@ -83,7 +83,7 @@ impl<'a> P<'a> {
     fn eat_kw(&mut self, kw: &str) -> bool {
         self.ws();
         let r = &self.src[self.i..];
-        if r.len() >= kw.len() && r[..kw.len()].eq_ignore_ascii_case(kw) && r[kw.len()..].chars().next().map_or(true, |c| !(c.is_alphanumeric() || c == '_')) {
+        if r.len() >= kw.len() && r.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) && r[kw.len()..].chars().next().map_or(true, |c| !(c.is_alphanumeric() || c == '_')) {
             self.i += kw.len();
             true
         } else {

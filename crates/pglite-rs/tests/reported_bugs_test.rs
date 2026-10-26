@@ -282,3 +282,23 @@ fn dbrs_bug13_json_output_of_text_and_jsonb() {
     let w = db.query_wire("SELECT tpl, j FROM t13", &[]).unwrap();
     assert_eq!(w.rows, vec![vec![Some("{{app_name}} code {{code}}".to_string()), Some("{}".to_string())]]);
 }
+
+/// db-rs panic (SIGABRT) trên server: tên cột mặc định của literal không đặt alias cắt chuỗi theo byte,
+/// `'Hoàng Thanh Tùng'` có byte 16 nằm giữa chữ `ù` → `byte index 16 is not a char boundary`.
+#[test]
+fn dbrs_default_column_name_of_multibyte_literal() {
+    let mut db = PGlite::in_memory().unwrap();
+    assert_eq!(rows3(&mut db, "SELECT 'Hoàng Thanh Tùng'", &[]), vec![json!({"?column?": "Hoàng Thanh Tùng"})]);
+    assert_eq!(rows3(&mut db, "SELECT 'Hoàng Thanh Tùng' AS n", &[]), vec![json!({"n": "Hoàng Thanh Tùng"})]);
+    // ký tự nhiều byte ở mọi độ lệch: mỗi điểm cắt cố định của parser đều rơi vào giữa một ký tự ở vài vòng
+    exec(&mut db, "CREATE TABLE vn (id INT, name TEXT)");
+    for pad in 0..24 {
+        let v = format!("{}Tùng Đặng ạ 🙂", "x".repeat(pad));
+        assert_eq!(rows3(&mut db, &format!("SELECT '{v}'"), &[]), vec![json!({"?column?": v})]);
+        exec(&mut db, &format!("INSERT INTO vn VALUES ({pad}, '{v}')"));
+        let q = format!("SELECT name FROM vn WHERE name = '{v}' ORDER BY id");
+        assert_eq!(rows3(&mut db, &q, &[]), vec![json!({"name": v})]);
+        let _ = db.query(&format!("SELECT {}ù FROM vn", "a".repeat(pad)), &[]);
+        let _ = db.query(&format!("UPDATE vn SET name = '{v}' WHERE {}ù = 1", "a".repeat(pad)), &[]);
+    }
+}

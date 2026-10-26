@@ -280,7 +280,7 @@ pub(crate) fn primary_start(s: &str, m: &[bool], end: usize) -> Option<usize> {
 /// `UPDATE t SET a[2] = v, j['k'] = w ...`: gán vào phần tử mảng / khoá jsonb (PostgreSQL) → hàm trên cả cột.
 fn update_subscript_set(sql: &str) -> Option<String> {
     let t = sql.trim_start();
-    if t.len() < 7 || !t[..7].eq_ignore_ascii_case("UPDATE ") || !sql.contains('[') {
+    if t.len() < 7 || !t.as_bytes()[..7].eq_ignore_ascii_case(b"UPDATE ") || !sql.contains('[') {
         return None;
     }
     let m = code_mask(sql);
@@ -525,11 +525,11 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         let tail = s[e..].to_string();
         let mut t = tail.trim_start();
         let mut ord = "";
-        if t.len() >= 15 && t[..15].eq_ignore_ascii_case("WITH ORDINALITY") {
+        if t.len() >= 15 && t.as_bytes()[..15].eq_ignore_ascii_case(b"WITH ORDINALITY") {
             ord = " WITH ORDINALITY";
             t = t[15..].trim_start();
         }
-        if t.len() >= 3 && t[..3].eq_ignore_ascii_case("AS ") {
+        if t.len() >= 3 && t.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") {
             t = t[3..].trim_start();
         }
         let w: String = t.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '"').collect();
@@ -629,7 +629,7 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
         let Some(open) = s[g + 5..].find('(').map(|o| g + 5 + o).filter(|o| s[g + 5..*o].trim().is_empty()) else { continue };
         let Some(close) = super::constraints::matching_paren(&s, open) else { break };
         let ob = s[open + 1..close].trim();
-        if ob.len() < 8 || !ob[..8].eq_ignore_ascii_case("ORDER BY") {
+        if ob.len() < 8 || !ob.as_bytes()[..8].eq_ignore_ascii_case(b"ORDER BY") {
             continue;
         }
         let mut key = ob[8..].trim().to_string();
@@ -680,7 +680,7 @@ pub(crate) fn rewrite(sql: &str) -> Option<String> {
             continue;
         }
         let inner = s[open + 1..].trim_start();
-        if inner.len() < 5 || !inner[..5].eq_ignore_ascii_case("name ") {
+        if inner.len() < 5 || !inner.as_bytes()[..5].eq_ignore_ascii_case(b"name ") {
             continue;
         }
         let name_start = open + 1 + (s[open + 1..].len() - inner.len()) + 5;

@@ -29,7 +29,7 @@ const NOT_ALIAS: &[&str] = &[
 ];
 
 fn word_ci(s: &str, kw: &str) -> bool {
-    s.len() >= kw.len() && s[..kw.len()].eq_ignore_ascii_case(kw) && s[kw.len()..].chars().next().map_or(true, |c| !(c.is_alphanumeric() || c == '_'))
+    s.len() >= kw.len() && s.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) && s[kw.len()..].chars().next().map_or(true, |c| !(c.is_alphanumeric() || c == '_'))
 }
 
 impl Executor {

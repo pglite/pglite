@@ -75,7 +75,7 @@ pub(crate) fn default_column_name(expr: &str) -> String {
             }
         }
     }
-    if s.len() > 16 && s[..16].eq_ignore_ascii_case("pg_record_field(") {
+    if s.len() > 16 && s.as_bytes()[..16].eq_ignore_ascii_case(b"pg_record_field(") {
         let parts = super::executor::split_comma_separated_tokens(&s[16..s.len().saturating_sub(1)]);
         if let Some(f) = parts.get(1) {
             return f.trim().trim_matches('\'').to_string();
@@ -104,7 +104,7 @@ pub(crate) fn default_column_name(expr: &str) -> String {
     let up = s.to_uppercase();
     // literal có kiểu: INTERVAL '1 day', DATE '...', int '5'
     for (kw, name) in [("INTERVAL ", "interval"), ("TIMESTAMPTZ ", "timestamptz"), ("TIMESTAMP ", "timestamp"), ("DATE ", "date"), ("TIME ", "time"), ("INT ", "int4"), ("INTEGER ", "int4"), ("BIGINT ", "int8"), ("TEXT ", "text"), ("NUMERIC ", "numeric"), ("BOOLEAN ", "bool"), ("JSONB ", "jsonb"), ("UUID ", "uuid")] {
-        if up.starts_with(kw) && s[kw.len()..].trim_start().starts_with('\'') && s.ends_with('\'') {
+        if up.starts_with(kw) && s.get(kw.len()..).is_some_and(|r| r.trim_start().starts_with('\'')) && s.ends_with('\'') {
             return name.to_string();
         }
     }

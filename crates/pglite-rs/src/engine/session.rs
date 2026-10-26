@@ -136,10 +136,10 @@ impl Executor {
                     return Some(Err("LOCK TABLE can only be used in transaction blocks".to_string()));
                 }
                 let mut rest = sql[4..].trim();
-                if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("TABLE ") {
+                if rest.len() >= 6 && rest.as_bytes()[..6].eq_ignore_ascii_case(b"TABLE ") {
                     rest = rest[6..].trim();
                 }
-                if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("ONLY ") {
+                if rest.len() >= 5 && rest.as_bytes()[..5].eq_ignore_ascii_case(b"ONLY ") {
                     rest = rest[5..].trim();
                 }
                 let ru = rest.to_ascii_uppercase();

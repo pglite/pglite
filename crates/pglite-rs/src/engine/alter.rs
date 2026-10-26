@@ -426,7 +426,7 @@ impl Executor {
             return self.alter_column_type(table, idx, &cur, type_str, using);
         }
         // ADD GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(...)]
-        if op.len() >= 13 && op[..13].eq_ignore_ascii_case("ADD GENERATED") {
+        if op.len() >= 13 && op.as_bytes()[..13].eq_ignore_ascii_case(b"ADD GENERATED") {
             let (has_default, is_identity) = {
                 let t = self.storage.get_table(table).unwrap();
                 // SERIAL có DEFAULT nextval ngầm
@@ -449,7 +449,7 @@ impl Executor {
             return Ok(());
         }
         // SET GENERATED {ALWAYS | BY DEFAULT}
-        if op.len() >= 13 && op[..13].eq_ignore_ascii_case("SET GENERATED") {
+        if op.len() >= 13 && op.as_bytes()[..13].eq_ignore_ascii_case(b"SET GENERATED") {
             let sp = self.storage.get_table(table).unwrap().identity.get(&cur.name.to_lowercase()).copied();
             let Some(mut sp) = sp else {
                 return Err(format!("column \"{}\" of relation \"{}\" is not an identity column", cur.name, table));
@@ -459,7 +459,7 @@ impl Executor {
             return Ok(());
         }
         // DROP IDENTITY [IF EXISTS]
-        if op.len() >= 13 && op[..13].eq_ignore_ascii_case("DROP IDENTITY") {
+        if op.len() >= 13 && op.as_bytes()[..13].eq_ignore_ascii_case(b"DROP IDENTITY") {
             let is_identity = self.storage.get_table(table).unwrap().identity.contains_key(&cur.name.to_lowercase());
             if !is_identity {
                 if op.to_ascii_uppercase().contains("IF EXISTS") {
@@ -472,7 +472,7 @@ impl Executor {
             return Ok(());
         }
         // DROP EXPRESSION: cột generated thành cột thường (giữ giá trị)
-        if op.len() >= 15 && op[..15].eq_ignore_ascii_case("DROP EXPRESSION") {
+        if op.len() >= 15 && op.as_bytes()[..15].eq_ignore_ascii_case(b"DROP EXPRESSION") {
             let key = format!("generated:{}", cur.name.to_lowercase());
             if self.storage.get_table(table).unwrap().meta.contains_key(&key) {
                 self.storage.log_schema_op(SchemaOp::TableMeta { table: table.to_string(), key, value: None });

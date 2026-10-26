@@ -99,7 +99,7 @@ fn parse_arg(s: &str) -> Option<RoutineArg> {
     }
     let mut mode = "in".to_string();
     for m in ["INOUT ", "OUT ", "IN ", "VARIADIC "] {
-        if t.len() > m.len() && t[..m.len()].eq_ignore_ascii_case(m) {
+        if t.len() > m.len() && t.as_bytes()[..m.len()].eq_ignore_ascii_case(m.as_bytes()) {
             mode = m.trim().to_lowercase();
             t = t[m.len()..].trim_start();
             break;
@@ -780,7 +780,7 @@ impl Executor {
                             let mut out = out;
                             if alias_follows && def.returns_set && def.outputs().is_empty() {
                                 let t2 = s[close + 1..].trim_start();
-                                let t2 = if t2.len() >= 3 && t2[..3].eq_ignore_ascii_case("AS ") { t2[3..].trim_start() } else { t2 };
+                                let t2 = if t2.len() >= 3 && t2.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") { t2[3..].trim_start() } else { t2 };
                                 let a: String = t2.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '"').collect();
                                 let has_cols = t2[a.len()..].trim_start().starts_with('(');
                                 if !a.is_empty() && !has_cols {
@@ -1011,7 +1011,7 @@ fn call_in_from(s: &str, st: usize) -> bool {
 /// Sau vị trí `i` có alias (`AS x` / `x`) không.
 fn alias_after(s: &str, i: usize) -> bool {
     let t = s[i..].trim_start();
-    if t.len() >= 3 && t[..3].eq_ignore_ascii_case("AS ") {
+    if t.len() >= 3 && t.as_bytes()[..3].eq_ignore_ascii_case(b"AS ") {
         return true;
     }
     let w: String = t.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '"').collect();
