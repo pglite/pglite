@@ -302,3 +302,62 @@ fn dbrs_default_column_name_of_multibyte_literal() {
         let _ = db.query(&format!("UPDATE vn SET name = '{v}' WHERE {}ù = 1", "a".repeat(pad)), &[]);
     }
 }
+
+// ---- E.M.G WaiKi2 (to_regclass với tham số) ---------------------------------------------------
+
+#[test]
+fn to_regclass_with_parameter_and_expression() {
+    let mut db = PGlite::in_memory().unwrap();
+    exec(&mut db, "CREATE TABLE specialists (id INT)");
+    let q = "SELECT to_regclass($1) IS NOT NULL AS ok";
+    assert_eq!(rows3(&mut db, q, &[Value::text("specialists")]), vec![json!({"ok": true})]);
+    assert_eq!(rows3(&mut db, q, &[Value::text("public.specialists")]), vec![json!({"ok": true})]);
+    assert_eq!(rows3(&mut db, q, &[Value::text("nope")]), vec![json!({"ok": false})]);
+    assert_eq!(rows3(&mut db, q, &[Value::Null]), vec![json!({"ok": false})]);
+    assert_eq!(rows3(&mut db, "SELECT to_regclass($1) AS r", &[Value::text("specialists")]), vec![json!({"r": "specialists"})]);
+    assert_eq!(rows3(&mut db, "SELECT to_regclass(NULL) AS r", &[]), vec![json!({"r": null})]);
+    assert_eq!(rows3(&mut db, "SELECT to_regclass('public.' || 'specialists') AS r", &[]), vec![json!({"r": "specialists"})]);
+    assert_eq!(rows3(&mut db, "SELECT to_regclass('specialists') AS r", &[]), vec![json!({"r": "specialists"})]);
+    assert_eq!(rows3(&mut db, "SELECT to_regnamespace($1) IS NOT NULL AS ok", &[Value::text("public")]), vec![json!({"ok": true})]);
+    assert_eq!(rows3(&mut db, "SELECT to_regtype($1) AS t", &[Value::text("int4")]), vec![json!({"t": "integer"})]);
+}
+
+#[test]
+fn unknown_qualified_column_in_join_and_subquery_is_42703() {
+    let mut db = PGlite::in_memory().unwrap();
+    exec(&mut db, "CREATE TABLE p (id SERIAL PRIMARY KEY, booking_id INT, tenant_id INT, info JSONB)");
+    exec(&mut db, "CREATE TABLE b (id SERIAL PRIMARY KEY, tenant_id INT, customer_id INT, created_at TIMESTAMPTZ DEFAULT now())");
+    exec(&mut db, "INSERT INTO p (booking_id, tenant_id) VALUES (1, 1)");
+    exec(&mut db, "INSERT INTO b (tenant_id, customer_id) VALUES (1, 2)");
+    for (q, col) in [
+        ("SELECT DISTINCT b.id FROM p JOIN b ON b.id = p.booking_id WHERE p.customer_id = 2", "p.customer_id"),
+        ("SELECT b.id FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.booking_id = b.id AND p.nocol = 3)", "p.nocol"),
+        ("SELECT b.*, (SELECT COUNT(*) FROM p x WHERE x.nocol = b.id) AS c FROM b", "x.nocol"),
+        ("SELECT b.id FROM b JOIN p ON p.nocol = b.id", "p.nocol"),
+        ("SELECT b.id FROM b WHERE b.id IN (SELECT pp.nocol FROM p pp)", "pp.nocol"),
+        ("UPDATE b SET customer_id = 1 FROM p WHERE p.booking_id = b.id AND p.nocol = 1", "p.nocol"),
+        ("DELETE FROM b USING p WHERE p.nocol = b.id", "p.nocol"),
+        ("SELECT bb.nocol FROM b bb", "bb.nocol"),
+    ] {
+        let e = db.query(q, &[]).expect_err(q);
+        assert!(e.contains(&format!("column {col} does not exist")), "{q}: {e}");
+    }
+    // hợp lệ: không được báo nhầm
+    for q in [
+        "WITH p AS (SELECT 1 AS nocol) SELECT p.nocol FROM p",
+        "SELECT s.nocol FROM (SELECT 1 AS nocol) s",
+        "SELECT s.x FROM b, LATERAL (SELECT b.id AS x) s",
+        "SELECT g.g FROM generate_series(1, 2) AS g(g)",
+        "SELECT t.a FROM b JOIN (VALUES (1)) AS t(a) ON t.a = b.id",
+        "SELECT EXTRACT(YEAR FROM b.created_at) FROM b",
+        "SELECT b.created_at IS DISTINCT FROM p.info::text::timestamptz FROM b JOIN p ON p.booking_id = b.id WHERE false",
+        "SELECT p.info->>'x', b.ctid IS NOT NULL FROM b JOIN p ON p.booking_id = b.id",
+        "SELECT public.b.id FROM public.b",
+        "SELECT x.id FROM b x WHERE x.id = (SELECT x.booking_id FROM p x LIMIT 1)",
+        "INSERT INTO b (id, tenant_id) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET tenant_id = excluded.tenant_id",
+        "SELECT pg_catalog.lower('A'), b.id FROM b",
+        "SELECT 1.5, b.id FROM b",
+    ] {
+        db.query(q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}

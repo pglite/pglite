@@ -34,6 +34,8 @@ pub struct Executor {
     pub settings: HashMap<String, String>,
     /// SELECT đã qua kiểm tra tên cột: câu SQL → (bảng, dấu vân tay cột) hoặc None = không thuộc diện.
     column_check_cache: HashMap<String, Option<(String, u64)>>,
+    /// Kết quả `validate::check_qualified_refs` theo câu SQL: None = không thuộc diện xét; Some = các bảng đã xét + dấu vân tay cột.
+    qual_check_cache: HashMap<String, Option<(Vec<String>, u64)>>,
     /// `json_cell_kinds` theo câu SQL, kèm dấu vân tay kiểu cột của các bảng trong FROM (đổi schema thì tính lại).
     json_kinds_cache: HashMap<String, (Option<Vec<JsonCellKind>>, Vec<(String, u64)>)>,
     /// PREPARE tên AS câu lệnh: chỉ sống trong phiên, không ghi xuống đĩa.
@@ -64,6 +66,7 @@ impl Executor {
             custom_constraints: Vec::new(),
             settings: HashMap::new(),
             column_check_cache: HashMap::new(),
+            qual_check_cache: HashMap::new(),
             json_kinds_cache: HashMap::new(),
             prepared: HashMap::new(),
             seq_session: HashMap::new(),
@@ -140,6 +143,18 @@ impl Executor {
                 return decode_quoted_idents(Err(e));
             }
         }
+        if top && self.storage.tables.len() > 0 {
+            let head = sql.trim_start().get(..6).map(|h| h.to_ascii_uppercase());
+            if matches!(head.as_deref(), Some("SELECT") | Some("WITH ") | Some("WITH\n") | Some("UPDATE") | Some("DELETE") | Some("INSERT")) || head.as_deref().is_some_and(|h| h.starts_with("WITH")) {
+                let ns_sql = if self.namespaces_active() { self.resolve_namespaces(sql) } else { None };
+                if let Err(e) = self.check_qualified_refs_cached(ns_sql.as_deref().unwrap_or(sql)) {
+                    if self.storage.in_transaction {
+                        self.storage.tx_aborted = true;
+                    }
+                    return decode_quoted_idents(Err(e));
+                }
+            }
+        }
         let appended_before = self.storage.wal.appended;
         // Lệnh lỗi giữa chừng (vi phạm ràng buộc ở dòng thứ n, cascade lỗi...) được hoàn tác hết.
         let mark = self.storage.begin_statement();
@@ -194,6 +209,36 @@ impl Executor {
             self.column_check_cache.clear();
         }
         self.column_check_cache.insert(sql.to_string(), entry);
+        Ok(())
+    }
+
+    /// Kiểm tra `alias.cột` ở mọi mức (`validate::check_qualified_refs`), cache theo câu SQL.
+    fn check_qualified_refs_cached(&mut self, sql: &str) -> Result<(), String> {
+        use crate::engine::validate::{check_qualified_refs, columns_fingerprint};
+        let fp = |storage: &crate::storage::engine::StorageEngine, tables: &[String]| -> Option<u64> {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for t in tables {
+                h = (h ^ columns_fingerprint(storage, t)?).wrapping_mul(0x100000001b3);
+            }
+            Some(h)
+        };
+        match self.qual_check_cache.get(sql) {
+            Some(None) => return Ok(()),
+            Some(Some((ts, f))) if fp(&self.storage, ts) == Some(*f) => return Ok(()),
+            _ => {}
+        }
+        let Ok(lexed) = crate::engine::frontend::lex(sql) else { return Ok(()) };
+        let entry = match check_qualified_refs(&lexed, &self.storage)? {
+            None => None,
+            Some(ts) => match fp(&self.storage, &ts) {
+                Some(f) => Some((ts, f)),
+                None => return Ok(()),
+            },
+        };
+        if self.qual_check_cache.len() >= 4096 {
+            self.qual_check_cache.clear();
+        }
+        self.qual_check_cache.insert(sql.to_string(), entry);
         Ok(())
     }
 

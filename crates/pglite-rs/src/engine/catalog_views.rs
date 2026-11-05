@@ -1397,6 +1397,40 @@ pub(crate) fn bare_select_item(out: &str, after: &str) -> bool {
     (before.ends_with("select") || before.ends_with(',')) && (after.is_empty() || after.starts_with(',') || after.starts_with("as ") || after.starts_with("from ") || after.starts_with(';'))
 }
 
+/// `arg` là đúng một literal `'...'` (không phải `'a' || 'b'`).
+fn is_single_literal(arg: &str) -> bool {
+    let b = arg.as_bytes();
+    if b.len() < 2 || b[0] != b'\'' || b[b.len() - 1] != b'\'' {
+        return false;
+    }
+    let mut j = 1;
+    while j < b.len() - 1 {
+        if b[j] == b'\'' {
+            if b[j + 1] == b'\'' && j + 1 < b.len() - 1 {
+                j += 2;
+                continue;
+            }
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Tra `to_regclass/to_regnamespace/to_regtype(name)` (kind 0/1/2): OID hoặc tên, NULL khi không có.
+fn to_reg(m: &Model, name: &str, kind: i64, as_oid: bool) -> Value {
+    let found = match kind {
+        0 => m.regclass(name).map(|o| (o, m.relname(o).unwrap_or(name.to_string()))),
+        1 => m.nsp_oid(name).map(|o| (o, name.to_lowercase())),
+        _ => DeclType::parse(name).map(|d| type_oid_of_decl(&d, &HashMap::new())).filter(|o| *o != 25 || name.eq_ignore_ascii_case("text")).map(|o| (o, format_type(o, None))),
+    };
+    match found {
+        Some((o, _)) if as_oid => Value::Int(o),
+        Some((_, n)) => Value::text(n),
+        None => Value::Null,
+    }
+}
+
 /// `'x'::regclass[::oid]`, `to_regclass('x')`, `'x'::regtype`, `'x'::regnamespace`; `cột::regclass` → tên.
 fn rewrite_reg_casts(sql: &str, m: &Model) -> Result<String, String> {
     let mut out = String::with_capacity(sql.len());
@@ -1460,7 +1494,18 @@ fn rewrite_reg_casts(sql: &str, m: &Model) -> Result<String, String> {
                 if lower[i..].starts_with(f) {
                     if let Some(close) = super::constraints::matching_paren(sql, i + f.len() - 1) {
                         let arg = sql[i + f.len()..close].trim();
-                        if arg.len() >= 2 && arg.starts_with('\'') && arg.ends_with('\'') {
+                        if !is_single_literal(arg) {
+                            // tham số `$1`, NULL, biểu thức: tra lúc chạy
+                            let as_oid = lower[close + 1..].starts_with("::oid") || !bare_select_item(&out, &lower[close + 1..]);
+                            out.push_str(&format!("pg_cat_toreg({}, {}, {})", arg, kind, as_oid as i32));
+                            i = close + 1;
+                            if lower[i..].starts_with("::oid") {
+                                i += 5;
+                            }
+                            replaced = true;
+                            break;
+                        }
+                        {
                             let name = arg[1..arg.len() - 1].replace("''", "'");
                             let found = match kind {
                                 0 => m.regclass(&name).map(|o| (o, m.relname(o).unwrap_or(name.clone()))),
@@ -1562,7 +1607,7 @@ pub(crate) fn is_catalog_fn(name: &str) -> bool {
         name,
         "FORMAT_TYPE" | "PG_GET_INDEXDEF" | "PG_GET_CONSTRAINTDEF" | "PG_GET_EXPR" | "PG_GET_USERBYID" | "PG_TABLE_IS_VISIBLE" | "PG_TYPE_IS_VISIBLE"
             | "PG_FUNCTION_IS_VISIBLE" | "PG_GET_VIEWDEF" | "PG_ENCODING_TO_CHAR" | "PG_CAT_RELNAME" | "PG_CAT_TYPNAME" | "PG_CAT_NSP" | "PG_CAT_PROCNAME"
-            | "PG_CAT_RELOID" | "PG_GET_TRIGGERDEF" | "PG_GET_FUNCTION_ARGUMENTS" | "PG_GET_FUNCTION_RESULT" | "PG_GET_FUNCTIONDEF"
+            | "PG_CAT_RELOID" | "PG_CAT_TOREG" | "PG_GET_TRIGGERDEF" | "PG_GET_FUNCTION_ARGUMENTS" | "PG_GET_FUNCTION_RESULT" | "PG_GET_FUNCTIONDEF"
     )
 }
 
@@ -1665,6 +1710,15 @@ pub(crate) fn call_catalog_fn(name: &str, args: &[Value]) -> Option<Value> {
                 Some(o) => text_or_null(with_model(|m| m.relname(o)).flatten().or_else(|| Some(o.to_string()))),
                 None => args.first().cloned().unwrap_or(Value::Null),
             }
+        }
+        "PG_CAT_TOREG" => {
+            let name = match args.first()? {
+                Value::Text(t) => t.to_string(),
+                v => v.as_str(),
+            };
+            let kind = arg_i64(args.get(1)).unwrap_or(0);
+            let as_oid = arg_i64(args.get(2)).unwrap_or(1) != 0;
+            with_model(|m| to_reg(m, &name, kind, as_oid)).unwrap_or(Value::Null)
         }
         "PG_CAT_RELOID" => match args.first()? {
             Value::Text(t) if t.parse::<i64>().is_err() => with_model(|m| m.regclass(t)).flatten().map(Value::Int).unwrap_or(Value::Null),

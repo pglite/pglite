@@ -27,8 +27,10 @@ try {
     { RUSTFLAGS: "-C link-arg=-undefined -C link-arg=dynamic_lookup" }
   );
 
-  const macDylib = join(CRATES_DIR, "target/release/libpglite_rs.dylib");
-  if (existsSync(macDylib)) {
+  // Cargo.toml at the root is a workspace: cargo writes to <root>/target, not crates/pglite-rs/target
+  const macDylib = join(ROOT_DIR, "target/release/libpglite_rs.dylib");
+  if (!existsSync(macDylib)) throw new Error(`cargo build finished but ${macDylib} is missing`);
+  {
     copyFileSync(macDylib, join(CRATES_DIR, "pglite.darwin-arm64.node"));
     copyFileSync(macDylib, join(CRATES_DIR, "pglite.node"));
     copyFileSync(macDylib, join(DIST_DIR, "pglite.darwin-arm64.node"));
@@ -49,7 +51,7 @@ try {
     { RUSTFLAGS: `-C linker=${ZIG_SCRIPT}` }
   );
 
-  const linuxSo = join(CRATES_DIR, "target/x86_64-unknown-linux-gnu/release/libpglite_rs.so");
+  const linuxSo = join(ROOT_DIR, "target/x86_64-unknown-linux-gnu/release/libpglite_rs.so");
   if (existsSync(linuxSo)) {
     copyFileSync(linuxSo, join(CRATES_DIR, "pglite.linux-x64.node"));
     copyFileSync(linuxSo, join(DIST_DIR, "pglite.linux-x64.node"));
